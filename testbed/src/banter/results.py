@@ -65,13 +65,13 @@ class Row:
     skills: str             # skill bundle name or "none"
     skills_version: int     # 0 when skills=none; else version of the snapshot used
     skills_hash: str        # "" when skills=none; else 8-hex hash of the snapshot
-    skills_dir: str         # path to skills/<name>/<version>/, "" when skills=none
-    version: int            # interface variant index (starts at 0)
-    hash: str               # 8-hex runtime hash of interface variant contents
-    interface_dir: str      # path to interfaces/<name>/<mode>/<version>/
-    prompt_version: int     # always 0 today (prompts are static; no versioning)
-    prompt_hash: str        # 8-hex runtime hash of the prompt file content
-    prompt_file: str        # path to prompts/interfaces/<name>/<mode>.md
+    skills_dir: str         # configs/skills/<name>/<version>/, "" when skills=none
+    version: int            # interface variant index (0=base, autoresearch creates 1+)
+    hash: str               # 8-hex hash of manifest + binary folder + version
+    interface_dir: str      # configs/interfaces/<name>/<mode>.yaml (manifest path)
+    prompt_version: int     # same integer as `version`; prompts are per-version
+    prompt_hash: str        # 8-hex hash of the resolved prompt text
+    prompt_file: str        # configs/interfaces/<name>/<mode>.yaml#versions.<v>.prompt
     auth: str
     model: str
     wall_time_s: float

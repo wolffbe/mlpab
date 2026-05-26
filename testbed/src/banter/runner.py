@@ -1,26 +1,23 @@
 """Orchestrates a single (challenge, interface, mode, skills) run.
 
-Layout produced under
-    runs/<interface>_<mode>_<version>_<hash>_<challenge>_<skills_suffix>/
+Layout produced under (within the caller-supplied runs_root):
+    <interface>/<mode>/<skills|no_skills>/v<version>/<challenge>/
 
-Single flat directory per (interface, mode, version, hash, challenge, skills)
-combo. Re-running the same combo overwrites the previous run dir and
-replaces its row in results.csv. `<version>_<hash>` matches the interface
-variant folder under `testbed/interfaces/<interface>_<mode>_<version>_<hash>/`.
-`<skills_suffix>` is literally `skills` or `no_skills`.
-
+Each challenge run folder contains:
+    prompt.txt            # exact task prompt handed to claude -p
     venv/                 # fresh per-run venv (memory: project_run_isolation)
     data/                 # symlink to prepared MLE-bench data
     submission/           # where the agent writes submission.csv
     transcript.jsonl      # full claude -p stream-json output (tokens + cost in `result` event)
     commands.jsonl        # one line per tool call (cli/mcp/sdk/python/bash/...)
     grading.json          # MLE-bench grader output
-    prompt.txt            # exact task prompt handed to claude -p
     .claude/settings.json # PreToolUse hook config for claude -p
     .claude/skills/       # copied skill bundle                    [skills != none]
     .mcp.json             # MCP servers                            [mode == mcp]
 
-A row is appended to a single top-level runs/results.csv across all runs.
+A row is appended to runs_root/results.csv for each run. Autoresearch and
+benchmark sessions each supply their own isolated runs_root so every session
+has its own results.csv.
 """
 from __future__ import annotations
 
@@ -42,6 +39,11 @@ AUTH_MODES = ("api-key", "login")
 TESTBED_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DATA_ROOT = TESTBED_ROOT / "cache" / "mle-bench"
 
+# Global aggregate CSV — every run from every session (autoresearch,
+# benchmark, ad-hoc `banter run`) appends here so you have a single
+# cross-session table for analysis.
+GLOBAL_RESULTS_CSV = TESTBED_ROOT / "results" / "results.csv"
+
 
 @dataclass
 class RunSpec:
@@ -52,8 +54,10 @@ class RunSpec:
     model: str = DEFAULT_MODEL
     auth: str = "api-key"
     timeout_s: int = 60 * 60
-    runs_root: Path = Path("runs")
+    runs_root: Path = Path("results")
     data_root: Path = DEFAULT_DATA_ROOT
+    interface_version: int | None = None  # None → latest version
+    skills_version: int | None = None     # None → latest version
 
 
 def _make_venv(target: Path) -> Path:
@@ -75,24 +79,28 @@ def run(spec: RunSpec) -> results.Row:
         raise ValueError(f"Unknown auth mode {spec.auth!r}; expected one of {AUTH_MODES}")
 
     started = datetime.now(timezone.utc)
-    version, variant_hash = interfaces.variant_for(spec.interface, spec.mode)
-    interface_dir = f"interfaces/{spec.interface}/{spec.mode}/{version}"
-    prompt_file = f"prompts/interfaces/{spec.interface}/{spec.mode}.md"
-    prompt_version = 0  # prompts are static today; no install-style versioning
-    prompt_hash = interfaces.prompt_hash_for(spec.interface, spec.mode)
+    version, variant_hash = interfaces.variant_for(spec.interface, spec.mode, spec.interface_version)
+    interface_dir = f"configs/interfaces/{spec.interface}/{spec.mode}.yaml"
+    prompt_file = f"{interface_dir}#versions.{version}.prompt"
+    prompt_version = version
+    prompt_hash = interfaces.prompt_hash_for(spec.interface, spec.mode, version)
     # Fail fast on unverified skill bundles — before spending time on
     # venv/data/prep we want to know the bundle is well-formed.
     if spec.skills == "none":
         skills_version, skills_hash = 0, ""
         skills_dir = ""
-        skills_suffix = "no_skills"
+        skills_label = "no_skills"
     else:
-        skills_version, skills_hash, _ = skills_mod.verify_installed(spec.skills)
-        skills_dir = f"skills/{spec.skills}/{skills_version}"
-        skills_suffix = f"{spec.skills}_{skills_version}_{skills_hash}"
-    run_dir = spec.runs_root / (
-        f"{spec.interface}_{spec.mode}_{version}_{variant_hash}_"
-        f"{spec.challenge_id}_{skills_suffix}"
+        skills_version, skills_hash, _ = skills_mod.verify_installed(spec.skills, spec.skills_version)
+        skills_dir = f"configs/skills/{spec.skills}/{skills_version}"
+        skills_label = spec.skills
+    run_dir = (
+        spec.runs_root
+        / spec.interface
+        / spec.mode
+        / skills_label
+        / f"v{version}"
+        / spec.challenge_id
     )
     # Same combo re-runs overwrite the previous output.
     if run_dir.exists():
@@ -103,13 +111,12 @@ def run(spec: RunSpec) -> results.Row:
     venv_python = _make_venv(run_dir / "venv")
     (run_dir / "submission").mkdir(exist_ok=True)
 
-    try:
-        mlebench_wrapper.prepare(spec.challenge_id, run_dir, spec.data_root)
-    except Exception as e:
-        print(f"[banter] prepare failed: {e}", file=sys.stderr)
+    # mle-bench data prep must succeed before we spin up Claude — without
+    # data/ the solver has nothing to score against. Don't swallow.
+    mlebench_wrapper.prepare(spec.challenge_id, run_dir, spec.data_root)
 
-    interface_setup = interfaces.setup(spec.interface, spec.mode, run_dir, venv_python)
-    skills_setup = skills_mod.apply(spec.skills, run_dir)
+    interface_setup = interfaces.setup(spec.interface, spec.mode, run_dir, venv_python, spec.interface_version)
+    skills_setup = skills_mod.apply(spec.skills, run_dir, spec.skills_version)
     if skills_setup.installed:
         print(
             f"[banter] skills v{skills_setup.version} ({skills_setup.hash}): "
@@ -185,5 +192,12 @@ def run(spec: RunSpec) -> results.Row:
         **counts,
     )
 
-    results.append(spec.runs_root / "results.csv", row)
+    # Per-session CSV (autoresearch/benchmark session dir, or the standalone
+    # `banter run` root) + global cross-session aggregate. When they resolve
+    # to the same path (standalone runs into results/), we only write once
+    # — append() dedupes by run_dir anyway, but the comparison saves I/O.
+    session_csv = spec.runs_root / "results.csv"
+    results.append(GLOBAL_RESULTS_CSV, row)
+    if session_csv.resolve() != GLOBAL_RESULTS_CSV.resolve():
+        results.append(session_csv, row)
     return row

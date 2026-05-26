@@ -1,26 +1,26 @@
-"""Install a chosen (interface, type) into a challenge run.
+"""Resolve a chosen (interface, type, version) for a challenge run.
 
-An *interface* is a vendor or product (e.g. `hopsworks`, `none`). A *type*
-is how Claude talks to it (`cli`, `mcp`, `sdk`, or `none`). Variants live
-under a nested layout:
+The single source of truth for an interface is its install manifest:
 
-    interfaces/<name>/<type>/<version>/
-        config.yaml      # repo, ref, install, binary, mcp_servers, ...
-        <other files>    # binaries, scripts, etc. — all included in the hash
+    configs/interfaces/<name>/<type>.yaml
 
-`<version>` is an integer (0, 1, 2, ...) — banter picks the highest
-existing version for a (name, type). The hash of the variant is computed
-on the fly each run by recursively sha256'ing the contents combined with
-the version int, so it stays off disk.
+The manifest carries everything the testbed needs:
 
-Prompts are kept separately and constant across variants of the same
-(name, type):
+    repo, ref, install, auth_command         # one-time install (banter install)
+    binary, runtime_install, mcp_servers     # runtime defaults (banter run)
+    versions:                                # autoresearch-managed
+      0: { prompt: "..." }                   # base
+      1: { prompt: "...", install: [...] }   # per-version overrides
 
-    prompts/interfaces/<name>_<type>.md
+Binary artifacts live separately and only exist when needed:
 
-`setup()` returns the artifacts the runner needs: a prompt fragment to
-splice into the task, the CLI binary name (used to count CLI tool calls),
-and the MCP server config to write to .mcp.json (if any).
+    interfaces/<name>/<type>/<version>/      # e.g. .../hopsworks/cli/0/hops
+
+For SDK/MCP interfaces no binary is needed — the version folder may be absent.
+
+Version 0 is the base, set up by `banter install`. Versions 1+ are created by
+autoresearch (appended to `versions:` in the manifest, with a copy of the
+binary if applicable).
 """
 from __future__ import annotations
 
@@ -36,8 +36,11 @@ import yaml
 
 TYPES = ("cli", "mcp", "sdk", "none")
 _TESTBED_ROOT = Path(__file__).resolve().parents[2]
-INTERFACES_DIR = _TESTBED_ROOT / "interfaces"
-PROMPTS_DIR = _TESTBED_ROOT / "prompts" / "interfaces"
+
+# configs/interfaces/<name>/<type>.yaml — install manifests
+IFACE_CONFIGS_DIR = _TESTBED_ROOT / "configs" / "interfaces"
+# interfaces/<name>/<type>/<version>/ — built binary artifacts only
+IFACE_BINS_DIR = _TESTBED_ROOT / "interfaces"
 
 
 @dataclass
@@ -45,142 +48,261 @@ class InterfaceSetup:
     name: str
     type: str
     prompt_fragment: str
-    version: int            # 0-based variant index from the folder name
-    hash: str               # runtime sha256 of the variant folder contents
+    version: int
+    hash: str
     cli_binary: str | None = None
     sdk_module: str | None = None
     mcp_servers: dict[str, Any] = field(default_factory=dict)
 
 
-def _variant_dir(name: str, type_: str) -> Path:
-    """Return `interfaces/<name>/<type>/<highest-version>/` or raise."""
-    type_dir = INTERFACES_DIR / name / type_
-    if not type_dir.is_dir():
-        raise ValueError(
-            f"No variants for interface {name!r}, type {type_!r}. "
-            f"Expected a folder under {type_dir} named with an integer version."
-        )
-    versions = [int(p.name) for p in type_dir.iterdir() if p.is_dir() and p.name.isdigit()]
-    if not versions:
-        raise ValueError(
-            f"No version folder for interface {name!r}, type {type_!r} under {type_dir}."
-        )
-    return type_dir / str(max(versions))
+# ---------------------------------------------------------------------------
+# Manifest helpers
+# ---------------------------------------------------------------------------
 
 
-def _compute_hash(variant: Path, version: int) -> str:
-    """Recursive sha256 of the variant folder's files + version int."""
-    h = hashlib.sha256()
-    for path in sorted(p for p in variant.rglob("*") if p.is_file()):
-        rel = path.relative_to(variant).as_posix()
-        h.update(rel.encode())
-        h.update(b"\0")
-        h.update(path.read_bytes())
-        h.update(b"\0")
-    h.update(f"|v={version}".encode())
-    return h.hexdigest()[:8]
+def manifest_path(name: str, type_: str) -> Path:
+    return IFACE_CONFIGS_DIR / name / f"{type_}.yaml"
 
 
-def _load_config(variant: Path) -> dict[str, Any]:
-    cfg_path = variant / "config.yaml"
-    if not cfg_path.exists():
+def bin_dir(name: str, type_: str, version: int) -> Path:
+    return IFACE_BINS_DIR / name / type_ / str(version)
+
+
+def load_manifest(name: str, type_: str) -> dict[str, Any]:
+    p = manifest_path(name, type_)
+    if not p.exists():
         return {}
-    return yaml.safe_load(cfg_path.read_text()) or {}
+    return yaml.safe_load(p.read_text()) or {}
 
 
-def _load_prompt(name: str, type_: str) -> str:
-    p = PROMPTS_DIR / name / f"{type_}.md"
-    return p.read_text().strip() if p.exists() else ""
+def _version_entries(manifest: dict[str, Any]) -> dict[int, dict[str, Any]]:
+    """Normalise manifest['versions'] to {int: dict}."""
+    raw = manifest.get("versions") or {}
+    out: dict[int, dict[str, Any]] = {}
+    if isinstance(raw, dict):
+        for k, v in raw.items():
+            try:
+                out[int(k)] = v or {}
+            except (TypeError, ValueError):
+                continue
+    elif isinstance(raw, list):
+        for entry in raw:
+            if not isinstance(entry, dict):
+                continue
+            try:
+                out[int(entry.get("version", 0))] = entry
+            except (TypeError, ValueError):
+                continue
+    return out
 
 
-def prompt_hash_for(name: str, type_: str) -> str:
-    """8-hex sha256 of the prompt file content (empty string -> empty hash)."""
-    text = _load_prompt(name, type_)
+def available_versions(name: str, type_: str) -> list[int]:
+    return sorted(_version_entries(load_manifest(name, type_)).keys())
+
+
+def _resolved_version_config(
+    manifest: dict[str, Any], version: int
+) -> dict[str, Any]:
+    """Merge base manifest defaults with per-version overrides."""
+    ver_entries = _version_entries(manifest)
+    ver = ver_entries.get(version) or {}
+    merged: dict[str, Any] = {
+        "binary": manifest.get("binary"),
+        "runtime_install": manifest.get("runtime_install") or [],
+        "mcp_servers": manifest.get("mcp_servers") or {},
+        "prompt": ver.get("prompt"),
+    }
+    # Per-version overrides (apply on top of base defaults)
+    for key in ("binary", "runtime_install", "mcp_servers"):
+        if key in ver:
+            merged[key] = ver[key]
+    return merged
+
+
+# ---------------------------------------------------------------------------
+# Prompt helpers
+# ---------------------------------------------------------------------------
+
+
+def _auto_prompt(name: str, type_: str, binary: str | None) -> str:
+    """Generate a sensible default prompt when the manifest doesn't supply one."""
+    cap = name.capitalize()
+    if type_ == "cli" and binary:
+        return (
+            f"The {cap} `{binary}` CLI is installed and authenticated. "
+            f"Use `{binary} <subcommand>` for all {cap} operations."
+        )
+    if type_ == "sdk":
+        return f"The {cap} Python SDK is installed. Import and use it for all {cap} operations."
+    if type_ == "mcp":
+        return f"You have access to the {cap} MCP server. Use the provided MCP tools for all {cap} operations."
+    return ""
+
+
+def _prompt_for(name: str, type_: str, manifest: dict[str, Any], version: int) -> str:
+    cfg = _resolved_version_config(manifest, version)
+    text = cfg.get("prompt")
+    if text:
+        return text.strip()
+    return _auto_prompt(name, type_, cfg.get("binary"))
+
+
+def prompt_hash_for(name: str, type_: str, version: int | None = None) -> str:
+    if name == "none" and type_ == "none":
+        return ""
+    manifest = load_manifest(name, type_)
+    versions = sorted(_version_entries(manifest).keys())
+    if not versions:
+        return ""
+    chosen = version if version is not None else max(versions)
+    text = _prompt_for(name, type_, manifest, chosen)
     if not text:
         return ""
     return hashlib.sha256(text.encode()).hexdigest()[:8]
 
 
+# ---------------------------------------------------------------------------
+# Hashing
+# ---------------------------------------------------------------------------
+
+
+def _compute_hash(name: str, type_: str, version: int) -> str:
+    """sha256 over manifest bytes + binary folder bytes + version int."""
+    h = hashlib.sha256()
+    mp = manifest_path(name, type_)
+    if mp.exists():
+        h.update(mp.read_bytes())
+        h.update(b"\0")
+    bd = bin_dir(name, type_, version)
+    if bd.is_dir():
+        for path in sorted(p for p in bd.rglob("*") if p.is_file()):
+            rel = path.relative_to(bd).as_posix()
+            h.update(rel.encode())
+            h.update(b"\0")
+            h.update(path.read_bytes())
+            h.update(b"\0")
+    h.update(f"|v={version}".encode())
+    return h.hexdigest()[:8]
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+
 def available() -> dict[str, list[str]]:
-    """Return {interface_name: [types...]} by scanning the interfaces folder."""
+    """Return {interface_name: [types...]} by scanning manifest YAML files."""
     out: dict[str, set[str]] = defaultdict(set)
-    if not INTERFACES_DIR.exists():
+    if not IFACE_CONFIGS_DIR.exists():
         return {}
-    for name_dir in INTERFACES_DIR.iterdir():
+    for name_dir in IFACE_CONFIGS_DIR.iterdir():
         if not name_dir.is_dir():
             continue
-        for type_dir in name_dir.iterdir():
-            if not type_dir.is_dir() or type_dir.name not in TYPES:
+        for yaml_file in name_dir.iterdir():
+            if not yaml_file.is_file() or yaml_file.suffix != ".yaml":
                 continue
-            # Must contain at least one version folder.
-            if any(p.is_dir() and p.name.isdigit() for p in type_dir.iterdir()):
-                out[name_dir.name].add(type_dir.name)
+            type_ = yaml_file.stem
+            if type_ not in TYPES:
+                continue
+            manifest = yaml.safe_load(yaml_file.read_text()) or {}
+            if _version_entries(manifest):
+                out[name_dir.name].add(type_)
     return {k: sorted(v) for k, v in sorted(out.items())}
 
 
-def variant_for(name: str, type_: str) -> tuple[int, str]:
-    """Return (version, hash) of the latest variant for (name, type) without
-    performing any setup side effects. Hash is computed on the fly."""
+def variant_for(name: str, type_: str, version: int | None = None) -> tuple[int, str]:
+    """Return (version, hash). Picks latest version when version is None."""
+    if name == "none" and type_ == "none":
+        return 0, ""
     if type_ not in TYPES:
         raise ValueError(f"Unknown interface type {type_!r}; expected one of {TYPES}")
-    variant = _variant_dir(name, type_)
-    version = int(variant.name)
-    return version, _compute_hash(variant, version)
+    manifest = load_manifest(name, type_)
+    versions = sorted(_version_entries(manifest).keys())
+    if not versions:
+        raise ValueError(
+            f"No versions for {name!r}/{type_!r} in {manifest_path(name, type_)}. "
+            f"Run: banter install configs/interfaces/{name}/{type_}.yaml"
+        )
+    chosen = version if version is not None else max(versions)
+    if chosen not in versions:
+        raise ValueError(
+            f"Interface {name!r}/{type_!r} has no version {chosen}. Available: {versions}."
+        )
+    return chosen, _compute_hash(name, type_, chosen)
 
 
-def setup(name: str, type_: str, run_dir: Path, venv_python: Path) -> InterfaceSetup:
+def setup(
+    name: str,
+    type_: str,
+    run_dir: Path,
+    venv_python: Path,
+    version: int | None = None,
+) -> InterfaceSetup:
     if type_ not in TYPES:
         raise ValueError(f"Unknown interface type {type_!r}; expected one of {TYPES}")
-
-    variant = _variant_dir(name, type_)
-    version = int(variant.name)
-    cfg = _load_config(variant)
-    prompt_fragment = _load_prompt(name, type_)
-    hash_ = _compute_hash(variant, version)
 
     if name == "none" and type_ == "none":
-        return InterfaceSetup(
-            name=name,
-            type=type_,
-            prompt_fragment=prompt_fragment,
-            version=version,
-            hash=hash_,
+        return InterfaceSetup(name="none", type="none", prompt_fragment="", version=0, hash="")
+
+    manifest = load_manifest(name, type_)
+    versions = sorted(_version_entries(manifest).keys())
+    if not versions:
+        raise ValueError(
+            f"Interface {name!r}/{type_!r} has no versions. "
+            f"Run: banter install configs/interfaces/{name}/{type_}.yaml"
+        )
+    chosen = version if version is not None else max(versions)
+    if chosen not in versions:
+        raise ValueError(
+            f"Interface {name!r}/{type_!r} has no version {chosen}. Available: {versions}."
         )
 
-    repo = cfg.get("repo")
-    install_steps = cfg.get("install") or []
-    if repo:
-        _git_clone(repo, cfg.get("ref", "main"), run_dir / "interface")
-    if install_steps:
-        _run_install(install_steps, cwd=run_dir, venv_python=venv_python)
+    cfg = _resolved_version_config(manifest, chosen)
+    binary = cfg.get("binary")
+    runtime_install = cfg.get("runtime_install") or []
+    mcp_servers = cfg.get("mcp_servers") or {}
+    prompt_fragment = _prompt_for(name, type_, manifest, chosen)
+    hash_ = _compute_hash(name, type_, chosen)
+    bins = bin_dir(name, type_, chosen)
+
+    # Guard: if runtime steps reference $INTERFACE_DIR (pre-built binary), it must exist.
+    if binary and runtime_install and any("$INTERFACE_DIR" in s for s in runtime_install):
+        if not (bins / binary).exists():
+            raise RuntimeError(
+                f"Interface {name!r}/{type_!r} v{chosen} binary '{binary}' not found at "
+                f"{bins / binary}. Run: banter install configs/interfaces/{name}/{type_}.yaml"
+            )
+
+    if runtime_install:
+        _run_install(runtime_install, cwd=run_dir, venv_python=venv_python, interface_dir=bins)
 
     return InterfaceSetup(
         name=name,
         type=type_,
         prompt_fragment=prompt_fragment,
-        version=version,
+        version=chosen,
         hash=hash_,
-        cli_binary=cfg.get("binary"),
-        # SDK module name is always the interface name when mode is `sdk`.
+        cli_binary=binary,
         sdk_module=name if type_ == "sdk" else None,
-        mcp_servers=cfg.get("mcp_servers") or {},
+        mcp_servers=mcp_servers,
     )
 
 
-def _git_clone(repo: str, ref: str, target: Path) -> None:
-    if target.exists():
-        return
-    subprocess.run(
-        ["git", "clone", "--depth", "1", "--branch", ref, repo, str(target)],
-        check=True,
-    )
-
-
-def _run_install(steps: list[str], cwd: Path, venv_python: Path) -> None:
+def _run_install(
+    steps: list[str],
+    cwd: Path,
+    venv_python: Path,
+    interface_dir: Path | None = None,
+) -> None:
     import os
 
     env = os.environ.copy()
     env["PATH"] = f"{venv_python.parent}:{env['PATH']}"
     env["VIRTUAL_ENV"] = str(venv_python.parent.parent)
+    if interface_dir is not None:
+        env["INTERFACE_DIR"] = str(interface_dir)
+    pip_cache = _TESTBED_ROOT / "cache" / "pip"
+    pip_cache.mkdir(parents=True, exist_ok=True)
+    env["PIP_CACHE_DIR"] = str(pip_cache)
     for step in steps:
         subprocess.run(step, shell=True, cwd=cwd, env=env, check=True)

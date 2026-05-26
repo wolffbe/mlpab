@@ -1,4 +1,4 @@
-.PHONY: help install setup clean reset venv
+.PHONY: help install setup clean reset venv check-git
 
 # Pin to a Python that orjson/PyO3 supports. PyO3 0.23 caps at 3.13; pip-built
 # orjson on 3.14 fails. Override with `make install PYTHON=python3.13`.
@@ -17,7 +17,11 @@ help:
 	@echo "  make clean     — remove .venv and runs/"
 	@echo "  make reset     — clean then reinstall"
 
-install: $(VENV)/.installed setup
+check-git:
+	@command -v git >/dev/null 2>&1 || { echo "ERROR: git is not installed. Install git and retry."; exit 1; }
+	@echo ">> git OK ($(shell git --version))"
+
+install: check-git $(VENV)/.installed setup
 
 $(VENV)/.installed: pyproject.toml
 	@echo ">> using interpreter: $(PYTHON)"

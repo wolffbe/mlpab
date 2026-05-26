@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 
-SKILLS_ROOT = Path(__file__).resolve().parents[2] / "skills"
+SKILLS_ROOT = Path(__file__).resolve().parents[2] / "configs" / "skills"
 
 
 @dataclass
@@ -36,8 +36,9 @@ class SkillsSetup:
     installed: list[str] = field(default_factory=list)
 
 
-def _bundle_dir(name: str) -> Path:
-    """Return `skills/<name>/<highest-version>/`. Raises if no version exists."""
+def _bundle_dir(name: str, version: int | None = None) -> Path:
+    """Return `skills/<name>/<version>/`. When version is None, picks the
+    highest existing version folder. Raises if the bundle or version is absent."""
     bundle = SKILLS_ROOT / name
     if not bundle.is_dir():
         raise ValueError(
@@ -50,7 +51,12 @@ def _bundle_dir(name: str) -> Path:
             f"Bundle {name!r} has no version subfolders. Expected "
             f"{bundle}/<version>/<skill>/SKILL.md layout."
         )
-    return bundle / str(max(versions))
+    chosen = version if version is not None else max(versions)
+    if chosen not in versions:
+        raise ValueError(
+            f"Skill bundle {name!r} has no version {chosen}. Available: {sorted(versions)}."
+        )
+    return bundle / str(chosen)
 
 
 def _compute_hash(variant: Path, version: int) -> str:
@@ -79,16 +85,16 @@ def available() -> list[str]:
     return sorted(set(out))
 
 
-def verify_installed(name: str) -> tuple[int, str, Path]:
+def verify_installed(name: str, version: int | None = None) -> tuple[int, str, Path]:
     """Fail fast if the chosen bundle version isn't usable. Checks:
 
     - A version subfolder exists.
     - At least one skill subfolder with a SKILL.md file is present.
 
     Returns (version, hash, version_path). Caller is expected to
-    short-circuit when `name == "none"`.
+    short-circuit when `name == "none"`. When version is None, picks latest.
     """
-    variant = _bundle_dir(name)
+    variant = _bundle_dir(name, version)
     version = int(variant.name)
     skill_dirs = [p for p in variant.iterdir() if p.is_dir()]
     if not skill_dirs:
@@ -105,13 +111,14 @@ def verify_installed(name: str) -> tuple[int, str, Path]:
     return version, _compute_hash(variant, version), variant
 
 
-def apply(name: str, run_dir: Path) -> SkillsSetup:
-    """Used by `banter run`: copy the latest version's skill subfolders into
-    `run_dir/.claude/skills/`. `name == "none"` is a no-op."""
+def apply(name: str, run_dir: Path, version: int | None = None) -> SkillsSetup:
+    """Used by `banter run`: copy a skill bundle version's subfolders into
+    `run_dir/.claude/skills/`. `name == "none"` is a no-op. When version is
+    None, picks the latest version."""
     if name == "none":
         return SkillsSetup(name="none")
 
-    version, hash_, src = verify_installed(name)
+    version, hash_, src = verify_installed(name, version)
     dst = run_dir / ".claude" / "skills"
     dst.mkdir(parents=True, exist_ok=True)
 

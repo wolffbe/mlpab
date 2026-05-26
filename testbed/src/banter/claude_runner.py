@@ -4,6 +4,11 @@ We set up a project-scoped .claude/settings.json with a PreToolUse hook so
 every tool call is logged, then run `claude -p` against the user's configured
 Anthropic credentials (api-key or login) and capture the full stream-json
 transcript. Cost + token totals come from the transcript's `result` event.
+
+The same rate-limit retry helper (`run_with_retry`) is used by the solver
+(`run` in this module) AND the autoresearch researcher — every `claude -p`
+invocation in the testbed goes through it, so a 429/529 anywhere triggers
+exponential back-off within the same 12h retry budget.
 """
 from __future__ import annotations
 
@@ -14,7 +19,7 @@ import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 TESTBED_ROOT = Path(__file__).resolve().parents[2]
@@ -148,21 +153,109 @@ def run(
     if mcp_cfg:
         cmd.extend(["--mcp-config", str(mcp_cfg)])
 
+    exit_code, wall = run_with_retry(
+        cmd=cmd,
+        cwd=run_dir,
+        env=env,
+        transcript_path=transcript_path,
+        stderr_path=stderr_path,
+        timeout_s=timeout_s,
+        log_prefix="claude_runner",
+    )
+
+    return ClaudeResult(
+        exit_code=exit_code,
+        wall_time_s=wall,
+        transcript_path=transcript_path,
+        stderr_path=stderr_path,
+    )
+
+
+def run_with_retry(
+    cmd: list[str],
+    cwd: Path,
+    env: dict[str, str],
+    transcript_path: Path,
+    stderr_path: Path,
+    timeout_s: int | None = None,
+    on_line: Callable[[str], None] | None = None,
+    log_prefix: str = "claude_runner",
+) -> tuple[int, float]:
+    """Run a `claude -p` subprocess with exponential rate-limit back-off.
+
+    Used by both the solver and the autoresearch researcher.
+
+    - Appends stdout to `transcript_path` (stream-json) and stderr to
+      `stderr_path`. Appending — not truncating — so each retry's events
+      accumulate; `_last_result_is_rate_limited` always inspects the LAST
+      `result` event.
+    - When `on_line` is given, stdout is piped through and each line is
+      forwarded to the callback (for live streaming display).
+    - On rate-limit detection (429/529/overloaded in the last `result`),
+      sleeps `min(2 * 2^(attempt-1), 3600)` seconds and retries until the
+      12h total budget is exhausted.
+
+    Returns `(exit_code, total_wall_time_s)` including sleep time.
+    """
     start = time.monotonic()
     attempt = 0
     exit_code = 1
     while True:
         attempt += 1
-        # Append (don't truncate) so each retry's stream-json events accumulate
-        # — parse_transcript_usage already keeps the LAST result event.
-        with open(transcript_path, "ab") as out, open(stderr_path, "ab") as err:
-            proc = subprocess.Popen(cmd, cwd=run_dir, env=env, stdout=out, stderr=err)
-            try:
-                exit_code = proc.wait(timeout=timeout_s)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait(timeout=10)
-                exit_code = 124  # conventional timeout code
+        if on_line is not None:
+            with open(transcript_path, "ab") as tf, open(stderr_path, "ab") as sf:
+                proc = subprocess.Popen(
+                    cmd,
+                    cwd=str(cwd),
+                    env=env,
+                    stdout=subprocess.PIPE,
+                    stderr=sf,
+                    text=True,
+                )
+                try:
+                    for raw_line in proc.stdout:  # type: ignore[union-attr]
+                        raw_line = raw_line.rstrip("\n")
+                        tf.write((raw_line + "\n").encode())
+                        tf.flush()
+                        if raw_line.strip():
+                            try:
+                                on_line(raw_line)
+                            except Exception:
+                                pass
+                    if timeout_s is not None:
+                        exit_code = proc.wait(timeout=timeout_s)
+                    else:
+                        exit_code = proc.wait()
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=10)
+                    exit_code = 124
+                except KeyboardInterrupt:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                    raise
+        else:
+            with open(transcript_path, "ab") as out, open(stderr_path, "ab") as err:
+                proc = subprocess.Popen(cmd, cwd=str(cwd), env=env, stdout=out, stderr=err)
+                try:
+                    if timeout_s is not None:
+                        exit_code = proc.wait(timeout=timeout_s)
+                    else:
+                        exit_code = proc.wait()
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=10)
+                    exit_code = 124
+                except KeyboardInterrupt:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                    raise
 
         if exit_code == 0 or not _last_result_is_rate_limited(transcript_path):
             break
@@ -173,25 +266,19 @@ def run(
         )
         if elapsed + backoff > RATE_LIMIT_RETRY_WINDOW_S:
             print(
-                f"[claude_runner] rate-limited after {attempt} attempts "
-                f"({elapsed:.0f}s elapsed); 12h retry budget exhausted, giving up.",
+                f"[{log_prefix}] rate-limited after {attempt} attempts "
+                f"({elapsed:.0f}s elapsed); {RATE_LIMIT_RETRY_WINDOW_S // 3600}h retry budget "
+                f"exhausted, giving up.",
                 flush=True,
             )
             break
         print(
-            f"[claude_runner] rate-limited on attempt {attempt} "
+            f"[{log_prefix}] rate-limited on attempt {attempt} "
             f"({elapsed:.0f}s elapsed); sleeping {backoff}s before retry.",
             flush=True,
         )
         time.sleep(backoff)
-    wall = time.monotonic() - start
-
-    return ClaudeResult(
-        exit_code=exit_code,
-        wall_time_s=wall,
-        transcript_path=transcript_path,
-        stderr_path=stderr_path,
-    )
+    return exit_code, time.monotonic() - start
 
 
 def _last_result_is_rate_limited(transcript_path: Path) -> bool:
