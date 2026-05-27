@@ -1,0 +1,95 @@
+"""Tests for config parsing: interface config references + unified tasks."""
+import tempfile
+import unittest
+from pathlib import Path
+
+from banter import autoresearch as ar, benchmark as bm, interfaces
+
+
+class NameTypeFromConfigTests(unittest.TestCase):
+    def test_derives_name_and_type(self):
+        self.assertEqual(
+            interfaces.name_type_from_config("configs/interfaces/hopsworks/cli.yaml"),
+            ("hopsworks", "cli"),
+        )
+
+    def test_bad_path_raises(self):
+        with self.assertRaises(ValueError):
+            interfaces.name_type_from_config("some/random/path.yaml")
+
+    def test_unknown_type_raises(self):
+        with self.assertRaises(ValueError):
+            interfaces.name_type_from_config("configs/interfaces/hopsworks/bogus.yaml")
+
+
+def _write(text: str) -> Path:
+    f = tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False)
+    f.write(text)
+    f.close()
+    return Path(f.name)
+
+
+class AutoresearchConfigTests(unittest.TestCase):
+    def test_tasks_and_interface_config_refs(self):
+        p = _write(
+            """
+improve: [interface]
+skills: none
+tasks:
+  image_classification: [aerial-cactus-identification]
+  tabular: [nomad2018-predict-transparent-conductors, tabular-playground-series-dec-2021]
+interfaces:
+  - config: configs/interfaces/hopsworks/cli.yaml
+  - config: configs/interfaces/hopsworks/mcp.yaml
+goals: [score]
+budget: {max_increments: 3}
+"""
+        )
+        cfg = ar.load_config(p)
+        self.assertEqual(list(cfg.tasks), ["image_classification", "tabular"])
+        # challenges flattened (deduped, order-preserving)
+        self.assertEqual(len(cfg.challenges), 3)
+        self.assertEqual([(i.name, i.mode) for i in cfg.interfaces],
+                         [("hopsworks", "cli"), ("hopsworks", "mcp")])
+        self.assertEqual(cfg.interfaces[0].config, "configs/interfaces/hopsworks/cli.yaml")
+        self.assertEqual(cfg.skills, "none")
+        self.assertEqual(cfg.budget.max_increments, 3)
+
+    def test_legacy_keys_still_parse(self):
+        p = _write(
+            """
+improve: interface
+starting_skills: none
+challenges: [aerial-cactus-identification]
+starting_interfaces:
+  - {name: hopsworks, mode: cli}
+goals: [score]
+budget: {max_cycles: 2}
+"""
+        )
+        cfg = ar.load_config(p)
+        self.assertEqual(cfg.tasks, {"all": ["aerial-cactus-identification"]})
+        self.assertEqual(cfg.interfaces[0].name, "hopsworks")
+        self.assertEqual(cfg.budget.max_increments, 2)
+
+
+class BenchmarkConfigTests(unittest.TestCase):
+    def test_matrix_interface_config_ref(self):
+        p = _write(
+            """
+engineer_model: claude-sonnet-4-6
+challenges: [aerial-cactus-identification]
+interfaces:
+  - {config: configs/interfaces/hopsworks/cli.yaml, session: abc123, version: 2}
+skills: [none]
+"""
+        )
+        cfg = bm.load_config(p)
+        self.assertEqual(len(cfg.runs), 1)
+        r = cfg.runs[0]
+        self.assertEqual((r.interface, r.mode, r.session, r.interface_version),
+                         ("hopsworks", "cli", "abc123", 2))
+
+
+if __name__ == "__main__":
+    unittest.main()

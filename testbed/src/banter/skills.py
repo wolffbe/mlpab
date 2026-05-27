@@ -1,8 +1,8 @@
 """Skill bundles for Claude Code runs.
 
-A *bundle* is a folder under `testbed/skills/` containing versioned
-subfolders, each of which holds one or more skill subfolders (each with a
-SKILL.md):
+A *bundle* is a folder under the top-level `skills/` directory containing
+versioned subfolders, each of which holds one or more skill subfolders (each
+with a SKILL.md):
 
     skills/<name>/<version>/<skill-subfolder>/SKILL.md
 
@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 
-SKILLS_ROOT = Path(__file__).resolve().parents[2] / "configs" / "skills"
+SKILLS_ROOT = Path(__file__).resolve().parents[2] / "skills"
 
 
 @dataclass

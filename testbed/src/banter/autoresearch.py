@@ -1,24 +1,32 @@
 """Manager Claude that iteratively optimizes interface and skill configurations.
 
+Hierarchy: a SESSION contains multiple INCREMENTS; each increment spans multiple
+TASKS (ML task types); each task spans its CHALLENGES. Every RQ config uses the
+same `tasks:` mapping (RQ1 = one challenge per task; RQ2 = several per task; RQ3
+= same shape with skills layered on frozen interfaces).
+
 Spawns a `claude -p` researcher session. The researcher:
-  - Runs ALL target challenges with the current config (one full round = one cycle)
-  - Reads all run dirs and results.csv to understand solver behaviour across challenges
-  - Creates new interface versions by appending to the manifest YAML's `versions:`
-    dict (and copying the binary into interfaces/<name>/<mode>/<v+1>/ if any), or
-    new skill bundle versions (configs/skills/<bundle>/<v+1>/<skill>/SKILL.md)
-  - Evaluates the change by running ALL challenges again
-  - Makes a conclusive decision by comparing cross-challenge aggregate metrics
-  - Iterates until budget (max_cycles) is exhausted
+  - Runs every (interface × task × challenge) with the current config
+  - Reads all run dirs and results.csv to understand engineer behaviour
+  - Creates session-local interface versions
+    (results/autoresearch/<id>/interfaces/<name>/<mode>/v<n>/version.yaml) or
+    skill bundle versions (skills/<bundle>/<v+1>/<skill>/SKILL.md)
+  - Evaluates the change by re-running, then decides conclusively
+  - Ends each increment with a SUMMARY OF OBSERVATIONS and a clear STATEMENT OF
+    PROPOSED CHANGES; ends the session with a FINAL REPORT
+  - Iterates until budget (max_increments) is exhausted
 
 Session layout:
     results/autoresearch/<session_id>/
         results.csv        # one row per individual challenge run
-        cycles.jsonl       # one entry per improvement cycle
+        increments.jsonl   # one entry per improvement increment
+        report.md          # final session report (written at the end)
         prompt.txt         # researcher prompt (for debugging)
         transcript.jsonl   # raw researcher stream-json
         transcript.log     # human-readable researcher output
+        interfaces/<name>/<mode>/v<n>/version.yaml   # session-local versions
         <interface>/<mode>/<skills>/v<version>/<challenge>/
-            prompt.txt     # solver prompt
+            prompt.txt     # engineer prompt
             venv/
             submission/
             transcript.log
@@ -35,12 +43,13 @@ import csv
 import json
 import os
 import shutil
-import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import yaml
+
+from banter import interfaces
 
 
 # ---------------------------------------------------------------------------
@@ -56,19 +65,31 @@ class Goal:
 
 @dataclass
 class Budget:
-    max_cycles: int = 10                       # each cycle = one full round across all (interface, challenge) pairs
+    # One increment = one full round across all (interface × task × challenge).
+    max_increments: int = 10
     max_cost_usd: float = float("inf")         # no cap by default
+
+    # Back-compat: older configs/code referenced `max_cycles`.
+    @property
+    def max_cycles(self) -> int:
+        return self.max_increments
 
 
 @dataclass
 class InterfaceRef:
     name: str
     mode: str
-    version: int | None = None      # None → use latest; integer → pin to that version
+    version: int | None = None      # None/0 → base manifest; >0 → a session version
+    # Autoresearch session that produced a pinned `version` > 0 (e.g. RQ3 pinning
+    # an RQ1 winner). None means "this session" / base.
+    session: str | None = None
+    # The interface config path this ref came from (when referenced by `config:`).
+    config: str | None = None
 
     def __str__(self) -> str:
         v = f" v{self.version}" if self.version is not None else ""
-        return f"{self.name}/{self.mode}{v}"
+        s = f" @{self.session}" if self.session else ""
+        return f"{self.name}/{self.mode}{v}{s}"
 
 
 _VALID_IMPROVE_SCOPES = {"interface", "skills"}
@@ -76,21 +97,21 @@ _VALID_IMPROVE_SCOPES = {"interface", "skills"}
 
 @dataclass
 class AutoresearchConfig:
-    challenges: list[str]
-    starting_interfaces: list[InterfaceRef]   # one or more interfaces run side-by-side per cycle
-    starting_skills: str
+    # tasks: ML task type → its challenges. The unifying structure across all
+    # RQ configs (RQ1 = one challenge per task; RQ2 = several; RQ3 = same as
+    # RQ1 with skills). The researcher runs `max_increments` increments PER TASK.
+    tasks: dict[str, list[str]]
+    challenges: list[str]                # flattened union of all tasks (derived)
+    interfaces: list[InterfaceRef]       # interfaces run side-by-side per increment
+    skills: str                          # starting skill bundle name, or "none"
     goals: list[Goal]
     budget: Budget
     improve: list[str]              # subset of {"interface", "skills"}
-    # Optional grouping: ML task type → list of challenges in that group.
-    # When set, the researcher runs `max_cycles` cycles PER GROUP (each cycle
-    # uses only that group's challenges), producing a specialised version
-    # per group rather than one general-purpose version. `challenges:` is
-    # auto-populated as the flattened union of all groups if left empty.
-    challenge_groups: dict[str, list[str]] | None = None
+    # The engineer is the controlled instance; the researcher controls it.
+    engineer_model: str = "claude-sonnet-4-6"
+    engineer_auth: str = "api-key"
     researcher_model: str = "claude-sonnet-4-6"
-    auth: str = "api-key"
-    model: str = "claude-sonnet-4-6"    # model for the solver agent
+    researcher_auth: str = "api-key"
 
 
 # Metrics where lower is better; everything else defaults to maximize.
@@ -115,9 +136,12 @@ def _parse_goal(entry: Any) -> Goal:
 
 
 def _parse_interfaces(data: dict) -> list[InterfaceRef]:
-    """Accept either `starting_interfaces: [{name, mode}, ...]` (new, plural)
-    or `starting_interface: {name, mode}` (legacy, singular)."""
-    raw = data.get("starting_interfaces")
+    """Parse `interfaces`. Each entry references an interface either by its
+    config file (`config: configs/interfaces/<name>/<type>.yaml`) — the
+    preferred, explicit form — or by `name` + `mode`. Optional `version` +
+    `session` say where to start (base v0, or a version pinned from a session).
+    Accepts legacy `starting_interfaces` / `starting_interface`."""
+    raw = data.get("interfaces") or data.get("starting_interfaces")
     if raw is None and "starting_interface" in data:
         single = data["starting_interface"]
         raw = [single] if isinstance(single, dict) else []
@@ -127,17 +151,21 @@ def _parse_interfaces(data: dict) -> list[InterfaceRef]:
     for entry in raw:
         if not isinstance(entry, dict):
             raise ValueError(
-                f"`starting_interfaces` entries must be mappings with `name`+`mode`; "
-                f"got {entry!r}"
+                f"`interfaces` entries must be mappings with `config:` "
+                f"(or `name`+`mode`); got {entry!r}"
             )
+        config_ref = entry.get("config")
+        if config_ref:
+            name, mode = interfaces.name_type_from_config(config_ref)
+        else:
+            name, mode = entry.get("name", "none"), entry.get("mode", "none")
         version = entry.get("version")
         if version is not None:
             version = int(version)
         out.append(
             InterfaceRef(
-                name=entry.get("name", "none"),
-                mode=entry.get("mode", "none"),
-                version=version,
+                name=name, mode=mode, version=version,
+                session=entry.get("session"), config=config_ref,
             )
         )
     return out
@@ -158,43 +186,54 @@ def load_config(path: Path) -> AutoresearchConfig:
             f"Invalid `improve` values: {invalid}. "
             f"Must be a subset of {sorted(_VALID_IMPROVE_SCOPES)}."
         )
-    # Parse optional challenge_groups (ML task type → challenges in that group).
-    raw_groups = data.get("challenge_groups")
-    groups: dict[str, list[str]] | None = None
-    if raw_groups:
-        if not isinstance(raw_groups, dict):
+    # tasks: ML task type → its challenges. Canonical key is `tasks`; we accept
+    # the legacy `challenge_groups`, and a flat `challenges:` list (wrapped as a
+    # single "all" task) for back-compat.
+    raw_tasks = data.get("tasks") or data.get("challenge_groups")
+    tasks: dict[str, list[str]] = {}
+    if raw_tasks:
+        if not isinstance(raw_tasks, dict):
             raise ValueError(
-                f"`challenge_groups` must be a mapping of group_name → [challenges]; "
-                f"got {type(raw_groups).__name__}."
+                f"`tasks` must be a mapping of task_name → [challenges]; "
+                f"got {type(raw_tasks).__name__}."
             )
-        groups = {}
-        for name, items in raw_groups.items():
+        for name, items in raw_tasks.items():
             if not isinstance(items, list) or not items:
                 raise ValueError(
-                    f"challenge_groups[{name!r}] must be a non-empty list of challenge ids."
+                    f"tasks[{name!r}] must be a non-empty list of challenge ids."
                 )
-            groups[str(name)] = [str(c) for c in items]
+            tasks[str(name)] = [str(c) for c in items]
+    elif data.get("challenges"):
+        tasks = {"all": [str(c) for c in data["challenges"]]}
 
-    challenges = data.get("challenges") or []
-    if not challenges and groups:
-        # Flatten groups into challenges (deduplicated, preserves order of first occurrence).
-        seen: set[str] = set()
-        challenges = [c for items in groups.values() for c in items if not (c in seen or seen.add(c))]
+    # Flattened union of all task challenges (deduped, order-preserving).
+    seen: set[str] = set()
+    challenges = [c for items in tasks.values() for c in items if not (c in seen or seen.add(c))]
 
     return AutoresearchConfig(
+        tasks=tasks,
         challenges=challenges,
-        starting_interfaces=_parse_interfaces(data),
-        starting_skills=data.get("starting_skills", "none"),
+        interfaces=_parse_interfaces(data),
+        skills=data.get("skills", data.get("starting_skills", "none")),
         goals=goals,
         budget=Budget(
-            max_cycles=int(bud.get("max_cycles", bud.get("max_runs", 10))),
+            max_increments=int(
+                bud.get("max_increments", bud.get("max_cycles", bud.get("max_runs", 10)))
+            ),
             max_cost_usd=float(bud.get("max_cost_usd", float("inf"))),
         ),
         improve=improve,
-        challenge_groups=groups,
-        researcher_model=data.get("researcher_model", data.get("model", "claude-sonnet-4-6")),
-        auth=data.get("auth", "api-key"),
-        model=data.get("model", "claude-sonnet-4-6"),
+        # `engineer_*` are canonical; `model`/`auth` are accepted as legacy
+        # fallbacks. The researcher defaults to the engineer's auth/model when
+        # not given its own.
+        engineer_model=data.get("engineer_model", data.get("model", "claude-sonnet-4-6")),
+        engineer_auth=data.get("engineer_auth", data.get("auth", "api-key")),
+        researcher_model=data.get(
+            "researcher_model", data.get("engineer_model", data.get("model", "claude-sonnet-4-6"))
+        ),
+        researcher_auth=data.get(
+            "researcher_auth", data.get("engineer_auth", data.get("auth", "api-key"))
+        ),
     )
 
 
@@ -233,6 +272,8 @@ def _recent_results_table(runs_root: Path, n: int = 40) -> str:
 
 
 def _scan_interfaces(testbed_root: Path) -> str:
+    """List configured interfaces. Version 0 is the base config; higher versions
+    are created session-locally during the run (not listed here)."""
     idir = testbed_root / "configs" / "interfaces"
     if not idir.exists():
         return "  (none)"
@@ -244,24 +285,18 @@ def _scan_interfaces(testbed_root: Path) -> str:
             if not yaml_file.is_file() or yaml_file.suffix != ".yaml":
                 continue
             type_ = yaml_file.stem
+            if type_ not in ("cli", "mcp", "sdk", "none"):
+                continue
             manifest = yaml.safe_load(yaml_file.read_text()) or {}
-            raw = manifest.get("versions") or {}
-            if isinstance(raw, dict):
-                versions = sorted(int(k) for k in raw.keys() if str(k).isdigit() or isinstance(k, int))
-            elif isinstance(raw, list):
-                versions = sorted(int(e.get("version", 0)) for e in raw if isinstance(e, dict))
-            else:
-                versions = []
-            if versions:
-                lines.append(
-                    f"  {name_dir.name}/{type_}  versions={versions}  latest={max(versions)}"
-                )
+            if isinstance(manifest, dict) and manifest:
+                has_bin = " (binary)" if manifest.get("binary") else ""
+                lines.append(f"  {name_dir.name}/{type_}  base=v0{has_bin}")
     return "\n".join(lines) or "  (none)"
 
 
 def _scan_skills(testbed_root: Path) -> str:
-    sdir = testbed_root / "configs" / "skills"
-    lines = ["  none  (control — no skills injected into the solver)"]
+    sdir = testbed_root / "skills"
+    lines = ["  none  (control — no skills injected into the engineer)"]
     if not sdir.exists():
         return "\n".join(lines)
     for bundle_dir in sorted(sdir.iterdir()):
@@ -310,6 +345,17 @@ def _current_version(testbed_root: Path, iface: InterfaceRef) -> int:
     return max(ints) if ints else 0
 
 
+def _fragment(testbed_root: Path, name: str, **kw: Any) -> str:
+    """Load a prompt fragment from prompts/fragments/<name>, formatting if needed.
+
+    All researcher prompt wording lives under prompts/ — the code only selects
+    and fills fragments, it does not hold prose.
+    """
+    p = testbed_root / "prompts" / "fragments" / name
+    text = p.read_text().rstrip("\n") if p.exists() else ""
+    return text.format(**kw) if kw else text
+
+
 def build_researcher_prompt(
     config: AutoresearchConfig,
     testbed_root: Path,
@@ -321,10 +367,10 @@ def build_researcher_prompt(
         f"  {i + 1}. {g.direction.upper()} `{g.metric}`"
         for i, g in enumerate(config.goals)
     )
-    if config.challenge_groups:
+    if config.tasks:
         challenges_lines = "\n".join(
             f"  [{group}]\n" + "\n".join(f"    - {c}" for c in items)
-            for group, items in config.challenge_groups.items()
+            for group, items in config.tasks.items()
         )
     else:
         challenges_lines = "\n".join(f"  - {c}" for c in config.challenges)
@@ -332,493 +378,131 @@ def build_researcher_prompt(
     avail_skills = _scan_skills(testbed_root)
     recent_results = _recent_results_table(runs_root)
     n_challenges = len(config.challenges)
-    n_interfaces = len(config.starting_interfaces)
-    runs_per_cycle = n_challenges * n_interfaces
+    n_interfaces = len(config.interfaces)
+    runs_per_increment = n_challenges * n_interfaces
 
     # Per-interface current/next versions
     iface_versions = {
         str(iface): (_current_version(testbed_root, iface), _current_version(testbed_root, iface) + 1)
-        for iface in config.starting_interfaces
+        for iface in config.interfaces
     }
     interfaces_table = "\n".join(
         f"  - {iface}  (current v{cur}, next would be v{nxt})"
         for iface, (cur, nxt) in iface_versions.items()
     )
 
-    # Improvement scope description
+    # Improvement scope + conditional prose (loaded from prompts/fragments/).
     can_interface = "interface" in config.improve
     can_skills = "skills" in config.improve
     if can_interface and can_skills:
-        scope_desc = (
-            "any of the **interface manifests** listed above (append entries to "
-            "`versions:`) AND **skill bundles** (configs/skills/...)"
-        )
+        scope_desc = _fragment(testbed_root, "scope_both.md")
         scope_deny = ""
     elif can_interface:
-        scope_desc = (
-            "any of the **interface manifests** listed above (append entries to "
-            "`versions:` in configs/interfaces/<name>/<mode>.yaml)"
-        )
-        scope_deny = "❌ Do NOT create or modify skill bundles."
+        scope_desc = _fragment(testbed_root, "scope_interface.md")
+        scope_deny = _fragment(testbed_root, "scope_deny_skills.md")
     else:
-        scope_desc = "**skill bundles only**"
-        scope_deny = "❌ Do NOT create or modify interface manifests."
+        from_scratch = (
+            _fragment(testbed_root, "scope_skills_from_scratch.md")
+            if config.skills == "none" else ""
+        )
+        scope_desc = _fragment(testbed_root, "scope_skills.md", from_scratch=from_scratch)
+        scope_deny = _fragment(testbed_root, "scope_deny_interface.md")
 
-    cycles_path = runs_root / "cycles.jsonl"
-    first_iface = config.starting_interfaces[0]
+    hierarchy_note = _fragment(
+        testbed_root,
+        "hierarchy_tasks.md" if config.tasks else "hierarchy_single.md",
+    )
+    skills_note = (
+        _fragment(testbed_root, "skills_note.md")
+        if (config.skills == "none" and "skills" in config.improve) else ""
+    )
+    cost_cap = (
+        "unlimited" if config.budget.max_cost_usd == float("inf")
+        else f"${config.budget.max_cost_usd:.2f} USD"
+    )
+
+    increments_path = runs_root / "increments.jsonl"
+    first_iface = config.interfaces[0]
     cur_iface_version, next_iface_version = iface_versions[str(first_iface)]
 
-    # When challenge_groups: is set, the session is run PER GROUP. Each group
-    # gets its own pass of max_cycles cycles (using only that group's
-    # challenges), producing a specialised version per group. Sketch a
-    # per-group section the researcher can copy into the cycle log.
-    if config.challenge_groups:
-        group_section_lines = [
-            "## Challenge groups (RQ2-style: per-group specialisation)",
-            "",
-            f"This session has {len(config.challenge_groups)} ML task type(s). Process them",
-            f"sequentially: for each group, run {config.budget.max_cycles} cycles using ONLY that",
-            "group's challenges, producing a specialised interface version per group.",
-            "",
-            "Group order + challenges:",
-        ]
-        for gname, gitems in config.challenge_groups.items():
-            group_section_lines.append(f"  [{gname}]")
+    # Tasks section (RQ2-style per-task specialisation) — loaded from prompts/.
+    if config.tasks:
+        task_lines = []
+        for gname, gitems in config.tasks.items():
+            task_lines.append(f"  [{gname}]")
             for c in gitems:
-                group_section_lines.append(f"    - {c}")
-        group_section_lines.append("")
-        group_section_lines.append(
-            "Tag every cycle.jsonl entry with `\"group\": \"<group_name>\"` so the resulting"
-        )
-        group_section_lines.append(
-            "interface versions can be cross-referenced to ML task type during analysis."
-        )
-        group_section_lines.append("")
-        group_section_lines.append(
-            f"Total runs in this session: {len(config.challenge_groups)} groups × "
-            f"{config.budget.max_cycles} cycles × n_interfaces × challenges_per_group."
-        )
-        groups_block = "\n".join(group_section_lines) + "\n\n---\n"
+                task_lines.append(f"    - {c}")
+        groups_block = _fragment(
+            testbed_root, "tasks_section.md",
+            n_tasks=len(config.tasks),
+            max_increments=config.budget.max_increments,
+            tasks_list="\n".join(task_lines),
+        ) + "\n"
     else:
         groups_block = ""
-    skills_label = config.starting_skills if config.starting_skills != "none" else "no_skills"
+    skills_label = config.skills if config.skills != "none" else "no_skills"
     run_dir_example = (
-        f"{runs_root}/{first_iface.name}/{first_iface.mode}/"
+        f"{runs_root}/inc<N>/{first_iface.name}/{first_iface.mode}/"
         f"{skills_label}/v{cur_iface_version}/"
         f"{config.challenges[0] if config.challenges else 'challenge-id'}/"
     )
 
-    # Pre-render the "run every (interface, challenge) pair" block once
-    # (used for baseline + per-cycle evaluation snippets below). When an
-    # interface pins a `version:`, pass it as --interface-version so the
-    # solver runs against the pinned variant (used heavily by RQ3-style
-    # skills-only autoresearch on top of frozen RQ1/RQ2 interface winners).
+    # Pre-render the "run every (interface, challenge) pair" block once (used for
+    # baseline + per-cycle evaluation snippets below). A pinned starting version
+    # (e.g. RQ3 on top of an RQ1 winner) passes --interface-version AND the
+    # --version-root of the session that produced it. New versions you create
+    # this session live under THIS session's --version-root ({runs_root}).
     eval_block_lines = []
-    for iface in config.starting_interfaces:
-        version_flag = f" --interface-version {iface.version}" if iface.version is not None else ""
+    for iface in config.interfaces:
+        flags = ""
+        if iface.version:
+            flags += f" --interface-version {iface.version}"
+            vr = _version_root_for(testbed_root, iface.session)
+            if vr is not None:
+                flags += f" --version-root {vr}"
         for c in (config.challenges or ["<challenge>"]):
             eval_block_lines.append(
                 f"{banter_bin} run \\\n"
                 f"  --challenge {c} \\\n"
                 f"  --interface {iface.name} \\\n"
-                f"  --mode {iface.mode}{version_flag} \\\n"
-                f"  --skills {config.starting_skills} \\\n"
-                f"  --runs-root {runs_root}"
+                f"  --mode {iface.mode}{flags} \\\n"
+                f"  --skills {config.skills} \\\n"
+                f"  --runs-root {runs_root}/inc<N>"
             )
     eval_block = "\n".join(eval_block_lines)
 
-    return f"""You are a research agent managing a Claude Code MLE-bench testbed. Your job is to iteratively improve solver performance by modifying interfaces and/or skills, guided by the goals below.
-
-## Session
-- ID: {session_id}
-- Testbed root: {testbed_root}
-- Session directory: {runs_root}
-- Per-session results CSV: {runs_root}/results.csv       ← this session only
-- Global results CSV: {testbed_root}/results/results.csv ← every run ever (cross-session)
-- Cycle log: {cycles_path}
-
-## Goals
-{goals_lines}
-
-## Budget
-- Max improvement cycles: {config.budget.max_cycles}
-- Each cycle runs ALL {n_challenges} challenge(s) across ALL {n_interfaces} interface(s) = {runs_per_cycle} runs/cycle
-- Total individual banter runs across the session: up to {config.budget.max_cycles * runs_per_cycle}
-- Max total solver cost: {('unlimited' if config.budget.max_cost_usd == float('inf') else f'${config.budget.max_cost_usd:.2f} USD')}
-
-## Target challenges
-{challenges_lines}
-
-## Starting configuration — {n_interfaces} interface(s) run side-by-side per cycle
-{interfaces_table}
-- Skills: {config.starting_skills}
-
----
-
-## Improvement scope
-
-You are allowed to improve: {scope_desc}
-{scope_deny}
-
----
-
-## How the testbed works
-
-Each evaluation run:
-1. Creates a fresh Python venv
-2. Prepares competition data from the MLE-bench cache
-3. Installs the interface if configured (CLI binary / MCP server / SDK)
-4. Injects skill SKILL.md files into the solver's `.claude/skills/` if a bundle is chosen
-5. Runs `claude -p <task_prompt>` — the **solver** Claude Code instance
-6. Grades the solver's `submission.csv` with MLE-bench
-
-You control what the solver sees through:
-- **Interface prompt** — added to the task prompt (e.g. "use the `hops` CLI")
-- **Skill bundles** — named Claude Code skills the solver can invoke
-- **Interface config** — install steps, binary name, MCP servers
-
----
-
-## File structure
-
-### Interface manifests
-
-A single YAML file is the source of truth for each interface:
-
-```
-{testbed_root}/configs/interfaces/<name>/<type>.yaml
-```
-
-**Manifest schema:**
-```yaml
-# Install-time (banter install):
-repo: https://github.com/...    # optional
-ref: main
-install:                         # one-time build steps
-  - go build -o $INTERFACE_DIR/my-cli .
-auth_command: my-cli login       # optional
-
-# Runtime defaults (per-run; versions can override):
-binary: my-cli                   # CLI binary name
-runtime_install:                 # steps run per evaluation
-  - cp $INTERFACE_DIR/my-cli $VIRTUAL_ENV/bin/my-cli
-# mcp_servers:                   # for MCP interfaces
-#   my_service:
-#     command: my-mcp-server
-
-# Versions (0 = base; you append improved versions):
-versions:
-  0:
-    prompt: |
-      ...base prompt seen by the solver...
-  # Improved versions you create:
-  # 1:
-  #   prompt: |
-  #     ...refined prompt...
-  #   # Optional per-version overrides:
-  #   # runtime_install:
-  #   #   - ...
-```
-
-`$INTERFACE_DIR` → `{testbed_root}/interfaces/<name>/<type>/<version>/` (binary artifacts)
-`$VIRTUAL_ENV`   → per-run venv (copy/install the tool here so the solver can invoke it)
-
-**To create a new interface version** (almost always a prompt tweak):
-
-1. Pick which interface to evolve this cycle (e.g. `{first_iface.name}/{first_iface.mode}`)
-2. Open `{testbed_root}/configs/interfaces/<name>/<mode>.yaml`
-3. Append a new entry under `versions:` keyed by `<cur+1>` with a refined `prompt:`
-4. If the binary should be reused (typical), copy it:
-   ```bash
-   mkdir -p {testbed_root}/interfaces/<name>/<mode>/<cur+1>
-   cp -r {testbed_root}/interfaces/<name>/<mode>/<cur>/. \\
-         {testbed_root}/interfaces/<name>/<mode>/<cur+1>/
-   ```
-   (skip this step if the interface has no binary — SDK/MCP)
-
-The testbed always picks the **highest-numbered version** automatically.
-
-### Skill bundles
-
-```
-{testbed_root}/configs/skills/<bundle>/<version>/<skill_name>/
-    SKILL.md        # plain Markdown — what the solver sees as a named skill
-```
-
-**To create a new bundle:**
-```bash
-mkdir -p {testbed_root}/configs/skills/my_bundle/0/skill_name
-cat > {testbed_root}/configs/skills/my_bundle/0/skill_name/SKILL.md << 'SKILL'
-<skill instructions here>
-SKILL
-```
-
-**To add a new version of an existing bundle:**
-```bash
-cp -r {testbed_root}/configs/skills/<bundle>/0 {testbed_root}/configs/skills/<bundle>/1
-# Edit files inside version 1
-```
-
-### Run directory layout
-
-Each challenge run produces:
-```
-{run_dir_example}
-    prompt.txt       # solver task prompt
-    venv/
-    submission/
-    transcript.log   # human-readable solver transcript
-    grading.json
-```
-
----
-
-## Running evaluations
-
-```bash
-# Run ONE challenge with a specific config
-{banter_bin} run \\
-  --challenge <challenge_id> \\
-  --interface <name> \\
-  --mode <type_or_none> \\
-  --skills <bundle_or_none> \\
-  --runs-root {runs_root}
-```
-
-Always pass `--runs-root {runs_root}`.
-
-Key columns in `{runs_root}/results.csv`:
-| Column | Meaning |
-|--------|---------|
-| `score` | MLE-bench accuracy 0.0–1.0 |
-| `medal` | gold/silver/bronze/None |
-| `total_tokens` | input + output tokens |
-| `wall_time_s` | elapsed seconds |
-| `python_calls` | Bash calls invoking a Python interpreter |
-| `cli_calls` | calls to the interface CLI binary |
-| `cost_usd` | estimated solver cost |
-| `run_dir` | path to run folder (contains prompt.txt, transcript.log, grading.json) |
-
----
-
-## Cycle log
-
-After **every** complete cycle (all interfaces × all challenges run), append
-one JSON line to `{cycles_path}`. Group metrics PER INTERFACE so improvement
-attribution is unambiguous:
-
-```json
-{{
-  "cycle": 1,
-  "scope": "interface:{first_iface.name}/{first_iface.mode}",
-  "hypothesis": "Adding a hops feature-group example to the CLI prompt reduces python_calls",
-  "change": "Appended versions.{next_iface_version} to configs/interfaces/{first_iface.name}/{first_iface.mode}.yaml",
-  "before": {{
-    "per_interface": {{
-      "{first_iface.name}/{first_iface.mode}": {{
-         "avg_score": 0.62, "avg_total_tokens": 8400, "avg_wall_time_s": 1240,
-         "avg_python_calls": 9.5, "avg_cli_calls": 0.3
-      }}
-      // ... one block per interface in scope ...
-    }}
-  }},
-  "after": {{
-    "per_interface": {{
-      "{first_iface.name}/{first_iface.mode}": {{
-         "avg_score": 0.68, "avg_total_tokens": 6900, "avg_wall_time_s": 1100,
-         "avg_python_calls": 5.2, "avg_cli_calls": 3.1
-      }}
-    }}
-  }},
-  "verdict": "positive",
-  "verdict_reason": "{first_iface.name}/{first_iface.mode}: +9.7% score, -18% tokens, +cli_calls. Other interfaces unchanged.",
-  "keep": true
-}}
-```
-
-`verdict` must be one of: `positive` | `negative` | `neutral`
-`scope` should name the specific interface modified, e.g. `interface:hopsworks/cli`,
-`interface:hopsworks/mcp`, or `skills:<bundle>`.
-
-Write with:
-```bash
-echo '<json line>' >> {cycles_path}
-```
-
----
-
-## Current state
-
-### Available interfaces
-{avail_interfaces}
-
-### Available skill bundles
-{avail_skills}
-
-### Session results so far
-```
-{recent_results}
-```
-
----
-
-{groups_block}## Installation responsibility (YOU own this)
-
-The solver Claude assumes every interface it is asked to use is already
-installed and ready. You — the researcher — are responsible for ensuring
-this is true before EVERY `banter run` invocation. Concretely:
-
-### Pre-flight: install all base (v0) interfaces
-
-Before Cycle 0, make sure every interface listed under "Starting
-configuration" has a working v0:
-
-```bash
-{chr(10).join(
-    f"{banter_bin} install {testbed_root}/configs/interfaces/{iface.name}/{iface.mode}.yaml"
-    for iface in config.starting_interfaces
-    if not (iface.name == 'none' and iface.mode == 'none')
-)}
-```
-
-`banter install` is idempotent — it clones/updates the source repo, runs
-the manifest's one-time `install:` steps (writing the binary into
-`{testbed_root}/interfaces/<name>/<mode>/0/`), and runs the `auth_command`
-if any. Run it once per interface before any solver runs.
-
-For SDK-type interfaces the `install` step is a `pip install` that happens
-per-run in the solver's venv — but you must still create v0's metadata.
-Running `banter install` on an SDK manifest writes the `interfaces/.../0/`
-folder (it'll be empty for SDKs — that's expected).
-
-### When you ADD a new version `<v+1>` for an interface
-
-The solver expects `interfaces/<name>/<mode>/<v+1>/` to exist and (for CLI
-interfaces with a `binary:` key) to contain the binary. After you append
-the new entry to the manifest's `versions:` map, provision the artifact
-folder yourself:
-
-```bash
-# For CLI interfaces — copy the v_cur binary across (the binary itself is
-# typically unchanged; only the prompt/config differs).
-mkdir -p {testbed_root}/interfaces/<name>/<mode>/<v+1>
-cp -r {testbed_root}/interfaces/<name>/<mode>/<v>/. \\
-      {testbed_root}/interfaces/<name>/<mode>/<v+1>/
-
-# For SDK / MCP — just ensure the version folder exists (may be empty).
-mkdir -p {testbed_root}/interfaces/<name>/<mode>/<v+1>
-```
-
-Verify with `ls`:
-```bash
-ls {testbed_root}/interfaces/<name>/<mode>/<v+1>/
-```
-
-### If a `banter run` fails with "binary not found" / "Run: banter install ..."
-
-You forgot to provision either v0 (run `banter install`) or v+1 (run the
-mkdir/cp above). Fix the install state, then retry — do NOT log the failed
-run as a result; results.csv should reflect successful evaluations only.
-
-### A clean cycle checklist
-
-1. Verify install state of every interface in scope (one `ls` per interface).
-2. Run the (interface × challenge) evaluation block.
-3. Inspect results.csv + transcripts.
-4. Propose ONE change → append new `versions:` entry → provision its folder.
-5. Re-run the evaluation block.
-6. Log cycle entry with verdict.
-
----
-
-## Research process
-
-### Cycle 0 — Establish baseline (run once, first thing)
-
-Run every (interface × challenge) pair once with the starting config. That's
-{runs_per_cycle} runs total ({n_interfaces} interface(s) × {n_challenges} challenge(s)):
-
-```bash
-{eval_block}
-```
-
-Read every run's `transcript.log` and `grading.json` to understand solver behaviour
-PER INTERFACE. Then log cycle 0 in `{cycles_path}` with `"change": "baseline"`
-and `"before": null`, recording averaged metrics grouped by interface (see
-the cycle log schema above).
-
-### Cycles 1–{config.budget.max_cycles} — Improvement cycles
-
-For each cycle:
-
-1. **Analyse all runs** — read `{runs_root}/results.csv` and group rows by
-   `interface`+`mode`. Inspect `<run_dir>/transcript.log` for representative
-   challenges. Look for patterns PER INTERFACE:
-   - Does one interface consistently score worse across challenges?
-   - Are token counts or python_calls particularly high for one interface?
-   - Does an interface prompt miss context that hurts every challenge?
-
-2. **Hypothesize** — ONE specific, testable change to ONE of the
-   {n_interfaces} interfaces in scope. Examples:
-   - "CLI prompt doesn't tell the solver to use `hops fg create` — every
-     challenge fell back to local Python for feature group creation"
-   - "MCP tool list isn't documented in the prompt — solver ignored it
-     and used Python instead"
-
-3. **Implement** — append a new entry under `versions:` in the relevant
-   interface's manifest AND provision its `interfaces/<name>/<mode>/<v+1>/`
-   artifact folder per the "Installation responsibility" section above.
-   The solver will fail fast if v+1's binary is missing, so do this BEFORE
-   the next `banter run`. You may modify ONE interface per cycle for clean
-   attribution.
-
-4. **Evaluate** — re-run ALL {runs_per_cycle} (interface × challenge) pairs:
-```bash
-{eval_block}
-```
-
-5. **Decide conclusively** — compare AVERAGED metrics across challenges
-   PER INTERFACE between before and after:
-   - If the modified interface's avg_score improved AND no challenge regressed
-     significantly → `positive`, keep
-   - If avg_score unchanged but token/call counts improved consistently
-     for that interface → `positive`, keep
-   - If results are mixed → `neutral`, investigate further
-   - If avg_score dropped on any challenge for that interface → `negative`,
-     drop the new version (or pin to its previous version) and try again
-
-6. **Log** — append a cycle entry to `{cycles_path}` with per-interface
-   per-challenge breakdown AND per-interface averaged metrics.
-
-**Budget tracking**: count every `banter run` call. Stop when total runs ≥
-{config.budget.max_cycles * runs_per_cycle}.
-
-### Final summary
-
-When budget is exhausted or goals are met, output exactly one JSON object:
-```json
-{{
-  "session_id": "{session_id}",
-  "cycles_completed": 0,
-  "best_versions": {{
-    // best version per interface, e.g.:
-    // "hopsworks/cli": 2,
-    // "hopsworks/mcp": 1,
-    // "hopsworks/sdk": 0
-  }},
-  "best_avg_score_per_interface": {{}},
-  "positive_changes": [],
-  "negative_changes": [],
-  "recommendations": []
-}}
-```
-
-Begin by running the pre-flight `banter install` for every interface in scope,
-THEN start Cycle 0: check the results CSV, run the baseline across all
-(interface × challenge) pairs if needed, inspect every run, then start Cycle 1.
-Whenever you create a new version, provision its interfaces/.../<v+1>/ folder
-BEFORE the next `banter run` — the solver will refuse to start without it.
-"""
+    ctx = dict(
+        session_id=session_id,
+        testbed_root=testbed_root,
+        runs_root=runs_root,
+        increments_path=increments_path,
+        hierarchy_note=hierarchy_note,
+        goals_lines=goals_lines,
+        max_increments=config.budget.max_increments,
+        n_challenges=n_challenges,
+        n_interfaces=n_interfaces,
+        runs_per_increment=runs_per_increment,
+        total_runs=config.budget.max_increments * runs_per_increment,
+        cost_cap=cost_cap,
+        challenges_lines=challenges_lines,
+        interfaces_table=interfaces_table,
+        starting_skills=config.skills,
+        skills_note=skills_note,
+        scope_desc=scope_desc,
+        scope_deny=scope_deny,
+        first_iface_name=first_iface.name,
+        first_iface_mode=first_iface.mode,
+        next_iface_version=next_iface_version,
+        run_dir_example=run_dir_example,
+        banter_bin=banter_bin,
+        eval_block=eval_block,
+        avail_interfaces=avail_interfaces,
+        avail_skills=avail_skills,
+        recent_results=recent_results,
+        groups_block=groups_block,
+    )
+    template = (testbed_root / "prompts" / "researcher.md").read_text()
+    return template.format(**ctx)
 
 
 # ---------------------------------------------------------------------------
@@ -867,6 +551,13 @@ def _display_event(event: dict[str, Any]) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _version_root_for(testbed_root: Path, session: str | None) -> Path | None:
+    """Session dir holding pinned interface versions, or None for the base."""
+    if not session:
+        return None
+    return testbed_root / "results" / "autoresearch" / session
+
+
 def run_autoresearch(
     config: AutoresearchConfig,
     testbed_root: Path,
@@ -881,8 +572,31 @@ def run_autoresearch(
             f"`banter` not found at {banter_bin}. Run `make install` in the testbed first."
         )
 
-    session_id = uuid.uuid4().hex[:8]
-    session_dir = runs_root / "autoresearch" / session_id
+    # The researcher only kicks in once every required interface is built, set
+    # up, authenticated, and tested — deterministically, no AI — and any skill
+    # is accessible. Fail fast before spawning the researcher otherwise.
+    from banter import preflight as preflight_mod
+    reqs = [
+        preflight_mod.Requirement(
+            interface=i.name,
+            mode=i.mode,
+            interface_version=i.version,
+            version_root=_version_root_for(testbed_root, i.session),
+            skills=config.skills,
+        )
+        for i in config.interfaces
+    ]
+    try:
+        preflight_mod.preflight(reqs, auth=config.engineer_auth, model=config.engineer_model)
+    except preflight_mod.PreflightError as e:
+        raise RuntimeError(
+            f"[autoresearch] preflight failed — fix before the researcher can start:\n{e}"
+        )
+
+    from banter import results as results_mod
+    parent = runs_root / "autoresearch"
+    session_id = results_mod.next_session_id(parent)
+    session_dir = parent / session_id
     session_dir.mkdir(parents=True, exist_ok=True)
 
     prompt = build_researcher_prompt(config, testbed_root, session_dir, session_id, banter_bin)
@@ -893,7 +607,7 @@ def run_autoresearch(
 
     env = os.environ.copy()
     env.pop("ANTHROPIC_BASE_URL", None)
-    if config.auth == "login":
+    if config.researcher_auth == "login":
         env.pop("ANTHROPIC_API_KEY", None)
     venv_bin = str(testbed_root / ".venv" / "bin")
     env["PATH"] = f"{venv_bin}{os.pathsep}{env.get('PATH', '')}"
@@ -909,15 +623,15 @@ def run_autoresearch(
         "--verbose",
     ]
 
-    n_ifaces = len(config.starting_interfaces)
+    n_ifaces = len(config.interfaces)
     n_chals = len(config.challenges)
-    iface_list = ", ".join(str(i) for i in config.starting_interfaces)
+    iface_list = ", ".join(str(i) for i in config.interfaces)
     print(
         f"[autoresearch] session={session_id}\n"
         f"  interfaces={iface_list}\n"
         f"  goals={[f'{g.direction}({g.metric})' for g in config.goals]}\n"
-        f"  budget={config.budget.max_cycles} cycles × {n_ifaces} interfaces × {n_chals} challenges "
-        f"= up to {config.budget.max_cycles * n_ifaces * n_chals} runs\n"
+        f"  budget={config.budget.max_increments} increments × {n_ifaces} interfaces × {n_chals} challenges "
+        f"= up to {config.budget.max_increments * n_ifaces * n_chals} runs\n"
         f"  cost_cap={'∞' if config.budget.max_cost_usd == float('inf') else f'${config.budget.max_cost_usd:.2f}'}",
         flush=True,
     )
@@ -931,7 +645,7 @@ def run_autoresearch(
             return
         _display_event(event)
 
-    # Researcher Claude shares the solver's rate-limit retry helper: 12h budget,
+    # Researcher Claude shares the engineer's rate-limit retry helper: 12h budget,
     # exponential back-off, automatic resume on 429/529/overloaded.
     from banter import claude_runner
     try:
@@ -952,5 +666,14 @@ def run_autoresearch(
         results_mod.write_readable_transcript(transcript_path, session_dir / "transcript.log")
     except Exception:
         pass
+
+    # Deterministically aggregate the per-increment run CSVs up to the session
+    # results.csv (one row per increment) and the top-level autoresearch
+    # results.csv (one before/after row per session). No AI involved.
+    try:
+        from banter import results as results_mod
+        results_mod.rollup_autoresearch(session_dir)
+    except Exception as e:
+        print(f"[autoresearch] rollup skipped: {e}", flush=True)
 
     print(f"\n[autoresearch] done. session dir: {session_dir}", flush=True)

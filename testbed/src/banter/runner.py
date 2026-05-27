@@ -28,7 +28,14 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from banter import claude_runner, interfaces, mlebench_wrapper, results, skills as skills_mod
+from banter import (
+    claude_runner,
+    interfaces,
+    mlebench_wrapper,
+    preflight as preflight_mod,
+    results,
+    skills as skills_mod,
+)
 
 
 DEFAULT_MODEL = "claude-sonnet-4-6"
@@ -56,17 +63,31 @@ class RunSpec:
     timeout_s: int = 60 * 60
     runs_root: Path = Path("results")
     data_root: Path = DEFAULT_DATA_ROOT
-    interface_version: int | None = None  # None → latest version
+    interface_version: int | None = None  # None/0 → base manifest; >0 → session version
     skills_version: int | None = None     # None → latest version
+    # Where session-local interface versions live (an autoresearch session dir).
+    # Required to resolve interface_version > 0.
+    version_root: Path | None = None
+    # Run the upfront preflight (interface install/login + skill access probe).
+    # Batch runners set this False after doing one shared preflight over the union.
+    preflight: bool = True
 
 
 def _make_venv(target: Path) -> Path:
+    """Create the engineer's per-run venv as a venv-within-a-venv.
+
+    `banter` runs inside the global venv (the researcher's environment), so
+    building the engineer venv from this interpreter with system_site_packages
+    nests it on the global venv: the engineer inherits every package already
+    installed globally, and the shared pip cache means common ML libraries are
+    downloaded once and reused across engineer runs.
+    """
     if not (target / "bin" / "python").exists():
-        venv.EnvBuilder(with_pip=True, clear=False).create(target)
+        venv.EnvBuilder(with_pip=True, clear=False, system_site_packages=True).create(target)
     return target / "bin" / "python"
 
 
-TASK_PROMPT_PATH = TESTBED_ROOT / "prompts" / "task.md"
+TASK_PROMPT_PATH = TESTBED_ROOT / "prompts" / "engineer.md"
 
 
 def _build_prompt(challenge_id: str, fragment: str) -> str:
@@ -79,11 +100,38 @@ def run(spec: RunSpec) -> results.Row:
         raise ValueError(f"Unknown auth mode {spec.auth!r}; expected one of {AUTH_MODES}")
 
     started = datetime.now(timezone.utc)
-    version, variant_hash = interfaces.variant_for(spec.interface, spec.mode, spec.interface_version)
+
+    # Fail fast, upfront: the interface must be installed + login must work, and
+    # any chosen skill bundle must be accessible to the engineer in a run.
+    # Batch runners (benchmark/autoresearch) preflight the union once and pass
+    # preflight=False here to avoid re-probing per run.
+    if spec.preflight:
+        preflight_mod.check_run(
+            interface=spec.interface,
+            mode=spec.mode,
+            interface_version=spec.interface_version,
+            version_root=spec.version_root,
+            skills=spec.skills,
+            skills_version=spec.skills_version,
+            auth=spec.auth,
+            model=spec.model,
+        )
+
+    version, variant_hash = interfaces.variant_for(
+        spec.interface, spec.mode, spec.interface_version, spec.version_root
+    )
     interface_dir = f"configs/interfaces/{spec.interface}/{spec.mode}.yaml"
-    prompt_file = f"{interface_dir}#versions.{version}.prompt"
+    if version and spec.version_root is not None:
+        prompt_file = (
+            f"{interfaces.version_dir(spec.version_root, spec.interface, spec.mode, version)}"
+            "/version.yaml#prompt"
+        )
+    else:
+        prompt_file = f"{interface_dir}#prompt"
     prompt_version = version
-    prompt_hash = interfaces.prompt_hash_for(spec.interface, spec.mode, version)
+    prompt_hash = interfaces.prompt_hash_for(
+        spec.interface, spec.mode, version, spec.version_root
+    )
     # Fail fast on unverified skill bundles — before spending time on
     # venv/data/prep we want to know the bundle is well-formed.
     if spec.skills == "none":
@@ -92,7 +140,7 @@ def run(spec: RunSpec) -> results.Row:
         skills_label = "no_skills"
     else:
         skills_version, skills_hash, _ = skills_mod.verify_installed(spec.skills, spec.skills_version)
-        skills_dir = f"configs/skills/{spec.skills}/{skills_version}"
+        skills_dir = f"skills/{spec.skills}/{skills_version}"
         skills_label = spec.skills
     run_dir = (
         spec.runs_root
@@ -112,10 +160,13 @@ def run(spec: RunSpec) -> results.Row:
     (run_dir / "submission").mkdir(exist_ok=True)
 
     # mle-bench data prep must succeed before we spin up Claude — without
-    # data/ the solver has nothing to score against. Don't swallow.
+    # data/ the engineer has nothing to score against. Don't swallow.
     mlebench_wrapper.prepare(spec.challenge_id, run_dir, spec.data_root)
 
-    interface_setup = interfaces.setup(spec.interface, spec.mode, run_dir, venv_python, spec.interface_version)
+    interface_setup = interfaces.setup(
+        spec.interface, spec.mode, run_dir, venv_python,
+        spec.interface_version, spec.version_root,
+    )
     skills_setup = skills_mod.apply(spec.skills, run_dir, spec.skills_version)
     if skills_setup.installed:
         print(
@@ -137,6 +188,7 @@ def run(spec: RunSpec) -> results.Row:
         mcp_servers=interface_setup.mcp_servers,
         command_log=run_dir / "commands.jsonl",
         timeout_s=spec.timeout_s,
+        extra_env=interface_setup.keys,
     )
 
     if cr.exit_code != 0:

@@ -21,6 +21,140 @@ _PYTHON_PREFIXES = ("python", "python3", "uv run python", "uv run", "pip", "pip3
 _PY_INTERPRETER_BASENAMES = ("python", "python3", "pip", "pip3")
 
 
+# High-level (one row per session) summary schemas. These live at the top of
+# each runner's results tree: results/<benchmark|autoresearch>/results.csv.
+BENCHMARK_SUMMARY_FIELDS = [
+    "session", "started_at", "interfaces", "skills", "n_runs",
+    "avg_score", "avg_total_tokens", "avg_wall_time_s", "avg_cost_usd",
+]
+# Autoresearch aggregates before (baseline / increment 0) vs after (final).
+AUTORESEARCH_SUMMARY_FIELDS = [
+    "session", "started_at", "interfaces", "skills", "n_increments",
+    "avg_score_before", "avg_score_after",
+    "avg_total_tokens_before", "avg_total_tokens_after",
+    "avg_wall_time_s_before", "avg_wall_time_s_after",
+    "avg_cost_usd_before", "avg_cost_usd_after",
+]
+
+
+# One row per increment, inside a session: results/autoresearch/<session>/results.csv
+INCREMENT_SUMMARY_FIELDS = [
+    "increment", "n_runs", "avg_score", "avg_total_tokens", "avg_wall_time_s", "avg_cost_usd",
+]
+
+
+def append_summary(path: Path, header: list[str], row: dict[str, Any]) -> None:
+    """Append one aggregated row to a high-level results.csv (header on create)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    is_new = not path.exists()
+    with open(path, "a", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=header)
+        if is_new:
+            w.writeheader()
+        w.writerow({k: row.get(k, "") for k in header})
+
+
+def _avg(values: list[float]) -> str:
+    nums = [v for v in values if v is not None]
+    return f"{sum(nums) / len(nums):.4f}" if nums else ""
+
+
+def _read_runs(csv_path: Path) -> list[dict[str, str]]:
+    if not csv_path.exists():
+        return []
+    with open(csv_path) as f:
+        return list(csv.DictReader(f))
+
+
+def _num_col(runs: list[dict[str, str]], key: str) -> list[float]:
+    out: list[float] = []
+    for r in runs:
+        try:
+            out.append(float(r.get(key, "")))
+        except (TypeError, ValueError):
+            pass
+    return out
+
+
+def _agg_runs(runs: list[dict[str, str]]) -> dict[str, Any]:
+    return {
+        "n_runs": len(runs),
+        "avg_score": _avg(_num_col(runs, "score")),
+        "avg_total_tokens": _avg(_num_col(runs, "total_tokens")),
+        "avg_wall_time_s": _avg(_num_col(runs, "wall_time_s")),
+        "avg_cost_usd": _avg(_num_col(runs, "cost_usd")),
+    }
+
+
+def rollup_autoresearch(session_dir: Path) -> None:
+    """Aggregate a finished autoresearch session up the results hierarchy.
+
+    Reads each `<session>/inc<N>/results.csv` (per-run rows), writes one row per
+    increment to `<session>/results.csv`, and appends one before/after row for
+    the whole session to the top-level `results/autoresearch/results.csv`.
+    Deterministic and best-effort — safe to call after the researcher finishes.
+    """
+    if not session_dir.exists():
+        return
+    inc_dirs = sorted(
+        (d for d in session_dir.iterdir()
+         if d.is_dir() and d.name.startswith("inc") and d.name[3:].isdigit()),
+        key=lambda d: int(d.name[3:]),
+    )
+    if not inc_dirs:
+        return
+
+    per_increment: list[dict[str, Any]] = []
+    for d in inc_dirs:
+        agg = _agg_runs(_read_runs(d / "results.csv"))
+        per_increment.append({"increment": int(d.name[3:]), **agg})
+
+    # Session level — one row per increment (overwrite each rollup).
+    session_csv = session_dir / "results.csv"
+    with open(session_csv, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=INCREMENT_SUMMARY_FIELDS)
+        w.writeheader()
+        for row in per_increment:
+            w.writerow({k: row.get(k, "") for k in INCREMENT_SUMMARY_FIELDS})
+
+    # Session metadata (interfaces/skills/started_at) from the first increment's runs.
+    first_runs = _read_runs(inc_dirs[0] / "results.csv")
+    interfaces = "|".join(sorted({f"{r['interface']}/{r['mode']}" for r in first_runs})) if first_runs else ""
+    skills = "|".join(sorted({r["skills"] for r in first_runs})) if first_runs else ""
+    started_at = first_runs[0].get("started_at", "") if first_runs else ""
+
+    before, after = per_increment[0], per_increment[-1]
+    append_summary(
+        session_dir.parent / "results.csv",
+        AUTORESEARCH_SUMMARY_FIELDS,
+        {
+            "session": session_dir.name,
+            "started_at": started_at,
+            "interfaces": interfaces,
+            "skills": skills,
+            "n_increments": len(per_increment),
+            "avg_score_before": before["avg_score"], "avg_score_after": after["avg_score"],
+            "avg_total_tokens_before": before["avg_total_tokens"], "avg_total_tokens_after": after["avg_total_tokens"],
+            "avg_wall_time_s_before": before["avg_wall_time_s"], "avg_wall_time_s_after": after["avg_wall_time_s"],
+            "avg_cost_usd_before": before["avg_cost_usd"], "avg_cost_usd_after": after["avg_cost_usd"],
+        },
+    )
+
+
+def next_session_id(parent: Path) -> str:
+    """Next incrementing integer session id (as a string) under `parent`.
+
+    Scans existing integer-named session directories and returns max+1, or "0"
+    when there are none.
+    """
+    existing = [
+        int(p.name)
+        for p in (parent.iterdir() if parent.exists() else [])
+        if p.is_dir() and p.name.isdigit()
+    ]
+    return str(max(existing) + 1 if existing else 0)
+
+
 FIELDS = [
     "started_at",
     "challenge_id",
@@ -65,13 +199,13 @@ class Row:
     skills: str             # skill bundle name or "none"
     skills_version: int     # 0 when skills=none; else version of the snapshot used
     skills_hash: str        # "" when skills=none; else 8-hex hash of the snapshot
-    skills_dir: str         # configs/skills/<name>/<version>/, "" when skills=none
-    version: int            # interface variant index (0=base, autoresearch creates 1+)
-    hash: str               # 8-hex hash of manifest + binary folder + version
-    interface_dir: str      # configs/interfaces/<name>/<mode>.yaml (manifest path)
+    skills_dir: str         # skills/<name>/<version>/, "" when skills=none
+    version: int            # interface version (0=base config; >0=session-local)
+    hash: str               # 8-hex hash of config + version override + binary
+    interface_dir: str      # configs/interfaces/<name>/<mode>.yaml (config path)
     prompt_version: int     # same integer as `version`; prompts are per-version
     prompt_hash: str        # 8-hex hash of the resolved prompt text
-    prompt_file: str        # configs/interfaces/<name>/<mode>.yaml#versions.<v>.prompt
+    prompt_file: str        # v0: configs/.../<mode>.yaml#prompt; v>0: <session>/.../v<n>/version.yaml#prompt
     auth: str
     model: str
     wall_time_s: float

@@ -1,0 +1,146 @@
+"""Unit tests for interface resolution, keys, and preflight (no AI, no network)."""
+import tempfile
+import unittest
+from pathlib import Path
+
+from banter import interfaces, preflight
+
+
+def _write(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+
+
+class InterfaceTestBase(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.configs = self.root / "configs" / "interfaces"
+        self.bins = self.root / "interfaces"
+        # Redirect the module-level path constants at the temp tree.
+        self._orig_cfg = interfaces.IFACE_CONFIGS_DIR
+        self._orig_bin = interfaces.IFACE_BINS_DIR
+        interfaces.IFACE_CONFIGS_DIR = self.configs
+        interfaces.IFACE_BINS_DIR = self.bins
+
+    def tearDown(self) -> None:
+        interfaces.IFACE_CONFIGS_DIR = self._orig_cfg
+        interfaces.IFACE_BINS_DIR = self._orig_bin
+        self._tmp.cleanup()
+
+    def write_manifest(self, name: str, type_: str, text: str) -> Path:
+        p = self.configs / name / f"{type_}.yaml"
+        _write(p, text)
+        return p
+
+
+class KeysTests(InterfaceTestBase):
+    def test_keys_for_mapping(self):
+        self.write_manifest("svc", "sdk", "keys:\n  API_KEY: \"abc\"\n  HOST: \"\"\nprompt: hi\n")
+        self.assertEqual(interfaces.keys_for("svc", "sdk"), {"API_KEY": "abc", "HOST": ""})
+
+    def test_keys_for_none(self):
+        self.assertEqual(interfaces.keys_for("none", "none"), {})
+
+    def test_resolved_keys_fall_back_to_env(self):
+        self.write_manifest("svc", "sdk", "keys:\n  API_KEY: \"\"\nprompt: hi\n")
+        got = interfaces._resolved_keys("svc", "sdk", env={"API_KEY": "from-env"})
+        self.assertEqual(got, {"API_KEY": "from-env"})
+
+
+class VersionResolutionTests(InterfaceTestBase):
+    def test_base_version_is_zero(self):
+        self.write_manifest("svc", "sdk", "prompt: base prompt\n")
+        version, _hash = interfaces.variant_for("svc", "sdk")
+        self.assertEqual(version, 0)
+
+    def test_version_gt_zero_requires_version_root(self):
+        self.write_manifest("svc", "sdk", "prompt: base\n")
+        with self.assertRaises(ValueError):
+            interfaces.variant_for("svc", "sdk", version=1)
+
+    def test_session_local_version_overrides_prompt(self):
+        self.write_manifest("svc", "sdk", "prompt: base prompt\n")
+        vroot = self.root / "session"
+        vp = interfaces.version_dir(vroot, "svc", "sdk", 1) / "version.yaml"
+        _write(vp, "prompt: improved prompt\n")
+        version, _ = interfaces.variant_for("svc", "sdk", version=1, version_root=vroot)
+        self.assertEqual(version, 1)
+        frag = interfaces._prompt_for("svc", "sdk", 1, vroot)
+        self.assertEqual(frag, "improved prompt")
+
+    def test_none_interface(self):
+        self.assertEqual(interfaces.variant_for("none", "none"), (0, ""))
+
+
+class PreflightTests(InterfaceTestBase):
+    def test_none_is_ok(self):
+        st = interfaces.preflight("none", "none")
+        self.assertTrue(st.ok)
+
+    def test_unknown_type(self):
+        st = interfaces.preflight("svc", "bogus")
+        self.assertFalse(st.ok)
+
+    def test_missing_config_not_installed(self):
+        st = interfaces.preflight("ghost", "cli", auto_build=False)
+        self.assertFalse(st.ok)
+        self.assertFalse(st.installed)
+
+    def test_sdk_missing_keys_fails_login(self):
+        # No auth_command + declared keys → login satisfied only when keys set.
+        self.write_manifest("svc", "sdk", "keys:\n  API_KEY: \"\"\nprompt: hi\n")
+        st = interfaces.preflight("svc", "sdk", env={})
+        self.assertFalse(st.ok)
+        self.assertIn("API_KEY", st.missing_keys)
+        self.assertIn("setup", st.fix_command)
+
+    def test_sdk_keys_present_passes(self):
+        self.write_manifest("svc", "sdk", "keys:\n  API_KEY: \"\"\nprompt: hi\n")
+        st = interfaces.preflight("svc", "sdk", env={"API_KEY": "x"})
+        self.assertTrue(st.ok)
+        self.assertTrue(st.authenticated)
+
+    def test_auth_command_success(self):
+        self.write_manifest("svc", "cli", "auth_command: \"true\"\nprompt: hi\n")
+        st = interfaces.preflight("svc", "cli", env={})
+        self.assertTrue(st.ok)
+
+    def test_auth_command_failure(self):
+        self.write_manifest("svc", "cli", "auth_command: \"false\"\nprompt: hi\n")
+        st = interfaces.preflight("svc", "cli", env={})
+        self.assertFalse(st.ok)
+        self.assertFalse(st.authenticated)
+
+    def test_test_command_failure(self):
+        self.write_manifest("svc", "cli", "test_command: \"false\"\nprompt: hi\n")
+        st = interfaces.preflight("svc", "cli", env={})
+        self.assertFalse(st.ok)
+
+    def test_missing_binary_without_build(self):
+        self.write_manifest(
+            "svc", "cli",
+            "binary: tool\nruntime_install:\n  - cp $INTERFACE_DIR/tool .\nprompt: hi\n",
+        )
+        st = interfaces.preflight("svc", "cli", auto_build=False, env={})
+        self.assertFalse(st.ok)
+        self.assertFalse(st.installed)
+
+
+class PreflightModuleTests(InterfaceTestBase):
+    def test_none_requirement_passes(self):
+        preflight.preflight(
+            [preflight.Requirement(interface="none", mode="none")],
+            auth="api-key", model="claude-sonnet-4-6", probe_skills=False,
+        )
+
+    def test_missing_interface_raises(self):
+        with self.assertRaises(preflight.PreflightError):
+            preflight.preflight(
+                [preflight.Requirement(interface="ghost", mode="cli")],
+                auth="api-key", model="claude-sonnet-4-6", probe_skills=False,
+            )
+
+
+if __name__ == "__main__":
+    unittest.main()

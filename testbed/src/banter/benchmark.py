@@ -10,26 +10,26 @@ Results are isolated per session:
 
 Config format (YAML):
 
-    model: claude-sonnet-4-6
-    auth: api-key
+    engineer_model: claude-sonnet-4-6   # model for the engineer (legacy: model)
+    engineer_auth: api-key              # engineer auth (legacy: auth)
 
-    # Option A — explicit run list (supports version pinning)
+    # Option A — explicit run list (supports session/version pinning)
     runs:
       - challenge: aerial-cactus-identification
         interface: none
         mode: none
-        # interface_version: 0   # omit → latest
         skills: none
-        # skills_version: null   # omit → latest
       - challenge: aerial-cactus-identification
-        interface: none
-        mode: none
-        interface_version: 0     # run an old autoresearch-generated version
+        interface: hopsworks
+        mode: cli
+        # Interface versions live inside an autoresearch session — pin both:
+        session: a1b2c3d4         # the autoresearch session that produced it
+        interface_version: 2      # the version number within that session
         skills: none
 
-    # Option B — Cartesian matrix (all at latest versions)
+    # Option B — Cartesian matrix
     # challenges: [aerial-cactus-identification]
-    # interfaces: [{name: none, mode: none}]
+    # interfaces: [{name: hopsworks, mode: cli, session: a1b2c3d4, version: 2}]
     # skills: [none]
 
     timeout_s: 3600    # per-run wall-clock cap (optional)
@@ -37,14 +37,13 @@ Config format (YAML):
 from __future__ import annotations
 
 import sys
-import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import yaml
 
-from banter import results, runner
+from banter import interfaces, preflight as preflight_mod, results, runner
 
 
 # ---------------------------------------------------------------------------
@@ -60,13 +59,16 @@ class RunEntry:
     skills: str = "none"
     interface_version: int | None = None
     skills_version: int | None = None
+    # Autoresearch session that produced the pinned interface version (needed
+    # to resolve interface_version > 0, which lives inside that session).
+    session: str | None = None
 
 
 @dataclass
 class BenchmarkConfig:
     runs: list[RunEntry]
-    model: str = runner.DEFAULT_MODEL
-    auth: str = "api-key"
+    engineer_model: str = runner.DEFAULT_MODEL
+    engineer_auth: str = "api-key"
     timeout_s: int = 3600
 
 
@@ -79,30 +81,39 @@ def _parse_runs(data: dict[str, Any]) -> list[RunEntry]:
     if "runs" in data:
         entries = []
         for r in data["runs"]:
+            if r.get("config"):
+                name, mode = interfaces.name_type_from_config(r["config"])
+            else:
+                name, mode = r["interface"], r.get("mode", "none")
             entries.append(
                 RunEntry(
                     challenge=r["challenge"],
-                    interface=r["interface"],
-                    mode=r.get("mode", "none"),
+                    interface=name,
+                    mode=mode,
                     skills=r.get("skills", "none"),
-                    interface_version=r.get("interface_version"),
+                    interface_version=r.get("interface_version", r.get("version")),
                     skills_version=r.get("skills_version"),
+                    session=r.get("session"),
                 )
             )
         return entries
 
-    # Cartesian matrix fallback. Each interface and skill entry may pin a
-    # specific `version:` integer; omit it to use the latest.
+    # Cartesian matrix fallback. Each interface entry references its config
+    # (`config:`) or gives name+mode, and may pin a `version:` (+ `session:`).
     challenges = data.get("challenges") or []
-    interfaces = data.get("interfaces") or []
+    iface_entries = data.get("interfaces") or []
     skills_list = data.get("skills") or ["none"]
     entries = []
     for ch in challenges:
-        for iface in interfaces:
+        for iface in iface_entries:
             if not isinstance(iface, dict):
                 raise ValueError(
                     f"benchmark `interfaces` entries must be mappings, got {iface!r}"
                 )
+            if iface.get("config"):
+                name, mode = interfaces.name_type_from_config(iface["config"])
+            else:
+                name, mode = iface["name"], iface.get("mode", "none")
             for sk in skills_list:
                 if isinstance(sk, str):
                     sk_name, sk_version = sk, None
@@ -114,11 +125,12 @@ def _parse_runs(data: dict[str, Any]) -> list[RunEntry]:
                 entries.append(
                     RunEntry(
                         challenge=ch,
-                        interface=iface["name"],
-                        mode=iface.get("mode", "none"),
+                        interface=name,
+                        mode=mode,
                         skills=sk_name,
                         interface_version=iface.get("version"),
                         skills_version=sk_version,
+                        session=iface.get("session"),
                     )
                 )
     return entries
@@ -129,8 +141,10 @@ def load_config(path: Path) -> BenchmarkConfig:
         data = yaml.safe_load(f)
     return BenchmarkConfig(
         runs=_parse_runs(data),
-        model=data.get("model", runner.DEFAULT_MODEL),
-        auth=data.get("auth", "api-key"),
+        # `engineer_model`/`engineer_auth` are the canonical keys; `model`/`auth`
+        # are accepted as legacy fallbacks so older configs keep working.
+        engineer_model=data.get("engineer_model", data.get("model", runner.DEFAULT_MODEL)),
+        engineer_auth=data.get("engineer_auth", data.get("auth", "api-key")),
         timeout_s=int(data.get("timeout_s", 3600)),
     )
 
@@ -140,14 +154,40 @@ def load_config(path: Path) -> BenchmarkConfig:
 # ---------------------------------------------------------------------------
 
 
+def _version_root_for(session: str | None) -> Path | None:
+    """Session dir holding pinned interface versions, or None for the base."""
+    if not session:
+        return None
+    return runner.TESTBED_ROOT / "results" / "autoresearch" / session
+
+
 def run_benchmark(config: BenchmarkConfig, runs_root: Path) -> None:
     total = len(config.runs)
     if total == 0:
         print("[benchmark] No runs configured.", file=sys.stderr)
         return
 
-    session_id = uuid.uuid4().hex[:8]
-    session_dir = runs_root / "benchmark" / session_id
+    # Fail fast, once, over the union of requirements before doing any work.
+    reqs = [
+        preflight_mod.Requirement(
+            interface=e.interface,
+            mode=e.mode,
+            interface_version=e.interface_version,
+            version_root=_version_root_for(e.session),
+            skills=e.skills,
+            skills_version=e.skills_version,
+        )
+        for e in config.runs
+    ]
+    try:
+        preflight_mod.preflight(reqs, auth=config.engineer_auth, model=config.engineer_model)
+    except preflight_mod.PreflightError as e:
+        print(f"\n[benchmark] preflight failed:\n{e}", file=sys.stderr)
+        raise
+
+    parent = runs_root / "benchmark"
+    session_id = results.next_session_id(parent)
+    session_dir = parent / session_id
     session_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"[benchmark] session={session_id}  runs={total}  dir={session_dir}")
@@ -170,12 +210,14 @@ def run_benchmark(config: BenchmarkConfig, runs_root: Path) -> None:
                 interface=entry.interface,
                 mode=entry.mode,
                 skills=entry.skills,
-                model=config.model,
-                auth=config.auth,
+                model=config.engineer_model,
+                auth=config.engineer_auth,
                 timeout_s=config.timeout_s,
                 runs_root=session_dir,
                 interface_version=entry.interface_version,
                 skills_version=entry.skills_version,
+                version_root=_version_root_for(entry.session),
+                preflight=False,  # union already verified upfront
             )
             row = runner.run(spec)
             completed.append(row)
@@ -187,6 +229,26 @@ def run_benchmark(config: BenchmarkConfig, runs_root: Path) -> None:
             label = f"{entry.challenge}/{entry.interface}/{entry.mode}"
             print(f"[benchmark] FAILED {label}: {exc}", file=sys.stderr)
             failed.append(f"{label}: {exc}")
+
+    # High-level rollup: one aggregated row per session at results/benchmark/results.csv.
+    if completed:
+        ifaces = sorted({f"{r.interface}/{r.mode}" for r in completed})
+        skills = sorted({r.skills for r in completed})
+        results.append_summary(
+            parent / "results.csv",
+            results.BENCHMARK_SUMMARY_FIELDS,
+            {
+                "session": session_id,
+                "started_at": completed[0].started_at,
+                "interfaces": "|".join(ifaces),
+                "skills": "|".join(skills),
+                "n_runs": len(completed),
+                "avg_score": results._avg([r.score for r in completed]),
+                "avg_total_tokens": results._avg([r.total_tokens for r in completed]),
+                "avg_wall_time_s": results._avg([r.wall_time_s for r in completed]),
+                "avg_cost_usd": results._avg([r.cost_usd for r in completed]),
+            },
+        )
 
     _print_summary(completed, failed, session_dir)
 

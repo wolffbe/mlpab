@@ -1,16 +1,19 @@
-"""banter CLI.
+"""banter CLI — deliberately small.
+
+Two things only:
+
+    banter <config.yaml>     run an autoresearch or benchmark config
+    banter setup [MANIFEST]   one-time auth + credential keys (used by `make setup`)
+
+Everything else — building interface binaries, logging in, testing they run —
+happens automatically at preflight when you run a config, with no AI involved.
+The researcher drives individual challenge evaluations internally via the
+`run --challenge ...` form (not part of the everyday surface).
 
 Examples:
-    banter setup                                                         # one-time creds setup
-    banter run --challenge titanic --interface none
-    banter run --challenge titanic --interface hopsworks --mode cli
-    banter run --challenge titanic --interface hopsworks --mode cli --skills hopsworks-essentials
-    banter run configs/autoresearch_rq1_hopsworks.yaml                   # autoresearch dispatch
-    banter run configs/benchmark_smoke_test.yaml                         # benchmark dispatch
-    banter install configs/interfaces/hopsworks/cli.yaml                 # one-time install
-    banter uninstall configs/interfaces/hopsworks/cli.yaml               # remove binary
-    banter interfaces                                                     # list configured interfaces
-    banter skills                                                         # list available skill bundles
+    banter configs/autoresearch_rq1_hopsworks.yaml
+    banter configs/benchmark_smoke_test.yaml
+    make setup
 """
 from __future__ import annotations
 
@@ -22,7 +25,7 @@ from pathlib import Path
 
 import click
 
-from banter import interfaces, runner, skills
+from banter import interfaces, runner
 
 
 # Testbed repo root. We anchor all per-project state here so the repo is
@@ -58,72 +61,49 @@ def _write_dotenv(updates: dict[str, str]) -> None:
     DOTENV_PATH.chmod(0o600)
 
 
-@click.group()
+class _ConfigGroup(click.Group):
+    """A group where `banter <path>` is shorthand for `banter run <path>`."""
+
+    def resolve_command(self, ctx, args):
+        if args and args[0] not in self.commands and not args[0].startswith("-"):
+            args = ["run", *args]
+        return super().resolve_command(ctx, args)
+
+
+@click.group(cls=_ConfigGroup)
 def main() -> None:
     """MLE-bench testbed driver for Claude Code."""
     _load_dotenv()
 
 
 # ---------------------------------------------------------------------------
-# banter run
+# banter run  (config dispatch; the --challenge form is for the researcher)
 # ---------------------------------------------------------------------------
 
 
 @main.command("run")
 @click.argument("config", required=False, default=None, metavar="[CONFIG.yaml]")
-@click.option("--challenge", default=None, help="MLE-bench competition id, e.g. `titanic`.")
-@click.option(
-    "--interface",
-    "interface_name",
-    default=None,
-    help="Interface name (e.g. `hopsworks`, `none`).",
-)
-@click.option(
-    "--mode",
-    type=click.Choice(interfaces.TYPES),
-    default=None,
-    help="Interface type: cli, mcp, sdk, or none.",
-)
-@click.option(
-    "--interface-version",
-    "interface_version",
-    type=int,
-    default=None,
-    help="Pin to a specific interface version (integer). Omit → latest in manifest.",
-)
-@click.option(
-    "--skills",
-    default="none",
-    show_default=True,
-    help="Skill bundle name under configs/skills/, or `none`.",
-)
-@click.option(
-    "--skills-version",
-    "skills_version",
-    type=int,
-    default=None,
-    help="Pin to a specific skill bundle version (integer). Omit → latest.",
-)
+@click.option("--challenge", default=None, help="MLE-bench competition id (single-run form).")
+@click.option("--interface", "interface_name", default=None, help="Interface name, e.g. `hopsworks`, `none`.")
+@click.option("--mode", type=click.Choice(interfaces.TYPES), default=None, help="Interface type.")
+@click.option("--interface-version", "interface_version", type=int, default=None,
+              help="Interface version. Omit/0 → base config; >0 → a session version.")
+@click.option("--version-root", "version_root", type=click.Path(path_type=Path), default=None,
+              help="Session dir holding versions > 0 (required when --interface-version > 0).")
+@click.option("--skills", default="none", show_default=True, help="Skill bundle name under skills/, or `none`.")
+@click.option("--skills-version", "skills_version", type=int, default=None, help="Pin a skill bundle version.")
 @click.option("--model", default=runner.DEFAULT_MODEL, show_default=True)
-@click.option(
-    "--auth",
-    type=click.Choice(runner.AUTH_MODES),
-    default=lambda: os.environ.get("BANTER_AUTH", "api-key"),
-    show_default="from .env or api-key",
-)
+@click.option("--auth", type=click.Choice(runner.AUTH_MODES),
+              default=lambda: os.environ.get("BANTER_AUTH", "api-key"), show_default="from .env or api-key")
 @click.option("--timeout", "timeout_s", type=int, default=60 * 60, show_default=True)
-@click.option(
-    "--runs-root",
-    type=click.Path(path_type=Path),
-    default=Path("results"),
-    show_default=True,
-)
+@click.option("--runs-root", type=click.Path(path_type=Path), default=Path("results"), show_default=True)
 def run(
     config: str | None,
     challenge: str | None,
     interface_name: str | None,
     mode: str | None,
     interface_version: int | None,
+    version_root: Path | None,
     skills: str,
     skills_version: int | None,
     model: str,
@@ -131,19 +111,18 @@ def run(
     timeout_s: int,
     runs_root: Path,
 ) -> None:
-    """Run one challenge or dispatch an autoresearch/benchmark config file."""
+    """Run an autoresearch/benchmark CONFIG, or a single challenge."""
     if config is not None:
         _dispatch_config(Path(config), runs_root)
         return
 
     if challenge is None:
-        raise click.UsageError("--challenge is required when not passing a config file.")
+        raise click.UsageError("Pass a CONFIG file (e.g. `banter configs/...yaml`) or use --challenge.")
     if interface_name is None:
-        raise click.UsageError("--interface is required when not passing a config file.")
+        raise click.UsageError("--interface is required for the single-challenge form.")
     if mode is None:
-        if interface_name == "none":
-            mode = "none"
-        else:
+        mode = "none" if interface_name == "none" else None
+        if mode is None:
             raise click.UsageError("--mode is required for non-`none` interfaces.")
 
     spec = runner.RunSpec(
@@ -157,6 +136,7 @@ def run(
         runs_root=runs_root,
         interface_version=interface_version,
         skills_version=skills_version,
+        version_root=version_root,
     )
     row = runner.run(spec)
     click.echo(
@@ -187,360 +167,48 @@ def _dispatch_config(config_path: Path, runs_root: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# banter install / uninstall
-# ---------------------------------------------------------------------------
-
-
-@main.command("install")
-@click.argument("config_path", type=click.Path(exists=True, path_type=Path))
-def install_cmd(config_path: Path) -> None:
-    """Install an interface from a manifest YAML.
-
-    Example: banter install configs/interfaces/hopsworks/cli.yaml
-    """
-    _install_from_manifest(config_path.resolve())
-
-
-@main.command("uninstall")
-@click.argument("config_path", type=click.Path(path_type=Path))
-def uninstall_cmd(config_path: Path) -> None:
-    """Remove a previously installed interface (binary + generated runtime config).
-
-    Example: banter uninstall configs/interfaces/hopsworks/cli.yaml
-    """
-    _uninstall_from_manifest(config_path.resolve())
-
-
-def _detect_name_type(config_path: Path) -> tuple[str, str]:
-    """Infer (name, type) from a manifest path like configs/interfaces/<name>/<type>.yaml."""
-    parts = config_path.parts
-    try:
-        idx = list(parts).index("interfaces")
-        name = parts[idx + 1]
-        type_ = Path(parts[idx + 2]).stem  # strip ".yaml"
-    except (ValueError, IndexError):
-        raise click.ClickException(
-            f"Cannot infer interface name/type from {config_path}. "
-            "Expected path: configs/interfaces/<name>/<type>.yaml"
-        )
-    if type_ not in interfaces.TYPES:
-        raise click.ClickException(
-            f"Unknown interface type {type_!r}; expected one of {interfaces.TYPES}"
-        )
-    return name, type_
-
-
-def _install_from_manifest(config_path: Path) -> None:
-    import yaml
-
-    cfg = yaml.safe_load(config_path.read_text()) or {}
-    name, type_ = _detect_name_type(config_path)
-
-    repo = cfg.get("repo")
-    ref = cfg.get("ref", "main")
-    install_steps = cfg.get("install") or []
-    auth_command = cfg.get("auth_command")
-    binary = cfg.get("binary")
-
-    venv_bin = TESTBED_ROOT / ".venv" / "bin"
-    # Binary artifacts go here (interfaces/<name>/<type>/0/).
-    bins_dir = TESTBED_ROOT / "interfaces" / name / type_ / "0"
-    bins_dir.mkdir(parents=True, exist_ok=True)
-    # Source / build cache (separate from binary output).
-    src_dir = TESTBED_ROOT / "cache" / "interfaces" / name / type_ / "src"
-
-    # 1 — clone / update the source repo (if any)
-    if repo:
-        if (src_dir / ".git").exists():
-            click.echo(f"[install] Updating {src_dir}")
-            subprocess.run(["git", "-C", str(src_dir), "pull"], check=True)
-        else:
-            click.echo(f"[install] Cloning {repo} → {src_dir}")
-            src_dir.parent.mkdir(parents=True, exist_ok=True)
-            subprocess.run(
-                ["git", "clone", "--depth", "1", "--branch", ref, repo, str(src_dir)],
-                check=True,
-            )
-
-    # 2 — run one-time build/install steps
-    if install_steps:
-        pip_cache = TESTBED_ROOT / "cache" / "pip"
-        pip_cache.mkdir(parents=True, exist_ok=True)
-        env = os.environ.copy()
-        env["PATH"] = f"{bins_dir}{os.pathsep}{venv_bin}{os.pathsep}{env.get('PATH', '')}"
-        env["VIRTUAL_ENV"] = str(TESTBED_ROOT / ".venv")
-        env["INTERFACE_DIR"] = str(bins_dir)
-        env["PIP_CACHE_DIR"] = str(pip_cache)
-        cwd = str(src_dir) if src_dir.exists() else str(bins_dir)
-        for step in install_steps:
-            click.echo(f"[install] $ {step}")
-            subprocess.run(step, shell=True, env=env, cwd=cwd, check=True)
-
-    # 3 — run interactive auth; the CLI saves credentials to its own config.
-    # We add bins_dir AND venv_bin to PATH so a freshly-built binary is callable.
-    if auth_command:
-        env = os.environ.copy()
-        env["PATH"] = f"{bins_dir}{os.pathsep}{venv_bin}{os.pathsep}{env.get('PATH', '')}"
-        env["INTERFACE_DIR"] = str(bins_dir)
-        click.echo(f"\n[install] Running: {auth_command}")
-        click.echo("[install] Follow the prompts to log in.")
-        subprocess.run(auth_command, shell=True, env=env)
-
-    # 4 — report result
-    if binary:
-        binary_path = bins_dir / binary
-        if binary_path.exists():
-            click.secho(f"\n[install] {name}/{type_} ready. Binary: {binary_path}", fg="green")
-        else:
-            click.secho(
-                f"\n[install] Warning: '{binary}' not found at {binary_path} after install.",
-                fg="yellow",
-            )
-    else:
-        click.secho(f"\n[install] {name}/{type_} installed.", fg="green")
-
-
-def _uninstall_from_manifest(config_path: Path) -> None:
-    name, type_ = _detect_name_type(config_path)
-
-    bins_dir = TESTBED_ROOT / "interfaces" / name / type_
-    src_dir = TESTBED_ROOT / "cache" / "interfaces" / name / type_
-
-    removed = []
-    if bins_dir.exists():
-        if click.confirm(f"Remove binary dir {bins_dir}?", default=True):
-            shutil.rmtree(bins_dir)
-            removed.append(str(bins_dir))
-    if src_dir.exists():
-        if click.confirm(f"Remove source cache {src_dir}?", default=False):
-            shutil.rmtree(src_dir)
-            removed.append(str(src_dir))
-
-    if removed:
-        click.secho(f"[uninstall] Removed: {', '.join(removed)}", fg="green")
-    else:
-        click.echo(f"[uninstall] Nothing removed for {name}/{type_}.")
-
-
-# ---------------------------------------------------------------------------
-# banter reset
-# ---------------------------------------------------------------------------
-
-
-@main.command("reset")
-@click.argument("config_path", type=click.Path(exists=True, path_type=Path))
-@click.option(
-    "--delete-sessions/--keep-sessions",
-    default=True,
-    help="Delete all results/autoresearch/* session directories.",
-)
-def reset_cmd(config_path: Path, delete_sessions: bool) -> None:
-    """Reset autoresearch state for a config: drop improved versions and sessions.
-
-    Example: banter reset configs/autoresearch_rq1_hopsworks.yaml
-
-    Removes versions > 0 from the starting interface's manifest, deletes the
-    matching interfaces/<name>/<type>/<v>/ binary folders, and (by default)
-    deletes all results/autoresearch/*. Base version 0 is preserved.
-    """
-    _reset_from_config(config_path.resolve(), delete_sessions=delete_sessions)
-
-
-def _reset_from_config(config_path: Path, delete_sessions: bool) -> None:
-    import yaml as _yaml
-
-    data = _yaml.safe_load(config_path.read_text()) or {}
-    if "goals" not in data and "improve" not in data:
-        raise click.ClickException(
-            f"{config_path} is not an autoresearch config (no `goals` or `improve` key)."
-        )
-
-    # Accept both `starting_interfaces` (plural list) and the legacy
-    # `starting_interface` (single dict).
-    raw = data.get("starting_interfaces")
-    if raw is None and "starting_interface" in data:
-        single = data["starting_interface"]
-        raw = [single] if isinstance(single, dict) else []
-    raw = raw or []
-    if not raw:
-        click.echo("[reset] No starting interfaces to reset.")
-    else:
-        for entry in raw:
-            if not isinstance(entry, dict):
-                continue
-            name = entry.get("name")
-            type_ = entry.get("mode")
-            if not name or not type_ or (name == "none" and type_ == "none"):
-                click.echo(f"[reset] Skipping {entry} (none/none or incomplete).")
-                continue
-            _reset_interface_versions(name, type_)
-
-    if delete_sessions:
-        sessions_dir = TESTBED_ROOT / "results" / "autoresearch"
-        if sessions_dir.exists():
-            count = sum(1 for _ in sessions_dir.iterdir() if _.is_dir())
-            if count and click.confirm(
-                f"Remove all {count} autoresearch session(s) under {sessions_dir}?",
-                default=True,
-            ):
-                shutil.rmtree(sessions_dir)
-                click.secho(f"[reset] Removed {sessions_dir}", fg="green")
-            else:
-                click.echo("[reset] Kept session directories.")
-        else:
-            click.echo(f"[reset] No sessions to remove ({sessions_dir} absent).")
-
-
-def _reset_interface_versions(name: str, type_: str) -> None:
-    """Drop versions > 0 from the manifest YAML and remove their binary folders."""
-    import yaml as _yaml
-
-    mpath = TESTBED_ROOT / "configs" / "interfaces" / name / f"{type_}.yaml"
-    if not mpath.exists():
-        click.echo(f"[reset] No manifest at {mpath}; skipping interface reset.")
-        return
-
-    manifest = _yaml.safe_load(mpath.read_text()) or {}
-    versions = manifest.get("versions") or {}
-    to_drop: list[int] = []
-    if isinstance(versions, dict):
-        kept = {}
-        for k, v in versions.items():
-            try:
-                ki = int(k)
-            except (TypeError, ValueError):
-                continue
-            if ki == 0:
-                kept[ki] = v
-            else:
-                to_drop.append(ki)
-        manifest["versions"] = kept
-    elif isinstance(versions, list):
-        kept_list = []
-        for entry in versions:
-            if not isinstance(entry, dict):
-                continue
-            try:
-                vnum = int(entry.get("version", 0))
-            except (TypeError, ValueError):
-                continue
-            if vnum == 0:
-                kept_list.append(entry)
-            else:
-                to_drop.append(vnum)
-        manifest["versions"] = kept_list
-
-    if to_drop:
-        mpath.write_text(_yaml.dump(manifest, default_flow_style=False, sort_keys=False))
-        click.secho(
-            f"[reset] {mpath}: dropped versions {sorted(to_drop)}, kept 0.",
-            fg="green",
-        )
-    else:
-        click.echo(f"[reset] {mpath}: no improved versions to drop.")
-
-    bins_root = TESTBED_ROOT / "interfaces" / name / type_
-    if bins_root.exists():
-        for sub in bins_root.iterdir():
-            if not sub.is_dir() or not sub.name.isdigit():
-                continue
-            if int(sub.name) > 0:
-                shutil.rmtree(sub)
-                click.echo(f"[reset] Removed {sub}")
-
-
-# ---------------------------------------------------------------------------
-# banter autoresearch / benchmark (explicit commands)
-# ---------------------------------------------------------------------------
-
-
-@main.command("autoresearch")
-@click.option(
-    "--config",
-    "config_path",
-    required=True,
-    type=click.Path(exists=True, path_type=Path),
-    help="YAML autoresearch config.",
-)
-@click.option(
-    "--runs-root",
-    type=click.Path(path_type=Path),
-    default=None,
-    help="Override results directory. Defaults to testbed/results/.",
-)
-def autoresearch_cmd(config_path: Path, runs_root: Path | None) -> None:
-    """Launch a manager Claude that iteratively improves interfaces and skills."""
-    from banter import autoresearch as ar_mod
-
-    config = ar_mod.load_config(config_path.resolve())
-    rr = (runs_root or TESTBED_ROOT / "results").resolve()
-    ar_mod.run_autoresearch(config, TESTBED_ROOT, rr)
-
-
-@main.command("benchmark")
-@click.option(
-    "--config",
-    "config_path",
-    required=True,
-    type=click.Path(exists=True, path_type=Path),
-    help="YAML benchmark config.",
-)
-@click.option(
-    "--runs-root",
-    type=click.Path(path_type=Path),
-    default=None,
-    help="Override results directory. Defaults to testbed/results/.",
-)
-def benchmark_cmd(config_path: Path, runs_root: Path | None) -> None:
-    """Run a set of configured (challenge, interface, skills) combinations once."""
-    from banter import benchmark as bm_mod
-
-    config = bm_mod.load_config(config_path.resolve())
-    rr = (runs_root or TESTBED_ROOT / "results").resolve()
-    bm_mod.run_benchmark(config, rr)
-
-
-# ---------------------------------------------------------------------------
-# banter interfaces / skills
-# ---------------------------------------------------------------------------
-
-
-@main.command("interfaces")
-def list_interfaces() -> None:
-    """List configured interfaces and their types."""
-    for name, types in interfaces.available().items():
-        click.echo(f"{name}: {', '.join(types) if types else '(no types)'}")
-
-
-@main.command("skills")
-def list_skills() -> None:
-    """List available skill bundles under configs/skills/."""
-    for bundle in skills.available():
-        click.echo(bundle)
-
-
-# ---------------------------------------------------------------------------
-# banter setup
+# banter setup  (auth for engineer + researcher; credential keys per interface)
 # ---------------------------------------------------------------------------
 
 
 @main.command("setup")
-def setup() -> None:
-    """Interactive credential + auth setup. Idempotent — re-run to update."""
+@click.argument("manifest", required=False, type=click.Path(path_type=Path))
+def setup(manifest: Path | None) -> None:
+    """One-time setup. With no argument: Kaggle + Claude auth + all interface keys.
+    With a MANIFEST: set just that interface's credential keys."""
+    if manifest is not None:
+        _setup_interface_keys(manifest.resolve())
+        return
     click.echo("== banter setup ==")
     click.echo(f"Claude Code default model: {runner.DEFAULT_MODEL}")
     _setup_kaggle()
     _setup_claude_auth()
-    click.echo("\nDone. Try: banter run --challenge titanic --interface none")
+    _setup_all_interface_keys()
+    click.echo("\nDone. Try: banter configs/benchmark_smoke_test.yaml")
+
+
+def _detect_name_type(config_path: Path) -> tuple[str, str]:
+    """Infer (name, type) from configs/interfaces/<name>/<type>.yaml."""
+    parts = config_path.parts
+    try:
+        idx = list(parts).index("interfaces")
+        name = parts[idx + 1]
+        type_ = Path(parts[idx + 2]).stem
+    except (ValueError, IndexError):
+        raise click.ClickException(
+            f"Cannot infer interface name/type from {config_path}. "
+            "Expected: configs/interfaces/<name>/<type>.yaml"
+        )
+    if type_ not in interfaces.TYPES:
+        raise click.ClickException(f"Unknown interface type {type_!r}; expected one of {interfaces.TYPES}")
+    return name, type_
 
 
 def _setup_kaggle() -> None:
-    click.secho("\n[1/2] Kaggle credentials", bold=True)
+    click.secho("\n[1/3] Kaggle credentials", bold=True)
     click.echo("  Required by mle-bench to download competition data.")
-    click.echo("  IMPORTANT: use the LEGACY API key (32 hex chars), not the new")
-    click.echo("  access token (starts with 'KGAT...'). Get one at:")
-    click.echo("    https://www.kaggle.com/settings  →  API  →  Create New API Token")
-    click.echo("  which downloads a kaggle.json containing {username, key}.")
+    click.echo("  Use the LEGACY API key (32 hex chars), not the new 'KGAT...' token.")
+    click.echo("  Get one at https://www.kaggle.com/settings → API → Create New API Token.")
     kaggle_json = KAGGLE_DIR / "kaggle.json"
     if kaggle_json.exists():
         click.echo(f"  Existing credentials at {kaggle_json}.")
@@ -550,8 +218,7 @@ def _setup_kaggle() -> None:
     key = click.prompt("  Kaggle API key (legacy, 32 hex chars)", hide_input=True)
     if key.startswith("KGAT") or len(key) != 32:
         click.secho(
-            f"  Warning: key looks unusual (length={len(key)}, prefix={key[:4]!r}). "
-            "The legacy key is 32 hex chars. Proceeding anyway.",
+            f"  Warning: key looks unusual (length={len(key)}, prefix={key[:4]!r}). Proceeding.",
             fg="yellow",
         )
     kaggle_json.parent.mkdir(parents=True, exist_ok=True)
@@ -561,26 +228,80 @@ def _setup_kaggle() -> None:
 
 
 def _setup_claude_auth() -> None:
-    click.secho("\n[2/2] Claude Code auth", bold=True)
-    click.echo("  api-key  — claude-code calls Anthropic directly with ANTHROPIC_API_KEY.")
-    click.echo("  login    — claude-code uses your Claude subscription via `claude /login`.")
-    click.echo("  Tokens + cost are read from claude-code's own transcript in either mode.")
-    choice = click.prompt(
-        "  Auth mode",
-        type=click.Choice(list(runner.AUTH_MODES)),
-        default="api-key",
-    )
+    click.secho("\n[2/3] Claude Code auth (engineer + researcher)", bold=True)
+    click.echo("  Both the engineer (controlled) and researcher (controller) instances")
+    click.echo("  authenticate the same way:")
+    click.echo("    api-key  — claude-code calls Anthropic with ANTHROPIC_API_KEY.")
+    click.echo("    login    — claude-code uses your Claude subscription via `claude /login`.")
+    choice = click.prompt("  Auth mode", type=click.Choice(list(runner.AUTH_MODES)), default="api-key")
     if choice == "api-key":
         api_key = click.prompt("  Anthropic API key", hide_input=True)
         _write_dotenv({"BANTER_AUTH": "api-key", "ANTHROPIC_API_KEY": api_key})
         click.echo(f"  Wrote ANTHROPIC_API_KEY to {DOTENV_PATH}")
+        click.echo("  This key authenticates both the engineer and the researcher.")
     else:
         _write_dotenv({"BANTER_AUTH": "login"})
         if shutil.which("claude") is None:
             click.secho("  `claude` CLI not on PATH — install Claude Code first.", fg="yellow")
             return
-        if click.confirm("  Launch `claude /login` now?", default=True):
+        if click.confirm("  Launch `claude /login` now? (logs in engineer + researcher)", default=True):
             subprocess.run(["claude", "/login"], check=False)
+
+
+def _setup_all_interface_keys() -> None:
+    click.secho("\n[3/3] Interface credential keys", bold=True)
+    avail = interfaces.available()
+    any_keys = False
+    for name, types in avail.items():
+        for type_ in types:
+            if interfaces.keys_for(name, type_):
+                any_keys = True
+                mpath = interfaces.manifest_path(name, type_)
+                if click.confirm(f"  Set keys for {name}/{type_}?", default=True):
+                    _setup_interface_keys(mpath)
+    if not any_keys:
+        click.echo("  No interfaces declare `keys:` — nothing to set.")
+
+
+def _setup_interface_keys(manifest_path: Path) -> None:
+    if not manifest_path.exists():
+        raise click.ClickException(f"Manifest not found: {manifest_path}")
+    name, type_ = _detect_name_type(manifest_path)
+    keys = interfaces.keys_for(name, type_)
+    if not keys:
+        click.echo(f"  {name}/{type_}: no `keys:` declared in the config.")
+        return
+    click.secho(f"  Credentials for {name}/{type_}:", bold=True)
+    updated: dict[str, str] = {}
+    for k, cur in keys.items():
+        shown = "(set)" if cur else "(empty)"
+        val = click.prompt(f"    {k} {shown}", default=cur, hide_input=True, show_default=False)
+        updated[k] = val
+    _write_manifest_keys(manifest_path, updated)
+    click.secho(f"  Wrote keys into {manifest_path}", fg="green")
+
+
+def _write_manifest_keys(manifest_path: Path, keys: dict[str, str]) -> None:
+    """Splice a `keys:` block into the manifest, preserving its comments.
+
+    Replaces an existing top-level `keys:` block (its line plus the indented
+    lines under it) or appends one at the end. Text splice (not a YAML rewrite)
+    so the manifest's comments survive.
+    """
+    text = manifest_path.read_text()
+    lines = text.splitlines()
+    rendered = ["keys:"] + [f'  {k}: "{v}"' for k, v in keys.items()]
+
+    start = next((i for i, ln in enumerate(lines) if ln.rstrip() == "keys:" or ln.startswith("keys:")), None)
+    if start is None:
+        new_lines = lines + ([""] if (lines and lines[-1].strip()) else []) + rendered
+    else:
+        end = start + 1
+        while end < len(lines) and (not lines[end].strip() or lines[end].startswith((" ", "\t"))):
+            end += 1
+        new_lines = lines[:start] + rendered + lines[end:]
+    manifest_path.write_text("\n".join(new_lines) + "\n")
+    manifest_path.chmod(0o600)
 
 
 if __name__ == "__main__":

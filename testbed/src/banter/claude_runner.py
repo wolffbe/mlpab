@@ -5,7 +5,7 @@ every tool call is logged, then run `claude -p` against the user's configured
 Anthropic credentials (api-key or login) and capture the full stream-json
 transcript. Cost + token totals come from the transcript's `result` event.
 
-The same rate-limit retry helper (`run_with_retry`) is used by the solver
+The same rate-limit retry helper (`run_with_retry`) is used by the engineer
 (`run` in this module) AND the autoresearch researcher — every `claude -p`
 invocation in the testbed goes through it, so a 429/529 anywhere triggers
 exponential back-off within the same 12h retry budget.
@@ -23,7 +23,8 @@ from typing import Any, Callable
 
 
 TESTBED_ROOT = Path(__file__).resolve().parents[2]
-HOOK_SCRIPT = TESTBED_ROOT / "hooks" / "log_tool_call.py"
+# Hook script ships inside the package (src/banter/hooks/).
+HOOK_SCRIPT = Path(__file__).resolve().parent / "hooks" / "log_tool_call.py"
 # Shared pip download cache so deps Claude installs into a per-run venv
 # (torch, sklearn, etc.) are not re-downloaded for every run. The per-run
 # venv stays empty on creation — this only avoids the network round-trip.
@@ -89,12 +90,16 @@ def run(
     mcp_servers: dict[str, Any],
     command_log: Path,
     timeout_s: int = 60 * 60,
+    extra_env: dict[str, str] | None = None,
 ) -> ClaudeResult:
-    """Spawn `claude -p`.
+    """Spawn `claude -p` (the engineer instance).
 
     auth == "api-key": leave ANTHROPIC_API_KEY in env (claude-code reads it).
     auth == "login":   strip ANTHROPIC_API_KEY so claude-code uses stored OAuth
                        credentials from `claude /login`.
+
+    `extra_env` (e.g. an interface's credential keys) is layered onto the
+    engineer's environment so the CLI/SDK/MCP server can authenticate.
     """
     if shutil.which("claude") is None:
         raise RuntimeError("`claude` CLI not found on PATH. Install Claude Code first.")
@@ -128,6 +133,11 @@ def run(
 
     PIP_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     env["PIP_CACHE_DIR"] = str(PIP_CACHE_DIR)
+
+    # Interface credential keys (from the manifest) override inherited values so
+    # the engineer's CLI/SDK/MCP server authenticates against the configured host.
+    if extra_env:
+        env.update({k: v for k, v in extra_env.items() if v})
 
     # Absolute path — `--settings` is resolved relative to cwd (=run_dir),
     # not the caller's cwd, so a relative path would miss.
@@ -183,7 +193,7 @@ def run_with_retry(
 ) -> tuple[int, float]:
     """Run a `claude -p` subprocess with exponential rate-limit back-off.
 
-    Used by both the solver and the autoresearch researcher.
+    Used by both the engineer and the autoresearch researcher.
 
     - Appends stdout to `transcript_path` (stream-json) and stderr to
       `stderr_path`. Appending — not truncating — so each retry's events

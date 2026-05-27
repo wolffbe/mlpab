@@ -1,4 +1,4 @@
-.PHONY: help install setup clean reset venv check-git
+.PHONY: help install setup test clean reset venv check-git
 
 # Pin to a Python that orjson/PyO3 supports. PyO3 0.23 caps at 3.13; pip-built
 # orjson on 3.14 fails. Override with `make install PYTHON=python3.13`.
@@ -13,9 +13,12 @@ help:
 	@echo ""
 	@echo "Targets:"
 	@echo "  make install   — create venv, install banter + mle-bench, then run setup"
-	@echo "  make setup     — interactive credential setup (Kaggle, Claude Code auth)"
+	@echo "  make setup     — auth for engineer + researcher (Kaggle, Claude) + interface keys"
+	@echo "  make test      — run the unit tests"
 	@echo "  make clean     — remove .venv and runs/"
 	@echo "  make reset     — clean then reinstall"
+	@echo ""
+	@echo "Run a config:  $(BANTER) configs/<name>.yaml"
 
 check-git:
 	@command -v git >/dev/null 2>&1 || { echo "ERROR: git is not installed. Install git and retry."; exit 1; }
@@ -35,6 +38,9 @@ venv: $(VENV)/.installed
 
 setup: venv
 	@$(BANTER) setup
+
+test: venv
+	$(PY) -m unittest discover -s tests -p 'test_*.py' -v
 
 clean:
 	rm -rf $(VENV) runs/ src/banter.egg-info src/banter/__pycache__ */__pycache__
