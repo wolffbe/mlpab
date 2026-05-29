@@ -68,14 +68,18 @@ def _ensure_real_leaderboard(competition_id: str) -> None:
     )
 
 
-def prepare(competition_id: str, workspace_dir: Path, data_dir: Path) -> Path:
-    """Stage competition data under workspace_dir and return its path.
+def download_competition(competition_id: str, data_dir: Path) -> Path:
+    """Download + prepare a competition into `data_dir/<comp>/prepared/public`.
 
-    `data_dir` is the cache where mlebench keeps raw Kaggle downloads so we
-    don't redownload across runs.
+    Idempotent — skips the `mlebench prepare` invocation when the prepared
+    dir already exists. Call this from the UNSANDBOXED parent process at
+    session start so the cache is ready before any sandboxed work begins.
+    Returns the prepared path.
     """
+    prepared = data_dir / competition_id / "prepared" / "public"
+    if prepared.is_dir() and any(prepared.iterdir()):
+        return prepared
     cli = _mlebench()
-    workspace_dir.mkdir(parents=True, exist_ok=True)
     data_dir.mkdir(parents=True, exist_ok=True)
     _ensure_real_leaderboard(competition_id)
     subprocess.run(
@@ -90,13 +94,27 @@ def prepare(competition_id: str, workspace_dir: Path, data_dir: Path) -> Path:
         check=True,
         cwd=_TESTBED_ROOT,
     )
-    # mlebench prepares into <data_dir>/<comp>/prepared/public. We symlink it
-    # into workspace_dir/data so the agent sees a stable path regardless of
-    # where the cache lives.
-    prepared = data_dir / competition_id / "prepared" / "public"
+    return prepared
+
+
+def prepare(competition_id: str, workspace_dir: Path, data_dir: Path) -> Path:
+    """Stage competition data under workspace_dir and return its path.
+
+    Calls `download_competition` (idempotent — no-op if cache is warm) then
+    materializes `workspace_dir/data` as an APFS clone of the prepared dir.
+    We can't symlink here because Seatbelt resolves symlinks to their target
+    before checking allowRead — the engineer's sandbox would deny reads of
+    the cache target. APFS `cp -Rc` clones share blocks until modified, so
+    even multi-GB datasets cost near-zero disk space.
+    """
+    workspace_dir.mkdir(parents=True, exist_ok=True)
+    prepared = download_competition(competition_id, data_dir)
     target = workspace_dir / "data"
     if not target.exists():
-        target.symlink_to(prepared)
+        try:
+            subprocess.run(["cp", "-Rc", str(prepared), str(target)], check=True)
+        except subprocess.CalledProcessError:
+            subprocess.run(["cp", "-R", str(prepared), str(target)], check=True)
     return target
 
 

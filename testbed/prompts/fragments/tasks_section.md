@@ -7,8 +7,8 @@ challenges, producing a task-specialised interface version.
 Task order + challenges:
 {tasks_list}
 
-Tag every increments.jsonl entry with `"task": "<task_name>"` so the resulting
-interface versions can be cross-referenced to ML task type during analysis.
+Each `banter run` already records its `task` column from the `--task` flag;
+that's the grouping key for per-task analysis in results.csv.
 
 Total runs in this session: {n_tasks} tasks × {max_increments} increments ×
 n_interfaces × challenges_per_task.

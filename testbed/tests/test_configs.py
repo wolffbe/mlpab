@@ -9,17 +9,13 @@ from banter import autoresearch as ar, benchmark as bm, interfaces
 class NameTypeFromConfigTests(unittest.TestCase):
     def test_derives_name_and_type(self):
         self.assertEqual(
-            interfaces.name_type_from_config("configs/interfaces/hopsworks/cli.yaml"),
+            interfaces.name_type_from_config("interfaces/hopsworks/cli/config.yaml"),
             ("hopsworks", "cli"),
         )
 
-    def test_bad_path_raises(self):
-        with self.assertRaises(ValueError):
-            interfaces.name_type_from_config("some/random/path.yaml")
-
     def test_unknown_type_raises(self):
         with self.assertRaises(ValueError):
-            interfaces.name_type_from_config("configs/interfaces/hopsworks/bogus.yaml")
+            interfaces.name_type_from_config("interfaces/hopsworks/bogus/config.yaml")
 
 
 def _write(text: str) -> Path:
@@ -39,8 +35,8 @@ tasks:
   image_classification: [aerial-cactus-identification]
   tabular: [nomad2018-predict-transparent-conductors, tabular-playground-series-dec-2021]
 interfaces:
-  - config: configs/interfaces/hopsworks/cli.yaml
-  - config: configs/interfaces/hopsworks/mcp.yaml
+  - config: interfaces/hopsworks/cli/config.yaml
+  - config: interfaces/hopsworks/mcp/config.yaml
 goals: [score]
 budget: {max_increments: 3}
 """
@@ -51,7 +47,7 @@ budget: {max_increments: 3}
         self.assertEqual(len(cfg.challenges), 3)
         self.assertEqual([(i.name, i.mode) for i in cfg.interfaces],
                          [("hopsworks", "cli"), ("hopsworks", "mcp")])
-        self.assertEqual(cfg.interfaces[0].config, "configs/interfaces/hopsworks/cli.yaml")
+        self.assertEqual(cfg.interfaces[0].config, "interfaces/hopsworks/cli/config.yaml")
         self.assertEqual(cfg.skills, "none")
         self.assertEqual(cfg.budget.max_increments, 3)
 
@@ -80,7 +76,7 @@ class BenchmarkConfigTests(unittest.TestCase):
 engineer_model: claude-sonnet-4-6
 challenges: [aerial-cactus-identification]
 interfaces:
-  - {config: configs/interfaces/hopsworks/cli.yaml, session: abc123, version: 2}
+  - {config: interfaces/hopsworks/cli/config.yaml, session: abc123, version: 2}
 skills: [none]
 """
         )

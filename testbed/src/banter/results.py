@@ -23,35 +23,57 @@ _PY_INTERPRETER_BASENAMES = ("python", "python3", "pip", "pip3")
 
 # High-level (one row per session) summary schemas. These live at the top of
 # each runner's results tree: results/<benchmark|autoresearch>/results.csv.
-BENCHMARK_SUMMARY_FIELDS = [
-    "session", "started_at", "interfaces", "skills", "n_runs",
-    "avg_score", "avg_total_tokens", "avg_wall_time_s", "avg_cost_usd",
-]
-# Autoresearch aggregates before (baseline / increment 0) vs after (final).
-AUTORESEARCH_SUMMARY_FIELDS = [
-    "session", "started_at", "interfaces", "skills", "n_increments",
-    "avg_score_before", "avg_score_after",
-    "avg_total_tokens_before", "avg_total_tokens_after",
-    "avg_wall_time_s_before", "avg_wall_time_s_after",
-    "avg_cost_usd_before", "avg_cost_usd_after",
-]
-
-
-# One row per increment, inside a session: results/autoresearch/<session>/results.csv
-INCREMENT_SUMMARY_FIELDS = [
-    "increment", "n_runs", "avg_score", "avg_total_tokens", "avg_wall_time_s", "avg_cost_usd",
+# Metrics averaged at every results.csv level — one per numeric per-run column
+# in FIELDS, so the rollups reflect ALL per-run metrics. `platform_invocations`
+# is the derived remote-platform delegation total (cli + mcp + sdk calls).
+AGG_METRICS = [
+    "score",
+    "eng_wall_time_s", "eng_input_tokens", "eng_output_tokens", "eng_total_tokens", "eng_cost_usd",
+    "res_wall_time_s", "res_input_tokens", "res_output_tokens", "res_total_tokens", "res_cost_usd",
+    "total_wall_time_s", "total_tokens", "total_cost",
+    "llm_calls", "cli_calls", "mcp_calls", "sdk_calls", "python_calls",
+    "bash_calls", "other_tool_calls", "skill_calls",
+    "platform_invocations",
+    # `valid_submission` is the only grading bool we keep in FIELDS; averaging
+    # it gives the valid-submission rate across a combo's runs.
+    "valid_submission",
 ]
 
+# Canonical metrics that are ALWAYS tracked + charted in every autoresearch
+# run, with their natural improvement direction. The autoresearch config's
+# `goals` list only decides WHICH of these (or others) the researcher
+# optimizes for; charts are produced for the full TRACKED_METRICS set
+# regardless of what the config picks. Order = chart order in the notebook.
+TRACKED_METRICS: list[tuple[str, str]] = [
+    ("score", "maximize"),
+    ("total_tokens", "minimize"),
+    ("eng_wall_time_s", "minimize"),
+    ("total_cost", "minimize"),
+    ("python_calls", "minimize"),
+    ("cli_calls", "maximize"),
+]
 
-def append_summary(path: Path, header: list[str], row: dict[str, Any]) -> None:
-    """Append one aggregated row to a high-level results.csv (header on create)."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    is_new = not path.exists()
-    with open(path, "a", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=header)
-        if is_new:
-            w.writeheader()
-        w.writerow({k: row.get(k, "") for k in header})
+# Benchmark CSV uses plain metric names (no `eng_`/`total_` prefix since
+# there's no researcher). Same canonical list, different column names.
+BENCHMARK_TRACKED_METRICS: list[tuple[str, str]] = [
+    ("score", "maximize"),
+    ("total_tokens", "minimize"),
+    ("wall_time_s", "minimize"),
+    ("cost_usd", "minimize"),
+    ("python_calls", "minimize"),
+    ("cli_calls", "maximize"),
+]
+
+# Per-run rollup (benchmark): one row per <run> folder, averaging its
+# per-challenge rows. Written to results/benchmark/results.csv.
+COMBO_SUMMARY_FIELDS = (
+    ["combo", "interface", "type", "skills", "n_runs"]
+    + [f"avg_{m}" for m in AGG_METRICS]
+    + ["dir"]   # the run folder
+)
+# RUN_SUMMARY_FIELDS (autoresearch per-run: <run>/results.csv) and
+# GLOBAL_AUTORESEARCH_FIELDS (the best-increment global) are defined just after
+# FIELDS below, since they extend it.
 
 
 def _avg(values: list[float]) -> str:
@@ -76,152 +98,249 @@ def _num_col(runs: list[dict[str, str]], key: str) -> list[float]:
     return out
 
 
+def _platform_col(runs: list[dict[str, str]]) -> list[float]:
+    """Per-run remote-platform invocations = cli + mcp + sdk calls."""
+    out: list[float] = []
+    for r in runs:
+        total, seen = 0.0, False
+        for k in ("cli_calls", "mcp_calls", "sdk_calls"):
+            try:
+                total += float(r.get(k, ""))
+                seen = True
+            except (TypeError, ValueError):
+                pass
+        if seen:
+            out.append(total)
+    return out
+
+
 def _agg_runs(runs: list[dict[str, str]]) -> dict[str, Any]:
-    return {
-        "n_runs": len(runs),
-        "avg_score": _avg(_num_col(runs, "score")),
-        "avg_total_tokens": _avg(_num_col(runs, "total_tokens")),
-        "avg_wall_time_s": _avg(_num_col(runs, "wall_time_s")),
-        "avg_cost_usd": _avg(_num_col(runs, "cost_usd")),
-    }
+    out: dict[str, Any] = {"n_runs": len(runs)}
+    for m in AGG_METRICS:
+        col = _platform_col(runs) if m == "platform_invocations" else _num_col(runs, m)
+        out[f"avg_{m}"] = _avg(col)
+    return out
 
 
-def rollup_autoresearch(session_dir: Path) -> None:
-    """Aggregate a finished autoresearch session up the results hierarchy.
+def roll_up_combos(parent: Path) -> list[dict[str, Any]]:
+    """Average each `<combo>/results.csv` run folder under `parent` into one row
+    and (over)write `parent/results.csv` (COMBO_SUMMARY_FIELDS). Returns the rows.
 
-    Reads each `<session>/inc<N>/results.csv` (per-run rows), writes one row per
-    increment to `<session>/results.csv`, and appends one before/after row for
-    the whole session to the top-level `results/autoresearch/results.csv`.
-    Deterministic and best-effort — safe to call after the researcher finishes.
+    A "combo" folder is any immediate subdir holding a detailed per-challenge
+    results.csv (e.g. `0_no_interface_no_type_no_skills_no_session_v0/`).
     """
-    if not session_dir.exists():
-        return
-    inc_dirs = sorted(
-        (d for d in session_dir.iterdir()
-         if d.is_dir() and d.name.startswith("inc") and d.name[3:].isdigit()),
-        key=lambda d: int(d.name[3:]),
-    )
-    if not inc_dirs:
-        return
-
-    per_increment: list[dict[str, Any]] = []
-    for d in inc_dirs:
-        agg = _agg_runs(_read_runs(d / "results.csv"))
-        per_increment.append({"increment": int(d.name[3:]), **agg})
-
-    # Session level — one row per increment (overwrite each rollup).
-    session_csv = session_dir / "results.csv"
-    with open(session_csv, "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=INCREMENT_SUMMARY_FIELDS)
+    rows: list[dict[str, Any]] = []
+    if not parent.exists():
+        return rows
+    for d in sorted(p for p in parent.iterdir() if p.is_dir()):
+        runs = _read_runs(d / "results.csv")
+        if not runs:
+            continue
+        first = runs[0]
+        rows.append({
+            "combo": d.name,
+            "interface": first.get("interface", ""),
+            "type": first.get("type", ""),
+            "skills": first.get("skills", ""),
+            **_agg_runs(runs),
+            "dir": str(d),
+        })
+    with open(parent / "results.csv", "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=COMBO_SUMMARY_FIELDS)
         w.writeheader()
-        for row in per_increment:
-            w.writerow({k: row.get(k, "") for k in INCREMENT_SUMMARY_FIELDS})
+        for row in rows:
+            w.writerow({k: row.get(k, "") for k in COMBO_SUMMARY_FIELDS})
+    return rows
 
-    # Session metadata (interfaces/skills/started_at) from the first increment's runs.
-    first_runs = _read_runs(inc_dirs[0] / "results.csv")
-    interfaces = "|".join(sorted({f"{r['interface']}/{r['mode']}" for r in first_runs})) if first_runs else ""
-    skills = "|".join(sorted({r["skills"] for r in first_runs})) if first_runs else ""
-    started_at = first_runs[0].get("started_at", "") if first_runs else ""
 
-    before, after = per_increment[0], per_increment[-1]
-    append_summary(
-        session_dir.parent / "results.csv",
-        AUTORESEARCH_SUMMARY_FIELDS,
-        {
-            "session": session_dir.name,
-            "started_at": started_at,
-            "interfaces": interfaces,
-            "skills": skills,
-            "n_increments": len(per_increment),
-            "avg_score_before": before["avg_score"], "avg_score_after": after["avg_score"],
-            "avg_total_tokens_before": before["avg_total_tokens"], "avg_total_tokens_after": after["avg_total_tokens"],
-            "avg_wall_time_s_before": before["avg_wall_time_s"], "avg_wall_time_s_after": after["avg_wall_time_s"],
-            "avg_cost_usd_before": before["avg_cost_usd"], "avg_cost_usd_after": after["avg_cost_usd"],
-        },
-    )
+# The runner appends each challenge row directly to `<run>/results.csv`
+# (one CSV per session, tagged with `session` + `increment`); the notebook
+# computes its own per-increment means from those raw rows.
+
+
+# Benchmark CSV has no researcher (no eng/res split needed) and no increments,
+# so it uses plain column names (`wall_time_s`, `total_tokens`, …) rather than
+# the autoresearch `eng_*` / `res_*` / `total_*` triple. Mapping from the
+# autoresearch Row's fields → benchmark column names. Listed in the order they
+# appear in the benchmark CSV; `BENCHMARK_FIELDS` is the .keys() view.
+_BENCHMARK_VIEW = {
+    "started_at": "started_at",
+    "interface": "interface",
+    "type": "type",
+    "skills": "skills",
+    "prev_run": "prev_run",
+    "prev_version": "prev_version",
+    "task": "task",
+    "challenge": "challenge",
+    "valid_submission": "valid_submission",
+    "score": "score",
+    "medal": "medal",
+    # Engineer metrics: drop the `eng_` prefix in the benchmark CSV.
+    "wall_time_s": "eng_wall_time_s",
+    "input_tokens": "eng_input_tokens",
+    "output_tokens": "eng_output_tokens",
+    "total_tokens": "eng_total_tokens",
+    "cost_usd": "eng_cost_usd",
+    "llm_calls": "llm_calls",
+    "cli_calls": "cli_calls",
+    "mcp_calls": "mcp_calls",
+    "sdk_calls": "sdk_calls",
+    "python_calls": "python_calls",
+    "bash_calls": "bash_calls",
+    "skill_calls": "skill_calls",
+    "other_tool_calls": "other_tool_calls",
+    "run_dir": "run_dir",
+}
 
 
 def next_session_id(parent: Path) -> str:
     """Next incrementing integer session id (as a string) under `parent`.
 
-    Scans existing integer-named session directories and returns max+1, or "0"
-    when there are none.
+    Counts the leading integer of each child dir name — both pure-integer session
+    dirs (autoresearch: `0`, `1`) and `<id>_<combo>` run folders (benchmark:
+    `0_no_interface_..._v0`). Returns max+1, or "0" when there are none.
     """
-    existing = [
-        int(p.name)
-        for p in (parent.iterdir() if parent.exists() else [])
-        if p.is_dir() and p.name.isdigit()
-    ]
-    return str(max(existing) + 1 if existing else 0)
+    nums: list[int] = []
+    if parent.exists():
+        for p in parent.iterdir():
+            if not p.is_dir():
+                continue
+            head = p.name.split("_", 1)[0]
+            if head.isdigit():
+                nums.append(int(head))
+    return str(max(nums) + 1 if nums else 0)
 
 
 FIELDS = [
+    # When the engineer's `claude -p` started (UTC ISO-8601). One per row.
     "started_at",
-    "challenge_id",
-    "interface",
-    "mode",
-    "skills",
-    "skills_version",
-    "skills_hash",
-    "skills_dir",
+    # Run / version identity (autoresearch). `version` is `v<N>` (e.g. `v2`)
+    # — the same string that names the increment's filesystem dir.
+    "run",
     "version",
-    "hash",
-    "interface_dir",
-    "prompt_version",
-    "prompt_hash",
-    "prompt_file",
-    "auth",
-    "model",
-    "wall_time_s",
-    "input_tokens",
-    "output_tokens",
+    "interface",
+    "type",            # interface type: cli/mcp/sdk/none
+    "skills",
+    "prev_run",        # carried from autoresearch config; "" if not a continuation
+    "prev_version",    # e.g. "v2" — last version of `prev_run` we continue from
+    # The work this row covers.
+    "task",
+    "challenge",
+    # Grading (slim set — full breakdown is in the per-challenge `grading.json`).
+    "valid_submission",
+    "score",
+    "medal",
+    # Engineer-side wall/tokens/cost — per-challenge values from the
+    # engineer's `claude -p`.
+    "eng_wall_time_s",
+    "eng_input_tokens",
+    "eng_output_tokens",
+    "eng_total_tokens",
+    "eng_cost_usd",
+    # Researcher-side contribution attributed to this row. The researcher's
+    # `claude -p` runs ONCE per autoresearch session; at end-of-session
+    # `autoresearch.run_autoresearch` parses its transcript and distributes
+    # the totals equally across all rows of the session. Empty/0 for
+    # benchmark rows (no researcher).
+    "res_wall_time_s",
+    "res_input_tokens",
+    "res_output_tokens",
+    "res_total_tokens",
+    "res_cost_usd",
+    # Combined totals = eng_* + res_*. Pre-computed so the CSV is
+    # self-contained (no need to derive them downstream). Config budgets
+    # (`max_cost_usd`, `max_seconds`) check against these, not the engineer alone.
+    "total_wall_time_s",
     "total_tokens",
-    "cost_usd",
+    "total_cost",
+    # Tool-call accounting parsed from the engineer's transcript.
     "llm_calls",
     "cli_calls",
     "mcp_calls",
     "sdk_calls",
     "python_calls",
     "bash_calls",
+    "skill_calls",
     "other_tool_calls",
-    "medal",
-    "score",
+    # Per-increment annotations the researcher fills in after evaluating the
+    # increment (via `banter annotate-increment`). Every challenge row in the
+    # same (session, increment) carries the same annotation — denormalised
+    # so a single CSV is the full record.
+    "hypothesis",         # one-line rationale for the change
+    "change",             # what was modified vs. the previous increment
+    "verdict",            # positive | negative | neutral
+    "verdict_reason",
+    "keep",               # 0/1 — did the researcher keep this change?
+    "observations",       # qualitative findings from the engineer transcripts
+    "proposed_changes",   # what to try next
+    # Pointer to the engineer's per-challenge artifacts dir (transcript, stream.log, submission, grading.json, …).
     "run_dir",
 ]
+
+# Benchmark CSV columns, in order. Sourced from `_BENCHMARK_VIEW.keys()`.
+BENCHMARK_FIELDS = list(_BENCHMARK_VIEW.keys())
+
+
+def _benchmark_view(row_dict: dict[str, Any]) -> dict[str, Any]:
+    """Project an autoresearch Row dict into the benchmark column set.
+
+    Renames `eng_*` → plain names, drops everything that isn't a benchmark
+    column (session/increment/res_*/total_*/annotations).
+    """
+    return {dest: row_dict.get(src, "") for dest, src in _BENCHMARK_VIEW.items()}
 
 
 @dataclass
 class Row:
+    # UTC ISO-8601 timestamp recorded when the engineer's `claude -p` started.
     started_at: str
-    challenge_id: str
-    interface: str          # interface NAME, e.g. "hopsworks" or "none"
-    mode: str               # interface TYPE: cli/mcp/sdk/none
+    # Identity. Field order MATCHES `FIELDS` so csv.DictWriter emits columns
+    # in the documented order.
+    run: str                # autoresearch run id (empty for benchmark rows)
+    version: str            # `v<N>` (e.g. "v2"); "" for benchmark rows
+    interface: str          # interface NAME, e.g. "mlkit" or "none"
+    type: str               # interface TYPE: cli/mcp/sdk/none
     skills: str             # skill bundle name or "none"
-    skills_version: int     # 0 when skills=none; else version of the snapshot used
-    skills_hash: str        # "" when skills=none; else 8-hex hash of the snapshot
-    skills_dir: str         # skills/<name>/<version>/, "" when skills=none
-    version: int            # interface version (0=base config; >0=session-local)
-    hash: str               # 8-hex hash of config + version override + binary
-    interface_dir: str      # configs/interfaces/<name>/<mode>.yaml (config path)
-    prompt_version: int     # same integer as `version`; prompts are per-version
-    prompt_hash: str        # 8-hex hash of the resolved prompt text
-    prompt_file: str        # v0: configs/.../<mode>.yaml#prompt; v>0: <session>/.../v<n>/version.yaml#prompt
-    auth: str
-    model: str
-    wall_time_s: float
-    input_tokens: int = 0
-    output_tokens: int = 0
+    prev_run: str           # autoresearch config continuation hint; "" if none
+    prev_version: str       # e.g. "v2"; "" if none
+    task: str               # ML task / challenge group this challenge belongs to
+    challenge: str          # MLE-bench competition id
+    # Slim grading (full breakdown in the per-challenge `grading.json`).
+    valid_submission: int = 0
+    score: float | None = None
+    medal: str | None = None
+    # Engineer-side wall + tokens + cost.
+    eng_wall_time_s: float = 0.0
+    eng_input_tokens: int = 0
+    eng_output_tokens: int = 0
+    eng_total_tokens: int = 0
+    eng_cost_usd: float = 0.0
+    # Researcher attribution (set at end-of-session by autoresearch).
+    res_wall_time_s: float = 0.0
+    res_input_tokens: int = 0
+    res_output_tokens: int = 0
+    res_total_tokens: int = 0
+    res_cost_usd: float = 0.0
+    # Combined totals (eng + res); also written at end-of-session.
+    total_wall_time_s: float = 0.0
     total_tokens: int = 0
-    cost_usd: float = 0.0
+    total_cost: float = 0.0
     llm_calls: int = 0
     cli_calls: int = 0
     mcp_calls: int = 0
     sdk_calls: int = 0
     python_calls: int = 0
     bash_calls: int = 0
+    skill_calls: int = 0
     other_tool_calls: int = 0
-    medal: str | None = None
-    score: float | None = None
+    # Per-increment annotations (researcher fills in via `banter annotate-increment`).
+    hypothesis: str = ""
+    change: str = ""
+    verdict: str = ""          # "positive" | "negative" | "neutral"
+    verdict_reason: str = ""
+    keep: int = 0              # 0 / 1
+    observations: str = ""
+    proposed_changes: str = ""
     run_dir: str = ""
 
 
@@ -311,6 +430,61 @@ def _command_uses_sdk(tokens: list[str], command: str, sdk_module: str, run_dir:
     return False
 
 
+_SEGMENT_SEPARATORS = {";", "&&", "||", "|", "&", "(", ")", "{", "}", "\n"}
+
+
+def _is_env_var_assignment(tok: str) -> bool:
+    """True for shell var-assignment tokens like `FOO=bar`, `BASE=/x`."""
+    if "=" not in tok or tok.startswith("="):
+        return False
+    head = tok.split("=", 1)[0]
+    if not head or not (head[0].isalpha() or head[0] == "_"):
+        return False
+    return all(c.isalnum() or c == "_" for c in head)
+
+
+def _executable_tokens(tokens: list[str], depth: int = 0) -> list[str]:
+    """Yield the executable token of each command SEGMENT in `tokens`.
+
+    Walks the token list tracking command-segment boundaries (`;`, `&&`,
+    `||`, `|`, `&`, etc.), skipping environment-variable-assignment prefixes
+    (`FOO=bar python script.py` → python is the executable). When a segment
+    starts with `bash`/`sh`/`zsh -c "<script>"`, recursively scans the
+    quoted inner script so e.g. `bash -c "python train.py"` is correctly
+    classified as a python call.
+    """
+    out: list[str] = []
+    expect_exec = True
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok in _SEGMENT_SEPARATORS:
+            expect_exec = True
+            i += 1
+            continue
+        if not expect_exec:
+            i += 1
+            continue
+        if _is_env_var_assignment(tok):
+            i += 1
+            continue  # still expecting the executable
+        # bash/sh -c "..." → recurse into the quoted script body.
+        if depth < 2 and tok in ("bash", "sh", "zsh") and i + 2 < len(tokens) and tokens[i + 1] == "-c":
+            inner = tokens[i + 2]
+            try:
+                inner_tokens = shlex.split(inner)
+            except ValueError:
+                inner_tokens = inner.split()
+            out.extend(_executable_tokens(inner_tokens, depth + 1))
+            i += 3
+            expect_exec = False
+            continue
+        out.append(tok)
+        expect_exec = False
+        i += 1
+    return out
+
+
 def _classify_tool_use(
     tool_name: str,
     tool_input: dict[str, Any],
@@ -318,6 +492,8 @@ def _classify_tool_use(
     sdk_module: str | None = None,
     run_dir: Path | None = None,
 ) -> str:
+    if tool_name == "Skill":
+        return "skill"
     if tool_name.startswith("mcp__"):
         return "mcp"
     if tool_name != "Bash":
@@ -325,16 +501,33 @@ def _classify_tool_use(
     command = (tool_input.get("command") or "").strip()
     if not command:
         return "bash"
-    try:
-        tokens = shlex.split(command)
-    except ValueError:
-        tokens = command.split()
+    # Engineers commonly write multi-line bash scripts where the python
+    # invocation isn't the first token (env-var assignments first, or
+    # cd/setup lines before the actual call). `shlex.split` strips newlines,
+    # so split by line first; within a line, segment by `;`/`&&`/`||`/`|`.
+    exec_tokens: list[str] = []
+    tokens: list[str] = []
+    for line in command.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            line_tokens = shlex.split(line)
+        except ValueError:
+            line_tokens = line.split()
+        tokens.extend(line_tokens)
+        exec_tokens.extend(_executable_tokens(line_tokens))
     if not tokens:
         return "bash"
-    first = tokens[0]
-    if cli_binary and (first == cli_binary or first.endswith(f"/{cli_binary}")):
+    if not exec_tokens:
+        return "bash"
+    # Priority: cli (interface usage) > python (counts even when nested in
+    # a bash script) > bash (pure shell utilities).
+    def _is_cli(tok: str) -> bool:
+        return bool(cli_binary) and (tok == cli_binary or tok.endswith(f"/{cli_binary}"))
+    if any(_is_cli(t) for t in exec_tokens):
         return "cli"
-    if _is_python_first(first):
+    if any(_is_python_first(t) for t in exec_tokens):
         if sdk_module and _command_uses_sdk(tokens, command, sdk_module, run_dir):
             return "sdk"
         return "python"
@@ -362,6 +555,7 @@ def aggregate_commands(
         "sdk_calls": 0,
         "python_calls": 0,
         "bash_calls": 0,
+        "skill_calls": 0,
         "other_tool_calls": 0,
     }
     bucket = {
@@ -370,6 +564,7 @@ def aggregate_commands(
         "sdk": "sdk_calls",
         "python": "python_calls",
         "bash": "bash_calls",
+        "skill": "skill_calls",
         "other": "other_tool_calls",
     }
     if not transcript_path.exists():
@@ -452,114 +647,77 @@ def write_commands_log(
     commands_log.write_text("\n".join(lines) + ("\n" if lines else ""))
 
 
-def _truncate(text: str, limit: int = 2000) -> str:
-    """Shorten long tool I/O blobs so the readable log stays scannable."""
-    if len(text) <= limit:
-        return text
-    head = text[: limit - 200]
-    return f"{head}\n... <truncated {len(text) - (limit - 200)} chars>"
+_ANNOTATION_KEYS = (
+    "hypothesis", "change", "verdict", "verdict_reason",
+    "keep", "observations", "proposed_changes",
+)
 
 
-def _block_text(block: dict[str, Any]) -> str:
-    """Flatten a content block to a readable line or short paragraph."""
-    btype = block.get("type")
-    if btype == "text":
-        return block.get("text") or ""
-    if btype == "thinking":
-        return f"(thinking) {block.get('thinking') or ''}"
-    if btype == "tool_use":
-        name = block.get("name", "?")
-        try:
-            args = json.dumps(block.get("input") or {}, ensure_ascii=False)
-        except (TypeError, ValueError):
-            args = str(block.get("input"))
-        return f"TOOL_USE {name}({_truncate(args)})"
-    if btype == "tool_result":
-        content = block.get("content")
-        if isinstance(content, list):
-            parts = []
-            for sub in content:
-                if isinstance(sub, dict) and sub.get("type") == "text":
-                    parts.append(sub.get("text") or "")
-                else:
-                    parts.append(json.dumps(sub, ensure_ascii=False))
-            content_text = "\n".join(parts)
-        elif isinstance(content, str):
-            content_text = content
-        else:
-            content_text = json.dumps(content, ensure_ascii=False)
-        prefix = "TOOL_ERROR" if block.get("is_error") else "TOOL_RESULT"
-        return f"{prefix}\n{_truncate(content_text)}"
-    return f"{btype}: {json.dumps(block, ensure_ascii=False)}"
+def annotate_version(
+    results_csv: Path,
+    *,
+    run: str,
+    version: str,
+    updates: dict[str, Any],
+) -> int:
+    """Fill in the per-version annotation columns on every row whose
+    `(run, version)` matches. Returns the number of rows updated.
 
-
-def write_readable_transcript(transcript_path: Path, out_path: Path) -> Path:
-    """Render the stream-json transcript as plain text alongside it.
-
-    One section per event, headed by `[timestamp] ROLE`, body is the
-    flattened content (text, tool calls, tool results). Long tool blobs
-    are truncated so the file remains scannable.
+    The researcher calls `banter annotate-version` once per finished
+    version with the verdict + observations + proposed_changes; those
+    values land on every challenge row of that version so the CSV is
+    self-contained.
     """
-    if not transcript_path.exists():
-        out_path.write_text("(no transcript)\n")
-        return out_path
-
-    sections: list[str] = []
-    for line in transcript_path.read_text().splitlines():
-        if not line.strip():
-            continue
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-
-        etype = event.get("type")
-        timestamp = event.get("timestamp") or ""
-        prefix = f"[{timestamp}] " if timestamp else ""
-        if etype == "system":
-            sections.append(f"{prefix}SYSTEM {event.get('subtype', '')}")
-            continue
-        if etype == "result":
-            cost = event.get("total_cost_usd")
-            turns = event.get("num_turns")
-            stop = event.get("stop_reason") or event.get("subtype") or ""
-            text = event.get("result") or ""
-            sections.append(
-                f"{prefix}RESULT stop={stop} turns={turns} cost=${cost}"
-                + (f"\n{text}" if text else "")
-            )
-            continue
-
-        role = (event.get("message") or {}).get("role") or etype or "?"
-        blocks = (event.get("message") or {}).get("content") or []
-        if isinstance(blocks, str):
-            body = blocks
-        else:
-            body = "\n\n".join(_block_text(b) for b in blocks if isinstance(b, dict))
-        sections.append(f"{prefix}{role.upper()}\n{body}")
-
-    out_path.write_text("\n\n" + ("\n\n---\n\n".join(sections)) + "\n")
-    return out_path
+    if not results_csv.exists():
+        return 0
+    rows: list[dict[str, Any]] = []
+    with results_csv.open() as f:
+        rows = list(csv.DictReader(f))
+    n = 0
+    for r in rows:
+        if str(r.get("run", "")) == str(run) and str(r.get("version", "")) == str(version):
+            for k in _ANNOTATION_KEYS:
+                if k in updates and updates[k] is not None:
+                    r[k] = str(updates[k])
+            n += 1
+    if n:
+        with results_csv.open("w", newline="") as fw:
+            w = csv.DictWriter(fw, fieldnames=FIELDS)
+            w.writeheader()
+            for r in rows:
+                w.writerow({k: r.get(k, "") for k in FIELDS})
+    return n
 
 
-def append(results_csv: Path, row: Row) -> None:
+def append(results_csv: Path, row: Row, fields: list[str] | None = None) -> None:
     """Write `row` to results.csv. If a previous row has the same `run_dir`
     (i.e. the same combo was re-run), it's replaced rather than appended, so
-    each combo has at most one row at any time. Also migrates the header in
-    place when FIELDS changes between releases."""
+    each combo has at most one row at any time.
+
+    `fields` narrows the column set. `None` (default) writes the full
+    autoresearch schema. Pass `BENCHMARK_FIELDS` for benchmark: columns are
+    renamed and trimmed via `_benchmark_view`.
+    """
+    cols = fields if fields is not None else FIELDS
+    # Detect benchmark by column-list equality (callers import BENCHMARK_FIELDS
+    # so either `is` or `==` works; `==` is robust across module re-imports).
+    use_benchmark_view = cols == BENCHMARK_FIELDS
     results_csv.parent.mkdir(parents=True, exist_ok=True)
-    new_row = asdict(row)
+    raw = asdict(row)
+    new_row = _benchmark_view(raw) if use_benchmark_view else raw
     kept: list[dict[str, Any]] = []
     if results_csv.exists():
         with results_csv.open() as f:
             reader = csv.DictReader(f)
             for r in reader:
-                if r.get("run_dir") == new_row["run_dir"]:
+                if r.get("run_dir") == new_row.get("run_dir"):
                     continue  # replaced by new_row below
                 kept.append(r)
     with results_csv.open("w", newline="") as fw:
-        writer = csv.DictWriter(fw, fieldnames=FIELDS)
+        writer = csv.DictWriter(fw, fieldnames=cols)
         writer.writeheader()
         for r in kept:
-            writer.writerow({k: r.get(k, "") for k in FIELDS})
-        writer.writerow(new_row)
+            writer.writerow({k: r.get(k, "") for k in cols})
+        writer.writerow({k: new_row.get(k, "") for k in cols})
+
+

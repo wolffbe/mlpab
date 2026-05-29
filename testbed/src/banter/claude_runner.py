@@ -1,14 +1,11 @@
 """Spawn `claude -p` to drive a challenge.
 
-We set up a project-scoped .claude/settings.json with a PreToolUse hook so
-every tool call is logged, then run `claude -p` against the user's configured
-Anthropic credentials (api-key or login) and capture the full stream-json
-transcript. Cost + token totals come from the transcript's `result` event.
+Sets up a project-scoped .claude/settings.json (PreToolUse hook + sandbox +
+denies), runs `claude -p`, and captures the stream-json transcript. Cost +
+token totals come from the transcript's `result` event.
 
-The same rate-limit retry helper (`run_with_retry`) is used by the engineer
-(`run` in this module) AND the autoresearch researcher — every `claude -p`
-invocation in the testbed goes through it, so a 429/529 anywhere triggers
-exponential back-off within the same 12h retry budget.
+`run_with_retry` (shared with the autoresearch researcher) handles 429/529
+and 5xx back-off across a 6h budget.
 """
 from __future__ import annotations
 
@@ -21,22 +18,137 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+from banter import streaming
+
 
 TESTBED_ROOT = Path(__file__).resolve().parents[2]
+# Real user home from /etc/passwd, NOT $HOME — autoresearch redirects $HOME
+# into the run dir, so by the time `banter run` loads this module its
+# environ.HOME is already <run>/. Using that as HOME_DIR would emit a
+# denyRead rooted at <run>/, which then blocks the engineer's own writes
+# inside its boundary (parent-dir lookups for open(..., 'w') need read).
+import pwd
+HOME_DIR = Path(pwd.getpwuid(os.getuid()).pw_dir).resolve()
 # Hook script ships inside the package (src/banter/hooks/).
 HOOK_SCRIPT = Path(__file__).resolve().parent / "hooks" / "log_tool_call.py"
-# Shared pip download cache so deps Claude installs into a per-run venv
-# (torch, sklearn, etc.) are not re-downloaded for every run. The per-run
-# venv stays empty on creation — this only avoids the network round-trip.
-PIP_CACHE_DIR = TESTBED_ROOT / "cache" / "pip"
 
-# Rate-limit retry budget. If claude -p exits with a 429/529-style error we
-# sleep with exponential backoff and try again until total elapsed wall-clock
-# reaches 12h, then give up.
-RATE_LIMIT_RETRY_WINDOW_S = 12 * 3600
+# Tools blocked for both researcher and engineer: scheduling/async (end the
+# `-p` turn or run unobservably), nested subagents (cost-attribution loss),
+# plan/worktree modes (unused), and a few meta tools. `mcp__*` tools stay
+# allowed — including whichever interface MCP servers are loaded.
+COMMON_DENY = [
+    # Background scheduling / async — calling these in -p ends the turn.
+    "ScheduleWakeup",
+    "CronCreate", "CronDelete", "CronList",
+    "Task", "TaskCreate", "TaskUpdate", "TaskGet", "TaskList", "TaskOutput", "TaskStop",
+    "RemoteTrigger", "Monitor", "PushNotification",
+    # Nested subagents — bloat context, break per-call cost attribution.
+    "Agent",
+    # Plan / worktree modes unused in autoresearch / benchmark.
+    "EnterPlanMode", "ExitPlanMode",
+    "EnterWorktree", "ExitWorktree",
+    # Meta / helper tools not needed for the loop.
+    "ToolSearch", "ShareOnboardingGuide",
+]
+
+# Engineer-only denies. Web access kills reproducibility for the deterministic
+# ML task. Researcher keeps them — may look up library docs.
+ENGINEER_ONLY_DENY = ["WebFetch", "WebSearch"]
+
+
+def deny_patterns_for(boundary: Path) -> list[str]:
+    """Build `permissions.deny` patterns that DO fire under `bypassPermissions`.
+
+    Covers Bash escape patterns (cd .., cat/ls dotfiles in $HOME) — these
+    are the ones the engineer can't bypass. Read/Write/Edit `file_path`
+    patterns would be silently skipped in bypass mode, so those are
+    enforced by the PreToolUse hook instead (see `hooks/log_tool_call.py`).
+    """
+    boundary.resolve()  # accepted for future use
+    home = str(HOME_DIR)
+    return [
+        "Bash(cd *..*)",
+        f"Bash(cat {home}/.*)",  f"Bash(cat {home}/.*/**)",
+        f"Bash(ls {home}/.*)",   f"Bash(ls {home}/.*/**)",
+    ]
+
+
+def oauth_token_from_keychain() -> str | None:
+    """Return the Claude Code OAuth access token from macOS Keychain, or None.
+
+    None on non-macOS hosts, or when the user hasn't run `claude /login`.
+    """
+    try:
+        out = subprocess.run(
+            ["/usr/bin/security", "find-generic-password",
+             "-s", "Claude Code-credentials", "-w"],
+            check=True, capture_output=True, text=True, timeout=5,
+        ).stdout
+        return json.loads(out)["claudeAiOauth"]["accessToken"]
+    except (subprocess.CalledProcessError, FileNotFoundError,
+            subprocess.TimeoutExpired, json.JSONDecodeError, KeyError):
+        return None
+
+
+# File-based fallback for the OAuth token. Claude Code's Bash tool strips
+# CLAUDE_CODE_OAUTH_TOKEN from child env, so the chain
+# autoresearch → researcher → bash → banter run → engineer loses it.
+# autoresearch writes the token to <run>/.claude-oauth (mode 0600) and
+# points BANTER_TOKEN_CACHE at it; custom BANTER_* vars survive the hop.
+TOKEN_CACHE_FILENAME = ".claude-oauth"
+TOKEN_CACHE_ENV = "BANTER_TOKEN_CACHE"
+
+
+def write_token_cache(token: str, run_path: Path) -> Path:
+    """Write the OAuth token to ``run_path/.claude-oauth`` (mode 0600).
+
+    Returns the cache path. The caller is responsible for forwarding it via
+    the ``BANTER_TOKEN_CACHE`` env var so child banter invocations find it.
+    """
+    cache = run_path / TOKEN_CACHE_FILENAME
+    cache.write_text(token)
+    cache.chmod(0o600)
+    return cache
+
+
+def read_token_cache() -> str | None:
+    """Read the OAuth token from the cache pointed at by BANTER_TOKEN_CACHE."""
+    path = os.environ.get(TOKEN_CACHE_ENV)
+    if not path:
+        return None
+    try:
+        s = Path(path).read_text().strip()
+        return s or None
+    except (FileNotFoundError, OSError):
+        return None
+
+
+def resolve_oauth_token() -> str | None:
+    """Get the OAuth token via the most reliable available path.
+
+    Order: env (already-propagated by upstream), BANTER_TOKEN_CACHE file,
+    Keychain (works from the user's shell but fails silently in some nested
+    subprocess contexts). Returns the token string or None.
+    """
+    return (os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
+            or read_token_cache()
+            or oauth_token_from_keychain())
+
+
+# Rate-limit / transient-error retry budget. On a matching exit-error we
+# exp-backoff up to RATE_LIMIT_MAX_BACKOFF_S and retry until total wall-clock
+# reaches RATE_LIMIT_RETRY_WINDOW_S, then give up.
+RATE_LIMIT_RETRY_WINDOW_S = 6 * 3600
 RATE_LIMIT_BASE_BACKOFF_S = 2
 RATE_LIMIT_MAX_BACKOFF_S = 3600
-_RATE_LIMIT_TOKENS = ("rate_limit", "rate limit", "overloaded", "429", "529")
+# Anthropic rate limits (429/529, "overloaded") + transient 5xx. Without 5xx
+# in here, a mid-session 500 burns a whole version on retry.
+_RATE_LIMIT_TOKENS = (
+    "rate_limit", "rate limit", "overloaded",
+    "429", "529",
+    "500", "502", "503", "504",
+    "internal server error", "bad gateway", "service unavailable", "gateway timeout",
+)
 
 
 @dataclass
@@ -47,28 +159,98 @@ class ClaudeResult:
     stderr_path: Path
 
 
-def _write_settings(run_dir: Path, command_log: Path) -> None:
-    # `matcher` is a regex; ".*" matches every tool name. (`-p` mode silently
-    # ignores invalid settings, so the field must be present and well-formed.)
-    settings = {
-        "hooks": {
-            "PreToolUse": [
-                {
-                    "matcher": ".*",
-                    "hooks": [
-                        {
-                            "type": "command",
-                            "command": f"python3 {HOOK_SCRIPT}",
-                        }
-                    ],
-                }
-            ]
-        }
-    }
+# Baseline outbound hosts every engineer needs regardless of interface:
+# Claude itself (api.anthropic.com) + loopback for any local interface server.
+# Interface-specific hosts come from each `interfaces/<name>/<type>/config.yaml`
+# via the `allowed_domains:` key.
+BASE_ALLOWED_DOMAINS = (
+    "127.0.0.1", "localhost",
+    "api.anthropic.com", "*.anthropic.com",
+    "statsig.anthropic.com", "console.anthropic.com",
+)
+
+
+def _write_settings(
+    run_dir: Path,
+    command_log: Path,
+    version_dir: Path | None = None,
+    allowed_domains: list[str] | None = None,
+) -> None:
+    """Write the engineer's project-scoped `.claude/settings.json`.
+
+    `version_dir` (autoresearch `<run>/v<N>`) overrides the boundary;
+    otherwise it falls back to `run_dir` (benchmark challenge dir).
+
+    Confinement: Claude Code's built-in sandbox kernel-confines Bash
+    subprocesses to the boundary. `permissions.deny` adds tool-name and
+    Bash escape denies. Read/Write/Edit are NOT kernel-confined in
+    bypassPermissions — soft (prompt + cwd) only.
+
+    Network is unrestricted (no `allowedDomains`); `allowLocalBinding`
+    covers interface servers (mlkit binds 127.0.0.1:8765). `.claude/`
+    state lands inside `boundary` via the HOME redirect in :func:`run`.
+    """
+    # Engineer's world = its challenge folder (`run_dir`). Each challenge is
+    # a separate engineer invocation and is isolated from siblings (same
+    # version) and from all other versions / runs. allowRead also reaches
+    # the technical infra the engineer needs to function: ~/.claude, shared
+    # Python libs (where `./venv/` symlinks resolve), the mle-bench cache
+    # (where `./data/` resolves), and the PreToolUse hook script.
+    # `version_dir` is accepted for back-compat but no longer used — it would
+    # leak sibling challenges.
+    # Engineer's world = its challenge folder. Everything it needs lives
+    # inside the boundary: venv (materialized by `runner._make_venv`),
+    # challenge data (cloned by `mlebench_wrapper.prepare`), and the
+    # PreToolUse hook script (copied below). allowRead therefore only needs
+    # the boundary itself plus ~/.claude for Claude Code's own config.
+    _ = version_dir  # accepted for back-compat; not used
+    boundary = run_dir.resolve()
     settings_dir = run_dir / ".claude"
     settings_dir.mkdir(parents=True, exist_ok=True)
+    # Copy the hook script into the boundary so the PreToolUse hook can
+    # invoke it without reading outside the sandbox.
+    hooks_dir = settings_dir / "hooks"
+    hooks_dir.mkdir(exist_ok=True)
+    local_hook = hooks_dir / HOOK_SCRIPT.name
+    shutil.copy(HOOK_SCRIPT, local_hook)
+    local_hook.chmod(0o755)
+    # Sandbox: NETWORK gated, filesystem FULLY OPEN. Enabling the sandbox at
+    # all triggers default filesystem restrictions even without a `filesystem`
+    # block — so we explicitly opt back out with allowRead/Write `["/"]`,
+    # then layer just the network allowlist. Result:
+    #   - Outbound: only baseline (Claude API + loopback) + whatever the
+    #     interface declares in its `allowed_domains:` config. No pypi /
+    #     HF / kaggle / github / arbitrary HTTPS during the run.
+    #   - Filesystem: unrestricted. Confinement falls to the PreToolUse
+    #     hook (path-based deny for Read/Write/Edit, enforced regardless
+    #     of permission mode) + `permissions.deny` (Bash escape patterns
+    #     + tool-name denies).
+    domain_list = list(BASE_ALLOWED_DOMAINS) + list(allowed_domains or [])
+    settings = {
+        "hooks": {
+            "PreToolUse": [{
+                "matcher": ".*",  # regex over tool names
+                "hooks": [{"type": "command", "command": f"python3 {local_hook}"}],
+            }]
+        },
+        "sandbox": {
+            "enabled": True,
+            "autoAllowBashIfSandboxed": True,
+            "filesystem": {
+                "allowRead":  ["/"],
+                "allowWrite": ["/"],
+            },
+            "network": {
+                "allowLocalBinding": True,
+                "allowedDomains": domain_list,
+            },
+        },
+        "permissions": {
+            "deny": list(COMMON_DENY) + list(ENGINEER_ONLY_DENY) + deny_patterns_for(boundary),
+        },
+    }
     (settings_dir / "settings.json").write_text(json.dumps(settings, indent=2))
-    # Mirror the env var into the settings dir for debugging by hand.
+    # Mirror the command log path for debugging.
     (settings_dir / "command_log_path.txt").write_text(str(command_log))
 
 
@@ -91,20 +273,21 @@ def run(
     command_log: Path,
     timeout_s: int = 60 * 60,
     extra_env: dict[str, str] | None = None,
+    version_dir: Path | None = None,
+    allowed_domains: list[str] | None = None,
 ) -> ClaudeResult:
-    """Spawn `claude -p` (the engineer instance).
+    """Spawn `claude -p` (the engineer).
 
-    auth == "api-key": leave ANTHROPIC_API_KEY in env (claude-code reads it).
-    auth == "login":   strip ANTHROPIC_API_KEY so claude-code uses stored OAuth
-                       credentials from `claude /login`.
-
-    `extra_env` (e.g. an interface's credential keys) is layered onto the
-    engineer's environment so the CLI/SDK/MCP server can authenticate.
+    Always forwards a Keychain OAuth token (when present) since the
+    redirected HOME has no on-disk credentials. `auth="login"` additionally
+    strips ANTHROPIC_API_KEY so OAuth wins; `auth="api-key"` keeps both
+    and lets claude-code pick. `extra_env` layers interface credentials.
     """
     if shutil.which("claude") is None:
         raise RuntimeError("`claude` CLI not found on PATH. Install Claude Code first.")
 
-    _write_settings(run_dir, command_log)
+    _write_settings(run_dir, command_log, version_dir=version_dir,
+                    allowed_domains=allowed_domains)
     mcp_cfg = _write_mcp_config(run_dir, mcp_servers)
 
     transcript_path = run_dir / "transcript.jsonl"
@@ -112,57 +295,64 @@ def run(
     command_log.touch()
 
     env = os.environ.copy()
-    # ANTHROPIC_BASE_URL would route claude-code through a proxy; we don't use
-    # one, so strip it in case the parent shell set one.
-    env.pop("ANTHROPIC_BASE_URL", None)
+    env.pop("ANTHROPIC_BASE_URL", None)  # strip any parent-shell proxy
+    # HOME → boundary so `.claude/` state lands inside the run dir.
+    boundary = (version_dir or run_dir).resolve()
+    env["HOME"] = str(boundary)
+    # Auth: redirected HOME has no on-disk creds. resolve_oauth_token() tries
+    # env → token cache file → Keychain in order; the cache is what makes the
+    # researcher → bash → banter run → engineer chain work (env is stripped
+    # by Claude Code's Bash tool).
+    token = resolve_oauth_token()
+    if token:
+        env["CLAUDE_CODE_OAUTH_TOKEN"] = token
     if auth == "login":
         env.pop("ANTHROPIC_API_KEY", None)
+    if not env.get("ANTHROPIC_API_KEY") and not env.get("CLAUDE_CODE_OAUTH_TOKEN"):
+        print("[claude_runner] WARNING: no auth available (no ANTHROPIC_API_KEY, "
+              "no token in env/cache/Keychain). Engineer will fail. Re-run "
+              "banter from a shell where `claude /login` has been run.",
+              flush=True)
     env["ANTHROPIC_MODEL"] = model
     env["TESTBED_COMMAND_LOG"] = str(command_log)
+    # The PreToolUse hook reads this to enforce Read/Write/Edit path denies
+    # — those are silently skipped under bypassPermissions, but the hook
+    # fires regardless and rejects calls outside the boundary.
+    env["TESTBED_BOUNDARY"] = str(boundary)
     if cli_binary:
         env["TESTBED_CLI_BINARY"] = cli_binary
     if sdk_module:
         env["TESTBED_SDK_MODULE"] = sdk_module
 
-    # Activate the per-run venv so Claude's `python` / `pip` invocations land
-    # there (and not in the system Python, which may be too new for ML deps).
+    # Activate per-run venv so claude's python/pip find ML deps via .pth.
     venv_bin = run_dir / "venv" / "bin"
     if venv_bin.is_dir():
         env["PATH"] = f"{venv_bin}{os.pathsep}{env.get('PATH', '')}"
         env["VIRTUAL_ENV"] = str(run_dir / "venv")
 
-    PIP_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    env["PIP_CACHE_DIR"] = str(PIP_CACHE_DIR)
+    # Skip pip cache (per-run venv inherits via .pth; cache dir unwritable).
+    env["PIP_NO_CACHE_DIR"] = "1"
 
-    # Interface credential keys (from the manifest) override inherited values so
-    # the engineer's CLI/SDK/MCP server authenticates against the configured host.
+    # Interface credentials override inherited values.
     if extra_env:
         env.update({k: v for k, v in extra_env.items() if v})
 
-    # Absolute path — `--settings` is resolved relative to cwd (=run_dir),
-    # not the caller's cwd, so a relative path would miss.
+    # Absolute path: `--settings` resolves against cwd (=run_dir).
     settings_file = (run_dir / ".claude" / "settings.json").resolve()
     cmd = [
-        "claude",
-        "-p",
-        prompt,
-        "--output-format",
-        "stream-json",
-        "--verbose",
-        "--model",
-        model,
-        "--permission-mode",
-        "bypassPermissions",
-        # Force the per-run settings (including the PreToolUse hook) to load.
-        # `-p` mode silently ignores project settings unless asked explicitly.
-        "--settings",
-        str(settings_file),
-        "--setting-sources",
-        "project,local,user",
+        "claude", "-p", prompt,
+        "--output-format", "stream-json", "--verbose",
+        "--model", model,
+        "--permission-mode", "bypassPermissions",
+        # `-p` mode skips project settings unless we ask for them explicitly.
+        "--settings", str(settings_file),
+        "--setting-sources", "project,local,user",
     ]
     if mcp_cfg:
         cmd.extend(["--mcp-config", str(mcp_cfg)])
 
+    # `runner.run` wraps the call in `streaming.tee_to` for stream.log;
+    # full transcript still lands in transcript.jsonl regardless.
     exit_code, wall = run_with_retry(
         cmd=cmd,
         cwd=run_dir,
@@ -170,8 +360,12 @@ def run(
         transcript_path=transcript_path,
         stderr_path=stderr_path,
         timeout_s=timeout_s,
+        on_line=streaming.make_printer("engineer"),
         log_prefix="claude_runner",
     )
+
+    # `run_with_retry` only writes stderr_path when there's actual stderr
+    # output, so no empty-file cleanup is needed here.
 
     return ClaudeResult(
         exit_code=exit_code,
@@ -195,25 +389,31 @@ def run_with_retry(
 
     Used by both the engineer and the autoresearch researcher.
 
-    - Appends stdout to `transcript_path` (stream-json) and stderr to
-      `stderr_path`. Appending — not truncating — so each retry's events
-      accumulate; `_last_result_is_rate_limited` always inspects the LAST
-      `result` event.
+    - Appends stdout to `transcript_path` (stream-json). Stderr is buffered
+      to a temp file and only PROMOTED to `stderr_path` if non-empty, so
+      the run dir stays clean when nothing went wrong.
     - When `on_line` is given, stdout is piped through and each line is
       forwarded to the callback (for live streaming display).
-    - On rate-limit detection (429/529/overloaded in the last `result`),
-      sleeps `min(2 * 2^(attempt-1), 3600)` seconds and retries until the
-      12h total budget is exhausted.
+    - On rate-limit / 5xx detection in the last `result`, sleeps
+      `min(2 * 2^(attempt-1), 3600)` seconds and retries until the 6h
+      total budget is exhausted.
 
     Returns `(exit_code, total_wall_time_s)` including sleep time.
     """
+    import tempfile
+
     start = time.monotonic()
     attempt = 0
     exit_code = 1
+    # Buffer stderr to a temp file outside the run dir; we only move it into
+    # place at the END if it has actual content.
+    err_tmp = tempfile.NamedTemporaryFile(prefix="banter-err-", delete=False)
+    err_tmp_path = Path(err_tmp.name)
+    err_tmp.close()
     while True:
         attempt += 1
         if on_line is not None:
-            with open(transcript_path, "ab") as tf, open(stderr_path, "ab") as sf:
+            with open(transcript_path, "ab") as tf, open(err_tmp_path, "ab") as sf:
                 proc = subprocess.Popen(
                     cmd,
                     cwd=str(cwd),
@@ -248,7 +448,7 @@ def run_with_retry(
                         proc.kill()
                     raise
         else:
-            with open(transcript_path, "ab") as out, open(stderr_path, "ab") as err:
+            with open(transcript_path, "ab") as out, open(err_tmp_path, "ab") as err:
                 proc = subprocess.Popen(cmd, cwd=str(cwd), env=env, stdout=out, stderr=err)
                 try:
                     if timeout_s is not None:
@@ -288,6 +488,18 @@ def run_with_retry(
             flush=True,
         )
         time.sleep(backoff)
+
+    # Promote the temp stderr buffer to `stderr_path` only if non-empty;
+    # otherwise drop it so the run dir doesn't carry an empty log file.
+    try:
+        if err_tmp_path.exists() and err_tmp_path.stat().st_size > 0:
+            stderr_path.parent.mkdir(parents=True, exist_ok=True)
+            err_tmp_path.replace(stderr_path)
+        else:
+            err_tmp_path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
     return exit_code, time.monotonic() - start
 
 

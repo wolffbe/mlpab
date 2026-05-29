@@ -11,8 +11,9 @@ The researcher drives individual challenge evaluations internally via the
 `run --challenge ...` form (not part of the everyday surface).
 
 Examples:
-    banter configs/autoresearch_rq1_hopsworks.yaml
-    banter configs/benchmark_smoke_test.yaml
+    banter interfaces/none/benchmark/config.yaml
+    banter interfaces/mlkit/benchmark/cli/config.yaml
+    banter interfaces/hopsworks/autoresearch/rq1.yaml
     make setup
 """
 from __future__ import annotations
@@ -36,7 +37,19 @@ KAGGLE_DIR = TESTBED_ROOT / ".kaggle"
 
 
 def _load_dotenv() -> None:
+    """Load `.env` and OVERRIDE the shell — `.env` is the source of truth.
+
+    Stale shell exports (e.g. an old `ANTHROPIC_API_KEY` from a previous
+    session) would otherwise silently win over the file the user just edited.
+    `KAGGLE_CONFIG_DIR` still uses setdefault so a user-set override is honored.
+    """
     os.environ.setdefault("KAGGLE_CONFIG_DIR", str(KAGGLE_DIR))
+    # Suppress pip's `A new release of pip is available` banner everywhere.
+    # We're intentionally NOT upgrading pip in every venv; this just hides
+    # the notice from `make install`, per-run venv creation, interface
+    # `install:` steps, and any other subprocess pip call.
+    os.environ.setdefault("PIP_DISABLE_PIP_VERSION_CHECK", "1")
+    os.environ.setdefault("PIP_NO_PYTHON_VERSION_WARNING", "1")
     if not DOTENV_PATH.exists():
         return
     for line in DOTENV_PATH.read_text().splitlines():
@@ -44,7 +57,7 @@ def _load_dotenv() -> None:
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, value = line.split("=", 1)
-        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+        os.environ[key.strip()] = value.strip().strip('"').strip("'")
 
 
 def _write_dotenv(updates: dict[str, str]) -> None:
@@ -90,13 +103,31 @@ def main() -> None:
               help="Interface version. Omit/0 → base config; >0 → a session version.")
 @click.option("--version-root", "version_root", type=click.Path(path_type=Path), default=None,
               help="Session dir holding versions > 0 (required when --interface-version > 0).")
+@click.option("--interface-dir", "interface_dir", type=click.Path(path_type=Path), default=None,
+              help="Use this interface home (a per-increment copy) instead of the committed one; "
+                   "it's built + used by the engineer. Autoresearch passes <run>/<inc>/interface.")
+@click.option("--run", "run_id", default=None,
+              help="Autoresearch run id. Stored as the `run` column in the per-run results.csv.")
+@click.option("--version", "version", default=None,
+              help="Autoresearch version label (e.g. `v3` or just `3`). Stored as `version` in results.csv.")
+@click.option("--prev-run", "prev_run", default=None,
+              help="Autoresearch continuation hint: previous run id this one was bootstrapped from.")
+@click.option("--prev-version", "prev_version", default=None,
+              help="Autoresearch continuation hint: previous version (e.g. `v2`) this one was bootstrapped from.")
 @click.option("--skills", default="none", show_default=True, help="Skill bundle name under skills/, or `none`.")
 @click.option("--skills-version", "skills_version", type=int, default=None, help="Pin a skill bundle version.")
+@click.option("--docs", default="none", show_default=True,
+              help="Docs bundle under interfaces/<project>/docs/, or `none`. "
+                   "Bundle is copied into `<challenge>/docs/` for the engineer to browse.")
+@click.option("--task", default="no_task", show_default=True, help="ML task / challenge group (folder in the run path).")
 @click.option("--model", default=runner.DEFAULT_MODEL, show_default=True)
 @click.option("--auth", type=click.Choice(runner.AUTH_MODES),
               default=lambda: os.environ.get("BANTER_AUTH", "api-key"), show_default="from .env or api-key")
 @click.option("--timeout", "timeout_s", type=int, default=60 * 60, show_default=True)
 @click.option("--runs-root", type=click.Path(path_type=Path), default=Path("results"), show_default=True)
+@click.option("--quiet", "-q", is_flag=True, default=False,
+              help="Suppress live engineer/researcher streaming to the terminal "
+                   "(transcripts are still written). Same as BANTER_QUIET=1.")
 def run(
     config: str | None,
     challenge: str | None,
@@ -104,14 +135,26 @@ def run(
     mode: str | None,
     interface_version: int | None,
     version_root: Path | None,
+    interface_dir: Path | None,
+    run_id: str | None,
+    version: str | None,
+    prev_run: str | None,
+    prev_version: str | None,
     skills: str,
     skills_version: int | None,
+    docs: str,
+    task: str,
     model: str,
     auth: str,
     timeout_s: int,
     runs_root: Path,
+    quiet: bool,
 ) -> None:
     """Run an autoresearch/benchmark CONFIG, or a single challenge."""
+    if quiet:
+        # Set the env var (not just a local flag) so it reaches engineer runs
+        # the researcher spawns as `banter run --challenge` subprocesses.
+        os.environ["BANTER_QUIET"] = "1"
     if config is not None:
         _dispatch_config(Path(config), runs_root)
         return
@@ -130,19 +173,26 @@ def run(
         interface=interface_name,
         mode=mode,
         skills=skills,
+        docs=docs,
         model=model,
         auth=auth,
         timeout_s=timeout_s,
         runs_root=runs_root,
         interface_version=interface_version,
         skills_version=skills_version,
+        task=task,
         version_root=version_root,
+        interface_dir=interface_dir,
+        run_id=run_id,
+        version=version,
+        prev_run=prev_run,
+        prev_version=prev_version,
     )
     row = runner.run(spec)
     click.echo(
-        f"\n=== {challenge} [{row.interface}/{row.mode}, skills={row.skills}] "
-        f"done in {row.wall_time_s:.1f}s "
-        f"({row.total_tokens} tokens, ${row.cost_usd:.4f}); medal={row.medal} ===\n"
+        f"\n=== {challenge} [{row.interface}/{row.type}, skills={row.skills}] "
+        f"done in {row.eng_wall_time_s:.1f}s "
+        f"({row.eng_total_tokens} tokens, ${row.eng_cost_usd:.4f}); medal={row.medal} ===\n"
         f"run dir: {row.run_dir}"
     )
 
@@ -167,6 +217,169 @@ def _dispatch_config(config_path: Path, runs_root: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# banter reset  (wipe benchmark + autoresearch results)
+# ---------------------------------------------------------------------------
+
+
+@main.command("prepare-version")
+@click.argument("interface_dir", type=click.Path(path_type=Path))
+@click.option("--interface", "interface_name", required=True,
+              help="Interface name (e.g. mlkit).")
+@click.option("--mode", required=True, type=click.Choice(interfaces.TYPES),
+              help="Interface type (cli/mcp/sdk).")
+@click.option("--force", is_flag=True, default=False,
+              help="Overwrite an existing target directory.")
+def prepare_version(
+    interface_dir: Path, interface_name: str, mode: str, force: bool,
+) -> None:
+    """Auto-populate an autoresearch version's interface copy + build it.
+
+    INTERFACE_DIR is the target — typically `<run>/v<N>/interface`. The
+    parent dir's name (e.g. `v3`) determines N: when N>0 the copy comes from
+    the PREVIOUS version's `v<N-1>/interface`; when N=0 (or there's no
+    previous), it comes from the committed `interfaces/<name>/<type>/` — copied
+    in, NEVER edited in place. The interface is BUILT in the copy so it's
+    immediately runnable.
+
+    The researcher invokes this once per new version instead of writing
+    `cp -r` and running install steps — the copy + build is deterministic; no
+    AI is involved in file moves or installation, and the committed roster of
+    source files is never modified.
+    """
+    target = Path(interface_dir).resolve()
+    if target.exists():
+        if not force:
+            raise click.ClickException(
+                f"{target} already exists. Pass --force to overwrite."
+            )
+        shutil.rmtree(target)
+
+    v_name = target.parent.name
+    if not (v_name.startswith("v") and v_name[1:].isdigit()):
+        raise click.UsageError(
+            f"target's parent must be v<N>, got {target.parent.name!r}."
+        )
+    n = int(v_name[1:])
+
+    # v>0 → copy from the previous version if it has an interface/ dir;
+    # else (or for v0) → copy from the committed base (read-only — never touched).
+    src: Path | None = None
+    if n > 0:
+        prev = target.parent.parent / f"v{n - 1}" / "interface"
+        if prev.is_dir():
+            src = prev
+    if src is None:
+        src = TESTBED_ROOT / "interfaces" / interface_name / mode
+    if not src.is_dir():
+        raise click.ClickException(f"source interface dir not found: {src}")
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(src, target)
+    # Strip any wheel that came from the source so the build below is fresh.
+    for w in list(target.glob("*.whl")):
+        w.unlink()
+
+    # Build the interface IN the copy so the folder is in a runnable state (the
+    # researcher then just edits source for v>0; `banter run --interface-dir`
+    # force-rebuilds before each run so edits take effect).
+    interfaces.set_interface_home(interface_name, mode, target)
+    try:
+        interfaces.build(interface_name, mode)
+    except Exception as e:
+        raise click.ClickException(f"build failed in {target}: {e}")
+    built = [w.name for w in target.glob("*.whl")]
+    click.echo(
+        f"[prepare-version] {target}  ←  {src}"
+        + (f"  (built: {', '.join(built)})" if built else "  (no wheel produced)")
+    )
+
+
+@main.command("annotate-version")
+@click.option("--results-csv", type=click.Path(path_type=Path), required=True,
+              help="Path to the run's results.csv (typically <run>/results.csv).")
+@click.option("--run", "run_", required=True, help="run column value to match.")
+@click.option("--version", "version", required=True, help="version column value (e.g. `v3`).")
+@click.option("--hypothesis", default=None)
+@click.option("--change", default=None)
+@click.option("--verdict", type=click.Choice(["positive", "negative", "neutral"]), default=None)
+@click.option("--verdict-reason", default=None)
+@click.option("--keep", type=int, default=None, help="0 or 1.")
+@click.option("--observations", default=None)
+@click.option("--proposed-changes", default=None)
+def annotate_version(
+    results_csv: Path,
+    run_: str,
+    version: str,
+    hypothesis: str | None,
+    change: str | None,
+    verdict: str | None,
+    verdict_reason: str | None,
+    keep: int | None,
+    observations: str | None,
+    proposed_changes: str | None,
+) -> None:
+    """Fill the per-version annotation columns on every row matching
+    (run, version) — the researcher uses this to close out each version
+    with verdict, observations, and proposed next changes."""
+    from banter import results as results_mod
+    updates = {
+        "hypothesis": hypothesis,
+        "change": change,
+        "verdict": verdict,
+        "verdict_reason": verdict_reason,
+        "keep": keep,
+        "observations": observations,
+        "proposed_changes": proposed_changes,
+    }
+    n = results_mod.annotate_version(
+        results_csv,
+        run=run_,
+        version=version,
+        updates={k: v for k, v in updates.items() if v is not None},
+    )
+    click.echo(f"annotated {n} row(s) in {results_csv} (run={run_}, version={version})")
+
+
+@main.command("reset")
+@click.option("--yes", "-y", is_flag=True, default=False, help="Skip the confirmation prompt.")
+def reset(yes: bool) -> None:
+    """Delete all benchmark + autoresearch results — session directories AND the
+    rolled-up results CSVs (which also clears any session-local interface/skill
+    versions, since those live inside the autoresearch session dirs)."""
+    from banter import results as results_mod
+
+    results_dir = TESTBED_ROOT / "results"
+    plan = [
+        # benchmark global = one row per run; autoresearch global = best increment.
+        (results_dir / "benchmark", results_mod.COMBO_SUMMARY_FIELDS),
+        (results_dir / "autoresearch", results_mod.GLOBAL_AUTORESEARCH_FIELDS),
+    ]
+    sessions = [p for d, _ in plan if d.exists() for p in d.iterdir() if p.is_dir()]
+
+    if not sessions:
+        click.echo("Nothing to reset.")
+        return
+    if not yes:
+        click.echo(f"This will delete {len(sessions)} run/session dir(s) and clear the "
+                   f"rollup CSVs under {results_dir}.")
+        if not click.confirm("Proceed?", default=False):
+            click.echo("Aborted.")
+            return
+
+    for d, header in plan:
+        d.mkdir(parents=True, exist_ok=True)
+        for p in d.iterdir():
+            if p.is_dir():
+                shutil.rmtree(p)
+        (d / "results.csv").write_text(",".join(header) + "\n")   # reset rollup to header-only
+        (d / ".gitkeep").touch()
+
+    click.secho(
+        f"Reset: removed {len(sessions)} run/session dir(s) and cleared rollup CSVs.", fg="green"
+    )
+
+
+# ---------------------------------------------------------------------------
 # banter setup  (auth for engineer + researcher; credential keys per interface)
 # ---------------------------------------------------------------------------
 
@@ -174,8 +387,12 @@ def _dispatch_config(config_path: Path, runs_root: Path) -> None:
 @main.command("setup")
 @click.argument("manifest", required=False, type=click.Path(path_type=Path))
 def setup(manifest: Path | None) -> None:
-    """One-time setup. With no argument: Kaggle + Claude auth + all interface keys.
-    With a MANIFEST: set just that interface's credential keys."""
+    """One-time auth setup: Kaggle + Claude (engineer + researcher).
+
+    Interface build/login/keys are preflight concerns handled when you run a
+    config — preflight only points you at `banter setup <config.yaml>` if a key
+    that config needs is missing. Pass a MANIFEST here to set just that
+    interface's credential keys."""
     if manifest is not None:
         _setup_interface_keys(manifest.resolve())
         return
@@ -183,29 +400,19 @@ def setup(manifest: Path | None) -> None:
     click.echo(f"Claude Code default model: {runner.DEFAULT_MODEL}")
     _setup_kaggle()
     _setup_claude_auth()
-    _setup_all_interface_keys()
-    click.echo("\nDone. Try: banter configs/benchmark_smoke_test.yaml")
+    click.echo("\nDone. Try: banter interfaces/none/benchmark/config.yaml")
 
 
 def _detect_name_type(config_path: Path) -> tuple[str, str]:
-    """Infer (name, type) from configs/interfaces/<name>/<type>.yaml."""
-    parts = config_path.parts
+    """Infer (project, type) from interfaces/<project>/<type>/config.yaml."""
     try:
-        idx = list(parts).index("interfaces")
-        name = parts[idx + 1]
-        type_ = Path(parts[idx + 2]).stem
-    except (ValueError, IndexError):
-        raise click.ClickException(
-            f"Cannot infer interface name/type from {config_path}. "
-            "Expected: configs/interfaces/<name>/<type>.yaml"
-        )
-    if type_ not in interfaces.TYPES:
-        raise click.ClickException(f"Unknown interface type {type_!r}; expected one of {interfaces.TYPES}")
-    return name, type_
+        return interfaces.name_type_from_config(config_path)
+    except ValueError as e:
+        raise click.ClickException(str(e))
 
 
 def _setup_kaggle() -> None:
-    click.secho("\n[1/3] Kaggle credentials", bold=True)
+    click.secho("\n[1/2] Kaggle credentials", bold=True)
     click.echo("  Required by mle-bench to download competition data.")
     click.echo("  Use the LEGACY API key (32 hex chars), not the new 'KGAT...' token.")
     click.echo("  Get one at https://www.kaggle.com/settings → API → Create New API Token.")
@@ -228,11 +435,12 @@ def _setup_kaggle() -> None:
 
 
 def _setup_claude_auth() -> None:
-    click.secho("\n[2/3] Claude Code auth (engineer + researcher)", bold=True)
+    click.secho("\n[2/2] Claude Code auth (engineer + researcher)", bold=True)
     click.echo("  Both the engineer (controlled) and researcher (controller) instances")
     click.echo("  authenticate the same way:")
     click.echo("    api-key  — claude-code calls Anthropic with ANTHROPIC_API_KEY.")
-    click.echo("    login    — claude-code uses your Claude subscription via `claude /login`.")
+    click.echo("    login    — claude-code uses your Claude subscription via `claude auth login`.")
+    click.echo("  (The model is set per run from the configs' engineer_model/researcher_model.)")
     choice = click.prompt("  Auth mode", type=click.Choice(list(runner.AUTH_MODES)), default="api-key")
     if choice == "api-key":
         api_key = click.prompt("  Anthropic API key", hide_input=True)
@@ -244,23 +452,9 @@ def _setup_claude_auth() -> None:
         if shutil.which("claude") is None:
             click.secho("  `claude` CLI not on PATH — install Claude Code first.", fg="yellow")
             return
-        if click.confirm("  Launch `claude /login` now? (logs in engineer + researcher)", default=True):
-            subprocess.run(["claude", "/login"], check=False)
-
-
-def _setup_all_interface_keys() -> None:
-    click.secho("\n[3/3] Interface credential keys", bold=True)
-    avail = interfaces.available()
-    any_keys = False
-    for name, types in avail.items():
-        for type_ in types:
-            if interfaces.keys_for(name, type_):
-                any_keys = True
-                mpath = interfaces.manifest_path(name, type_)
-                if click.confirm(f"  Set keys for {name}/{type_}?", default=True):
-                    _setup_interface_keys(mpath)
-    if not any_keys:
-        click.echo("  No interfaces declare `keys:` — nothing to set.")
+        # `claude auth login` runs the sign-in flow and exits (no REPL to quit).
+        if click.confirm("  Run `claude auth login` now? (logs in engineer + researcher)", default=True):
+            subprocess.run(["claude", "auth", "login"], check=False)
 
 
 def _setup_interface_keys(manifest_path: Path) -> None:

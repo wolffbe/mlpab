@@ -15,21 +15,17 @@ class InterfaceTestBase(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
         self.root = Path(self._tmp.name)
-        self.configs = self.root / "configs" / "interfaces"
-        self.bins = self.root / "interfaces"
-        # Redirect the module-level path constants at the temp tree.
-        self._orig_cfg = interfaces.IFACE_CONFIGS_DIR
-        self._orig_bin = interfaces.IFACE_BINS_DIR
-        interfaces.IFACE_CONFIGS_DIR = self.configs
-        interfaces.IFACE_BINS_DIR = self.bins
+        self.ifaces = self.root / "interfaces"
+        # Redirect the single unified tree at the temp dir.
+        self._orig = interfaces.INTERFACES_DIR
+        interfaces.INTERFACES_DIR = self.ifaces
 
     def tearDown(self) -> None:
-        interfaces.IFACE_CONFIGS_DIR = self._orig_cfg
-        interfaces.IFACE_BINS_DIR = self._orig_bin
+        interfaces.INTERFACES_DIR = self._orig
         self._tmp.cleanup()
 
     def write_manifest(self, name: str, type_: str, text: str) -> Path:
-        p = self.configs / name / f"{type_}.yaml"
+        p = self.ifaces / name / type_ / "config.yaml"
         _write(p, text)
         return p
 
@@ -46,6 +42,31 @@ class KeysTests(InterfaceTestBase):
         self.write_manifest("svc", "sdk", "keys:\n  API_KEY: \"\"\nprompt: hi\n")
         got = interfaces._resolved_keys("svc", "sdk", env={"API_KEY": "from-env"})
         self.assertEqual(got, {"API_KEY": "from-env"})
+
+
+class AccountingFieldsTests(InterfaceTestBase):
+    """cli_command / sdk_module drive cli_calls / sdk_calls accounting."""
+
+    def test_resolved_config_surfaces_overrides(self):
+        self.write_manifest(
+            "svc", "cli",
+            "binary: svc_cli-0.1.0-py3-none-any.whl\ncli_command: svc\nprompt: hi\n",
+        )
+        cfg = interfaces._resolved_config("svc", "cli", 0, None)
+        self.assertEqual(cfg["cli_command"], "svc")
+        self.assertEqual(cfg["binary"], "svc_cli-0.1.0-py3-none-any.whl")
+
+    def test_resolved_config_defaults_none_when_absent(self):
+        self.write_manifest("svc", "cli", "binary: hops\nprompt: hi\n")
+        cfg = interfaces._resolved_config("svc", "cli", 0, None)
+        self.assertIsNone(cfg["cli_command"])   # falls back to binary in setup()
+        self.assertIsNone(cfg["sdk_module"])
+        self.assertEqual(cfg["teardown"], [])   # default: nothing to tear down
+
+    def test_resolved_config_surfaces_teardown(self):
+        self.write_manifest("svc", "cli", "teardown:\n  - 'echo bye'\nprompt: hi\n")
+        cfg = interfaces._resolved_config("svc", "cli", 0, None)
+        self.assertEqual(cfg["teardown"], ["echo bye"])
 
 
 class VersionResolutionTests(InterfaceTestBase):

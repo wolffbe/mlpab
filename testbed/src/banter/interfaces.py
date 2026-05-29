@@ -2,7 +2,7 @@
 
 Two locations, with one job each:
 
-    configs/interfaces/<name>/<type>.yaml   — CONFIG: where the interface lives,
+    interfaces/<name>/<type>/config.yaml   — CONFIG: where the interface lives,
                                               how to build it, how to run it,
                                               which credential keys it needs, and
                                               the base (version 0) prompt.
@@ -32,8 +32,10 @@ from __future__ import annotations
 
 import hashlib
 import os
+import shutil
 import subprocess
-from collections import defaultdict
+import sys
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -44,10 +46,15 @@ import yaml
 TYPES = ("cli", "mcp", "sdk", "none")
 _TESTBED_ROOT = Path(__file__).resolve().parents[2]
 
-# configs/interfaces/<name>/<type>.yaml — config manifests
-IFACE_CONFIGS_DIR = _TESTBED_ROOT / "configs" / "interfaces"
-# interfaces/<name>/<type>/ — built binary artifacts only
-IFACE_BINS_DIR = _TESTBED_ROOT / "interfaces"
+# Single unified tree. For each interface the config, the checked-out source
+# code, and the built binary all live together — that IS the base (v0) version:
+#     interfaces/<project>/<type>/config.yaml   (config: build/run/keys/prompt)
+#     interfaces/<project>/<type>/...           (source code + built artifact)
+# A project also holds its own skills + research configs:
+#     interfaces/<project>/skills/<bundle>/<version>/<skill>/SKILL.md
+#     interfaces/<project>/autoresearch/*.yaml
+#     interfaces/<project>/benchmark/*.yaml
+INTERFACES_DIR = _TESTBED_ROOT / "interfaces"
 
 
 @dataclass
@@ -61,6 +68,13 @@ class InterfaceSetup:
     sdk_module: str | None = None
     mcp_servers: dict[str, Any] = field(default_factory=dict)
     keys: dict[str, str] = field(default_factory=dict)
+    serve: list[str] = field(default_factory=list)      # per-run server-start steps
+    teardown: list[str] = field(default_factory=list)   # run start+end cleanup steps
+    # Outbound hosts THIS interface needs the engineer to reach (in addition to
+    # the testbed's baseline allowlist of claude API + loopback). Drives the
+    # engineer's network sandbox `allowedDomains`. e.g. `["api.openai.com",
+    # "*.openai.com"]` for a cloud SDK; empty for local-only interfaces.
+    allowed_domains: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -90,34 +104,45 @@ class InterfaceStatus:
 # ---------------------------------------------------------------------------
 
 
+# Per-(name,type) override of an interface's home directory. Autoresearch sets
+# this (via set_interface_home / `banter run --interface-dir`) so the engineer
+# builds + uses the increment's OWN interface copy (results/autoresearch/<run>/
+# <inc>/interface/) instead of the committed interfaces/<name>/<type>/. Safe as
+# process-global state: each `banter run` process handles exactly one interface.
+_INTERFACE_HOME: dict[tuple[str, str], Path] = {}
+
+
+def set_interface_home(name: str, type_: str, home: Path) -> None:
+    """Point this interface's home at `home` (the per-increment copy) for this
+    process — config.yaml, $INTERFACE_DIR, build, install all resolve there."""
+    _INTERFACE_HOME[(name, type_)] = Path(home)
+
+
 def manifest_path(name: str, type_: str) -> Path:
-    return IFACE_CONFIGS_DIR / name / f"{type_}.yaml"
+    return bin_dir(name, type_) / "config.yaml"
 
 
 def name_type_from_config(config_path: str | Path) -> tuple[str, str]:
-    """Infer (name, type) from an interface config path.
-
-    Lets autoresearch/benchmark configs reference an interface by its config
-    file (e.g. `configs/interfaces/hopsworks/cli.yaml`) instead of name+mode.
-    """
-    parts = Path(config_path).parts
-    try:
-        idx = list(parts).index("interfaces")
-        name = parts[idx + 1]
-        type_ = Path(parts[idx + 2]).stem
-    except (ValueError, IndexError):
-        raise ValueError(
-            f"Cannot infer interface name/type from {config_path!r}. "
-            "Expected a path like configs/interfaces/<name>/<type>.yaml"
-        )
+    """Infer (project name, type) from an interface config path like
+    `interfaces/<project>/<type>/config.yaml`."""
+    p = Path(config_path)
+    type_ = p.parent.name
+    name = p.parent.parent.name
     if type_ not in TYPES:
-        raise ValueError(f"Unknown interface type {type_!r} from {config_path!r}")
+        raise ValueError(
+            f"Unknown interface type {type_!r} from {config_path!r}. "
+            "Expected a path like interfaces/<project>/<type>/config.yaml"
+        )
     return name, type_
 
 
 def bin_dir(name: str, type_: str) -> Path:
-    """Directory holding the built binary artifact (no version subfolder)."""
-    return IFACE_BINS_DIR / name / type_
+    """The interface's home: config.yaml + checked-out code + built binary.
+
+    Honors a per-(name,type) override set via `set_interface_home` (autoresearch's
+    per-increment interface copy); otherwise the committed interfaces/<name>/<type>/.
+    """
+    return _INTERFACE_HOME.get((name, type_), INTERFACES_DIR / name / type_)
 
 
 def version_dir(version_root: Path, name: str, type_: str, version: int) -> Path:
@@ -160,8 +185,19 @@ def _resolved_config(
         "runtime_install": manifest.get("runtime_install") or [],
         "mcp_servers": manifest.get("mcp_servers") or {},
         "prompt": manifest.get("prompt"),
+        # Optional accounting overrides: the invokable CLI command (for cli_calls)
+        # and the importable SDK module (for sdk_calls). Default below to `binary`
+        # and the project `name` respectively, so existing configs are unchanged.
+        "cli_command": manifest.get("cli_command"),
+        "sdk_module": manifest.get("sdk_module"),
+        # Shell steps run per run in the run venv to START the servers the engineer
+        # needs (e.g. the MCP HTTP server claude connects to at launch), after the
+        # stale-server cleanup. `teardown` stops them again at run start + end.
+        "serve": manifest.get("serve") or [],
+        "teardown": manifest.get("teardown") or [],
     }
-    for key in ("binary", "runtime_install", "mcp_servers", "prompt"):
+    for key in ("binary", "runtime_install", "mcp_servers", "prompt",
+                "cli_command", "sdk_module", "serve", "teardown"):
         if key in override:
             merged[key] = override[key]
     return merged
@@ -287,31 +323,6 @@ def _compute_hash(name: str, type_: str, version: int, version_root: Path | None
     return h.hexdigest()[:8]
 
 
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
-
-
-def available() -> dict[str, list[str]]:
-    """Return {interface_name: [types...]} by scanning config manifests."""
-    out: dict[str, set[str]] = defaultdict(set)
-    if not IFACE_CONFIGS_DIR.exists():
-        return {}
-    for name_dir in IFACE_CONFIGS_DIR.iterdir():
-        if not name_dir.is_dir():
-            continue
-        for yaml_file in name_dir.iterdir():
-            if not yaml_file.is_file() or yaml_file.suffix != ".yaml":
-                continue
-            type_ = yaml_file.stem
-            if type_ not in TYPES:
-                continue
-            manifest = yaml.safe_load(yaml_file.read_text()) or {}
-            if isinstance(manifest, dict) and manifest:
-                out[name_dir.name].add(type_)
-    return {k: sorted(v) for k, v in sorted(out.items())}
-
-
 def _check_known(name: str, type_: str, version: int | None, version_root: Path | None) -> int:
     """Validate type/version and return the chosen version int. Raises ValueError."""
     if type_ not in TYPES:
@@ -320,7 +331,7 @@ def _check_known(name: str, type_: str, version: int | None, version_root: Path 
     if not manifest:
         raise ValueError(
             f"No config for {name!r}/{type_!r} at {manifest_path(name, type_)}. "
-            f"Create it (configs/interfaces/{name}/{type_}.yaml) — preflight builds the binary."
+            f"Create it (interfaces/{name}/{type_}/config.yaml) — preflight builds the binary."
         )
     chosen = version or 0
     if chosen and version_root is None:
@@ -369,6 +380,15 @@ def setup(
     runtime_install = cfg.get("runtime_install") or []
     mcp_servers = cfg.get("mcp_servers") or {}
     prompt_fragment = _prompt_for(name, type_, chosen, version_root)
+    # When an interface is configured, the engineer must use it as-is; routing
+    # around it (writing custom training code) defeats the experiment. Append
+    # the floor-and-faithful rule from the fragment. (Skipped for none/none
+    # above — there the engineer is free to build whatever it wants.)
+    _under_test = (_TESTBED_ROOT / "prompts" / "fragments"
+                   / "interface_is_under_test.md")
+    if _under_test.is_file():
+        prompt_fragment = (prompt_fragment + "\n\n"
+                           + _under_test.read_text().strip()).strip()
     hash_ = _compute_hash(name, type_, chosen, version_root)
     interface_dir = _interface_dir_for(name, type_, chosen, version_root, binary)
 
@@ -379,7 +399,7 @@ def setup(
             raise RuntimeError(
                 f"Interface {name!r}/{type_!r} v{chosen} binary '{binary}' not found at "
                 f"{interface_dir / binary}. Preflight should have built it; "
-                f"check configs/interfaces/{name}/{type_}.yaml install steps."
+                f"check interfaces/{name}/{type_}/config.yaml install steps."
             )
 
     if runtime_install:
@@ -393,11 +413,38 @@ def setup(
         hash=hash_,
         # `binary` may be a built artifact for any type (e.g. an SDK wheel); only
         # a CLI's binary is an invokable command worth tracking as cli_calls.
-        cli_binary=binary if type_ == "cli" else None,
-        sdk_module=name if type_ == "sdk" else None,
+        # cli_calls match the invokable command (`cli_command`, else the binary
+        # name — true for bare binaries like `hops`, but a wheel needs the
+        # explicit field). sdk_calls match the importable module (`sdk_module`,
+        # else the project name — true when the package == the project name).
+        cli_binary=(cfg.get("cli_command") or binary) if type_ == "cli" else None,
+        sdk_module=(cfg.get("sdk_module") or name) if type_ == "sdk" else None,
         mcp_servers=mcp_servers,
         keys=_resolved_keys(name, type_),
+        serve=cfg.get("serve") or [],
+        teardown=cfg.get("teardown") or [],
+        allowed_domains=list(cfg.get("allowed_domains") or []),
     )
+
+
+def _make_check_venv(target: Path) -> Path:
+    """Create an empty venv that shares the base .venv's libraries but holds no
+    interface packages — used for ephemeral preflight checks (and mirrors how
+    each engineer run's venv is built). Returns the venv's python.
+    """
+    base_py = _TESTBED_ROOT / ".venv" / "bin" / "python"
+    base = base_py if base_py.exists() else Path(sys.executable)
+    subprocess.run(
+        [str(base), "-m", "venv", "--system-site-packages", str(target)], check=True
+    )
+    py = target / "bin" / "python"
+    # Expose the base venv's site-packages (shared libs) explicitly, like runner.
+    if base_py.exists():
+        vsp = next((target / "lib").glob("python*/site-packages"), None)
+        bsp = next((_TESTBED_ROOT / ".venv" / "lib").glob("python*/site-packages"), None)
+        if vsp and bsp:
+            (vsp / "_base_venv.pth").write_text(f"{bsp}\n")
+    return py
 
 
 def preflight(
@@ -423,8 +470,8 @@ def preflight(
         `auth_command`, login is satisfied only when every declared key is set.
       * Test — the `test_command` exits 0.
     """
-    config_fix = f"check configs/interfaces/{name}/{type_}.yaml (build/install steps)"
-    setup_fix = "make setup  (or: banter setup " + f"configs/interfaces/{name}/{type_}.yaml)"
+    config_fix = f"check interfaces/{name}/{type_}/config.yaml (build/install steps)"
+    setup_fix = "make setup  (or: banter setup " + f"interfaces/{name}/{type_}/config.yaml)"
 
     if name == "none" and type_ == "none":
         return InterfaceStatus(name, type_, ok=True, installed=True, authenticated=True)
@@ -445,26 +492,40 @@ def preflight(
     cfg = _resolved_config(name, type_, chosen, version_root)
     binary = cfg.get("binary")
     runtime_install = cfg.get("runtime_install") or []
-    if binary and runtime_install and any("$INTERFACE_DIR" in s for s in runtime_install):
-        bpath = _interface_dir_for(name, type_, chosen, version_root, binary) / binary
-        if not bpath.exists() and auto_build and load_manifest(name, type_).get("install"):
-            try:
-                build(name, type_)
-            except Exception as e:  # build is shell-out heavy; surface failures
-                return InterfaceStatus(
-                    name, type_, ok=False, installed=False, authenticated=False,
-                    reason=f"build failed: {e}", fix_command=config_fix,
-                )
-        if not bpath.exists():
+    uses_prebuilt = bool(
+        binary and runtime_install and any("$INTERFACE_DIR" in s for s in runtime_install)
+    )
+    bpath = (
+        _interface_dir_for(name, type_, chosen, version_root, binary) / binary
+        if uses_prebuilt else None
+    )
+
+    # (Re)build only when the artifact is missing. The config's `install:` steps
+    # only BUILD the artifact into the interface dir — they no longer install it
+    # into the base .venv, so the base stays free of interface packages and runs
+    # don't overlap. The interface is installed fresh into a throwaway venv for
+    # the checks below, and into each engineer's per-run venv at run time.
+    artifact_missing = bpath is not None and not bpath.exists()
+    if artifact_missing and auto_build and load_manifest(name, type_).get("install"):
+        try:
+            build(name, type_)
+        except Exception as e:  # build is shell-out heavy; surface failures
             return InterfaceStatus(
                 name, type_, ok=False, installed=False, authenticated=False,
-                reason=f"binary {binary!r} missing at {bpath}", fix_command=config_fix,
+                reason=f"build failed: {e}", fix_command=config_fix,
             )
+    if bpath is not None and not bpath.exists():
+        return InterfaceStatus(
+            name, type_, ok=False, installed=False, authenticated=False,
+            reason=f"binary {binary!r} missing at {bpath}", fix_command=config_fix,
+        )
 
-    if not check_login:
-        return InterfaceStatus(name, type_, ok=True, installed=True, authenticated=True)
-
-    # 2) login / keys
+    # Verify in an EPHEMERAL venv that shares the base libs but installs ONLY this
+    # interface (its runtime_install) — exactly what an engineer run gets — then is
+    # torn down (keeps the base .venv free of interface packages). The session
+    # preflight runs only the build + `test_command`; LOGIN is verified per
+    # challenge (interfaces.login_status). check_login=True (single-challenge form)
+    # additionally checks login here.
     keys = keys_for(name, type_)
     base_env = dict(env) if env is not None else dict(os.environ)
     merged_env = dict(base_env)
@@ -475,39 +536,68 @@ def preflight(
             merged_env[k] = val
         else:
             missing.append(k)
-    # Make a freshly-built (not-yet-copied-into-venv) binary callable by auth_command.
-    bd = bin_dir(name, type_)
-    if bd.is_dir():
-        merged_env["PATH"] = f"{bd}{os.pathsep}{merged_env.get('PATH', '')}"
 
     manifest = load_manifest(name, type_)
-    auth_command = manifest.get("auth_command")
-    if auth_command:
-        if not _run_check(auth_command, merged_env, timeout_s):
-            return InterfaceStatus(
-                name, type_, ok=False, installed=True, authenticated=False,
-                missing_keys=missing,
-                reason=f"login check failed (`{auth_command}` returned non-zero or timed out)",
-                fix_command=setup_fix,
-            )
-    elif keys and missing:
-        # No auth_command — fall back to requiring all declared keys be present.
+    auth_command = manifest.get("auth_command") if check_login else None
+    test_command = manifest.get("test_command")
+    # No auth_command → login is satisfied only when every declared key is present.
+    if check_login and not auth_command and keys and missing:
         return InterfaceStatus(
             name, type_, ok=False, installed=True, authenticated=False,
             missing_keys=missing,
             reason=f"missing credential key(s): {', '.join(missing)}",
             fix_command=setup_fix,
         )
-
-    # 3) test — deterministic "does it actually run?" check (no AI involved).
-    test_command = manifest.get("test_command")
-    if test_command and not _run_check(test_command, merged_env, timeout_s):
+    # Nothing to verify in a venv (no login to check here, no test) → done.
+    if not auth_command and not test_command:
         return InterfaceStatus(
-            name, type_, ok=False, installed=True, authenticated=True,
-            missing_keys=missing,
-            reason=f"interface did not run reliably (`{test_command}` returned non-zero or timed out)",
-            fix_command=config_fix,
+            name, type_, ok=True, installed=True, authenticated=True, missing_keys=missing,
         )
+
+    # Only stand up a throwaway venv when there's actually something to install
+    # (real interfaces); otherwise run the checks against the base bin (cheap, and
+    # nothing to isolate). The venv installs ONLY this interface and is torn down.
+    tmp = None
+    try:
+        if runtime_install:
+            tmp = Path(tempfile.mkdtemp(prefix="banter-preflight-"))
+            check_python = _make_check_venv(tmp / "venv")
+            try:
+                _run_install(
+                    runtime_install, cwd=tmp, venv_python=check_python,
+                    interface_dir=_interface_dir_for(name, type_, chosen, version_root, binary),
+                )
+            except Exception as e:
+                return InterfaceStatus(
+                    name, type_, ok=False, installed=False, authenticated=False,
+                    reason=f"interface install failed: {e}", fix_command=config_fix,
+                )
+            check_bin = str(check_python.parent)
+            merged_env["VIRTUAL_ENV"] = str(tmp / "venv")
+        else:
+            check_bin = str(_TESTBED_ROOT / ".venv" / "bin")
+        # The interface command/module lives in the (throwaway) venv; expose its
+        # bin — and the interface dir, for bare binaries — on PATH for the checks.
+        path_parts = [str(bin_dir(name, type_)), check_bin, merged_env.get("PATH", "")]
+        merged_env["PATH"] = os.pathsep.join(p for p in path_parts if p)
+
+        if auth_command and not _run_check(auth_command, merged_env, timeout_s):
+            return InterfaceStatus(
+                name, type_, ok=False, installed=True, authenticated=False,
+                missing_keys=missing,
+                reason=f"login check failed (`{auth_command}` returned non-zero or timed out)",
+                fix_command=setup_fix,
+            )
+        if test_command and not _run_check(test_command, merged_env, timeout_s):
+            return InterfaceStatus(
+                name, type_, ok=False, installed=True, authenticated=True,
+                missing_keys=missing,
+                reason=f"interface did not run reliably (`{test_command}` returned non-zero or timed out)",
+                fix_command=config_fix,
+            )
+    finally:
+        if tmp is not None:
+            shutil.rmtree(tmp, ignore_errors=True)
 
     return InterfaceStatus(
         name, type_, ok=True, installed=True, authenticated=True, missing_keys=missing,
@@ -515,7 +605,13 @@ def preflight(
 
 
 def _run_check(command: str, env: dict[str, str], timeout_s: int) -> bool:
-    """Run a declared check command non-interactively. True iff it exits 0."""
+    """Run a declared check command non-interactively. True iff it exits 0.
+
+    On failure (non-zero exit OR timeout OR OSError) the captured output
+    is printed to stderr so the operator can SEE why the check failed —
+    otherwise a hanging auth_command looks identical to a silent stall.
+    """
+    import sys as _sys
     try:
         proc = subprocess.run(
             command, shell=True, env=env,
@@ -523,18 +619,89 @@ def _run_check(command: str, env: dict[str, str], timeout_s: int) -> bool:
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             timeout=timeout_s,
         )
-        return proc.returncode == 0
-    except (subprocess.TimeoutExpired, OSError):
+        if proc.returncode != 0:
+            print(
+                f"[interfaces] check FAILED (exit {proc.returncode}): {command}\n"
+                f"--- captured output ---\n{proc.stdout.decode('utf-8', 'replace')}"
+                f"\n--- end ---",
+                file=_sys.stderr, flush=True,
+            )
+            return False
+        return True
+    except subprocess.TimeoutExpired as e:
+        out = (e.output or b"").decode("utf-8", "replace") if e.output else "(no output)"
+        print(
+            f"[interfaces] check TIMED OUT after {timeout_s}s: {command}\n"
+            f"--- captured output before timeout ---\n{out}\n--- end ---",
+            file=_sys.stderr, flush=True,
+        )
+        return False
+    except OSError as e:
+        print(f"[interfaces] check OS error: {command}: {e}", file=_sys.stderr, flush=True)
         return False
 
 
-def build(name: str, type_: str) -> Path:
-    """Build the interface's binary from its config (deterministic, no AI).
+def login_status(
+    name: str,
+    type_: str,
+    *,
+    venv_python: Path,
+    keys: dict[str, str] | None = None,
+    timeout_s: int = 30,
+) -> InterfaceStatus:
+    """Per-challenge login check: run the interface's `auth_command` in the given
+    (per-run) venv. The build + test happen once at the session preflight; login
+    is re-verified for EVERY challenge here (so expired creds are caught
+    mid-session and each run authenticates in its own venv).
+    """
+    if name == "none" and type_ == "none":
+        return InterfaceStatus(name, type_, ok=True, installed=True, authenticated=True)
+    setup_fix = "make setup  (or: banter setup " + f"interfaces/{name}/{type_}/config.yaml)"
+    declared = keys_for(name, type_)
+    env = dict(os.environ)
+    missing = []
+    for k, dv in declared.items():
+        val = (keys or {}).get(k) or dv or env.get(k, "")
+        if val:
+            env[k] = val
+        else:
+            missing.append(k)
 
-    Clones/updates the source repo and runs the config's `install:` steps with
-    $INTERFACE_DIR pointing at the binary dir (interfaces/<name>/<type>/, no
-    version subfolder). Idempotent. Returns the binary dir. Run automatically by
-    preflight when the binary is missing.
+    auth_command = load_manifest(name, type_).get("auth_command")
+    if not auth_command:
+        # No auth_command → login is satisfied only when all declared keys exist.
+        if declared and missing:
+            return InterfaceStatus(
+                name, type_, ok=False, installed=True, authenticated=False,
+                missing_keys=missing,
+                reason=f"missing credential key(s): {', '.join(missing)}", fix_command=setup_fix,
+            )
+        return InterfaceStatus(name, type_, ok=True, installed=True, authenticated=True)
+
+    env["PATH"] = os.pathsep.join(
+        [str(bin_dir(name, type_)), str(venv_python.parent), env.get("PATH", "")]
+    )
+    env["VIRTUAL_ENV"] = str(venv_python.parent.parent)
+    if not _run_check(auth_command, env, timeout_s):
+        return InterfaceStatus(
+            name, type_, ok=False, installed=True, authenticated=False, missing_keys=missing,
+            reason=f"login check failed (`{auth_command}` returned non-zero or timed out)",
+            fix_command=setup_fix,
+        )
+    return InterfaceStatus(
+        name, type_, ok=True, installed=True, authenticated=True, missing_keys=missing,
+    )
+
+
+def build(name: str, type_: str) -> Path:
+    """Check out the interface's repo into its folder and build it (no AI).
+
+    The interface code is checked out INTO interfaces/<name>/<type>/ — that dir
+    is both the checkout and the build/artifact location ($INTERFACE_DIR). A
+    `repo:` that points at a local path (e.g. a `fake_repos/...` fake repo) is
+    copied in; a URL is git-cloned. Then the config's `install:` steps run there.
+    Idempotent. Returns the interface dir. Run automatically by preflight when
+    the binary is missing.
     """
     if name == "none" and type_ == "none":
         return bin_dir("none", "none")
@@ -545,33 +712,43 @@ def build(name: str, type_: str) -> Path:
     repo = manifest.get("repo")
     ref = manifest.get("ref", "main")
     install_steps = manifest.get("install") or []
-    bins = bin_dir(name, type_)
-    bins.mkdir(parents=True, exist_ok=True)
-    src = _TESTBED_ROOT / "cache" / "interfaces" / name / type_ / "src"
+    iface_dir = bin_dir(name, type_)   # holds config.yaml + (committed) source + artifact
+    iface_dir.mkdir(parents=True, exist_ok=True)
     venv_bin = _TESTBED_ROOT / ".venv" / "bin"
 
+    # Where install steps run. With no `repo:`, the source is committed in place
+    # (e.g. mlkit). A remote `repo:` is cloned into a `src/` subdir so it
+    # doesn't clobber config.yaml; a local path is copied in place.
+    src_cwd = iface_dir
     if repo:
-        if (src / ".git").exists():
-            subprocess.run(["git", "-C", str(src), "pull"], check=True)
+        local = _TESTBED_ROOT / repo
+        if local.is_dir():
+            shutil.copytree(local, iface_dir, dirs_exist_ok=True)
         else:
-            src.parent.mkdir(parents=True, exist_ok=True)
-            subprocess.run(
-                ["git", "clone", "--depth", "1", "--branch", ref, repo, str(src)],
-                check=True,
-            )
+            src = iface_dir / "src"
+            if (src / ".git").exists():
+                subprocess.run(["git", "-C", str(src), "pull"], check=True)
+            else:
+                src.parent.mkdir(parents=True, exist_ok=True)
+                subprocess.run(
+                    ["git", "clone", "--depth", "1", "--branch", ref, repo, str(src)],
+                    check=True,
+                )
+            src_cwd = src
 
     if install_steps:
-        pip_cache = _TESTBED_ROOT / "cache" / "pip"
-        pip_cache.mkdir(parents=True, exist_ok=True)
         env = os.environ.copy()
-        env["PATH"] = f"{bins}{os.pathsep}{venv_bin}{os.pathsep}{env.get('PATH', '')}"
+        env["PATH"] = f"{iface_dir}{os.pathsep}{venv_bin}{os.pathsep}{env.get('PATH', '')}"
         env["VIRTUAL_ENV"] = str(_TESTBED_ROOT / ".venv")
-        env["INTERFACE_DIR"] = str(bins)
-        env["PIP_CACHE_DIR"] = str(pip_cache)
-        cwd = str(src) if src.exists() else str(bins)
+        env["INTERFACE_DIR"] = str(iface_dir)
+        env["TESTBED_ROOT"] = str(_TESTBED_ROOT)
+        # Disable the pip download cache — interface installs are tiny wheels;
+        # the cache write path (<testbed>/cache/pip) is unreachable for the
+        # researcher/engineer (deny patterns) and triggers a pip warning otherwise.
+        env["PIP_NO_CACHE_DIR"] = "1"
         for step in install_steps:
-            subprocess.run(step, shell=True, env=env, cwd=cwd, check=True)
-    return bins
+            subprocess.run(step, shell=True, env=env, cwd=str(src_cwd), check=True)
+    return iface_dir
 
 
 def _run_install(
@@ -583,10 +760,11 @@ def _run_install(
     env = os.environ.copy()
     env["PATH"] = f"{venv_python.parent}:{env['PATH']}"
     env["VIRTUAL_ENV"] = str(venv_python.parent.parent)
+    env["TESTBED_ROOT"] = str(_TESTBED_ROOT)
     if interface_dir is not None:
         env["INTERFACE_DIR"] = str(interface_dir)
-    pip_cache = _TESTBED_ROOT / "cache" / "pip"
-    pip_cache.mkdir(parents=True, exist_ok=True)
-    env["PIP_CACHE_DIR"] = str(pip_cache)
+    # Disable pip's download cache: the shared cache path isn't writable
+    # to the engineer (deny patterns), and runtime_install steps are tiny.
+    env["PIP_NO_CACHE_DIR"] = "1"
     for step in steps:
         subprocess.run(step, shell=True, cwd=cwd, env=env, check=True)
