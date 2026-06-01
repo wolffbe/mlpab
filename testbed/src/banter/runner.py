@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -222,8 +223,27 @@ def detect_environment() -> str:
     return "\n".join(lines)
 
 
-def _build_prompt(challenge_id: str, fragment: str, docs_name: str = "none") -> str:
+# The "interface is under test" rule is the engineer default — baked into
+# engineer.md between these markers. It only applies when an interface is
+# present; for none/none (the engineer builds its own model freely) the whole
+# section is stripped.
+_UNDER_TEST_RE = re.compile(
+    r"<!--UNDER_TEST_START-->\n(.*?)\n<!--UNDER_TEST_END-->", re.DOTALL
+)
+
+
+def _build_prompt(
+    challenge_id: str,
+    fragment: str,
+    docs_name: str = "none",
+    interface_under_test: bool = True,
+) -> str:
     template = TASK_PROMPT_PATH.read_text()
+    if interface_under_test:
+        template = _UNDER_TEST_RE.sub(lambda m: m.group(1), template)
+    else:
+        template = _UNDER_TEST_RE.sub("", template)
+    template = re.sub(r"\n{3,}", "\n\n", template)
     if docs_name and docs_name != "none":
         docs_block = (
             f"\n\n## Reference docs\n\n"
@@ -384,7 +404,8 @@ def run(spec: RunSpec) -> results.Row:
             raise preflight_mod.PreflightError(login.message)
 
         prompt = _build_prompt(spec.challenge_id, interface_setup.prompt_fragment,
-                               docs_name=spec.docs)
+                               docs_name=spec.docs,
+                               interface_under_test=interface_setup.type != "none")
         (run_dir / "prompt.txt").write_text(prompt)
 
         # When in autoresearch (`spec.version` is set), confine the engineer's

@@ -44,25 +44,73 @@ AGG_METRICS = [
 # `goals` list only decides WHICH of these (or others) the researcher
 # optimizes for; charts are produced for the full TRACKED_METRICS set
 # regardless of what the config picks. Order = chart order in the notebook.
+# Per-category tool-call counts tracked on every (engineer) run. Each gets a
+# cumulative running ("rolling") average column `<cat>_avg` — the mean of that
+# count across results.csv rows up to and including the row, recomputed on every
+# append/replace (see `recompute_rolling_averages`). Directions are cosmetic
+# (chart-title labels); more interface use (cli/mcp/sdk/skill) is "good",
+# self-written code (python/bash) and raw turn count are "bad".
+CALL_COUNT_DIRECTIONS: dict[str, str] = {
+    "llm_calls": "minimize",
+    "cli_calls": "maximize",
+    "mcp_calls": "maximize",
+    "sdk_calls": "maximize",
+    "python_calls": "minimize",
+    "bash_calls": "minimize",
+    "skill_calls": "maximize",
+    "other_tool_calls": "minimize",
+}
+CALL_COUNT_COLS = tuple(CALL_COUNT_DIRECTIONS)
+
+# One chart per tracked metric. Wall time + every call category additionally
+# carry a rolling cumulative average, drawn as a dotted overlay on the same
+# chart (see `rolling_avg_col`) rather than as a separate diagram.
 TRACKED_METRICS: list[tuple[str, str]] = [
     ("score", "maximize"),
     ("total_tokens", "minimize"),
     ("eng_wall_time_s", "minimize"),
+    # Charted for visibility only (not an optimization target) — eng + researcher
+    # wall time is partly controller overhead, so it gets a neutral `observe`
+    # label rather than minimize/maximize.
+    ("total_wall_time_s", "observe"),
     ("total_cost", "minimize"),
-    ("python_calls", "minimize"),
-    ("cli_calls", "maximize"),
+    *((c, d) for c, d in CALL_COUNT_DIRECTIONS.items()),
 ]
 
 # Benchmark CSV uses plain metric names (no `eng_`/`total_` prefix since
-# there's no researcher). Same canonical list, different column names.
+# there's no researcher). Same canonical list, different wall-time name.
 BENCHMARK_TRACKED_METRICS: list[tuple[str, str]] = [
     ("score", "maximize"),
     ("total_tokens", "minimize"),
     ("wall_time_s", "minimize"),
     ("cost_usd", "minimize"),
-    ("python_calls", "minimize"),
-    ("cli_calls", "maximize"),
+    *((c, d) for c, d in CALL_COUNT_DIRECTIONS.items()),
 ]
+
+
+# Metric column → its rolling-average column. Rolling averages are an
+# AUTORESEARCH-only concept (a cumulative average across runs accumulates across
+# versions); benchmark is a single session of independent (task, challenge)
+# rows with nothing to accumulate, so it has no `*_avg` columns. This map plus
+# `CALL_COUNT_COLS` is the single source of raw→avg pairs, used both for chart
+# overlays (`rolling_avg_col`) and for the recompute (`_rolling_pairs`).
+_ROLLING_AVG_OF = {
+    "score": "score_avg",
+    "total_tokens": "total_tokens_avg",
+    "total_cost": "total_cost_avg",
+    "eng_wall_time_s": "eng_wall_time_avg_s",
+    "total_wall_time_s": "total_wall_time_avg_s",
+}
+
+
+def rolling_avg_col(metric: str) -> str | None:
+    """The rolling-average column to overlay (dotted) on `metric`'s chart, or
+    None when the metric has no rolling average."""
+    if metric in _ROLLING_AVG_OF:
+        return _ROLLING_AVG_OF[metric]
+    if metric in CALL_COUNT_COLS:
+        return f"{metric}_avg"
+    return None
 
 # Per-run rollup (benchmark): one row per <run> folder, averaging its
 # per-challenge rows. Written to results/benchmark/results.csv.
@@ -71,9 +119,9 @@ COMBO_SUMMARY_FIELDS = (
     + [f"avg_{m}" for m in AGG_METRICS]
     + ["dir"]   # the run folder
 )
-# RUN_SUMMARY_FIELDS (autoresearch per-run: <run>/results.csv) and
-# GLOBAL_AUTORESEARCH_FIELDS (the best-increment global) are defined just after
-# FIELDS below, since they extend it.
+# Autoresearch has no global rollup CSV: each session writes its own
+# <run>/results.csv (one row per (run, version, task, challenge), columns =
+# FIELDS below) and the researcher reports the best increment in report.md.
 
 
 def _avg(values: list[float]) -> str:
@@ -175,7 +223,9 @@ _BENCHMARK_VIEW = {
     "valid_submission": "valid_submission",
     "score": "score",
     "medal": "medal",
-    # Engineer metrics: drop the `eng_` prefix in the benchmark CSV.
+    # Engineer metrics: drop the `eng_` prefix in the benchmark CSV. Benchmark
+    # has NO `*_avg` rolling columns — a benchmark session is one run of
+    # independent (task, challenge) rows, with nothing to accumulate across.
     "wall_time_s": "eng_wall_time_s",
     "input_tokens": "eng_input_tokens",
     "output_tokens": "eng_output_tokens",
@@ -253,6 +303,14 @@ FIELDS = [
     "total_wall_time_s",
     "total_tokens",
     "total_cost",
+    # Rolling cumulative averages across rows (filled by `append`; the dotted
+    # "average across all runs" line on each chart). `total_*` are recomputed
+    # after the researcher backfill in autoresearch.
+    "score_avg",
+    "total_tokens_avg",
+    "total_cost_avg",
+    "eng_wall_time_avg_s",
+    "total_wall_time_avg_s",
     # Tool-call accounting parsed from the engineer's transcript.
     "llm_calls",
     "cli_calls",
@@ -262,6 +320,17 @@ FIELDS = [
     "bash_calls",
     "skill_calls",
     "other_tool_calls",
+    # Per-category rolling cumulative averages of the counts above (the mean of
+    # each count across rows up to and including the row). Recomputed by
+    # `append` on every write so they stay correct as rows are added/replaced.
+    "llm_calls_avg",
+    "cli_calls_avg",
+    "mcp_calls_avg",
+    "sdk_calls_avg",
+    "python_calls_avg",
+    "bash_calls_avg",
+    "skill_calls_avg",
+    "other_tool_calls_avg",
     # Per-increment annotations the researcher fills in after evaluating the
     # increment (via `banter annotate-increment`). Every challenge row in the
     # same (session, increment) carries the same annotation — denormalised
@@ -333,6 +402,22 @@ class Row:
     bash_calls: int = 0
     skill_calls: int = 0
     other_tool_calls: int = 0
+    # Rolling cumulative averages across results.csv rows (the mean of the
+    # corresponding raw column up to and including each row). All filled by
+    # `append` at write time, so they're left as None on a fresh Row.
+    score_avg: float | None = None
+    total_tokens_avg: float | None = None
+    total_cost_avg: float | None = None
+    eng_wall_time_avg_s: float | None = None
+    total_wall_time_avg_s: float | None = None
+    llm_calls_avg: float | None = None
+    cli_calls_avg: float | None = None
+    mcp_calls_avg: float | None = None
+    sdk_calls_avg: float | None = None
+    python_calls_avg: float | None = None
+    bash_calls_avg: float | None = None
+    skill_calls_avg: float | None = None
+    other_tool_calls_avg: float | None = None
     # Per-increment annotations (researcher fills in via `banter annotate-increment`).
     hypothesis: str = ""
     change: str = ""
@@ -713,11 +798,44 @@ def append(results_csv: Path, row: Row, fields: list[str] | None = None) -> None
                 if r.get("run_dir") == new_row.get("run_dir"):
                     continue  # replaced by new_row below
                 kept.append(r)
+    # Rolling averages: recompute the cumulative running mean of each tracked
+    # raw column over the rows in file order (kept first, the new/replacement
+    # row last) so the `*_avg` columns stay correct after an append OR a
+    # replace. Blank raw values don't contribute.
+    ordered = kept + [new_row]
+    recompute_rolling_averages(ordered, cols)
     with results_csv.open("w", newline="") as fw:
         writer = csv.DictWriter(fw, fieldnames=cols)
         writer.writeheader()
-        for r in kept:
+        for r in ordered:
             writer.writerow({k: r.get(k, "") for k in cols})
-        writer.writerow({k: new_row.get(k, "") for k in cols})
+
+
+def _rolling_pairs(cols: list[str]) -> list[tuple[str, str]]:
+    """(raw_col, avg_col) pairs to recompute, filtered to those present in
+    `cols`. Derived from the single `_ROLLING_AVG_OF` map plus the per-category
+    call counts — so benchmark (whose schema has no `*_avg` columns) yields an
+    empty list and the recompute is a no-op there."""
+    pairs = list(_ROLLING_AVG_OF.items()) + [(c, f"{c}_avg") for c in CALL_COUNT_COLS]
+    return [(r, a) for r, a in pairs if r in cols and a in cols]
+
+
+def recompute_rolling_averages(ordered: list[dict[str, Any]], cols: list[str]) -> None:
+    """In-place fill each rolling `*_avg` column with the cumulative running
+    mean of its raw column across `ordered` (file order). Skips pairs whose
+    columns aren't in the active schema; blank/None raw values are excluded
+    from the running mean (a blank row carries the mean-so-far forward)."""
+    for raw_col, avg_col in _rolling_pairs(cols):
+        running_sum = 0.0
+        running_n = 0
+        for r in ordered:
+            try:
+                x = float(r.get(raw_col))  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                x = None  # blank/None → no sample this row
+            if x is not None:
+                running_sum += x
+                running_n += 1
+            r[avg_col] = f"{running_sum / running_n:.4f}" if running_n else ""
 
 

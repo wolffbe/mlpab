@@ -86,13 +86,10 @@ running.
 
 ## How the testbed works
 
-Each evaluation run:
-1. Creates a fresh Python venv
-2. Prepares competition data from the MLE-bench cache
-3. Installs the interface if configured (CLI binary / MCP server / SDK)
-4. Injects skill SKILL.md files into the engineer's `.claude/skills/` if a bundle is chosen
-5. Runs `claude -p <task_prompt>` — the **engineer** Claude Code instance
-6. Grades the engineer's `submission.csv` with MLE-bench
+Each `banter run` creates a fresh venv, prepares the competition data from the
+MLE-bench cache, installs your interface (and any chosen skill bundle), runs
+`claude -p <task_prompt>` (the **engineer**), and grades its `submission.csv`
+with MLE-bench.
 
 You control what the engineer sees through:
 - **Interface prompt** — added to the task prompt (e.g. "use the `hops` CLI")
@@ -250,30 +247,54 @@ The eval command for an version (`--interface-dir` points at the per-version cop
 {eval_block}
 ```
 
-What `banter run` does on each call:
-1. Sets `{runs_root}/v<N>/interface` as the interface home for this process.
-2. Builds it (runs `install:` if the artifact is missing) — your modified source becomes the wheel/binary.
-3. Tests it (`test_command`).
-4. Creates the engineer's per-run venv; `runtime_install` installs your modified interface into it.
-5. Logs in (`auth_command`) in that venv — **login is verified for every challenge**.
-6. Runs the engineer (its task prompt is fixed), grades the submission.
-7. Appends one row (incl. `run`, `version`, `task`, `challenge`, all metrics + mle-bench grading) directly to `{runs_root}/results.csv`. One CSV per run — no per-version CSVs, no global rollup.
+Each call runs the per-version build→test→install→login→run→grade pipeline
+described above and appends one row per `(run, version, task, challenge)` to
+`{runs_root}/results.csv` (one CSV per run — no per-version CSVs, no global
+rollup). A misconfigured edit fails fast at build/login instead of producing a
+junk result. **You** read that CSV, pick the BEST version, and call it out in
+the final report — rows are already labelled with `run` and `version`.
 
-**You** read `{runs_root}/results.csv`, pick the BEST version, and call out that version in the final report. Rows are already labeled with `run` and `version`; no copying step.
+### Structure of `{runs_root}/results.csv` — where to read your results
 
-Each `banter run` rebuilds the interface in your copy and re-checks login, so a misconfigured edit fails fast instead of producing a junk result.
+**Grain: one row per `(run, version, task, challenge)`.** Every `banter run`
+appends exactly one row. Always filter to `run == "{run_id}"`; the `version`
+column (`v0`, `v1`, …) is how you compare increments.
 
-Key columns in `{runs_root}/results.csv`:
-| Column | Meaning |
-|--------|---------|
-| `score` | MLE-bench accuracy 0.0–1.0 |
-| `medal` | gold/silver/bronze/None |
-| `total_tokens` | input + output tokens |
-| `wall_time_s` | elapsed seconds |
-| `python_calls` | Bash calls invoking a Python interpreter |
-| `cli_calls` | calls to the interface CLI binary |
-| `cost_usd` | estimated engineer cost |
-| `run_dir` | path to run folder (contains prompt.txt, stream.log, grading.json) |
+Column groups:
+
+- **Identity:** `run`, `version`, `task`, `challenge`, `interface`, `type`, `skills`.
+- **Grading (per challenge):** `score` (0.0–1.0, the primary quality signal),
+  `medal` (gold/silver/bronze/None), `valid_submission` (0/1).
+- **Per-run metrics:**
+
+  | Column | Meaning |
+  |--------|---------|
+  | `eng_wall_time_s` | engineer wall-clock seconds (use `total_wall_time_s` for eng+researcher) |
+  | `total_tokens` | input + output tokens (engineer + researcher) |
+  | `total_cost` | estimated cost in USD (engineer + researcher) |
+  | `llm_calls` | engineer LLM turns |
+  | `cli_calls` / `mcp_calls` / `sdk_calls` | calls into the interface — the delegation signal you usually want HIGHER |
+  | `python_calls` / `bash_calls` | engineer self-written code — usually want LOWER |
+  | `run_dir` | path to that run's folder (`prompt.txt`, `stream.log`, `grading.json`) |
+
+- **Rolling averages — READ THESE INSTEAD OF AVERAGING ROWS YOURSELF.** For
+  every metric above there is a `<metric>_avg` column (`score_avg`,
+  `total_tokens_avg`, `total_cost_avg`, `eng_wall_time_avg_s`, `cli_calls_avg`,
+  `sdk_calls_avg`, …). Each holds the **cumulative average across ALL runs up to
+  and including that row** (append order). The `<metric>_avg` on the **latest
+  row** is therefore the running average over every run so far — your
+  at-a-glance "how are we doing overall" number, already computed.
+- **Annotations you fill** (via `banter annotate-version`, below): `hypothesis`,
+  `change`, `verdict`, `verdict_reason`, `keep`, `observations`, `proposed_changes`.
+
+**Where to look to optimize:** your goal metrics (listed at the top of this
+prompt) are columns of the same name — wall-time goals read `eng_wall_time_s` /
+`total_wall_time_s`, cost reads `total_cost`. To judge whether a version helped,
+compare the goal columns across `version` values (respect each goal's direction
+— maximize / minimize); the matching `<metric>_avg` column shows the running
+trend without any manual math. `analysis.ipynb` plots every metric across
+versions (solid line = per-version mean, dotted line = the `<metric>_avg`
+running average) so you can SEE development and convergence at a glance.
 
 ---
 
@@ -303,9 +324,9 @@ the full record.
 ```
 
 `observations` and `proposed_changes` are MANDATORY — they close the version
-and seed the next one. The numeric before/after deltas are derivable from the
-CSV itself (filter by (run, version) and compare aggregates); no need to
-duplicate them in the annotation.
+and seed the next one. You don't need to duplicate numbers in the annotation:
+the per-version values are in `results.csv`, and the `<metric>_avg` columns
+already give the running average across all runs (no manual aggregation).
 
 ---
 
@@ -324,33 +345,14 @@ duplicate them in the annotation.
 
 ---
 
-{groups_block}## Setup is already done — you only modify the per-version interface
+## Per-version workflow (recap)
 
-Every interface above was **built, logged in, and tested deterministically
-(no AI)** before you were started, using the keys set by `make setup`. You never
-touch the committed source under `{testbed_root}/interfaces/<project>/`. Each
-version, you make a COPY of the interface and edit THAT copy.
-
-```
-{runs_root}/v<N>/interface/   ← your editable copy for version N
-```
-
-### When you start a new version `<N>`
-
-The copy is deterministic — use `banter prepare-version`; never run `cp -r`
-yourself. The committed source under `{testbed_root}/interfaces/` is read-only
-and must never be modified.
-
-```bash
-# Auto-copies from the previous version's interface/, or from the committed
-# base for v0 / no previous exists; removes prebuilt wheels in the destination.
-{banter_bin} prepare-version {runs_root}/v<N>/interface \
-  --interface {first_iface_name} --mode {first_iface_mode}
-# Then (only for v>0) edit files under {runs_root}/v<N>/interface/ — source,
-# config.yaml, runtime_install, auth_command, etc. NEVER `prompt:`.
-```
-
-Then evaluate the version with `--interface-dir {runs_root}/v<N>/interface --runs-root {runs_root}/v<N>` (see the eval block above).
+Setup is already done (every interface built, logged in, and tested with no AI
+before you started, from the `make setup` keys). Per version you only: copy via
+`banter prepare-version` (above) → edit the SOURCE under
+`{runs_root}/v<N>/interface/` (never `prompt:`, never the committed base under
+`{testbed_root}/interfaces/`) → evaluate with
+`--interface-dir {runs_root}/v<N>/interface --runs-root {runs_root}/v<N>`.
 
 ### If a `banter run` fails preflight or login
 
@@ -359,19 +361,11 @@ It will print exactly what to fix (a failed build of your copy under
 credentials regressed — `make setup`). Fix the source in the copy and retry;
 do NOT log the failed run as a result.
 
-### A clean version checklist
-
-1. **Read `{changelog_path}`** to recall what's already been tried (and what's worked / not). This is your long-term memory — survives context compaction.
-2. Copy the previous version's `interface/` → this version's `interface/` (or the committed base for v0).
-3. Edit source under `{runs_root}/v<N>/interface/` (skip for v0). Remove any prebuilt wheel/binary.
-4. Run the evaluation block above for every (interface × task × challenge).
-5. Read `{runs_root}/results.csv`, filter `version == "v<N>"`, and inspect a few `stream.log` files under `{runs_root}/v<N>/<task>/<challenge>/`.
-6. Run `banter annotate-version` to fill in `hypothesis` / `change` / `verdict` / `verdict_reason` / `keep` / `observations` / `proposed_changes` on every row of this (run, version) — see the "Closing an version" section.
-7. **Append a Markdown section to `{changelog_path}`** following the template below.
-
 ### CHANGELOG.md entry template
 
-Append one section per version, in chronological order:
+`{changelog_path}` is your long-term memory (survives context compaction):
+**re-read it at the start of every version** to recall what's been tried, and
+append one section (chronological order) after each version:
 
 ```markdown
 ## v<N> — <one-line hypothesis>
@@ -424,22 +418,14 @@ For each version (and, when tasks are defined, for each task in turn):
    skills-only run, to the skill bundle). Example: "CLI prompt doesn't tell
    the engineer to use `hops fg create` — every challenge fell back to Python."
 
-3. **Implement** — call `banter prepare-version` to set up the new version's
-   `interface/` copy deterministically, then edit the SOURCE in that copy (not
-   `prompt:`):
-   ```bash
-   {banter_bin} prepare-version {runs_root}/v<N>/interface \
-     --interface {first_iface_name} --mode {first_iface_mode}
-   # edit files under {runs_root}/v<N>/interface/ — source, config.yaml, runtime_install, etc.
-   ```
-   One change per version for clean attribution. Never edit the committed base
-   under `{testbed_root}/interfaces/` — it is the read-only original.
+3. **Implement** — `banter prepare-version` (command above) to set up the new
+   version's `interface/` copy, then edit the SOURCE in that copy (never
+   `prompt:`, never the committed base under `{testbed_root}/interfaces/`). ONE
+   change per version for clean attribution.
 
-4. **Evaluate** — re-run ALL {runs_per_version} pairs with
-   `--interface-dir {runs_root}/v<N>/interface --runs-root {runs_root}/v<N>`:
-```bash
-{eval_block}
-```
+4. **Evaluate** — re-run ALL {runs_per_version} pairs (the eval block under
+   "Running evaluations") with `--interface-dir {runs_root}/v<N>/interface
+   --runs-root {runs_root}/v<N>`.
 
 5. **Decide conclusively** — compare AVERAGED metrics before vs. after:
    - avg_score up AND nothing regressed → `positive`, keep

@@ -217,7 +217,7 @@ def _dispatch_config(config_path: Path, runs_root: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# banter reset  (wipe benchmark + autoresearch results)
+# banter prepare-version  (copy a version's interface from the previous one)
 # ---------------------------------------------------------------------------
 
 
@@ -340,43 +340,53 @@ def annotate_version(
     click.echo(f"annotated {n} row(s) in {results_csv} (run={run_}, version={version})")
 
 
-@main.command("reset")
+@main.command("clean")
 @click.option("--yes", "-y", is_flag=True, default=False, help="Skip the confirmation prompt.")
-def reset(yes: bool) -> None:
-    """Delete all benchmark + autoresearch results — session directories AND the
-    rolled-up results CSVs (which also clears any session-local interface/skill
-    versions, since those live inside the autoresearch session dirs)."""
+def clean(yes: bool) -> None:
+    """Remove all benchmark + autoresearch runs — every session/run directory
+    under results/ (which also clears any session-local interface/skill versions,
+    since those live inside the autoresearch session dirs).
+
+    The benchmark rollup CSV (results/benchmark/results.csv) is reset to a
+    header-only file. Autoresearch has no global rollup — each session keeps its
+    own results.csv inside its dir — so any stale global CSV is just removed."""
     from banter import results as results_mod
 
     results_dir = TESTBED_ROOT / "results"
-    plan = [
-        # benchmark global = one row per run; autoresearch global = best increment.
-        (results_dir / "benchmark", results_mod.COMBO_SUMMARY_FIELDS),
-        (results_dir / "autoresearch", results_mod.GLOBAL_AUTORESEARCH_FIELDS),
-    ]
-    sessions = [p for d, _ in plan if d.exists() for p in d.iterdir() if p.is_dir()]
+    benchmark_dir = results_dir / "benchmark"
+    autoresearch_dir = results_dir / "autoresearch"
 
-    if not sessions:
-        click.echo("Nothing to reset.")
+    run_dirs = [
+        p
+        for d in (benchmark_dir, autoresearch_dir) if d.exists()
+        for p in d.iterdir() if p.is_dir()
+    ]
+    if not run_dirs:
+        click.echo("Nothing to clean.")
         return
     if not yes:
-        click.echo(f"This will delete {len(sessions)} run/session dir(s) and clear the "
-                   f"rollup CSVs under {results_dir}.")
+        click.echo(f"This will delete {len(run_dirs)} run/session dir(s) under {results_dir}.")
         if not click.confirm("Proceed?", default=False):
             click.echo("Aborted.")
             return
 
-    for d, header in plan:
+    for d in (benchmark_dir, autoresearch_dir):
         d.mkdir(parents=True, exist_ok=True)
         for p in d.iterdir():
             if p.is_dir():
                 shutil.rmtree(p)
-        (d / "results.csv").write_text(",".join(header) + "\n")   # reset rollup to header-only
         (d / ".gitkeep").touch()
 
-    click.secho(
-        f"Reset: removed {len(sessions)} run/session dir(s) and cleared rollup CSVs.", fg="green"
+    # Benchmark keeps a header-only rollup; autoresearch has no global rollup,
+    # so drop any stale global CSV instead of recreating one.
+    (benchmark_dir / "results.csv").write_text(
+        ",".join(results_mod.COMBO_SUMMARY_FIELDS) + "\n"
     )
+    stale_global = autoresearch_dir / "results.csv"
+    if stale_global.exists():
+        stale_global.unlink()
+
+    click.secho(f"Cleaned: removed {len(run_dirs)} run/session dir(s).", fg="green")
 
 
 # ---------------------------------------------------------------------------

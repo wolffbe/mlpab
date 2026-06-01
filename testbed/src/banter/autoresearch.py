@@ -23,7 +23,7 @@ Layout under `results/autoresearch/`:
             <task>/<challenge>/   # one engineer run + its artifacts
             results.csv    # per-increment: every challenge's row
         results.csv        # per-run: every increment's rows tagged by `increment`
-    results.csv            # GLOBAL: best increment (the researcher writes this)
+    (no global rollup — the researcher reports the best increment in report.md)
 
 Budget is graceful: `budget.max_seconds` (wall-clock seconds) is shown to the
 researcher with a `deadline_epoch`; it checks `date +%s` BEFORE each new
@@ -104,7 +104,8 @@ _VALID_IMPROVE_SCOPES = {"interface", "skills"}
 class AutoresearchConfig:
     # tasks: ML task type → its challenges. The unifying structure across all
     # RQ configs (RQ1 = one challenge per task; RQ2 = several; RQ3 = same as
-    # RQ1 with skills). The researcher runs `max_increments` increments PER TASK.
+    # RQ1 with skills). Each version spans ALL tasks; `task` is a grouping
+    # dimension on results.csv, not a separate per-task version chain.
     tasks: dict[str, list[str]]
     challenges: list[str]                # flattened union of all tasks (derived)
     interfaces: list[InterfaceRef]       # interfaces run side-by-side per increment
@@ -404,11 +405,10 @@ def build_researcher_prompt(
         scope_desc = _fragment(testbed_root, "scope_interface.md")
         scope_deny = _fragment(testbed_root, "scope_deny_skills.md")
     else:
-        from_scratch = (
-            _fragment(testbed_root, "scope_skills_from_scratch.md")
-            if config.skills == "none" else ""
-        )
-        scope_desc = _fragment(testbed_root, "scope_skills.md", from_scratch=from_scratch)
+        # The from-scratch wording (when skills == none) is carried by
+        # `skills_note` below, which fires in every skills+none case — no need
+        # to repeat it here.
+        scope_desc = _fragment(testbed_root, "scope_skills.md")
         scope_deny = _fragment(testbed_root, "scope_deny_interface.md")
 
     hierarchy_note = _fragment(
@@ -445,21 +445,6 @@ def build_researcher_prompt(
     first_iface = config.interfaces[0]
     _, next_iface_version = iface_versions[str(first_iface)]
 
-    # Tasks section (RQ2-style per-task specialisation) — loaded from prompts/.
-    if config.tasks:
-        task_lines = []
-        for gname, gitems in config.tasks.items():
-            task_lines.append(f"  [{gname}]")
-            for c in gitems:
-                task_lines.append(f"    - {c}")
-        groups_block = _fragment(
-            testbed_root, "tasks_section.md",
-            n_tasks=len(config.tasks),
-            max_increments=config.budget.max_increments,
-            tasks_list="\n".join(task_lines),
-        ) + "\n"
-    else:
-        groups_block = ""
     _ex_task = next(iter(config.tasks), "no_task") if config.tasks else "no_task"
     _ex_challenge = config.challenges[0] if config.challenges else "challenge-id"
     # Clean run-dir hierarchy: <run>/v<N>/<task>/<challenge>/.
@@ -548,7 +533,6 @@ def build_researcher_prompt(
         avail_interfaces=avail_interfaces,
         avail_skills=avail_skills,
         recent_results=recent_results,
-        groups_block=groups_block,
     )
     template = (testbed_root / "prompts" / "researcher.md").read_text()
     return template.format(**ctx)
@@ -998,6 +982,9 @@ def run_autoresearch(
                 r["total_wall_time_s"] = f"{_f('eng_wall_time_s') + _f('res_wall_time_s'):.6f}"
                 r["total_tokens"] = str(int(_f("eng_total_tokens") + _f("res_total_tokens")))
                 r["total_cost"] = f"{_f('eng_cost_usd') + _f('res_cost_usd'):.6f}"
+            # `total_wall_time_s` just changed, so refresh the rolling averages
+            # (recomputed over all rows in file order) before writing.
+            results_mod.recompute_rolling_averages(rows, results_mod.FIELDS)
             with csv_path.open("w", newline="") as fw:
                 w = _csv.DictWriter(fw, fieldnames=results_mod.FIELDS)
                 w.writeheader()

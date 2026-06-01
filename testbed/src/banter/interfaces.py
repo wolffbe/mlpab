@@ -380,15 +380,9 @@ def setup(
     runtime_install = cfg.get("runtime_install") or []
     mcp_servers = cfg.get("mcp_servers") or {}
     prompt_fragment = _prompt_for(name, type_, chosen, version_root)
-    # When an interface is configured, the engineer must use it as-is; routing
-    # around it (writing custom training code) defeats the experiment. Append
-    # the floor-and-faithful rule from the fragment. (Skipped for none/none
-    # above — there the engineer is free to build whatever it wants.)
-    _under_test = (_TESTBED_ROOT / "prompts" / "fragments"
-                   / "interface_is_under_test.md")
-    if _under_test.is_file():
-        prompt_fragment = (prompt_fragment + "\n\n"
-                           + _under_test.read_text().strip()).strip()
+    # The "use the interface as-is" rule is the engineer prompt's default
+    # (baked into engineer.md, stripped only for none/none) — not appended
+    # here. This fragment carries just the interface's own `prompt:` prose.
     hash_ = _compute_hash(name, type_, chosen, version_root)
     interface_dir = _interface_dir_for(name, type_, chosen, version_root, binary)
 

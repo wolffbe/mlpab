@@ -221,5 +221,70 @@ class CommandClassificationTests(unittest.TestCase):
         self.assertEqual(counts["python_calls"], 0)
 
 
+class RollingAverageTests(unittest.TestCase):
+    def _row(self, rd, *, cli=0, wall=0.0):
+        return results.Row(
+            started_at="t", run="", version="", interface="mlkit", type="cli",
+            skills="none", prev_run="", prev_version="", task="no_task",
+            challenge="c", run_dir=rd, cli_calls=cli, eng_wall_time_s=wall,
+            total_wall_time_s=wall)
+
+    def _ar_row(self, rd, *, cli=0, wall=0.0):
+        # Autoresearch row (rolling averages are autoresearch-only).
+        r = self._row(rd, cli=cli, wall=wall)
+        r.run, r.version = "1", "v0"
+        return r
+
+    def test_count_rolling_avg_is_cumulative(self):
+        # cli_calls_avg = cumulative running mean of cli_calls across rows.
+        d = Path(tempfile.mkdtemp())
+        csvp = d / "results.csv"
+        results.append(csvp, self._ar_row("r1", cli=2))  # fields=None → autoresearch
+        results.append(csvp, self._ar_row("r2", cli=4))
+        results.append(csvp, self._ar_row("r3", cli=0))
+        with csvp.open() as f:
+            rows = list(csv.DictReader(f))
+        # zeros count as real samples (a run with no cli calls is still a run).
+        self.assertEqual([r["cli_calls_avg"] for r in rows],
+                         ["2.0000", "3.0000", "2.0000"])  # 2, (2+4)/2, (2+4+0)/3
+
+    def test_wall_rolling_avg_and_recompute_on_replace(self):
+        d = Path(tempfile.mkdtemp())
+        csvp = d / "results.csv"
+        results.append(csvp, self._ar_row("r1", wall=10.0))
+        results.append(csvp, self._ar_row("r2", wall=20.0))
+        with csvp.open() as f:
+            rows = list(csv.DictReader(f))
+        self.assertEqual([r["eng_wall_time_avg_s"] for r in rows], ["10.0000", "15.0000"])
+        # Re-run r1 → moves to end, rolling recomputed over the new order.
+        results.append(csvp, self._ar_row("r1", wall=40.0))
+        with csvp.open() as f:
+            rows = list(csv.DictReader(f))
+        self.assertEqual([r["run_dir"] for r in rows], ["r2", "r1"])
+        self.assertEqual([r["eng_wall_time_avg_s"] for r in rows], ["20.0000", "30.0000"])
+
+    def test_autoresearch_schema_uses_eng_and_total_avg(self):
+        # Full FIELDS schema: engineer + total wall time each get a rolling avg.
+        d = Path(tempfile.mkdtemp())
+        csvp = d / "results.csv"
+        results.append(csvp, self._ar_row("r1", cli=3, wall=5.0))
+        with csvp.open() as f:
+            rows = list(csv.DictReader(f))
+        self.assertEqual(rows[0]["eng_wall_time_avg_s"], "5.0000")
+        self.assertEqual(rows[0]["total_wall_time_avg_s"], "5.0000")
+        self.assertEqual(rows[0]["cli_calls_avg"], "3.0000")
+
+    def test_benchmark_schema_has_no_rolling_avg_columns(self):
+        # Rolling averages are autoresearch-only; benchmark has nothing to
+        # accumulate across (one session of independent challenges).
+        self.assertFalse([c for c in results.BENCHMARK_FIELDS if c.endswith(("_avg", "_avg_s"))])
+        d = Path(tempfile.mkdtemp())
+        csvp = d / "results.csv"
+        results.append(csvp, self._row("r1", cli=2), fields=results.BENCHMARK_FIELDS)
+        with csvp.open() as f:
+            header = next(csv.reader(f))
+        self.assertFalse([c for c in header if c.endswith(("_avg", "_avg_s"))])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -50,6 +50,20 @@ class BuildPromptTests(unittest.TestCase):
         self.assertNotIn("{challenge_id}", prompt)
         self.assertNotIn("{fragment}", prompt)
 
+    def test_interface_under_test_section(self):
+        # With an interface present (default), the under-test rule is included
+        # and the HTML markers are stripped.
+        on = runner._build_prompt("c", "FRAG", interface_under_test=True)
+        self.assertIn("The interface is what's being measured", on)
+        self.assertNotIn("UNDER_TEST_START", on)
+        self.assertNotIn("UNDER_TEST_END", on)
+
+        # For none/none the whole section is removed.
+        off = runner._build_prompt("c", "FRAG", interface_under_test=False)
+        self.assertNotIn("The interface is what's being measured", off)
+        self.assertNotIn("UNDER_TEST", off)
+        self.assertNotIn("\n\n\n", off)  # no collapsed-newline gap left behind
+
 
 if __name__ == "__main__":
     unittest.main()

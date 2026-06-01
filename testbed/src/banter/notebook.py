@@ -57,34 +57,54 @@ def _setup_cell(master_csv_relpath: str, run_id: str) -> Any:
         "# Average every numeric column per version; non-numeric cols are dropped.\n"
         "numeric = raw.select_dtypes(include='number')\n"
         "df = numeric.groupby('version_idx', as_index=False).mean()\n"
-        "df['n_challenges'] = raw.groupby('version_idx').size().values\n"
+        "# `*_avg` columns are a cumulative running mean across rows in append\n"
+        "# order, so the value 'as of' a version is its LAST row — NOT the mean of\n"
+        "# the running means within the version. Overwrite those columns with the\n"
+        "# per-version last value so the dotted overlay is the true running average.\n"
+        "_avg_cols = [c for c in numeric.columns if c.endswith('_avg') or c.endswith('_avg_s')]\n"
+        "if _avg_cols:\n"
+        "    _last = numeric.groupby('version_idx', as_index=False)[_avg_cols].last()\n"
+        "    df = df.drop(columns=_avg_cols).merge(_last, on='version_idx')\n"
         "df = df.sort_values('version_idx').reset_index(drop=True)\n"
+        "df['n_challenges'] = raw.groupby('version_idx').size().reindex(df['version_idx']).values\n"
         "df\n"
     )
     return new_code_cell(src)
 
 
-def _plot_cell(metric: str, direction: str, optimized: bool) -> Any:
+def _plot_cell(metric: str, direction: str, optimized: bool, avg_col: str | None = None) -> Any:
     """Code cell rendering one metric as a single line chart over versions.
 
-    The y-value is the mean of `metric` across all tasks/challenges in each
+    The solid line is the mean of `metric` across all tasks/challenges in each
     version (already averaged in `results.csv`); `n_challenges` is annotated
-    above each point so the reader sees how many runs went into each mean.
-    Optimized goals get a thicker line + a `(optimized)` suffix in the title.
+    above each point. When `avg_col` is set, a second dotted line shows the
+    cumulative average across all runs (read straight from `results.csv`), so
+    convergence is visible as the two lines flatten and meet. Optimized goals
+    get a thicker line + a `(optimized)` title.
     """
     src = (
         f"metric = {json.dumps(metric)}\n"
         f"direction = {json.dumps(direction)}\n"
         f"optimized = {repr(bool(optimized))}\n"
+        f"avg_col = {repr(avg_col)}\n"
         "if metric not in df.columns:\n"
         "    print(f'(metric {metric!r} not in results.csv — skipping)')\n"
+        "elif pd.to_numeric(df[metric], errors='coerce').notna().sum() == 0:\n"
+        "    print(f'(no data for {metric!r} in this run — skipping)')\n"
         "else:\n"
         "    fig, ax = plt.subplots(figsize=(7, 4))\n"
         "    y = pd.to_numeric(df[metric], errors='coerce')\n"
         "    lw = 2.5 if optimized else 1.5\n"
         "    alpha = 1.0 if optimized else 0.85\n"
-        "    ax.plot(df['version_idx'], y, marker='o', linewidth=lw, alpha=alpha)\n"
-        "    # Annotate sample size when more than one challenge per version.\n"
+        "    ax.plot(df['version_idx'], y, marker='o', linewidth=lw, alpha=alpha, label=metric)\n"
+        "    # Overlay the cumulative rolling average as a dotted line.\n"
+        "    if avg_col and avg_col in df.columns:\n"
+        "        ya = pd.to_numeric(df[avg_col], errors='coerce')\n"
+        "        if ya.notna().any():\n"
+        "            ax.plot(df['version_idx'], ya, linestyle=':', linewidth=2,\n"
+        "                    color='gray', label='rolling avg')\n"
+        "            ax.legend(fontsize=8)\n"
+        "    # Annotate sample size (above) when more than one challenge per version.\n"
         "    if 'n_challenges' in df.columns and df['n_challenges'].max() > 1:\n"
         "        for xi, yi, ni in zip(df['version_idx'], y, df['n_challenges']):\n"
         "            if pd.notna(yi):\n"
@@ -121,7 +141,10 @@ def _intro_cell(
         f"version — the notebook computes per-version means itself). "
         f"This run produced **{n_versions} version(s)**.\n\n"
         f"## Tracked metrics\n{metrics_md}\n\n"
-        "Every metric is charted across versions. The **optimized** marker "
+        "Every metric is charted across versions as a solid line, with a second "
+        "**dotted line** showing the cumulative average across all runs so "
+        "convergence is visible as the two lines flatten and meet. The "
+        "**optimized** marker "
         "indicates which ones the researcher is actively driving per the "
         "config's `goals` block; the rest are tracked for situational "
         "awareness (e.g. an interface refactor that improves `score` while "
@@ -159,16 +182,18 @@ def _resolve_tracked(
 def _benchmark_chart_cell(metric: str, direction: str) -> Any:
     """Bar chart cell: one bar per (task, challenge), labelled.
 
-    Benchmark has no versions, so the natural x-axis is the
-    `(task, challenge)` pair (or just challenge when there's one task).
+    Benchmark has no versions (a single session of independent challenges), so
+    the x-axis is the `(task, challenge)` pair (or just challenge when there's
+    one task). No rolling-average overlay — there's nothing to accumulate across.
     """
     src = (
         f"metric = {json.dumps(metric)}\n"
         f"direction = {json.dumps(direction)}\n"
-        "if metric not in raw.columns:\n"
-        "    print(f'(metric {metric!r} not in results.csv — skipping)')\n"
+        "work = (raw.assign(_y=pd.to_numeric(raw[metric], errors='coerce')).dropna(subset=['_y'])\n"
+        "        if metric in raw.columns else raw.iloc[0:0].assign(_y=[]))\n"
+        "if work.empty:\n"
+        "    print(f'(no data for {metric!r} in this run — skipping)')\n"
         "else:\n"
-        "    work = raw.assign(_y=pd.to_numeric(raw[metric], errors='coerce')).dropna(subset=['_y'])\n"
         "    work = work.sort_values(['task', 'challenge']).reset_index(drop=True)\n"
         "    labels = [f'{t}/{c}' if t and t != 'no_task' else c\n"
         "              for t, c in zip(work['task'].astype(str), work['challenge'].astype(str))]\n"
@@ -308,6 +333,7 @@ def build_run_notebook(
     import os
     master_rel = os.path.relpath(master_csv, run_dir)
 
+    from banter import results as results_mod
     tracked = _resolve_tracked(goals)
     nb = new_notebook()
     nb.cells = [
@@ -319,7 +345,7 @@ def build_run_notebook(
     for metric, direction, optimized in tracked:
         marker = " — optimized" if optimized else ""
         nb.cells.append(new_markdown_cell(f"### `{direction}({metric})`{marker}"))
-        nb.cells.append(_plot_cell(metric, direction, optimized))
+        nb.cells.append(_plot_cell(metric, direction, optimized, results_mod.rolling_avg_col(metric)))
 
     if execute:
         import sys

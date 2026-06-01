@@ -154,12 +154,15 @@ class BuildRunNotebookTests(unittest.TestCase):
         nb_path = notebook_mod.build_run_notebook(self.run_dir, goals, "9", execute=True)
         self.assertIsNotNone(nb_path)
         nb = json.loads(nb_path.read_text())
-        # The last cell is the final chart cell (any TRACKED_METRICS chart).
-        chart_cell = nb["cells"][-1]
-        self.assertEqual(chart_cell["cell_type"], "code")
-        outs = chart_cell.get("outputs", [])
-        has_png = any("image/png" in (o.get("data") or {}) for o in outs)
-        self.assertTrue(has_png, f"no image/png output in chart cell: {outs}")
+        # At least one chart cell embeds a PNG (the `score` chart has data).
+        # Rolling-average charts legitimately skip here — the fixture omits
+        # those columns — so don't assume the LAST cell is a plotted chart.
+        has_png = any(
+            "image/png" in (o.get("data") or {})
+            for c in nb["cells"] if c["cell_type"] == "code"
+            for o in c.get("outputs", [])
+        )
+        self.assertTrue(has_png, "no chart cell embedded an image/png output")
 
 
 if __name__ == "__main__":

@@ -36,7 +36,7 @@ help:
 	@echo "  make uninstall — remove the venv + build artifacts (install state)"
 	@echo ""
 	@echo "Run a config:  banter run interfaces/<project>/<benchmark|autoresearch>/<name>.yaml"
-	@echo "Clear results: banter reset"
+	@echo "Clear results: banter clean"
 
 check-git:
 	@command -v git >/dev/null 2>&1 || { echo "ERROR: git is not installed. Install git and retry."; exit 1; }
