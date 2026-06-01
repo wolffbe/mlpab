@@ -23,18 +23,18 @@ its CHALLENGES. {hierarchy_note}
 - Each version runs ALL {n_challenges} challenge(s) across ALL {n_interfaces} interface(s) = {runs_per_version} runs/version
 - Total individual banter runs THIS run: up to {total_runs}
 - Max total cost (engineer + researcher combined): {cost_cap}
-- Max wall-clock seconds: {time_cap}  (graceful — see below)
-- Run started: epoch `{session_start_epoch}`; hard deadline: epoch `{deadline_epoch}` (`none` if uncapped)
+- Max COMPUTE time: {time_cap}  (graceful — see below; rate-limit waiting does NOT count)
+- Run started: epoch `{session_start_epoch}`
 
-**Graceful time cap** — BEFORE starting any new version, check the wall clock:
+**Graceful compute-time cap** — BEFORE starting any new version, check the
+compute budget. This counts actual computation only: wall-clock elapsed minus
+any time spent sleeping on rate limits.
 ```bash
-NOW=$(date +%s)
-DEADLINE={deadline_epoch}
-if [ "$DEADLINE" != "none" ] && [ "$NOW" -ge "$DEADLINE" ]; then echo "time cap reached"; fi
+{banter_bin} budget-check --start {session_start_epoch} --max-seconds {max_seconds} --ledger {ledger_path}
 ```
-If `$NOW >= $DEADLINE`, DO NOT start another version — finalize the current
-state and jump straight to the "Final step" / final report. The current
-version, once started, is allowed to finish.
+If it exits non-zero (compute budget exhausted), DO NOT start another version —
+finalize the current state and jump straight to the "Final step" / final
+report. The current version, once started, is allowed to finish.
 
 ## Target challenges (grouped by task)
 {challenges_lines}

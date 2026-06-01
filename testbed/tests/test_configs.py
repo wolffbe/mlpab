@@ -68,6 +68,34 @@ budget: {max_cycles: 2}
         self.assertEqual(cfg.interfaces[0].name, "hopsworks")
         self.assertEqual(cfg.budget.max_increments, 2)
 
+    def test_max_seconds_defaults_to_8h(self):
+        p = _write(
+            """
+improve: interface
+skills: none
+challenges: [aerial-cactus-identification]
+interfaces: [{name: hopsworks, mode: cli}]
+goals: [score]
+budget: {max_increments: 3}
+"""
+        )
+        cfg = ar.load_config(p)
+        self.assertEqual(cfg.budget.max_seconds, 8 * 3600.0)
+
+    def test_max_seconds_override(self):
+        p = _write(
+            """
+improve: interface
+skills: none
+challenges: [aerial-cactus-identification]
+interfaces: [{name: hopsworks, mode: cli}]
+goals: [score]
+budget: {max_increments: 3, max_seconds: 3600}
+"""
+        )
+        cfg = ar.load_config(p)
+        self.assertEqual(cfg.budget.max_seconds, 3600.0)
+
 
 class BenchmarkConfigTests(unittest.TestCase):
     def test_matrix_interface_config_ref(self):

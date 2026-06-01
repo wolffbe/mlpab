@@ -70,7 +70,7 @@ class BenchmarkConfig:
     runs: list[RunEntry]
     engineer_model: str = runner.DEFAULT_MODEL
     engineer_auth: str = "api-key"
-    # Per-engineer-run wall-clock cap, in seconds (matches autoresearch's budget.max_seconds).
+    # Per-engineer-run wall-clock cap, in seconds.
     max_seconds: float = 3600.0
 
 
@@ -183,7 +183,12 @@ def _version_root_for(session: str | None) -> Path | None:
     return runner.TESTBED_ROOT / "results" / "autoresearch" / session
 
 
-def run_benchmark(config: BenchmarkConfig, runs_root: Path) -> None:
+def run_benchmark(
+    config: BenchmarkConfig,
+    runs_root: Path,
+    config_name: str | None = None,
+    assume_yes: bool = False,
+) -> None:
     total = len(config.runs)
     if total == 0:
         print("[benchmark] No runs configured.", file=sys.stderr)
@@ -222,17 +227,16 @@ def run_benchmark(config: BenchmarkConfig, runs_root: Path) -> None:
 
     parent = runs_root / "benchmark"
     parent.mkdir(parents=True, exist_ok=True)
-    run_id = results.next_session_id(parent)
-    # Folder name mirrors autoresearch (minus the v<N> level since benchmark
-    # has no versions): <id>__<iface>__<mode>__<skills>__no_prev_run__no_prev_v
-    first = config.runs[0] if config.runs else None
-    iface_seg = (first.interface if first and first.interface != "none" else "no_interface")
-    type_seg = (first.mode if first and first.mode != "none" else "no_type")
-    skills_seg = (first.skills if first and first.skills != "none" else "no_skills")
-    run_dir_name = f"{run_id}__{iface_seg}__{type_seg}__{skills_seg}__no_prev_run__no_prev_v"
-    # The runner writes <run>/<task>/<challenge>/ and the per-session results.csv
-    # at <run>/results.csv (one row per challenge, incl. `task`).
-    run_path = parent / run_dir_name
+    # The config FILENAME stem names the results folder; else auto-increment.
+    run_id = config_name or results.next_session_id(parent)
+    # results/benchmark/<config-name>/. Each entry nests under its own
+    # <interface>/<type>/<skills>/ subtree (so multiple interfaces in one
+    # config don't collide on shared <task>/<challenge> dirs). Overwrite a
+    # pre-existing config folder, but confirm first.
+    run_path = parent / run_id
+    if not results.confirm_overwrite(run_path, assume_yes):
+        print(f"[benchmark] {run_path} exists — overwrite declined. Aborting.", flush=True)
+        return
     run_path.mkdir(parents=True, exist_ok=True)
 
     # OAuth token side-channel, mirroring autoresearch: write the Keychain JWT
@@ -269,6 +273,7 @@ def run_benchmark(config: BenchmarkConfig, runs_root: Path) -> None:
 
     completed: list[results.Row] = []
     failed: list[str] = []
+    leaf_roots: set[Path] = set()
 
     for n, entry in enumerate(config.runs, 1):
         version_tag = f" v{entry.interface_version}" if entry.interface_version is not None else ""
@@ -279,6 +284,10 @@ def run_benchmark(config: BenchmarkConfig, runs_root: Path) -> None:
             f"\n[benchmark {n}/{total}] {entry.challenge} | "
             f"{entry.interface}/{entry.mode}{version_tag} | skills={skills_tag}"
         )
+        # Nest by interface/type/skills so concurrent interfaces in one config
+        # never share a <task>/<challenge> dir. `none` is a literal segment.
+        leaf_root = run_path / entry.interface / entry.mode / (entry.skills or "none")
+        leaf_roots.add(leaf_root)
         try:
             spec = runner.RunSpec(
                 challenge_id=entry.challenge,
@@ -289,7 +298,7 @@ def run_benchmark(config: BenchmarkConfig, runs_root: Path) -> None:
                 model=config.engineer_model,
                 auth=config.engineer_auth,
                 timeout_s=int(config.max_seconds),
-                runs_root=run_path,
+                runs_root=leaf_root,
                 run_id=run_id,        # tagged into row.session in the master CSV
                 interface_version=entry.interface_version,
                 skills_version=entry.skills_version,
@@ -308,8 +317,21 @@ def run_benchmark(config: BenchmarkConfig, runs_root: Path) -> None:
             print(f"[benchmark] FAILED {label}: {exc}", file=sys.stderr)
             failed.append(f"{label}: {exc}")
 
-    # Each benchmark session keeps its results.csv local to its run dir.
-    # No global rollup — sessions are independent and shouldn't be averaged.
+    # The runner appends each row into its leaf's results.csv. Combine them
+    # into a single rollup at the config root for the summary + notebook.
+    import csv as _csv
+    combined: list[dict] = []
+    for leaf in sorted(leaf_roots):
+        leaf_csv = leaf / "results.csv"
+        if leaf_csv.exists():
+            with leaf_csv.open() as f:
+                combined.extend(_csv.DictReader(f))
+    with (run_path / "results.csv").open("w", newline="") as f:
+        w = _csv.DictWriter(f, fieldnames=results.BENCHMARK_FIELDS)
+        w.writeheader()
+        for r in combined:
+            w.writerow({k: r.get(k, "") for k in results.BENCHMARK_FIELDS})
+
     _print_summary(completed, failed, run_path / "results.csv")
 
     # Generate analysis.ipynb with one bar chart per TRACKED_METRICS metric,

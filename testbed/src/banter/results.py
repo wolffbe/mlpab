@@ -12,6 +12,8 @@ import csv
 import json
 import re
 import shlex
+import shutil
+import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -259,6 +261,34 @@ def next_session_id(parent: Path) -> str:
             if head.isdigit():
                 nums.append(int(head))
     return str(max(nums) + 1 if nums else 0)
+
+
+def confirm_overwrite(path: Path, assume_yes: bool = False) -> bool:
+    """If `path` exists, confirm before removing it; return True to proceed.
+
+    Returns True when the dir is absent (nothing to do) or the user agreed
+    (the dir is then removed so the caller can recreate it fresh). Returns
+    False only when the user declined at the prompt. `assume_yes` (the CLI
+    `-y/--yes` flag) skips the prompt and overwrites. A non-interactive stdin
+    without `assume_yes` is treated as a decline — never silently clobber.
+    """
+    if not path.exists():
+        return True
+    if not assume_yes:
+        if not sys.stdin or not sys.stdin.isatty():
+            print(
+                f"[banter] results dir already exists and stdin is not a TTY; "
+                f"refusing to overwrite without --yes:\n  {path}",
+                flush=True,
+            )
+            return False
+        resp = input(
+            f"Results dir already exists:\n  {path}\nOverwrite it? [y/N] "
+        ).strip().lower()
+        if resp not in ("y", "yes"):
+            return False
+    shutil.rmtree(path)
+    return True
 
 
 FIELDS = [

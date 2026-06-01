@@ -50,8 +50,10 @@ def _compute_hash(variant: Path, version: int) -> str:
     h = hashlib.sha256()
     for path in sorted(p for p in variant.rglob("*") if p.is_file()):
         rel = path.relative_to(variant).as_posix()
-        h.update(rel.encode()); h.update(b"\0")
-        h.update(path.read_bytes()); h.update(b"\0")
+        h.update(rel.encode())
+        h.update(b"\0")
+        h.update(path.read_bytes())
+        h.update(b"\0")
     h.update(f"|v={version}".encode())
     return h.hexdigest()[:8]
 

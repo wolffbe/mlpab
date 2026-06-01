@@ -23,7 +23,7 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 import nbformat
 from nbformat.v4 import new_code_cell, new_markdown_cell, new_notebook

@@ -299,37 +299,19 @@ def run(spec: RunSpec) -> results.Row:
             model=spec.model,
         )
 
-    version, variant_hash = interfaces.variant_for(
+    # Fail-fast: validate the interface version is known before doing work
+    # (raises on an unknown version). The resolved version/hash used for the
+    # row come from `interfaces.setup` below, not from here.
+    interfaces.variant_for(
         spec.interface, spec.mode, spec.interface_version, spec.version_root
-    )
-    interface_dir = (
-        str(spec.interface_dir) if spec.interface_dir is not None
-        else f"interfaces/{spec.interface}/{spec.mode}/config.yaml"
-    )
-    if version and spec.version_root is not None:
-        prompt_file = (
-            f"{interfaces.version_dir(spec.version_root, spec.interface, spec.mode, version)}"
-            "/version.yaml#prompt"
-        )
-    else:
-        prompt_file = f"{interface_dir}#prompt"
-    prompt_version = version
-    prompt_hash = interfaces.prompt_hash_for(
-        spec.interface, spec.mode, version, spec.version_root
     )
     # Fail fast on unverified skill bundles — before spending time on
     # venv/data/prep we want to know the bundle is well-formed.
     if spec.skills == "none":
         skills_version, skills_hash = 0, ""
-        skills_dir = ""
     else:
         skills_version, skills_hash, _ = skills_mod.verify_installed(
             spec.interface, spec.skills, spec.skills_version, spec.version_root
-        )
-        skills_dir = (
-            f"interfaces/{spec.interface}/skills/{spec.skills}"
-            if not skills_version
-            else f"{spec.version_root}/skills/{spec.skills}/v{skills_version}"
         )
     # Per-challenge output lives directly under the caller-supplied runs_root:
     #   benchmark      results/benchmark/<run>/<task>/<challenge>/

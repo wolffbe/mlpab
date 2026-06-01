@@ -128,6 +128,9 @@ def main() -> None:
 @click.option("--quiet", "-q", is_flag=True, default=False,
               help="Suppress live engineer/researcher streaming to the terminal "
                    "(transcripts are still written). Same as BANTER_QUIET=1.")
+@click.option("--yes", "-y", is_flag=True, default=False,
+              help="Skip the overwrite prompt when this config's results dir "
+                   "already exists (it will be replaced).")
 def run(
     config: str | None,
     challenge: str | None,
@@ -149,6 +152,7 @@ def run(
     timeout_s: int,
     runs_root: Path,
     quiet: bool,
+    yes: bool,
 ) -> None:
     """Run an autoresearch/benchmark CONFIG, or a single challenge."""
     if quiet:
@@ -156,7 +160,7 @@ def run(
         # the researcher spawns as `banter run --challenge` subprocesses.
         os.environ["BANTER_QUIET"] = "1"
     if config is not None:
-        _dispatch_config(Path(config), runs_root)
+        _dispatch_config(Path(config), runs_root, assume_yes=yes)
         return
 
     if challenge is None:
@@ -197,23 +201,30 @@ def run(
     )
 
 
-def _dispatch_config(config_path: Path, runs_root: Path) -> None:
-    """Dispatch to autoresearch or benchmark based on config content."""
+def _dispatch_config(config_path: Path, runs_root: Path, assume_yes: bool = False) -> None:
+    """Dispatch to autoresearch or benchmark based on config content.
+
+    The config FILENAME stem (e.g. `rq1`, `test-skills`) names the results
+    folder. `assume_yes` skips the overwrite confirmation when that folder
+    already exists.
+    """
     import yaml
 
     if not config_path.exists():
         raise click.ClickException(f"Config file not found: {config_path}")
     data = yaml.safe_load(config_path.read_text()) or {}
     rr = (TESTBED_ROOT / "results") if runs_root == Path("results") else runs_root.resolve()
+    config_name = config_path.stem
 
     if "goals" in data or "improve" in data:
         from banter import autoresearch as ar_mod
         cfg = ar_mod.load_config(config_path.resolve())
-        ar_mod.run_autoresearch(cfg, TESTBED_ROOT, rr)
+        ar_mod.run_autoresearch(cfg, TESTBED_ROOT, rr, config_name=config_name,
+                                assume_yes=assume_yes)
     else:
         from banter import benchmark as bm_mod
         cfg = bm_mod.load_config(config_path.resolve())
-        bm_mod.run_benchmark(cfg, rr)
+        bm_mod.run_benchmark(cfg, rr, config_name=config_name, assume_yes=assume_yes)
 
 
 # ---------------------------------------------------------------------------
@@ -387,6 +398,49 @@ def clean(yes: bool) -> None:
         stale_global.unlink()
 
     click.secho(f"Cleaned: removed {len(run_dirs)} run/session dir(s).", fg="green")
+
+
+# ---------------------------------------------------------------------------
+# banter budget-check  (graceful COMPUTE-time cap for the researcher)
+# ---------------------------------------------------------------------------
+
+
+@main.command("budget-check")
+@click.option("--start", type=int, required=True,
+              help="Session start epoch (seconds).")
+@click.option("--max-seconds", type=float, required=True,
+              help="Compute-time budget in seconds.")
+@click.option("--ledger", type=click.Path(path_type=Path), default=None,
+              help="Rate-limit-wait ledger; its total is excluded from elapsed.")
+@click.option("--json", "as_json", is_flag=True, default=False,
+              help="Emit a machine-readable JSON line instead of prose.")
+def budget_check(start: int, max_seconds: float, ledger: Path | None, as_json: bool) -> None:
+    """Check the COMPUTE-time budget — wall clock MINUS rate-limit waiting.
+
+    `compute = (now - start) - sum(ledger)`. Exit `3` when `compute >=
+    max-seconds` (so the researcher can do `banter budget-check ... || finalize`),
+    `0` otherwise. Rate-limit sleep time recorded in `--ledger` is excluded so
+    only actual computation counts against the budget.
+    """
+    import time
+    from banter import claude_runner
+
+    waited = claude_runner.read_rate_limit_wait(ledger) if ledger else 0.0
+    compute = max(0.0, (int(time.time()) - start) - waited)
+    over = compute >= max_seconds
+    if as_json:
+        click.echo(json.dumps({
+            "compute_s": round(compute, 1),
+            "max_seconds": max_seconds,
+            "rate_limit_wait_s": round(waited, 1),
+            "stop": over,
+        }))
+    else:
+        click.echo(
+            f"compute {compute:.0f}s / {max_seconds:.0f}s cap "
+            f"(rate-limit waits excluded: {waited:.0f}s) -> {'STOP' if over else 'CONTINUE'}"
+        )
+    raise SystemExit(3 if over else 0)
 
 
 # ---------------------------------------------------------------------------

@@ -3,8 +3,49 @@ import csv
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from banter import results
+
+
+class ConfirmOverwriteTests(unittest.TestCase):
+    def test_absent_path_proceeds(self):
+        missing = Path(tempfile.mkdtemp()) / "nope"
+        self.assertTrue(results.confirm_overwrite(missing, assume_yes=False))
+
+    def test_assume_yes_removes_and_proceeds(self):
+        d = Path(tempfile.mkdtemp()) / "run"
+        d.mkdir()
+        (d / "marker").write_text("x")
+        self.assertTrue(results.confirm_overwrite(d, assume_yes=True))
+        self.assertFalse(d.exists())  # removed, ready to recreate
+
+    def test_non_tty_without_yes_refuses(self):
+        d = Path(tempfile.mkdtemp()) / "run"
+        d.mkdir()
+        fake_stdin = mock.MagicMock()
+        fake_stdin.isatty.return_value = False
+        with mock.patch("sys.stdin", fake_stdin):
+            self.assertFalse(results.confirm_overwrite(d, assume_yes=False))
+        self.assertTrue(d.exists())  # untouched
+
+    def test_tty_decline_keeps_dir(self):
+        d = Path(tempfile.mkdtemp()) / "run"
+        d.mkdir()
+        fake_stdin = mock.MagicMock()
+        fake_stdin.isatty.return_value = True
+        with mock.patch("sys.stdin", fake_stdin), mock.patch("builtins.input", return_value="n"):
+            self.assertFalse(results.confirm_overwrite(d, assume_yes=False))
+        self.assertTrue(d.exists())
+
+    def test_tty_accept_removes_dir(self):
+        d = Path(tempfile.mkdtemp()) / "run"
+        d.mkdir()
+        fake_stdin = mock.MagicMock()
+        fake_stdin.isatty.return_value = True
+        with mock.patch("sys.stdin", fake_stdin), mock.patch("builtins.input", return_value="y"):
+            self.assertTrue(results.confirm_overwrite(d, assume_yes=False))
+        self.assertFalse(d.exists())
 
 
 class NextSessionIdTests(unittest.TestCase):

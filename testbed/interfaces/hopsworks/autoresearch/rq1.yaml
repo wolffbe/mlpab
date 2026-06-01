@@ -3,30 +3,31 @@
 # =============================================================================
 #
 # Research-question structure:
-#   RQ1 (this file) = interface-only optimisation across CLI + MCP + SDK,
-#                     run side-by-side in ONE autoresearch session.
-#                     10 cycles × 3 interfaces × 8 challenges = up to 240 runs.
+#   RQ1 (this file) = interface-only optimisation across CLI + MCP + SDK.
+#                     The interfaces run SEQUENTIALLY — one independent
+#                     researcher per interface — and the budget below applies
+#                     PER interface: 10 increments × 8 challenges = up to 80
+#                     runs each, ×3 interfaces = up to 240 runs total.
 #   RQ3 (later)     = layer skills on top of the winning RQ1 versions
-#                     for each interface, 10 cycles each.
+#                     for each interface, 10 increments each.
 #
 # Hypothesis (RQ1): refining each interface's prompt and per-version config
 # (no skills) is sufficient to achieve (1) higher MLE-bench task success,
-# (2) lower token consumption, (3) lower latency, and (4) greater delegation
-# to the remote Hopsworks platform — measured per-interface as cli_calls /
-# mcp_calls / sdk_calls — over locally-executed Python.
+# (2) lower token consumption, and (3) greater delegation to the remote
+# Hopsworks platform — measured per-interface as cli_calls / mcp_calls /
+# sdk_calls — over locally-executed Python. (Wall-clock time is charted in
+# the analysis for reference but is NOT an optimisation goal.)
 #
-# How the loop works:
-#   Per cycle:
-#     - Run every challenge with every interface (3 × 8 = 24 runs).
-#     - Researcher Claude groups results.csv by interface, computes per-
-#       interface AVERAGED metrics across the 8 challenges.
-#     - Proposes ONE targeted change to ONE interface (so attribution is
-#       clean) by appending a new entry under `versions:` in that
-#       interface's manifest.
-#     - Re-runs all 24 (interface × challenge) pairs.
-#     - Keeps the change only if that interface's averaged goals improved
-#       and no other interface regressed.
-#   Repeats for max_cycles iterations.
+# How the loop works (per interface, one after the other):
+#   Per increment:
+#     - Run all 8 challenges with this interface (8 runs/increment).
+#     - Researcher Claude reads this interface's results.csv, computes the
+#       AVERAGED metrics across the 8 challenges.
+#     - Prepares the next version (`banter prepare-version`) and edits the
+#       interface SOURCE — ONE targeted change so attribution is clean.
+#     - Re-runs all 8 challenges against the new version.
+#     - Keeps the change only if the averaged goals improved.
+#   Repeats for max_increments increments, then moves to the next interface.
 #
 # Prerequisites (one-time):
 #   make setup    # auth for engineer + researcher, plus interface keys
@@ -35,12 +36,14 @@
 # Run:
 #   banter interfaces/hopsworks/autoresearch/rq1.yaml
 #
-# Versions are session-local (results/autoresearch/<id>/interfaces/...), so
-# "resetting" is just deleting the session directory.
+# Results land under results/autoresearch/<config-name>/<interface>/<type>/
+# <skills>/v<N>/<task>/<challenge>/ (config-name = this file's stem, `rq1`).
+# Re-running the same config overwrites that folder (after a y/N prompt; `-y`
+# skips). Versions are session-local, so "resetting" is just deleting the dir.
 # =============================================================================
 
 engineer_model: claude-sonnet-4-6
-researcher_model: claude-sonnet-4-6
+researcher_model: claude-opus-4-5
 
 # -----------------------------------------------------------------------------
 # Tasks (ML task type → its challenges). RQ1 = ONE challenge per task.
@@ -56,8 +59,9 @@ tasks:
   sequence_to_sequence:   [text-normalization-challenge-english-language] # 10 MB
 
 # -----------------------------------------------------------------------------
-# Three Hopsworks interfaces run side-by-side every increment, referenced by
-# their config files (where each interface lives + how it is built/run).
+# Three Hopsworks interfaces, each autoresearched SEQUENTIALLY by its own
+# researcher, referenced by their config files (where each interface lives +
+# how it is built/run).
 # -----------------------------------------------------------------------------
 interfaces:
   - config: interfaces/hopsworks/cli/config.yaml
@@ -82,8 +86,6 @@ goals:
     direction: maximize
   - metric: total_tokens           # cost / efficiency
     direction: minimize
-  - metric: wall_time_s            # latency per challenge
-    direction: minimize
   - metric: python_calls           # less local Python = more remote delegation
     direction: minimize
   - metric: cli_calls              # more Hopsworks CLI usage (only fires on cli runs)
@@ -94,9 +96,10 @@ goals:
     direction: maximize
 
 # -----------------------------------------------------------------------------
-# Budget — 10 increments × 3 interfaces × 8 challenges = up to 240 engineer runs.
-# No cost cap.
+# Budget is PER interface: 10 increments × 8 challenges = up to 80 runs each,
+# ×3 interfaces = up to 240 runs total. No cost cap. `max_seconds` is the
+# COMPUTE budget (wall clock MINUS time spent waiting on rate limits); the
+# researcher stops gracefully at the version boundary once it's hit.
 # -----------------------------------------------------------------------------
 budget:
-  max_increments: 10
-  max_cost_usd: .inf
+  max_seconds: 28800   # 8h of compute (rate-limit waiting excluded)

@@ -25,9 +25,9 @@ Layout under `results/autoresearch/`:
         results.csv        # per-run: every increment's rows tagged by `increment`
     (no global rollup — the researcher reports the best increment in report.md)
 
-Budget is graceful: `budget.max_seconds` (wall-clock seconds) is shown to the
-researcher with a `deadline_epoch`; it checks `date +%s` BEFORE each new
-increment and stops at the increment boundary (no hard subprocess kill).
+Budget is graceful: `budget.max_seconds` caps COMPUTE time (wall clock minus
+rate-limit waiting). The researcher runs `banter budget-check` BEFORE each new
+increment and stops at the increment boundary when exhausted (no hard kill).
 
 Entry points:
   run_autoresearch(config, testbed_root, runs_root)   — called by CLI
@@ -40,7 +40,7 @@ import json
 import os
 import shutil
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -70,9 +70,12 @@ class Budget:
     # Continuation max_increments=3 → v0 seeded from prev + v1, v2, v3.
     max_increments: int = 10
     # `max_cost_usd` caps the COMBINED engineer + researcher spend (total_cost
-    # column). `max_seconds` caps the autoresearch session's wall-clock.
+    # column). `max_seconds` caps the session's COMPUTE time — wall clock minus
+    # time spent waiting on rate limits (recorded in the rate-limit ledger).
+    # Default 8h. Graceful: the researcher checks `banter budget-check` before
+    # each new version and stops at the version boundary when exceeded.
     max_cost_usd: float = float("inf")
-    max_seconds: float = float("inf")
+    max_seconds: float = 8 * 3600.0
 
     # Back-compat: older configs/code referenced `max_cycles`.
     @property
@@ -119,7 +122,7 @@ class AutoresearchConfig:
     # the researcher (planner / harder reasoning over many runs) runs Opus.
     engineer_model: str = "claude-sonnet-4-6"
     engineer_auth: str = "api-key"
-    researcher_model: str = "claude-opus-4-7"
+    researcher_model: str = "claude-opus-4-5"
     researcher_auth: str = "api-key"
     # Pin this run's id (the `run` column + run-dir prefix). When unset
     # (None) the id auto-increments: `next_session_id(results/autoresearch)`.
@@ -241,10 +244,12 @@ def load_config(path: Path) -> AutoresearchConfig:
                 bud.get("max_increments", bud.get("max_cycles", bud.get("max_runs", 10)))
             ),
             max_cost_usd=float(bud.get("max_cost_usd", float("inf"))),
-            # `max_seconds` preferred; `max_min` accepted as legacy (× 60).
+            # Compute-time cap. `max_seconds` preferred; `max_min` accepted as
+            # legacy (× 60); default 8h when unset.
             max_seconds=(
                 float(bud["max_seconds"]) if "max_seconds" in bud
-                else float(bud.get("max_min", float("inf"))) * 60.0
+                else float(bud["max_min"]) * 60.0 if "max_min" in bud
+                else 8 * 3600.0
             ),
         ),
         improve=improve,
@@ -257,7 +262,7 @@ def load_config(path: Path) -> AutoresearchConfig:
             "engineer_auth", data.get("auth", os.environ.get("BANTER_AUTH", "api-key"))
         ),
         # Researcher defaults to Opus (planner); engineer defaults to Sonnet.
-        researcher_model=data.get("researcher_model", "claude-opus-4-7"),
+        researcher_model=data.get("researcher_model", "claude-opus-4-5"),
         researcher_auth=data.get(
             "researcher_auth",
             data.get("engineer_auth", data.get("auth", os.environ.get("BANTER_AUTH", "api-key"))),
@@ -425,19 +430,17 @@ def build_researcher_prompt(
     )
     time_cap = (
         "unlimited" if config.budget.max_seconds == float("inf")
-        else f"{config.budget.max_seconds:.0f} s"
+        else f"{config.budget.max_seconds:.0f} s of compute"
     )
-    # Wall-clock budget enforcement is GRACEFUL via the researcher's own time
-    # checks: the prompt gives it the session start epoch and a deadline epoch;
-    # before each new increment it compares `date +%s` to deadline_epoch and
-    # stops at increment boundaries (no hard subprocess kill). The cap is the
-    # combined eng + res session wall (which IS the researcher's own wall —
-    # the engineer subprocesses run inside the researcher's session).
+    # COMPUTE-time budget enforcement is GRACEFUL: the prompt gives the
+    # researcher a `banter budget-check` command that compares (now - start -
+    # rate_limit_waits) against max_seconds. Time spent waiting on rate limits
+    # (recorded in the ledger by run_with_retry) is EXCLUDED, so only actual
+    # computation counts. The researcher runs it before each new version and
+    # stops at the version boundary when exceeded (no hard subprocess kill).
     session_start_epoch = int(time.time())
-    deadline_epoch = (
-        "none" if config.budget.max_seconds == float("inf")
-        else str(session_start_epoch + int(config.budget.max_seconds))
-    )
+    max_seconds_int = int(config.budget.max_seconds)
+    ledger_path = runs_root / ".rate_limit_wait_s"
 
     # Per-increment annotations live in `results.csv` columns, filled by
     # `banter annotate-increment`; CHANGELOG.md is the human-readable companion.
@@ -505,7 +508,8 @@ def build_researcher_prompt(
         cost_cap=cost_cap,
         time_cap=time_cap,
         session_start_epoch=session_start_epoch,
-        deadline_epoch=deadline_epoch,
+        max_seconds=max_seconds_int,
+        ledger_path=ledger_path,
         challenges_lines=challenges_lines,
         interfaces_table=interfaces_table,
         starting_skills=config.skills,
@@ -584,6 +588,8 @@ def run_autoresearch(
     config: AutoresearchConfig,
     testbed_root: Path,
     runs_root: Path,
+    config_name: str | None = None,
+    assume_yes: bool = False,
 ) -> None:
     if shutil.which("claude") is None:
         raise RuntimeError("`claude` CLI not found on PATH. Install Claude Code first.")
@@ -641,35 +647,60 @@ def run_autoresearch(
     from banter import results as results_mod
     parent = runs_root / "autoresearch"
     parent.mkdir(parents=True, exist_ok=True)
-    # Use the explicit `run:` from config if set; otherwise auto-increment.
-    if config.run is not None:
+
+    # The config FILENAME stem names the results folder (e.g. `rq1`,
+    # `test-skills`). An explicit `run:` in the config overrides it; otherwise
+    # fall back to the legacy auto-increment id when no name was passed in.
+    if config_name:
+        run_id = config_name
+    elif config.run is not None:
         run_id = str(config.run)
-        # Refuse to collide with an existing run dir — would clobber its results.
-        if any(p.name.startswith(f"{run_id}__") for p in parent.iterdir() if p.is_dir()):
-            raise ValueError(
-                f"[autoresearch] config.run={config.run!r} already exists under {parent}. "
-                "Pick a different id or delete the existing dir."
-            )
     else:
         run_id = results_mod.next_session_id(parent)
 
-    # Session folder name encodes the run's identity:
-    #   <id>__<interface>__<mode>__<skills>__<prev_run_seg>__<prev_version_seg>
-    # `prev_*` capture optional continuation from a previous session+increment.
+    # One folder per config: results/autoresearch/<run_id>/. Inside it, one
+    # sub-tree per interface — <interface>/<type>/<skills>/ — and EACH leaf is
+    # its own researcher (run sequentially), with v<N>/<task>/<challenge>/
+    # underneath. Overwrite a pre-existing config folder, but confirm first.
+    config_root = parent / run_id
+    if not results_mod.confirm_overwrite(config_root, assume_yes):
+        print(f"[autoresearch] {config_root} exists — overwrite declined. Aborting.",
+              flush=True)
+        return
+    config_root.mkdir(parents=True, exist_ok=True)
+
+    iface_list = config.interfaces or [InterfaceRef(name="none", mode="none")]
+    skills_seg = config.skills or "none"
+    print(f"[autoresearch] config={run_id}  "
+          f"interfaces={[str(i) for i in iface_list]}\n  dir={config_root}", flush=True)
+
+    # Each interface is an independent experiment with its own researcher,
+    # results.csv, and report under its leaf — no combined rollup at the root.
+    for n, iface in enumerate(iface_list, 1):
+        iface_root = config_root / iface.name / iface.mode / skills_seg
+        print(f"\n[autoresearch] === interface {n}/{len(iface_list)}: {iface} "
+              f"→ {iface_root.relative_to(config_root)} ===", flush=True)
+        _run_one_interface(
+            replace(config, interfaces=[iface]),
+            testbed_root, parent, iface_root, run_id, banter_bin,
+        )
+
+    print(f"\n[autoresearch] done. config dir: {config_root}", flush=True)
+
+
+def _run_one_interface(
+    config: AutoresearchConfig,
+    testbed_root: Path,
+    parent: Path,
+    run_path: Path,
+    run_id: str,
+    banter_bin: Path,
+) -> None:
+    """Run ONE interface's researcher, rooted at its leaf dir `run_path`
+    (`<config>/<interface>/<type>/<skills>/`). `config` is narrowed to that
+    single interface; `parent` is `results/autoresearch/` (for prev-run lookup).
+    """
     i0 = config.interfaces[0] if config.interfaces else None
-    iface_seg = (i0.name if i0 and i0.name != "none" else "no_interface")
-    type_seg = (i0.mode if i0 and i0.mode != "none" else "no_type")
-    skills_seg = config.skills if config.skills and config.skills != "none" else "no_skills"
-    prev_run_seg = (
-        f"prev_run_{config.prev_run}" if config.prev_run is not None
-        else "no_prev_run"
-    )
-    prev_ver_seg = (
-        f"prev_v{config.prev_version}" if config.prev_version is not None
-        else "no_prev_v"
-    )
-    run_dir_name = f"{run_id}__{iface_seg}__{type_seg}__{skills_seg}__{prev_run_seg}__{prev_ver_seg}"
-    run_path = parent / run_dir_name
     run_path.mkdir(parents=True, exist_ok=True)
 
     # Clone the docs bundle (git URL in `config.docs`) ONCE at the run root.
@@ -692,17 +723,25 @@ def run_autoresearch(
         incr0 = run_path / "v0" / "interface"
         src: Path | None = None
         if config.prev_run is not None and config.prev_version is not None:
-            # Resolve the prev session's folder under parent by leading int id.
-            matches = [
-                d for d in parent.iterdir()
-                if d.is_dir() and d.name.split("__", 1)[0].isdigit()
-                and int(d.name.split("__", 1)[0]) == config.prev_run
-            ]
-            if not matches:
+            # Resolve the prev config's matching leaf in the nested tree:
+            #   <parent>/<prev_run>/<iface>/<type>/<skills>/v<prev_version>/interface
+            prev_config = parent / str(config.prev_run)
+            if not prev_config.is_dir():
+                # Back-compat: match an old flat dir by its leading id segment.
+                flat = [
+                    d for d in parent.iterdir()
+                    if d.is_dir() and d.name.split("__", 1)[0] == str(config.prev_run)
+                ]
+                prev_config = flat[0] if flat else None
+            if prev_config is None:
                 raise RuntimeError(
                     f"[autoresearch] prev_run={config.prev_run} not found under {parent}"
                 )
-            prev_iface = matches[0] / f"v{config.prev_version}" / "interface"
+            skills_seg = config.skills or "none"
+            prev_iface = (
+                prev_config / i0.name / i0.mode / skills_seg
+                / f"v{config.prev_version}" / "interface"
+            )
             if not prev_iface.is_dir():
                 raise RuntimeError(
                     f"[autoresearch] prev_version dir not found: {prev_iface}"
@@ -825,7 +864,7 @@ def run_autoresearch(
         "## Structure\n"
         "- `v<N>/interface/` — the interface source for increment N.\n"
         "- `v<N>/<task>/<challenge>/` — per-challenge engineer artifacts.\n"
-        "- `results.csv` — one row per increment, all goal metrics averaged.\n"
+        "- `results.csv` — one row per (version, task, challenge), plus rolling-average columns.\n"
         "- `analysis.ipynb` — line charts of every tracked metric per increment.\n"
         "- `transcript.jsonl` — the researcher's own stream-json transcript.\n"
     )
@@ -851,6 +890,11 @@ def run_autoresearch(
     env["PATH"] = f"{venv_bin}{os.pathsep}{env.get('PATH', '')}"
     env.setdefault("KAGGLE_CONFIG_DIR", str(testbed_root / ".kaggle"))
     env["TESTBED_COMMAND_LOG"] = str(researcher_cmd_log)
+    # Rate-limit-wait ledger for the compute-time budget. `run_with_retry`
+    # (this researcher AND every engineer subprocess it spawns — BANTER_* vars
+    # survive the Bash hop) appends each rate-limit sleep here; `banter
+    # budget-check` subtracts the total from wall clock so only compute counts.
+    env[claude_runner.RATE_LIMIT_LEDGER_ENV] = str(run_path / ".rate_limit_wait_s")
     # Mark engineer subprocesses the researcher spawns as nested: they write
     # their stream.log but don't print to stdout (the researcher captures it).
     # The FileTailer below surfaces those logs live in this terminal instead.
@@ -885,7 +929,7 @@ def run_autoresearch(
         f"  budget={config.budget.max_increments} increments × {n_ifaces} interfaces × {n_chals} challenges "
         f"= up to {config.budget.max_increments * n_ifaces * n_chals} runs\n"
         f"  cost_cap={'∞' if config.budget.max_cost_usd == float('inf') else f'${config.budget.max_cost_usd:.2f}'}\n"
-        f"  time_cap={'∞' if config.budget.max_seconds == float('inf') else f'{config.budget.max_seconds:.0f} min'}",
+        f"  compute_cap={'∞' if config.budget.max_seconds == float('inf') else f'{config.budget.max_seconds:.0f}s (rate-limit waits excluded)'}",
         flush=True,
     )
     print(f"[autoresearch] run dir: {run_path}", flush=True)

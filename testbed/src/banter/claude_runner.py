@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import pwd
 import shutil
 import subprocess
 import time
@@ -27,7 +28,6 @@ TESTBED_ROOT = Path(__file__).resolve().parents[2]
 # environ.HOME is already <run>/. Using that as HOME_DIR would emit a
 # denyRead rooted at <run>/, which then blocks the engineer's own writes
 # inside its boundary (parent-dir lookups for open(..., 'w') need read).
-import pwd
 HOME_DIR = Path(pwd.getpwuid(os.getuid()).pw_dir).resolve()
 # Hook script ships inside the package (src/banter/hooks/).
 HOOK_SCRIPT = Path(__file__).resolve().parent / "hooks" / "log_tool_call.py"
@@ -141,6 +141,48 @@ def resolve_oauth_token() -> str | None:
 RATE_LIMIT_RETRY_WINDOW_S = 6 * 3600
 RATE_LIMIT_BASE_BACKOFF_S = 2
 RATE_LIMIT_MAX_BACKOFF_S = 3600
+
+# When set (by autoresearch), `run_with_retry` appends every rate-limit sleep
+# (in seconds) to this file so the compute-time budget can exclude waiting.
+# Custom BANTER_* vars survive the researcher → Bash → engineer hop, so the
+# researcher and all its engineer subprocesses accumulate into one ledger.
+RATE_LIMIT_LEDGER_ENV = "BANTER_RATELIMIT_LEDGER"
+
+
+def _record_rate_limit_wait(env: dict[str, str], seconds: float) -> None:
+    """Append `seconds` to the rate-limit-wait ledger named by env, if set.
+
+    Best-effort: a failed write must never abort the retry loop.
+    """
+    path = env.get(RATE_LIMIT_LEDGER_ENV)
+    if not path:
+        return
+    try:
+        with open(path, "a") as f:
+            f.write(f"{seconds}\n")
+    except OSError:
+        pass
+
+
+def read_rate_limit_wait(ledger: Path) -> float:
+    """Sum the rate-limit-wait ledger (seconds). Missing file → 0.0; any
+    unparseable line is skipped rather than discarding the whole total."""
+    total = 0.0
+    try:
+        lines = ledger.read_text().splitlines()
+    except OSError:
+        return 0.0
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            total += float(line)
+        except ValueError:
+            continue
+    return total
+
+
 # Anthropic rate limits (429/529, "overloaded") + transient 5xx. Without 5xx
 # in here, a mid-session 500 burns a whole version on retry.
 _RATE_LIMIT_TOKENS = (
@@ -397,6 +439,9 @@ def run_with_retry(
     - On rate-limit / 5xx detection in the last `result`, sleeps
       `min(2 * 2^(attempt-1), 3600)` seconds and retries until the 6h
       total budget is exhausted.
+    - Each rate-limit sleep is recorded to the `BANTER_RATELIMIT_LEDGER` file
+      (when that env var is set) so the autoresearch compute-time budget can
+      EXCLUDE waiting-on-rate-limit time from the session wall clock.
 
     Returns `(exit_code, total_wall_time_s)` including sleep time.
     """
@@ -488,6 +533,9 @@ def run_with_retry(
             flush=True,
         )
         time.sleep(backoff)
+        # Record the rate-limit wait so the autoresearch compute-time budget
+        # can subtract it from session wall clock (waiting != computing).
+        _record_rate_limit_wait(env, backoff)
 
     # Promote the temp stderr buffer to `stderr_path` only if non-empty;
     # otherwise drop it so the run dir doesn't carry an empty log file.
