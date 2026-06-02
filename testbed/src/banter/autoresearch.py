@@ -11,23 +11,24 @@ via `banter prepare-version`, then edits source). `banter run --interface-dir
 v<N>/interface` force-rebuilds the edits + the engineer uses them.
 
 Layout under `results/autoresearch/`:
-    <run_id>__<platform>__<interface>__<skills>__<prev_run_seg>__<prev_version_seg>/
+    experiments.csv        # GLOBAL table: one row per (config, version, task,
+                           #   challenge) across ALL runs (written live by the runner)
+    analysis.ipynb         # GLOBAL analysis (composite, baseline-vs-best, charts)
+    <run_id>/<platform>/<interface>/<skills>/
         prompt.txt         # researcher prompt (for debugging)
-        transcript.jsonl   # raw researcher stream-json
-        stream.log         # human-readable live researcher view (also used as transcript)
-        CHANGELOG.md       # per-increment narrative (researcher appends after each increment)
+        researcher.log     # human-readable live researcher view
+        CHANGELOG.md       # per-version narrative (researcher appends after each version)
         report.md          # final report (researcher writes at the end)
-        stream.log         # researcher's formatted live view
         v0/, v1/, …
-            interface/     # the per-increment interface copy (built)
-            <task>/<challenge>/   # one engineer run + its artifacts
-            results.csv    # per-increment: every challenge's row
-        results.csv        # per-run: every increment's rows tagged by `increment`
-    (no global rollup — the researcher reports the best increment in report.md)
+            interface/     # the per-version interface copy (built)
+            <task>/<challenge>/   # one engineer run + its artifacts (incl. stream.log)
+    (No per-run results.csv and no raw transcript — results go to the global
+     experiments.csv; the researcher scores versions via the `normalized_composite`
+     MCP tool.)
 
 Budget is graceful: `budget.max_seconds` caps COMPUTE time (wall clock minus
 rate-limit waiting). The researcher runs `banter budget-check` BEFORE each new
-increment and stops at the increment boundary when exhausted (no hard kill).
+version and stops at the version boundary when exhausted (no hard kill).
 
 Entry points:
   run_autoresearch(config, testbed_root, runs_root)   — called by CLI
@@ -35,7 +36,6 @@ Entry points:
 """
 from __future__ import annotations
 
-import csv
 import json
 import os
 import shutil
@@ -62,20 +62,24 @@ class Goal:
 
 @dataclass
 class Budget:
-    # `max_increments` is the count of IMPROVEMENT versions ON TOP of the
-    # baseline `v0`. v0 is always created (either fresh from the committed
-    # base or seeded from `prev_run`/`prev_version`); v1..v<max_increments>
-    # are the improvements the researcher iterates through.
-    # Fresh max_increments=3 → v0 (baseline) + v1, v2, v3 (4 dirs total).
-    # Continuation max_increments=3 → v0 seeded from prev + v1, v2, v3.
-    max_increments: int = 10
-    # `max_cost_usd` caps the COMBINED engineer + researcher spend (total_cost
-    # column). `max_seconds` caps the session's COMPUTE time — wall clock minus
-    # time spent waiting on rate limits (recorded in the rate-limit ledger).
-    # Default 8h. Graceful: the researcher checks `banter budget-check` before
-    # each new version and stops at the version boundary when exceeded.
+    # `iterations` is the TOTAL number of versions, INCLUDING the v0 baseline as
+    # the first step. v0 is always created (fresh from the committed base, or
+    # seeded from `prev_run`/`prev_version`); v1..v<iterations-1> are the
+    # researcher's improvements. iterations=4 → v0, v1, v2, v3.
+    iterations: int = 11
+    # `max_cost_usd` caps the COMBINED engineer + researcher spend (total_cost).
+    # `max_seconds` caps the session's COMPUTE time — wall clock minus time spent
+    # waiting on rate limits (recorded in the rate-limit ledger). Default 8h.
+    # Graceful: the researcher checks `banter budget-check` before each new
+    # version and stops at the version boundary when exceeded.
     max_cost_usd: float = float("inf")
     max_seconds: float = 8 * 3600.0
+
+    # `max_increments` = improvement versions on top of v0 = iterations - 1.
+    # Retained as a derived property so existing code/prompts keep working.
+    @property
+    def max_increments(self) -> int:
+        return max(0, self.iterations - 1)
 
     # Back-compat: older configs/code referenced `max_cycles`.
     @property
@@ -133,6 +137,19 @@ class AutoresearchConfig:
     # instead of the committed base. Both must be set together, or neither.
     prev_run: int | None = None
     prev_version: int | None = None
+    # Experiment-design metadata (set by generated treatment configs). All
+    # optional, defaulting to None so existing configs are unaffected. When
+    # `experiment` is set, the end-of-run hook propagates this treatment's
+    # outcome into the master `results/experiments.csv` table.
+    experiment: int | None = None
+    research_question: int | None = None
+    treatment: int | None = None
+    optimization_variable: str | None = None   # univariate | bivariate | multivariate
+    time: int | None = None                     # compute hours per challenge
+    language: str | None = None
+    # Absolute path of the config file this was loaded from. The experiment
+    # table keys off this (the config IS the treatment's identity).
+    config_path: str | None = None
 
 
 # Metrics where lower is better; everything else defaults to maximize.
@@ -240,8 +257,12 @@ def load_config(path: Path) -> AutoresearchConfig:
         docs=data.get("docs", "none"),
         goals=goals,
         budget=Budget(
-            max_increments=int(
-                bud.get("max_increments", bud.get("max_cycles", bud.get("max_runs", 10)))
+            # `iterations` = total versions incl. v0 (preferred). Legacy
+            # `max_increments`/`max_cycles`/`max_runs` counted improvements on
+            # top of v0, so iterations = that + 1. Default 11 (= old default 10).
+            iterations=(
+                int(bud["iterations"]) if "iterations" in bud
+                else int(bud.get("max_increments", bud.get("max_cycles", bud.get("max_runs", 10)))) + 1
             ),
             max_cost_usd=float(bud.get("max_cost_usd", float("inf"))),
             # Compute-time cap. `max_seconds` preferred; `max_min` accepted as
@@ -270,6 +291,15 @@ def load_config(path: Path) -> AutoresearchConfig:
         run=data.get("run"),
         prev_run=(int(data["prev_run"]) if data.get("prev_run") is not None else None),
         prev_version=(int(data["prev_version"]) if data.get("prev_version") is not None else None),
+        experiment=(int(data["experiment"]) if data.get("experiment") is not None else None),
+        research_question=(
+            int(data["research_question"]) if data.get("research_question") is not None else None
+        ),
+        treatment=(int(data["treatment"]) if data.get("treatment") is not None else None),
+        optimization_variable=data.get("optimization_variable"),
+        time=(int(data["time"]) if data.get("time") is not None else None),
+        language=data.get("language"),
+        config_path=str(path),
     )
 
 
@@ -278,33 +308,6 @@ def load_config(path: Path) -> AutoresearchConfig:
 # ---------------------------------------------------------------------------
 
 
-def _recent_results_table(runs_root: Path, n: int = 40) -> str:
-    results_path = runs_root / "results.csv"
-    if not results_path.exists():
-        return "(no results yet)"
-    with open(results_path) as f:
-        rows = list(csv.DictReader(f))
-    if not rows:
-        return "(no results yet)"
-    header = (
-        f"{'challenge':<35} {'platform/interface':<18} {'skills':<18} {'ver':<4} "
-        f"{'score':<8} {'tokens':<8} {'wall_s':<7} {'py_calls':<5} run_dir"
-    )
-    sep = "-" * 150
-    lines = [header, sep]
-    for row in rows[-n:]:
-        lines.append(
-            f"{row.get('challenge_id', '?'):<35} "
-            f"{row.get('platform', '?')}/{row.get('interface', '?'):<16} "
-            f"{row.get('skills', '?'):<18} "
-            f"{row.get('version', ''):<4} "
-            f"{row.get('score', ''):<8} "
-            f"{row.get('total_tokens', ''):<8} "
-            f"{row.get('wall_time_s', ''):<7} "
-            f"{row.get('python_calls', ''):<5} "
-            f"{row.get('run_dir', '')}"
-        )
-    return "\n".join(lines)
 
 
 def _scan_interfaces(testbed_root: Path) -> str:
@@ -385,7 +388,6 @@ def build_researcher_prompt(
         challenges_lines = "\n".join(f"  - {c}" for c in config.challenges)
     avail_interfaces = _scan_interfaces(testbed_root)
     avail_skills = _scan_skills(testbed_root, config.interfaces[0].platform if config.interfaces else "none")
-    recent_results = _recent_results_table(runs_root)
     n_challenges = len(config.challenges)
     n_interfaces = len(config.interfaces)
     runs_per_increment = n_challenges * n_interfaces
@@ -461,6 +463,9 @@ def build_researcher_prompt(
     # at that copy; the runner force-rebuilds + the engineer uses it.
     eval_block_lines = []
     task_items = list(config.tasks.items()) or [("no_task", config.challenges or ["<challenge>"])]
+    # All autoresearch records results straight into the global
+    # results/autoresearch/experiments.csv via this flag (no per-run results.csv).
+    exp_flag = f" \\\n  --experiment-config {config.config_path}" if config.config_path else ""
     for iface in config.interfaces:
         for task, task_challenges in task_items:
             for c in task_challenges:
@@ -478,7 +483,7 @@ def build_researcher_prompt(
                     f"  --docs {config.docs} \\\n"
                     f"  --interface-dir {runs_root}/v<N>/interface \\\n"
                     f"  --runs-root {runs_root}/v<N> \\\n"
-                    f"  --run {run_id} --version v<N>{prev_flags}"
+                    f"  --run {run_id} --version v<N>{prev_flags}{exp_flag}"
                 )
     eval_block = "\n".join(eval_block_lines)
 
@@ -533,10 +538,10 @@ def build_researcher_prompt(
         next_iface_version=next_iface_version,
         run_dir_example=run_dir_example,
         banter_bin=banter_bin,
+        experiment_config=config.config_path or "",
         eval_block=eval_block,
         avail_interfaces=avail_interfaces,
         avail_skills=avail_skills,
-        recent_results=recent_results,
     )
     template = (testbed_root / "prompts" / "researcher.md").read_text()
     return template.format(**ctx)
@@ -621,8 +626,12 @@ def run_autoresearch(
     try:
         # Build + test the platforms once at session start (login is checked per
         # challenge by the runner, in each run's own venv).
+        # cleanup_build: this upfront check builds each interface only to verify
+        # it; the artifacts are deleted afterwards so the committed source folder
+        # stays source-only. The real build/install happens per version (v0/vN).
         preflight_mod.preflight(
             reqs, auth=config.engineer_auth, model=config.engineer_model, check_login=False,
+            cleanup_build=True,
         )
     except preflight_mod.PreflightError as e:
         raise RuntimeError(
@@ -669,6 +678,14 @@ def run_autoresearch(
         return
     config_root.mkdir(parents=True, exist_ok=True)
 
+    # Clear this config's prior rows from the global experiments table so a
+    # re-run replaces (not duplicates) them; the leaves re-append live.
+    try:
+        from banter import experiments as experiments_mod
+        experiments_mod.clear_treatment(parent.parent, config)
+    except Exception as e:
+        print(f"[autoresearch] experiments clear skipped: {e}", flush=True)
+
     iface_list = config.interfaces or [InterfaceRef(platform="none", interface="none")]
     skills_seg = config.skills or "none"
     print(f"[autoresearch] config={run_id}  "
@@ -676,12 +693,18 @@ def run_autoresearch(
 
     # Each platform is an independent experiment with its own researcher,
     # results.csv, and report under its leaf — no combined rollup at the root.
+    from banter import experiments as _exp
     for n, iface in enumerate(iface_list, 1):
         iface_root = config_root / iface.platform / iface.interface / skills_seg
         print(f"\n[autoresearch] === platform {n}/{len(iface_list)}: {iface} "
               f"→ {iface_root.relative_to(config_root)} ===", flush=True)
+        # Per-leaf goals: keep only THIS interface's delegation (`*_calls`) goal —
+        # you can't maximize cli/mcp/sdk calls simultaneously on one interface.
+        leaf_goal_pairs = _exp.goals_for_interface(
+            [(g.metric, g.direction) for g in config.goals], iface.interface)
+        leaf_goals = [Goal(metric=m, direction=d) for m, d in leaf_goal_pairs]
         _run_one_interface(
-            replace(config, interfaces=[iface]),
+            replace(config, interfaces=[iface], goals=leaf_goals),
             testbed_root, parent, iface_root, run_id, banter_bin,
         )
 
@@ -769,15 +792,11 @@ def _run_one_interface(
     prompt = build_researcher_prompt(config, testbed_root, run_path, run_id, banter_bin)
     (run_path / "prompt.txt").write_text(prompt)
 
-    # Create empty results.csv (header only) and an empty analysis.ipynb up
-    # front so both files exist from the moment the run dir is created. The
-    # runner appends rows to the CSV and regenerates the notebook with the
-    # latest charts after each `banter run`.
-    from banter import results as results_mod
-    empty_csv = run_path / "results.csv"
-    if not empty_csv.exists():
-        with empty_csv.open("w", newline="") as f:
-            csv.DictWriter(f, fieldnames=results_mod.FIELDS).writeheader()
+    # Autoresearch writes results straight to the GLOBAL
+    # results/autoresearch/experiments.csv (one row per version/task/challenge,
+    # appended live by each `banter run`). No per-run results.csv — the single
+    # global results/autoresearch/analysis.ipynb does the math. Stale rows for
+    # this leaf are cleared at session start in `run_autoresearch`.
 
     # Pre-create CHANGELOG.md so it shows up next to report.md from the start.
     # The researcher appends one section per increment describing what changed
@@ -798,23 +817,16 @@ def _run_one_interface(
             "---\n"
         )
 
-    empty_nb = run_path / "analysis.ipynb"
-    if not empty_nb.exists():
-        from nbformat.v4 import new_notebook, new_markdown_cell
-        import nbformat as _nbf
-        nb = new_notebook()
-        goals_md = "\n".join(
-            f"- **{g.direction}**(`{g.metric}`)" for g in config.goals
-        ) or "_(none declared)_"
-        nb.cells = [new_markdown_cell(
-            f"# Autoresearch run `{run_id}` — analysis\n\n"
-            f"_(No results yet — this notebook regenerates after each `banter run`.)_\n\n"
-            f"## Optimization goals\n{goals_md}\n"
-        )]
-        with empty_nb.open("w") as f:
-            _nbf.write(nb, f)
+    # (Per-run analysis.ipynb retired — the single global notebook does the math.)
 
-    transcript_path = run_path / "transcript.jsonl"
+    # The raw stream-json transcript is no longer kept in the run dir (nothing
+    # reads it, and we don't want the researcher loading it as context). It's
+    # streamed to a throwaway temp file (human-readable view stays in stream.log)
+    # and removed when the session ends. The researcher's memory is CHANGELOG.md.
+    import tempfile
+    _tf = tempfile.NamedTemporaryFile(prefix="banter-researcher-", suffix=".jsonl", delete=False)
+    _tf.close()
+    transcript_path = Path(_tf.name)
     stderr_path = run_path / "researcher.stderr.log"
 
     # Set up a project-scoped `.claude/` INSIDE the autoresearch run dir so
@@ -825,8 +837,11 @@ def _run_one_interface(
     # here too, not in `<testbed>/.claude/`.
     claude_dir = run_path / ".claude"
     claude_dir.mkdir(parents=True, exist_ok=True)
-    researcher_cmd_log = run_path / "commands.jsonl"
-    researcher_cmd_log.touch()
+    # No researcher command log (commands.jsonl): the researcher's own tool calls
+    # aren't measured (only the engineer's are, via its per-challenge transcript),
+    # and we keep the run dir free of context the researcher might load. The
+    # PreToolUse hook still enforces confinement; it just skips logging when
+    # TESTBED_COMMAND_LOG is unset.
     # Researcher confinement is tool-layer only (permissions.deny). No kernel
     # sandbox — Claude Code's `allowWrite` has a depth cutoff that breaks
     # deep mkdir/file ops the spawned `banter run` subprocesses need to do
@@ -847,7 +862,6 @@ def _run_one_interface(
                     + claude_runner.deny_patterns_for(run_path.resolve()),
         },
     }, indent=2))
-    (claude_dir / "command_log_path.txt").write_text(str(researcher_cmd_log))
     # Project-scoped memory: loaded as system context by claude-code on every
     # tool invocation. Gives the researcher persistent notes that survive
     # context compaction and are visible if you re-open the run dir later.
@@ -864,9 +878,10 @@ def _run_one_interface(
         "## Structure\n"
         "- `v<N>/interface/` — the interface source for increment N.\n"
         "- `v<N>/<task>/<challenge>/` — per-challenge engineer artifacts.\n"
-        "- `results.csv` — one row per (version, task, challenge), plus rolling-average columns.\n"
-        "- `analysis.ipynb` — line charts of every tracked metric per increment.\n"
-        "- `transcript.jsonl` — the researcher's own stream-json transcript.\n"
+        "- `CHANGELOG.md` — your long-term memory: append an entry after EVERY version.\n"
+        "- `researcher.log` — human-readable view of your own run.\n"
+        "- Results go to the GLOBAL `results/autoresearch/experiments.csv` (one row per\n"
+        "  version/task/challenge); use the `normalized_composite` MCP tool to score versions.\n"
     )
 
     env = os.environ.copy()
@@ -889,7 +904,7 @@ def _run_one_interface(
     venv_bin = str(testbed_root / ".venv" / "bin")
     env["PATH"] = f"{venv_bin}{os.pathsep}{env.get('PATH', '')}"
     env.setdefault("KAGGLE_CONFIG_DIR", str(testbed_root / ".kaggle"))
-    env["TESTBED_COMMAND_LOG"] = str(researcher_cmd_log)
+    # (No TESTBED_COMMAND_LOG for the researcher — see above.)
     # Rate-limit-wait ledger for the compute-time budget. `run_with_retry`
     # (this researcher AND every engineer subprocess it spawns — BANTER_* vars
     # survive the Bash hop) appends each rate-limit sleep here; `banter
@@ -899,6 +914,32 @@ def _run_one_interface(
     # their stream.log but don't print to stdout (the researcher captures it).
     # The FileTailer below surfaces those logs live in this terminal instead.
     env["BANTER_NESTED"] = "1"
+
+    # Give the researcher a `normalized_composite` MCP tool over the global
+    # experiments table, scoped to THIS leaf (config + platform/interface/skills)
+    # and its configured goals. Dependency-free stdio server (`banter.research_mcp`).
+    from banter import experiments as experiments_mod
+    results_root = parent.parent
+    leaf_iface = config.interfaces[0] if config.interfaces else None
+    cfg_rel = experiments_mod._config_rel(config, results_root)
+    goals_str = experiments_mod._goals_str([(g.metric, g.direction) for g in config.goals])
+    venv_py = str(testbed_root / ".venv" / "bin" / "python")
+    mcp_config_path = run_path / ".mcp.json"
+    mcp_config_path.write_text(json.dumps({
+        "mcpServers": {
+            "banter-research": {
+                "command": venv_py,
+                "args": ["-m", "banter.research_mcp"],
+                "env": {
+                    "BANTER_EXPERIMENTS_CSV": str(experiments_mod.table_path(results_root)),
+                    "BANTER_CONFIG": cfg_rel,
+                    "BANTER_PLATFORM": leaf_iface.platform if leaf_iface else "",
+                    "BANTER_INTERFACE": leaf_iface.interface if leaf_iface else "",
+                    "BANTER_GOALS": goals_str,
+                },
+            }
+        }
+    }, indent=2))
 
     # `--settings` + `--setting-sources` mirror the engineer's setup
     # (claude_runner.run) — `-p` mode silently skips project settings unless
@@ -916,6 +957,8 @@ def _run_one_interface(
         "--settings", str(settings_file),
         "--setting-sources", "project,local,user",
     ]
+    if mcp_config_path is not None:
+        cmd.extend(["--mcp-config", str(mcp_config_path)])
     # Researcher's deny patterns + HOME redirect (settings written above +
     # env set above) keep it inside <run>/ at the tool layer.
 
@@ -935,9 +978,10 @@ def _run_one_interface(
     print(f"[autoresearch] run dir: {run_path}", flush=True)
     print()
 
-    # The researcher's own stream view is saved to the session's stream.log and
-    # printed live (emit() honors BANTER_QUIET for stdout, always writes the file).
-    researcher_log = run_path / "stream.log"
+    # The researcher's own stream view is saved to the session's researcher.log
+    # and printed live (emit() honors BANTER_QUIET for stdout, always writes it).
+    # (Engineer per-challenge logs are `stream.log`; the researcher's is distinct.)
+    researcher_log = run_path / "researcher.log"
 
     def _on_line(raw_line: str) -> None:
         try:
@@ -958,6 +1002,7 @@ def _run_one_interface(
     # Researcher Claude shares the engineer's rate-limit retry helper: 6h
     # budget, exponential back-off on 429/529/5xx/overloaded.
     researcher_wall_s = 0.0
+    researcher_usage: dict[str, float] = {}
     try:
         _, researcher_wall_s = claude_runner.run_with_retry(
             cmd=cmd,
@@ -978,75 +1023,47 @@ def _run_one_interface(
         if tailer is not None:
             tailer.stop()
             tailer.join(timeout=2)
-
-    # `run_with_retry` only writes researcher.stderr.log when there's stderr
-    # output, so no empty-file cleanup is needed here.
-
-    # Deterministically build this run's results.csv = all increments' per-challenge
-    # rows (the per-increment CSVs are written by the runner). The GLOBAL
-    # best-increment results.csv is the researcher's to write (it picks the best
-    # increment per the config goals). No AI involved here.
-    # `<run>/results.csv` is now built incrementally by the runner — each
-    # `banter run --version v<N>` appends a row directly there (one row
-    # per (run, increment, task, challenge)). No post-run consolidation needed.
-
-    # Distribute the researcher's wall/tokens/cost equally across every row
-    # of this session, then compute the `total_*` aggregates per row. Summed
-    # across rows this gives the right session totals; per-row it's an
-    # approximation (the researcher is shared overhead).
-    try:
-        from banter import results as results_mod
-        usage = results_mod.parse_transcript_usage(transcript_path)
-        csv_path = run_path / "results.csv"
-        if csv_path.exists():
-            import csv as _csv
-            with csv_path.open() as f:
-                rows = list(_csv.DictReader(f))
-            session_rows = [r for r in rows if str(r.get("run", "")) == str(run_id)]
-            n = len(session_rows) or 1
-            share = {
-                "res_wall_time_s": researcher_wall_s / n,
-                "res_input_tokens": int(usage.get("input_tokens", 0)) // n,
-                "res_output_tokens": int(usage.get("output_tokens", 0)) // n,
-                "res_total_tokens": int(usage.get("total_tokens", 0)) // n,
-                "res_cost_usd": float(usage.get("cost_usd", 0.0)) / n,
+        # Read the researcher's token/cost usage from the transcript BEFORE
+        # discarding it, then remove the throwaway raw transcript (keep stream.log).
+        try:
+            from banter import results as results_mod
+            u = results_mod.parse_transcript_usage(transcript_path)
+            researcher_usage = {
+                "input_tokens": float(u.get("input_tokens", 0) or 0),
+                "output_tokens": float(u.get("output_tokens", 0) or 0),
+                "total_tokens": float(u.get("total_tokens", 0) or 0),
+                "cost_usd": float(u.get("cost_usd", 0.0) or 0.0),
+                "wall_s": float(researcher_wall_s),
             }
-            for r in session_rows:
-                for k, v in share.items():
-                    r[k] = f"{v:.6f}" if isinstance(v, float) else str(v)
-                # total_* = eng + res. NB: total_wall_time_s here is the
-                # sum, NOT the actual session wall (engineer's wall is
-                # nested inside researcher's). Use the explicit budget
-                # signals — `time.monotonic()` deltas — for hard caps.
-                def _f(k: str) -> float:
-                    try:
-                        return float(r.get(k, "") or 0)
-                    except ValueError:
-                        return 0.0
-                r["total_wall_time_s"] = f"{_f('eng_wall_time_s') + _f('res_wall_time_s'):.6f}"
-                r["total_tokens"] = str(int(_f("eng_total_tokens") + _f("res_total_tokens")))
-                r["total_cost"] = f"{_f('eng_cost_usd') + _f('res_cost_usd'):.6f}"
-            # `total_wall_time_s` just changed, so refresh the rolling averages
-            # (recomputed over all rows in file order) before writing.
-            results_mod.recompute_rolling_averages(rows, results_mod.FIELDS)
-            with csv_path.open("w", newline="") as fw:
-                w = _csv.DictWriter(fw, fieldnames=results_mod.FIELDS)
-                w.writeheader()
-                for r in rows:
-                    w.writerow({k: r.get(k, "") for k in results_mod.FIELDS})
-    except Exception as e:
-        print(f"[autoresearch] researcher cost attribution skipped: {e}", flush=True)
+        except Exception:
+            researcher_usage = {"wall_s": float(researcher_wall_s)}
+        try:
+            transcript_path.unlink(missing_ok=True)
+        except Exception:
+            pass
 
-    # Auto-generate analysis.ipynb next to the per-run results.csv: one line
-    # chart per goal metric across increments. Pre-executed so plots embed
-    # in the notebook for direct viewing on GitHub or in JupyterLab.
+    # Distribute the researcher's tokens + wall time + cost across this leaf's
+    # rows in the global experiments table (shared overhead → total_* = eng_* + res_*).
     try:
-        from banter import notebook as notebook_mod
-        goals_pairs = [(g.metric, g.direction) for g in config.goals]
-        nb_path = notebook_mod.build_run_notebook(run_path, goals_pairs, run_id)
-        if nb_path is not None:
-            print(f"[autoresearch] wrote analysis notebook: {nb_path}", flush=True)
+        from banter import experiments as experiments_mod
+        i0 = config.interfaces[0] if config.interfaces else None
+        experiments_mod.attribute_researcher(
+            parent.parent, config,
+            i0.platform if i0 else "", i0.interface if i0 else "",
+            researcher_usage,
+        )
     except Exception as e:
-        print(f"[autoresearch] notebook generation skipped: {e}", flush=True)
+        print(f"[autoresearch] researcher attribution skipped: {e}", flush=True)
+
+    # Rows were appended live to results/autoresearch/experiments.csv by the
+    # runner (engineer-side metrics); `attribute_researcher` just filled the
+    # researcher's share. (Re)generate AND EXECUTE the global analysis notebook
+    # so its diagrams reflect the final, attributed numbers.
+    try:
+        from banter import experiments
+        nb = experiments.build_global_notebook(testbed_root, execute=True)
+        print(f"[autoresearch] refreshed global analysis notebook: {nb}", flush=True)
+    except Exception as e:
+        print(f"[autoresearch] global notebook refresh skipped: {e}", flush=True)
 
     print(f"\n[autoresearch] done. run dir: {run_path}", flush=True)

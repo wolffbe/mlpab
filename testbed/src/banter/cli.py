@@ -13,7 +13,8 @@ The researcher drives individual challenge evaluations internally via the
 Examples:
     banter platforms/none/benchmark/config.yaml
     banter platforms/mlkit/benchmark/cli/config.yaml
-    banter platforms/hopsworks/autoresearch/rq1.yaml
+    banter platforms/hopsworks/autoresearch/rq1/t01-cli-univariate.yaml   # run one treatment
+    banter experiments refresh                                   # rebuild the analysis notebook
     make setup
 """
 from __future__ import annotations
@@ -114,6 +115,9 @@ def main() -> None:
               help="Autoresearch continuation hint: previous run id this one was bootstrapped from.")
 @click.option("--prev-version", "prev_version", default=None,
               help="Autoresearch continuation hint: previous version (e.g. `v2`) this one was bootstrapped from.")
+@click.option("--experiment-config", "experiment_config", default=None,
+              help="Treatment config path (experiment runs). When it carries experiment "
+                   "metadata, the row is written to the global results/experiments.csv.")
 @click.option("--skills", default="none", show_default=True, help="Skill bundle name under skills/, or `none`.")
 @click.option("--skills-version", "skills_version", type=int, default=None, help="Pin a skill bundle version.")
 @click.option("--docs", default="none", show_default=True,
@@ -143,6 +147,7 @@ def run(
     version: str | None,
     prev_run: str | None,
     prev_version: str | None,
+    experiment_config: str | None,
     skills: str,
     skills_version: int | None,
     docs: str,
@@ -191,6 +196,7 @@ def run(
         version=version,
         prev_run=prev_run,
         prev_version=prev_version,
+        experiment_config=experiment_config,
     )
     row = runner.run(spec)
     click.echo(
@@ -305,50 +311,65 @@ def prepare_version(
     )
 
 
+@main.command("test")
+@click.argument("config", type=click.Path(path_type=Path))
+@click.option("--no-login", is_flag=True, default=False,
+              help="Skip the login/auth check (just build + run test_command).")
+def test_interface(config: Path, no_login: bool) -> None:
+    """Build + verify an interface ONCE, then delete the build artifacts.
+
+    CONFIG is an interface config (platforms/<platform>/<interface>/config.yaml).
+    Builds the interface, runs its auth + test_command checks, and cleans the
+    build output back out so the committed folder stays source-only — a quick
+    "does this interface still work?" check.
+    """
+    platform, interface = interfaces.platform_interface_from_config(config)
+    status = interfaces.preflight(
+        platform, interface, check_login=not no_login, cleanup_build=True,
+    )
+    if status.ok:
+        click.secho(f"OK — {platform}/{interface} builds, "
+                    f"{'authenticates, ' if not no_login else ''}and runs.", fg="green")
+    else:
+        raise click.ClickException(status.message)
+
+
 @main.command("annotate-version")
-@click.option("--results-csv", type=click.Path(path_type=Path), required=True,
-              help="Path to the run's results.csv (typically <run>/results.csv).")
-@click.option("--run", "run_", required=True, help="run column value to match.")
-@click.option("--version", "version", required=True, help="version column value (e.g. `v3`).")
+@click.option("--config", "config", required=True, type=click.Path(path_type=Path),
+              help="Treatment config path (the same one passed as --experiment-config).")
+@click.option("--version", "version", required=True, help="Version label, e.g. `v3`.")
+@click.option("--interface", "interface", default=None,
+              help="Scope to one interface leaf (cli/mcp/sdk). Omit for single-interface treatments.")
 @click.option("--hypothesis", default=None)
 @click.option("--change", default=None)
 @click.option("--verdict", type=click.Choice(["positive", "negative", "neutral"]), default=None)
-@click.option("--verdict-reason", default=None)
-@click.option("--keep", type=int, default=None, help="0 or 1.")
+@click.option("--verdict-reason", "verdict_reason", default=None)
+@click.option("--keep", type=int, default=None, help="0 or 1 — did you keep the change?")
 @click.option("--observations", default=None)
-@click.option("--proposed-changes", default=None)
+@click.option("--proposed-changes", "proposed_changes", default=None)
 def annotate_version(
-    results_csv: Path,
-    run_: str,
-    version: str,
-    hypothesis: str | None,
-    change: str | None,
-    verdict: str | None,
-    verdict_reason: str | None,
-    keep: int | None,
-    observations: str | None,
-    proposed_changes: str | None,
+    config: Path, version: str, interface: str | None,
+    hypothesis: str | None, change: str | None, verdict: str | None,
+    verdict_reason: str | None, keep: int | None,
+    observations: str | None, proposed_changes: str | None,
 ) -> None:
-    """Fill the per-version annotation columns on every row matching
-    (run, version) — the researcher uses this to close out each version
-    with verdict, observations, and proposed next changes."""
-    from banter import results as results_mod
+    """Fill the per-version annotation columns on every row of (config, version)
+    in the global results/autoresearch/experiments.csv — the researcher uses this
+    to record each version's hypothesis, change, verdict, and next steps."""
+    from banter import experiments as experiments_mod
+
+    config_rel = os.path.relpath(Path(config).resolve(), TESTBED_ROOT)
     updates = {
-        "hypothesis": hypothesis,
-        "change": change,
-        "verdict": verdict,
-        "verdict_reason": verdict_reason,
-        "keep": keep,
-        "observations": observations,
-        "proposed_changes": proposed_changes,
+        "hypothesis": hypothesis, "change": change, "verdict": verdict,
+        "verdict_reason": verdict_reason, "keep": keep,
+        "observations": observations, "proposed_changes": proposed_changes,
     }
-    n = results_mod.annotate_version(
-        results_csv,
-        run=run_,
-        version=version,
-        updates={k: v for k, v in updates.items() if v is not None},
+    n = experiments_mod.annotate_version(
+        TESTBED_ROOT / "results", config_rel, version,
+        {k: v for k, v in updates.items() if v is not None}, interface=interface,
     )
-    click.echo(f"annotated {n} row(s) in {results_csv} (run={run_}, version={version})")
+    click.echo(f"annotated {n} row(s) (config={config_rel}, version={version}"
+               + (f", interface={interface}" if interface else "") + ")")
 
 
 @main.command("clean")
@@ -397,6 +418,13 @@ def clean(yes: bool) -> None:
     if stale_global.exists():
         stale_global.unlink()
 
+    # Drop the global experiments table (results/autoresearch/experiments.csv);
+    # it's written live as treatments run, so a clean slate means removing it.
+    from banter import experiments as experiments_mod
+    exp_table = experiments_mod.table_path(results_dir)
+    if exp_table.exists():
+        exp_table.unlink()
+
     click.secho(f"Cleaned: removed {len(run_dirs)} run/session dir(s).", fg="green")
 
 
@@ -441,6 +469,34 @@ def budget_check(start: int, max_seconds: float, ledger: Path | None, as_json: b
             f"(rate-limit waits excluded: {waited:.0f}s) -> {'STOP' if over else 'CONTINUE'}"
         )
     raise SystemExit(3 if over else 0)
+
+
+# ---------------------------------------------------------------------------
+# banter experiments  (design matrix → per-treatment configs + master table)
+# ---------------------------------------------------------------------------
+
+
+@main.group("experiments")
+def experiments_grp() -> None:
+    """Global results table + analysis notebook over the autoresearch runs."""
+
+
+@experiments_grp.command("refresh")
+@click.option("--no-exec", is_flag=True, default=False,
+              help="Only (re)write the notebook; don't execute it.")
+def experiments_refresh(no_exec: bool) -> None:
+    """Regenerate AND execute the global results/autoresearch/analysis.ipynb
+    against the current experiments.csv (the table is written live by runs).
+    Run it any time to refresh the analysis; `--no-exec` skips execution."""
+    from banter import experiments as experiments_mod
+
+    try:
+        nb = experiments_mod.build_global_notebook(TESTBED_ROOT, execute=not no_exec)
+    except Exception as e:
+        # The notebook file was still written (unexecuted); surface the error.
+        nb = experiments_mod.table_path(TESTBED_ROOT / "results").parent / "analysis.ipynb"
+        raise click.ClickException(f"notebook written but execution failed: {e}\n  {nb}")
+    click.secho(f"{'Wrote' if no_exec else 'Executed'} global analysis notebook: {nb}", fg="green")
 
 
 # ---------------------------------------------------------------------------

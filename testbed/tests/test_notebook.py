@@ -1,17 +1,19 @@
-"""Tests for the autoresearch analysis-notebook generator.
+"""Tests for the benchmark analysis-notebook generator.
 
-Covers the cell construction (deterministic, no kernel needed) and the
-optional execution path. Execution-path tests skip if matplotlib + ipykernel
-aren't both installed.
+Covers cell construction (deterministic, no kernel needed) and the optional
+execution path. Execution-path tests skip if matplotlib + ipykernel aren't both
+installed. (Autoresearch's global notebook is covered in test_experiments.py.)
 """
 import csv
-import json
 import shutil
 import tempfile
 import unittest
 from pathlib import Path
 
+import nbformat
+
 from banter import notebook as notebook_mod
+from banter import results as results_mod
 
 
 def _has_exec_deps() -> bool:
@@ -24,145 +26,61 @@ def _has_exec_deps() -> bool:
         return False
 
 
-def _write_results_csv(parent: Path, rows: list[dict]) -> Path:
-    """Drop a minimal master results.csv into `parent`. Field set is derived
-    from the union of all keys in `rows` so each test only declares the
-    columns it cares about."""
-    fields: list[str] = []
-    for r in rows:
-        for k in r:
-            if k not in fields:
-                fields.append(k)
+def _write_benchmark_csv(parent: Path, rows: list[dict]) -> Path:
     path = parent / "results.csv"
     with open(path, "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=fields)
+        w = csv.DictWriter(f, fieldnames=results_mod.BENCHMARK_FIELDS)
         w.writeheader()
         for r in rows:
-            w.writerow(r)
+            w.writerow({k: r.get(k, "") for k in results_mod.BENCHMARK_FIELDS})
     return path
 
 
-class VersionIndexTests(unittest.TestCase):
-    def test_extracts_integer(self):
-        self.assertEqual(notebook_mod._version_index("v0"), 0)
-        self.assertEqual(notebook_mod._version_index("v12"), 12)
+def _bm_row(task, challenge, score, wall_time_s=10, total_tokens=100, cost_usd=0.1):
+    return {
+        "platform": "none", "interface": "none", "skills": "none",
+        "task": task, "challenge": challenge, "valid_submission": "1",
+        "score": str(score), "wall_time_s": str(wall_time_s),
+        "total_tokens": str(total_tokens), "cost_usd": str(cost_usd),
+    }
 
-    def test_returns_none_for_non_incr(self):
-        self.assertIsNone(notebook_mod._version_index("interface"))
-        self.assertIsNone(notebook_mod._version_index("vx"))
 
-
-class BuildRunNotebookTests(unittest.TestCase):
+class BuildBenchmarkNotebookTests(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
-        # Layout mirrors production: master at `<root>/results.csv`,
-        # per-session run dir at `<root>/<session>/analysis.ipynb`.
-        self.run_dir = self.tmp / "session"
+        self.run_dir = self.tmp / "0_none"
         self.run_dir.mkdir()
 
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def test_returns_none_when_no_results_csv(self):
-        self.assertIsNone(notebook_mod.build_run_notebook(self.run_dir, [("score", "maximize")], "0"))
+        self.assertIsNone(notebook_mod.build_benchmark_notebook(self.run_dir, "0"))
 
-    def test_returns_none_when_csv_has_no_increments_for_session(self):
-        # Empty master + a session id that doesn't appear → no notebook.
-        _write_results_csv(self.run_dir, [])
-        self.assertIsNone(notebook_mod.build_run_notebook(self.run_dir, [("score", "maximize")], "0"))
+    def test_returns_none_when_csv_empty(self):
+        _write_benchmark_csv(self.run_dir, [])
+        self.assertIsNone(notebook_mod.build_benchmark_notebook(self.run_dir, "0"))
 
-    def test_charts_all_tracked_metrics_regardless_of_goals(self):
-        # Every metric in results.TRACKED_METRICS is always charted; goals
-        # only mark which are flagged "(optimized)" in titles. The notebook
-        # reads raw per-challenge rows from the master CSV and computes
-        # per-increment means in-cell.
-        from banter import results as results_mod
-        _write_results_csv(self.run_dir, [
-            {"run": "7", "version": "v0", "challenge": "c1", "score": "0.5",
-             "total_tokens": "100", "wall_time_s": "10", "cli_calls": "0", "python_calls": "5"},
-            {"run": "7", "version": "v1", "challenge": "c1", "score": "0.7",
-             "total_tokens": "120", "wall_time_s": "12", "cli_calls": "2", "python_calls": "3"},
-            # Noise from another session — must be filtered out.
-            {"run": "9", "version": "v0", "challenge": "c1", "score": "0.1",
-             "total_tokens": "9", "wall_time_s": "1", "cli_calls": "0", "python_calls": "9"},
+    def test_writes_notebook_with_a_chart_per_tracked_metric(self):
+        _write_benchmark_csv(self.run_dir, [
+            _bm_row("tabular", "a", 0.5),
+            _bm_row("image", "b", 0.9),
         ])
-        goals = [("score", "maximize")]
-        nb_path = notebook_mod.build_run_notebook(self.run_dir, goals, "7", execute=False)
+        nb_path = notebook_mod.build_benchmark_notebook(self.run_dir, "0", execute=False)
         self.assertIsNotNone(nb_path)
-        nb = json.loads(nb_path.read_text())
-
-        cells = nb["cells"]
-        # Layout: [intro, "## Setup", setup_code, "## Metrics …", then
-        # 2 cells (header + chart) per tracked metric.
-        self.assertEqual(len(cells), 4 + 2 * len(results_mod.TRACKED_METRICS))
-
-        intro_src = "".join(cells[0]["source"]) if isinstance(cells[0]["source"], list) else cells[0]["source"]
-        self.assertIn("Autoresearch run `7`", intro_src)
-        # Intro lists every tracked metric; only `score` is marked optimized.
-        for metric, direction in results_mod.TRACKED_METRICS:
-            self.assertIn(f"**{direction}**(`{metric}`)", intro_src)
-        self.assertIn("**maximize**(`score`) — **optimized**", intro_src)
-
-        for i, (metric, direction) in enumerate(results_mod.TRACKED_METRICS):
-            hdr = cells[4 + 2 * i]
-            code = cells[4 + 2 * i + 1]
-            hdr_src = "".join(hdr["source"]) if isinstance(hdr["source"], list) else hdr["source"]
-            code_src = "".join(code["source"]) if isinstance(code["source"], list) else code["source"]
-            self.assertEqual(hdr["cell_type"], "markdown")
-            self.assertIn(f"`{direction}({metric})`", hdr_src)
-            if metric == "score":
-                self.assertIn("optimized", hdr_src)
-            self.assertEqual(code["cell_type"], "code")
-            self.assertIn(json.dumps(metric), code_src)
-            self.assertIn(json.dumps(direction), code_src)
-
-    def test_extra_config_goals_chart_after_tracked_set(self):
-        # A goal whose metric is NOT in TRACKED_METRICS still gets charted —
-        # appended after the canonical list.
-        _write_results_csv(self.run_dir, [
-            {"run": "1", "version": "v0", "challenge": "c1", "score": "0.5",
-             "total_tokens": "100", "wall_time_s": "10", "cli_calls": "0", "python_calls": "5"},
-        ])
-        # `_write_results_csv` only carries TRACKED_METRICS columns; the
-        # "cost_usd" column ends up missing → notebook code prints a skip.
-        goals = [("cost_usd", "minimize")]
-        nb_path = notebook_mod.build_run_notebook(self.run_dir, goals, "1", execute=False)
-        nb = json.loads(nb_path.read_text())
-        # Find the markdown header for the extra metric.
-        headers = [
-            ("".join(c["source"]) if isinstance(c["source"], list) else c["source"])
-            for c in nb["cells"] if c["cell_type"] == "markdown"
-        ]
-        self.assertTrue(any("`minimize(cost_usd)`" in h for h in headers),
-                        f"extra goal not charted; got headers: {headers}")
+        nb = nbformat.read(nb_path, as_version=4)
+        # One markdown + one code cell per tracked metric, plus setup/intro cells.
+        code = [c for c in nb.cells if c.cell_type == "code"]
+        self.assertGreaterEqual(len(code), len(results_mod.BENCHMARK_TRACKED_METRICS))
+        # The setup cell loads results.csv.
+        self.assertTrue(any("read_csv" in c.source for c in code))
 
     @unittest.skipUnless(_has_exec_deps(), "needs matplotlib + ipykernel")
-    def test_executed_notebook_embeds_plot_images(self):
-        # Two increments × two challenges each → the notebook groups by
-        # increment and averages. Confirms the kernel runs and embeds PNGs.
-        _write_results_csv(self.run_dir, [
-            {"run": "9", "version": "v0", "challenge": "c1", "score": "0.5",
-             "total_tokens": "100", "wall_time_s": "10", "cli_calls": "0", "python_calls": "5"},
-            {"run": "9", "version": "v0", "challenge": "c2", "score": "0.6",
-             "total_tokens": "110", "wall_time_s": "11", "cli_calls": "1", "python_calls": "4"},
-            {"run": "9", "version": "v1", "challenge": "c1", "score": "0.8",
-             "total_tokens": "120", "wall_time_s": "12", "cli_calls": "2", "python_calls": "3"},
-            {"run": "9", "version": "v1", "challenge": "c2", "score": "0.85",
-             "total_tokens": "130", "wall_time_s": "13", "cli_calls": "3", "python_calls": "2"},
-        ])
-        goals = [("score", "maximize")]
-        nb_path = notebook_mod.build_run_notebook(self.run_dir, goals, "9", execute=True)
-        self.assertIsNotNone(nb_path)
-        nb = json.loads(nb_path.read_text())
-        # At least one chart cell embeds a PNG (the `score` chart has data).
-        # Rolling-average charts legitimately skip here — the fixture omits
-        # those columns — so don't assume the LAST cell is a plotted chart.
-        has_png = any(
-            "image/png" in (o.get("data") or {})
-            for c in nb["cells"] if c["cell_type"] == "code"
-            for o in c.get("outputs", [])
-        )
-        self.assertTrue(has_png, "no chart cell embedded an image/png output")
+    def test_executed_notebook_embeds_outputs(self):
+        _write_benchmark_csv(self.run_dir, [_bm_row("tabular", "a", 0.5)])
+        nb_path = notebook_mod.build_benchmark_notebook(self.run_dir, "0", execute=True)
+        nb = nbformat.read(nb_path, as_version=4)
+        self.assertTrue(any(c.cell_type == "code" and c.get("outputs") for c in nb.cells))
 
 
 if __name__ == "__main__":

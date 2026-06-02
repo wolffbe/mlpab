@@ -270,8 +270,10 @@ def prompt_hash_for(
 def keys_for(platform: str, interface: str) -> dict[str, str]:
     """Return the manifest's declared credential keys as {name: value}.
 
-    Accepts both a mapping (`keys: {NAME: value}`) and a list
-    (`keys: [{name: NAME, value: ...}]`). Missing values normalise to "".
+    Accepts a mapping (`keys: {NAME: value}`), a plain list of names to read from
+    the environment (`keys: [NAME1, NAME2]`), or a list of `{name, value}` dicts.
+    A missing/empty value normalises to "" and is resolved from the env at run
+    time (see `_resolved_keys`).
     """
     if platform == "none" and interface == "none":
         return {}
@@ -282,7 +284,9 @@ def keys_for(platform: str, interface: str) -> dict[str, str]:
             out[str(k)] = "" if v is None else str(v)
     elif isinstance(raw, list):
         for entry in raw:
-            if isinstance(entry, dict) and entry.get("name"):
+            if isinstance(entry, str):
+                out[entry] = ""
+            elif isinstance(entry, dict) and entry.get("name"):
                 v = entry.get("value")
                 out[str(entry["name"])] = "" if v is None else str(v)
     return out
@@ -444,6 +448,76 @@ def _make_check_venv(target: Path) -> Path:
 
 
 def preflight(
+    platform: str,
+    interface: str,
+    version: int | None = None,
+    version_root: Path | None = None,
+    *,
+    check_login: bool = True,
+    auto_build: bool = True,
+    timeout_s: int = 120,
+    cleanup_build: bool = False,
+    env: dict[str, str] | None = None,
+) -> InterfaceStatus:
+    """Build + verify an interface. `cleanup_build=True` (session preflight and
+    `banter test`) deletes any build artifacts this created from the committed
+    source folder afterwards, so it stays source-only — real installs happen per
+    version (autoresearch `vX`) or per benchmark run. Default False leaves the
+    artifact in place (benchmark runs the engineer against it directly)."""
+    try:
+        return _preflight_impl(
+            platform, interface, version, version_root,
+            check_login=check_login, auto_build=auto_build, timeout_s=timeout_s, env=env,
+        )
+    finally:
+        if cleanup_build:
+            _clean_build_artifacts(platform, interface)
+
+
+def _force_rmtree(path: Path) -> None:
+    """`shutil.rmtree` that also removes read-only files. A `repo:` clone's
+    `.git` objects are read-only, and `rmtree(ignore_errors=True)` would silently
+    skip them — leaving a partial `src/` behind. Make every entry writable first,
+    then remove."""
+    if not path.exists():
+        return
+    try:
+        os.chmod(path, 0o700)            # the top dir itself, so its entries unlink
+    except OSError:
+        pass
+    for root, dirs, files in os.walk(path):
+        for name in files + dirs:
+            try:
+                os.chmod(os.path.join(root, name), 0o700)
+            except OSError:
+                pass
+    shutil.rmtree(path, ignore_errors=True)
+
+
+def _clean_build_artifacts(platform: str, interface: str) -> None:
+    """Remove build artifacts from the committed source folder so it stays
+    source-only (config + source). A wheel / build|dist|src dir / egg-info / the
+    configured `binary` in a source folder is always a build artifact."""
+    base = PLATFORMS_DIR / platform / interface
+    if not base.is_dir():
+        return
+    for d in ("build", "dist", "src"):
+        _force_rmtree(base / d)
+    for p in list(base.glob("*.egg-info")):
+        _force_rmtree(p)
+    for p in list(base.glob("*.whl")):
+        p.unlink(missing_ok=True)
+    manifest = load_manifest(platform, interface)
+    binary = manifest.get("binary")
+    if binary and not binary.endswith((".py", ".toml", ".md", ".yaml", ".yml")):
+        (base / binary).unlink(missing_ok=True)
+    # When build metadata lives in config.yaml (`package:`), pyproject.toml is
+    # generated at build time — remove it so the committed folder stays source-only.
+    if manifest.get("package"):
+        (base / "pyproject.toml").unlink(missing_ok=True)
+
+
+def _preflight_impl(
     platform: str,
     interface: str,
     version: int | None = None,
@@ -689,6 +763,43 @@ def login_status(
     )
 
 
+def _render_pyproject(pkg: dict) -> str:
+    """Render a `pyproject.toml` from a config.yaml `package:` block, so build
+    metadata lives in config.yaml and the committed folder stays source-only.
+
+    Supported keys: name, version, requires-python, description, dependencies
+    (list), scripts (name→target map), optional-dependencies (extra→[deps]),
+    packages (list). Build backend is setuptools.
+    """
+    def arr(xs: list) -> str:
+        return "[" + ", ".join(f'"{x}"' for x in xs) + "]"
+
+    lines = [
+        "[build-system]",
+        'requires = ["setuptools>=68"]',
+        'build-backend = "setuptools.build_meta"',
+        "",
+        "[project]",
+        f'name = "{pkg["name"]}"',
+        f'version = "{pkg.get("version", "0.1.0")}"',
+    ]
+    if pkg.get("requires-python"):
+        lines.append(f'requires-python = "{pkg["requires-python"]}"')
+    if pkg.get("description"):
+        lines.append(f'description = "{pkg["description"]}"')
+    if pkg.get("dependencies"):
+        lines.append(f'dependencies = {arr(pkg["dependencies"])}')
+    if pkg.get("scripts"):
+        lines += ["", "[project.scripts]"] + [f'{k} = "{v}"' for k, v in pkg["scripts"].items()]
+    if pkg.get("optional-dependencies"):
+        lines += ["", "[project.optional-dependencies]"] + [
+            f"{k} = {arr(v)}" for k, v in pkg["optional-dependencies"].items()
+        ]
+    if pkg.get("packages"):
+        lines += ["", "[tool.setuptools]", f'packages = {arr(pkg["packages"])}']
+    return "\n".join(lines) + "\n"
+
+
 def build(platform: str, interface: str) -> Path:
     """Check out the interface's repo into its folder and build it (no AI).
 
@@ -731,6 +842,13 @@ def build(platform: str, interface: str) -> Path:
                     check=True,
                 )
             src_cwd = src
+
+    # `package:` in config.yaml IS the build manifest — write the pyproject.toml
+    # the build needs into the build dir (not committed). Lets the committed
+    # folder stay config.yaml + source code only.
+    package = manifest.get("package")
+    if package:
+        (Path(src_cwd) / "pyproject.toml").write_text(_render_pyproject(package))
 
     if install_steps:
         env = os.environ.copy()

@@ -34,7 +34,7 @@ import re
 import shutil
 import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -93,9 +93,23 @@ class RunSpec:
     version: str | None = None       # "v<N>" or just N (int as string)
     prev_run: str | None = None
     prev_version: str | None = None  # "v<N>" or just N
+    # Treatment config path (experiment runs only). When set and it carries
+    # experiment metadata, the row is appended directly to the global
+    # results/experiments.csv instead of a per-run results.csv.
+    experiment_config: str | None = None
     # Run the upfront preflight (platform install/login + skill access probe).
     # Batch runners set this False after doing one shared preflight over the union.
     preflight: bool = True
+
+
+def _results_root_from(runs_root: Path) -> Path:
+    """The `results/` root containing a run's `runs_root` (…/results/autoresearch/
+    <run>/v<N>). Falls back to `runs_root` if no `results` ancestor is found."""
+    runs_root = Path(runs_root)
+    for p in (runs_root, *runs_root.parents):
+        if p.name == "results":
+            return p
+    return runs_root
 
 
 def _make_venv(target: Path) -> Path:
@@ -498,18 +512,31 @@ def run(spec: RunSpec) -> results.Row:
             **slim_grading,
         )
 
-        # One results.csv per session, inside that session's run dir. For
-        # autoresearch, `runs_root` is `<run>/incr_N`, so the CSV lives one
-        # level up at `<run>/results.csv` and accumulates rows from every
-        # increment in the session. Benchmark leaves `increment` None, so
-        # the CSV stays at `<runs_root>/results.csv`.
-        master_csv_dir = spec.runs_root.parent if spec.version else spec.runs_root
-        results.append(
-            master_csv_dir / "results.csv",
-            row,
-            # Benchmark uses the slimmer column set; autoresearch uses the full FIELDS.
-            fields=None if spec.version else results.BENCHMARK_FIELDS,
-        )
+        # Autoresearch writes ONE exploded row straight into the global
+        # results/autoresearch/experiments.csv (no per-run results.csv).
+        # Benchmark keeps its per-session results.csv.
+        exp_cfg = None
+        if spec.experiment_config:
+            from banter import autoresearch as ar_mod
+            try:
+                exp_cfg = ar_mod.load_config(Path(spec.experiment_config))
+            except Exception:
+                exp_cfg = None
+        if exp_cfg is not None:
+            from banter import experiments as experiments_mod
+            results_root = _results_root_from(spec.runs_root)
+            experiments_mod.append_run(results_root, exp_cfg, asdict(row))
+        else:
+            # One results.csv per session, inside that session's run dir. For
+            # autoresearch `runs_root` is `<run>/v<N>`, so the CSV lives one
+            # level up at `<run>/results.csv`; benchmark keeps it at runs_root.
+            master_csv_dir = spec.runs_root.parent if spec.version else spec.runs_root
+            results.append(
+                master_csv_dir / "results.csv",
+                row,
+                # Benchmark uses the slimmer column set; autoresearch the full FIELDS.
+                fields=None if spec.version else results.BENCHMARK_FIELDS,
+            )
 
         # Notebook regeneration happens once at end-of-autoresearch (which
         # has the goals in-process); the runner just appends rows to the CSV.

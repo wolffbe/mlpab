@@ -1,39 +1,56 @@
-# Hopsworks CLI interface — config (where it lives + how to build/run it).
+# Hopsworks CLI interface — the `hops` CLI shipped IN hopsworks-api
+# (python/hopsworks/cli, console script `hops` → hopsworks.cli.main:main).
 #
-# This file holds NO versions. The base prompt below is version 0. Improved
-# versions are created *inside* an autoresearch session, under
-#   results/autoresearch/<session_id>/platforms/hopsworks/cli/v<n>/version.yaml
-# and never mutate this file.
+# Built LOCALLY from source (no PyPI): preflight builds the hopsworks wheel from
+# the repo's python/ dir into $INTERFACE_DIR and each engineer run installs THAT
+# wheel into its venv. Same wheel as the SDK + MCP interfaces — only the entry
+# point (the `hops` command) differs.
 #
-# Build:    automatic at preflight (runs the `install:` steps below).
-# Set keys: banter setup platforms/hopsworks/cli/config.yaml   (or `make setup`)
+# This file holds NO versions. The base prompt below is version 0; improved
+# versions are created inside an autoresearch session under
+#   results/autoresearch/<session_id>/.../hopsworks/cli/v<n>/.
+#
+# Set keys: edit the global testbed/.env (see `keys:` below).
 
 # --- Where it lives / how to build it (run automatically at preflight) ---
-repo: https://github.com/MagicLex/hopsworks-cli
+repo: https://github.com/logicalclocks/hopsworks-api
 ref: main
 install:
-  # The built binary is written into the interface's binary dir:
-  #   platforms/hopsworks/cli/   ($INTERFACE_DIR)
-  - go build -o $INTERFACE_DIR/hops .
-# Non-interactive when HOPSWORKS_API_KEY / HOPSWORKS_HOST are present (see keys);
-# also used by preflight as the login check (exit 0 = authenticated).
-auth_command: hops login
-# Deterministic "does it actually run?" check (no AI). Preflight runs this with
-# the binary on PATH and the keys in the environment; exit 0 = healthy.
+  # Build the wheel from source into $INTERFACE_DIR, then RENAME it to one fixed,
+  # valid wheel filename (upstream version floats, e.g. 5.0.0.devN — `mv` leaves
+  # exactly one wheel, like the mlkit interfaces). pip reads the real version from
+  # the wheel's own metadata, so the fixed `-0-` name is cosmetic.
+  - pip install build
+  - python -m build --wheel --outdir "$INTERFACE_DIR" python
+  - sh -c 'mv "$(ls -t "$INTERFACE_DIR"/hopsworks-*.whl | head -1)" "$INTERFACE_DIR/hopsworks-0-py3-none-any.whl"'
+
+# Deterministic, OFFLINE "does it run?" check (no live cluster): the `hops`
+# command installs and responds to --help.
 test_command: hops --help
 
-# --- How to run it (per engineer run) ---
-binary: hops
-runtime_install:
-  - cp $INTERFACE_DIR/hops $VIRTUAL_ENV/bin/hops
+# Real connectivity check: `hops login` authenticates using HOPSWORKS_API_KEY /
+# HOPSWORKS_HOST from the environment (non-interactive when both are set) and
+# exits non-zero on a bad/missing key. `--no-save-key` keeps it from persisting
+# credentials to disk, so the check leaves no state behind.
+auth_command: hops login --no-save-key
 
-# --- Credentials (values live here; `banter setup <manifest>` fills them;
-#     injected into the engineer's environment for each run) ---
+# --- How to run it (per engineer run) — install the locally-built wheel. The
+#     `hops` console script ships with the package; `[python]` pulls the deps
+#     its commands need. ---
+binary: hopsworks-0-py3-none-any.whl
+# The invokable command name, so banter accounts `hops …` calls as cli_calls.
+cli_command: hops
+runtime_install:
+  - 'pip install "$INTERFACE_DIR/hopsworks-0-py3-none-any.whl[python]"'
+
+# --- Credentials — names only; values resolve from the GLOBAL testbed/.env at
+#     run time (never stored here). ---
 keys:
-  HOPSWORKS_API_KEY: ""
-  HOPSWORKS_HOST: ""
+  - HOPSWORKS_API_KEY   # secret
+  - HOPSWORKS_HOST      # Hopsworks endpoint
 
 # --- Base prompt (version 0) ---
 prompt: |
-  The Hopsworks `hops` CLI is installed and you are already authenticated.
-  Use `hops <subcommand>` for all Hopsworks operations. Run `hops --help` to list available commands.
+  The Hopsworks `hops` CLI is installed and authenticated via HOPSWORKS_API_KEY
+  and HOPSWORKS_HOST from the environment. Use `hops <subcommand>` for Hopsworks
+  operations; run `hops --help` to list available commands.

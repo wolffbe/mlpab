@@ -208,7 +208,12 @@ def run_benchmark(
     ]
     try:
         # Build + test the platforms once at session start (login is checked per
-        # challenge by the runner, in each run's own venv).
+        # challenge by the runner, in each run's own venv). NOTE: benchmark runs
+        # the engineer directly against the committed interface dir ($INTERFACE_DIR
+        # = bin_dir; RunSpec sets no interface_dir and preflight=False, so nothing
+        # rebuilds per run). The built artifact MUST persist here for the engineer's
+        # runtime_install — so we do NOT cleanup_build (unlike autoresearch, which
+        # builds into v0/vN copies and keeps the committed folder source-only).
         preflight_mod.preflight(
             reqs, auth=config.engineer_auth, model=config.engineer_model, check_login=False,
         )

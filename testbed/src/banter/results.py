@@ -762,48 +762,6 @@ def write_commands_log(
     commands_log.write_text("\n".join(lines) + ("\n" if lines else ""))
 
 
-_ANNOTATION_KEYS = (
-    "hypothesis", "change", "verdict", "verdict_reason",
-    "keep", "observations", "proposed_changes",
-)
-
-
-def annotate_version(
-    results_csv: Path,
-    *,
-    run: str,
-    version: str,
-    updates: dict[str, Any],
-) -> int:
-    """Fill in the per-version annotation columns on every row whose
-    `(run, version)` matches. Returns the number of rows updated.
-
-    The researcher calls `banter annotate-version` once per finished
-    version with the verdict + observations + proposed_changes; those
-    values land on every challenge row of that version so the CSV is
-    self-contained.
-    """
-    if not results_csv.exists():
-        return 0
-    rows: list[dict[str, Any]] = []
-    with results_csv.open() as f:
-        rows = list(csv.DictReader(f))
-    n = 0
-    for r in rows:
-        if str(r.get("run", "")) == str(run) and str(r.get("version", "")) == str(version):
-            for k in _ANNOTATION_KEYS:
-                if k in updates and updates[k] is not None:
-                    r[k] = str(updates[k])
-            n += 1
-    if n:
-        with results_csv.open("w", newline="") as fw:
-            w = csv.DictWriter(fw, fieldnames=FIELDS)
-            w.writeheader()
-            for r in rows:
-                w.writerow({k: r.get(k, "") for k in FIELDS})
-    return n
-
-
 def append(results_csv: Path, row: Row, fields: list[str] | None = None) -> None:
     """Write `row` to results.csv. If a previous row has the same `run_dir`
     (i.e. the same combo was re-run), it's replaced rather than appended, so

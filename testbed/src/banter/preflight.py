@@ -60,6 +60,7 @@ def preflight(
     check_login: bool = True,
     probe_skills: bool = True,
     timeout_s: int = 120,
+    cleanup_build: bool = False,
 ) -> None:
     """Verify every requirement upfront. Raises PreflightError on first failure.
 
@@ -84,7 +85,7 @@ def preflight(
         seen_platforms.add(pkey)
         status = interfaces.preflight(
             req.platform, req.interface, req.interface_version, req.version_root,
-            check_login=check_login, timeout_s=timeout_s,
+            check_login=check_login, timeout_s=timeout_s, cleanup_build=cleanup_build,
         )
         if not status.ok:
             raise PreflightError(status.message)
