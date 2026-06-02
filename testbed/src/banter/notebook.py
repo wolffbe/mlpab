@@ -147,7 +147,7 @@ def _intro_cell(
         "**optimized** marker "
         "indicates which ones the researcher is actively driving per the "
         "config's `goals` block; the rest are tracked for situational "
-        "awareness (e.g. an interface refactor that improves `score` while "
+        "awareness (e.g. a platform refactor that improves `score` while "
         "ballooning `wall_time_s`)."
     )
 

@@ -1,4 +1,4 @@
-"""Orchestrates a single (challenge, interface, mode, skills) engineer run.
+"""Orchestrates a single (challenge, platform, interface, skills) engineer run.
 
 Layout produced under the caller-supplied `runs_root`:
     <runs_root>/<task>/<challenge>/      # one engineer run; venv torn down at end
@@ -19,10 +19,10 @@ Each challenge run folder contains:
     grading.json          # MLE-bench grader output
     .claude/settings.json # PreToolUse hook for claude -p
     .claude/skills/       # copied skill bundle (deleted at teardown)   [skills != none]
-    .mcp.json             # MCP servers                                  [mode == mcp]
+    .mcp.json             # MCP servers                                  [interface == mcp]
 
 When `spec.interface_dir` is set (autoresearch's per-increment copy), this run's
-interface home is pointed at that copy via `interfaces.set_interface_home`; any
+platform home is pointed at that copy via `interfaces.set_interface_home`; any
 stale wheel is dropped and `interfaces.preflight` force-rebuilds the researcher's
 edits before the engineer uses it. Login (`auth_command`) is verified per run.
 """
@@ -66,10 +66,10 @@ RESEARCHER_VENV = TESTBED_ROOT / ".venv"
 @dataclass
 class RunSpec:
     challenge_id: str
-    interface: str                  # e.g. "hopsworks", "none"
-    mode: str                       # interface type: cli/mcp/sdk/none
+    platform: str                   # e.g. "hopsworks", "none"
+    interface: str                  # interface: cli/mcp/sdk/none
     skills: str = "none"            # bundle name under testbed/skills/ or "none"
-    docs: str = "none"              # docs bundle under interfaces/<project>/docs/ or "none"
+    docs: str = "none"              # docs bundle under platforms/<platform>/docs/ or "none"
     task: str = "no_task"           # ML task / challenge-group this challenge belongs to
     model: str = DEFAULT_MODEL
     auth: str = "api-key"
@@ -78,12 +78,12 @@ class RunSpec:
     data_root: Path = DEFAULT_DATA_ROOT
     interface_version: int | None = None  # None/0 → base manifest; >0 → session version
     skills_version: int | None = None     # None → latest version
-    # Where session-local interface versions live (an autoresearch session dir).
+    # Where session-local platform versions live (an autoresearch session dir).
     # Required to resolve interface_version > 0.
     version_root: Path | None = None
-    # Per-increment interface copy (autoresearch): the engineer builds + uses THIS
-    # interface home instead of the committed one. Built fresh here (the copy
-    # ships source, no binary). None → committed interfaces/<name>/<type>/.
+    # Per-increment platform copy (autoresearch): the engineer builds + uses THIS
+    # platform home instead of the committed one. Built fresh here (the copy
+    # ships source, no binary). None → committed platforms/<platform>/<interface>/.
     interface_dir: Path | None = None
     # Autoresearch context (None for benchmark). `run_id` → `run` column.
     # `prev_run` / `prev_version` come from the autoresearch config
@@ -93,7 +93,7 @@ class RunSpec:
     version: str | None = None       # "v<N>" or just N (int as string)
     prev_run: str | None = None
     prev_version: str | None = None  # "v<N>" or just N
-    # Run the upfront preflight (interface install/login + skill access probe).
+    # Run the upfront preflight (platform install/login + skill access probe).
     # Batch runners set this False after doing one shared preflight over the union.
     preflight: bool = True
 
@@ -151,7 +151,7 @@ def _clone_tree(src: Path, dst: Path) -> None:
 
 
 def _run_aux(steps: list[str], run_dir: Path, env: dict[str, str], timeout: int = 60) -> None:
-    """Best-effort interface housekeeping steps (serve/teardown). Failures are
+    """Best-effort platform housekeeping steps (serve/teardown). Failures are
     ignored and output discarded — these are not part of the engineer's work.
     """
     for cmd in steps:
@@ -223,8 +223,8 @@ def detect_environment() -> str:
     return "\n".join(lines)
 
 
-# The "interface is under test" rule is the engineer default — baked into
-# engineer.md between these markers. It only applies when an interface is
+# The "platform is under test" rule is the engineer default — baked into
+# engineer.md between these markers. It only applies when a platform is
 # present; for none/none (the engineer builds its own model freely) the whole
 # section is stripped.
 _UNDER_TEST_RE = re.compile(
@@ -248,7 +248,7 @@ def _build_prompt(
         docs_block = (
             f"\n\n## Reference docs\n\n"
             f"A docs bundle (`{docs_name}`) is available at `./docs/` — browse "
-            f"these files when you need to look up how the interface works "
+            f"these files when you need to look up how the platform works "
             f"(API surfaces, expected inputs/outputs, examples). Treat them as "
             f"read-only reference. They will NOT make API calls themselves."
         )
@@ -267,30 +267,30 @@ def run(spec: RunSpec) -> results.Row:
 
     started = datetime.now(timezone.utc)
 
-    # Per-version interface copy (autoresearch): point this interface's home
+    # Per-version platform copy (autoresearch): point this platform's home
     # at the copy so config/build/$INTERFACE_DIR/install all resolve there.
     # ALWAYS rebuild — the researcher may have edited source between
     # `prepare-version` and this run, so any wheel in the copy is potentially
     # stale. Drop it; preflight will rebuild + test.
     if spec.interface_dir is not None:
-        interfaces.set_interface_home(spec.interface, spec.mode, spec.interface_dir)
+        interfaces.set_interface_home(spec.platform, spec.interface, spec.interface_dir)
         for w in list(Path(spec.interface_dir).glob("*.whl")):
             try:
                 w.unlink()
             except OSError:
                 pass
-        st = interfaces.preflight(spec.interface, spec.mode, check_login=False, timeout_s=spec.timeout_s)
+        st = interfaces.preflight(spec.platform, spec.interface, check_login=False, timeout_s=spec.timeout_s)
         if not st.ok:
             raise preflight_mod.PreflightError(st.message)
 
-    # Fail fast, upfront: the interface must be installed + login must work, and
+    # Fail fast, upfront: the platform must be installed + login must work, and
     # any chosen skill bundle must be accessible to the engineer in a run.
     # Batch runners (benchmark/autoresearch) preflight the union once and pass
     # preflight=False here to avoid re-probing per run.
     if spec.preflight:
         preflight_mod.check_run(
+            platform=spec.platform,
             interface=spec.interface,
-            mode=spec.mode,
             interface_version=spec.interface_version,
             version_root=spec.version_root,
             skills=spec.skills,
@@ -299,11 +299,11 @@ def run(spec: RunSpec) -> results.Row:
             model=spec.model,
         )
 
-    # Fail-fast: validate the interface version is known before doing work
+    # Fail-fast: validate the platform version is known before doing work
     # (raises on an unknown version). The resolved version/hash used for the
     # row come from `interfaces.setup` below, not from here.
     interfaces.variant_for(
-        spec.interface, spec.mode, spec.interface_version, spec.version_root
+        spec.platform, spec.interface, spec.interface_version, spec.version_root
     )
     # Fail fast on unverified skill bundles — before spending time on
     # venv/data/prep we want to know the bundle is well-formed.
@@ -311,13 +311,13 @@ def run(spec: RunSpec) -> results.Row:
         skills_version, skills_hash = 0, ""
     else:
         skills_version, skills_hash, _ = skills_mod.verify_installed(
-            spec.interface, spec.skills, spec.skills_version, spec.version_root
+            spec.platform, spec.skills, spec.skills_version, spec.version_root
         )
     # Per-challenge output lives directly under the caller-supplied runs_root:
     #   benchmark      results/benchmark/<run>/<task>/<challenge>/
     #   autoresearch   results/autoresearch/<run>/<increment>/<task>/<challenge>/
-    # Interface / type / skills / version are recorded as results.csv columns, not
-    # encoded in the path (one interface per run, per the per-type configs).
+    # Platform / interface / skills / version are recorded as results.csv columns,
+    # not encoded in the path (one platform per run, per the per-interface configs).
     run_dir = spec.runs_root / spec.task / spec.challenge_id
     # Re-runs overwrite the previous output.
     if run_dir.exists():
@@ -339,11 +339,11 @@ def run(spec: RunSpec) -> results.Row:
         mlebench_wrapper.prepare(spec.challenge_id, run_dir, spec.data_root)
 
         interface_setup = interfaces.setup(
-            spec.interface, spec.mode, run_dir, venv_python,
+            spec.platform, spec.interface, run_dir, venv_python,
             spec.interface_version, spec.version_root,
         )
         skills_setup = skills_mod.apply(
-            spec.interface, spec.skills, run_dir, spec.skills_version, spec.version_root
+            spec.platform, spec.skills, run_dir, spec.skills_version, spec.version_root
         )
         if skills_setup.installed:
             print(
@@ -380,14 +380,14 @@ def run(spec: RunSpec) -> results.Row:
         # once at session preflight; login is re-checked on every run (catches
         # expired creds mid-session; each run authenticates in its own venv).
         login = interfaces.login_status(
-            spec.interface, spec.mode, venv_python=venv_python, keys=interface_setup.keys,
+            spec.platform, spec.interface, venv_python=venv_python, keys=interface_setup.keys,
         )
         if not login.ok:
             raise preflight_mod.PreflightError(login.message)
 
         prompt = _build_prompt(spec.challenge_id, interface_setup.prompt_fragment,
                                docs_name=spec.docs,
-                               interface_under_test=interface_setup.type != "none")
+                               interface_under_test=interface_setup.interface != "none")
         (run_dir / "prompt.txt").write_text(prompt)
 
         # When in autoresearch (`spec.version` is set), confine the engineer's
@@ -480,8 +480,8 @@ def run(spec: RunSpec) -> results.Row:
             started_at=started.isoformat(),
             run=spec.run_id or "",
             version=_to_v(spec.version),
+            platform=spec.platform,
             interface=spec.interface,
-            type=spec.mode,
             skills=spec.skills,
             prev_run=spec.prev_run or "",
             prev_version=_to_v(spec.prev_version),
@@ -514,8 +514,8 @@ def run(spec: RunSpec) -> results.Row:
         # Notebook regeneration happens once at end-of-autoresearch (which
         # has the goals in-process); the runner just appends rows to the CSV.
 
-        # Teardown: the run is done — stop the interface's background servers,
-        # then remove its standalone venv (the interface package + everything the
+        # Teardown: the run is done — stop the platform's background servers,
+        # then remove its standalone venv (the platform package + everything the
         # engineer pip-installed) and the copied skill bundle, so nothing persists
         # into other runs. Results/artifacts (transcript, stream.log, submission,
         # grading) stay.

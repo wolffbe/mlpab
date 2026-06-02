@@ -15,7 +15,7 @@ Materialization:
 
 `docs: none` is the without-docs control — no clone, nothing in the run.
 
-Docs are static across versions (they describe the interface, not the
+Docs are static across versions (they describe the platform, not the
 attempt). They influence neither the call-accounting metrics nor any
 permission/deny pattern — they're just files the model can `Read`.
 """

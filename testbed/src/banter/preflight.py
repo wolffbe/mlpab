@@ -4,7 +4,7 @@ Before any engineer run — and once, over the union of requirements, before a
 benchmark or autoresearch session — we verify that everything the engineer
 (the controlled Claude Code instance) will depend on is actually ready:
 
-  * Interfaces — built (from the config's install steps), logged in, and tested
+  * Platforms — built (from the config's install steps), logged in, and tested
     (delegated to interfaces.preflight; on failure it points at the config or
     `make setup`).
   * Skills — the bundle exists, installs, AND the engineer can actually access
@@ -27,14 +27,14 @@ from banter import interfaces, skills
 
 
 class PreflightError(RuntimeError):
-    """Raised when a required interface or skill isn't ready for a run."""
+    """Raised when a required platform or skill isn't ready for a run."""
 
 
 @dataclass
 class Requirement:
-    """One (interface, skills) combination a run will use."""
+    """One (platform, interface, skills) combination a run will use."""
+    platform: str
     interface: str
-    mode: str
     interface_version: int | None = None
     version_root: Path | None = None
     skills: str = "none"
@@ -65,7 +65,7 @@ def preflight(
 
     Runs in two distinct phases:
 
-      Phase 1 — INTERFACES (deterministic, no AI). Every interface is built,
+      Phase 1 — PLATFORMS (deterministic, no AI). Every platform is built,
       logged in, and tested via plain shell commands. This phase is fully
       independent of the researcher and the engineer; nothing here invokes a
       Claude instance, and it completes before any AI is involved.
@@ -73,17 +73,17 @@ def preflight(
       Phase 2 — SKILLS (uses the engineer). The only check that needs an AI:
       a short engineer probe confirms each skill is actually accessible.
 
-    Interfaces and skills are de-duplicated so each unique one is checked once.
+    Platforms and skills are de-duplicated so each unique one is checked once.
     """
-    # Phase 1 — interfaces only (no AI).
-    seen_ifaces: set[tuple] = set()
+    # Phase 1 — platforms only (no AI).
+    seen_platforms: set[tuple] = set()
     for req in requirements:
-        ikey = (req.interface, req.mode, req.interface_version, str(req.version_root))
-        if ikey in seen_ifaces:
+        pkey = (req.platform, req.interface, req.interface_version, str(req.version_root))
+        if pkey in seen_platforms:
             continue
-        seen_ifaces.add(ikey)
+        seen_platforms.add(pkey)
         status = interfaces.preflight(
-            req.interface, req.mode, req.interface_version, req.version_root,
+            req.platform, req.interface, req.interface_version, req.version_root,
             check_login=check_login, timeout_s=timeout_s,
         )
         if not status.ok:
@@ -93,19 +93,19 @@ def preflight(
     seen_skills: set[tuple] = set()
     for req in requirements:
         if req.skills and req.skills != "none":
-            skey = (req.interface, req.skills, req.skills_version, str(req.version_root))
+            skey = (req.platform, req.skills, req.skills_version, str(req.version_root))
             if skey not in seen_skills:
                 seen_skills.add(skey)
                 _check_skill(
-                    req.interface, req.skills, req.skills_version, req.version_root,
+                    req.platform, req.skills, req.skills_version, req.version_root,
                     auth=auth, model=model, probe=probe_skills, timeout_s=timeout_s,
                 )
 
 
 def check_run(
     *,
+    platform: str,
     interface: str,
-    mode: str,
     interface_version: int | None,
     version_root: Path | None,
     skills: str,
@@ -119,7 +119,7 @@ def check_run(
     Raises PreflightError on failure."""
     preflight(
         [Requirement(
-            interface=interface, mode=mode, interface_version=interface_version,
+            platform=platform, interface=interface, interface_version=interface_version,
             version_root=version_root, skills=skills, skills_version=skills_version,
         )],
         auth=auth, model=model, probe_skills=probe_skills, check_login=False,
@@ -148,7 +148,7 @@ def _check_skill(
     except ValueError as e:
         raise PreflightError(
             f"skill bundle {name!r}: {e}\n"
-            f"  → Fix the bundle under interfaces/{project}/skills/{name}/."
+            f"  → Fix the bundle under platforms/{project}/skills/{name}/."
         )
 
     if not probe:

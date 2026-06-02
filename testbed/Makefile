@@ -15,7 +15,7 @@ BANTER := $(VENV)/bin/banter
 LOCALBIN := $(HOME)/.local/bin
 
 # Silence the `A new release of pip is available` notice everywhere — make
-# install, per-run venv creation, interface `install:` steps. We intentionally
+# install, per-run venv creation, platform `install:` steps. We intentionally
 # don't upgrade pip in every venv; just hide the banner.
 export PIP_DISABLE_PIP_VERSION_CHECK := 1
 export PIP_NO_PYTHON_VERSION_WARNING := 1
@@ -35,7 +35,7 @@ help:
 	@echo "  make test-integration — run live-claude integration tests (real API calls)"
 	@echo "  make uninstall — remove the venv + build artifacts (install state)"
 	@echo ""
-	@echo "Run a config:  banter run interfaces/<project>/<benchmark|autoresearch>/<name>.yaml"
+	@echo "Run a config:  banter run platforms/<project>/<benchmark|autoresearch>/<name>.yaml"
 	@echo "Clear results: banter clean"
 
 check-git:

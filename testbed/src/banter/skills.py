@@ -4,7 +4,7 @@ Skills mirror interfaces: the base (version 0) bundle is committed in the
 project's interface tree, and improved versions are created session-locally
 under an autoresearch session (results/autoresearch/<id>/...):
 
-    interfaces/<project>/skills/<bundle>/<skill>/SKILL.md          # base (v0)
+    platforms/<project>/skills/<bundle>/<skill>/SKILL.md          # base (v0)
     <version_root>/skills/<bundle>/v<n>/<skill>/SKILL.md           # session v>0
 
 `banter run --skills <bundle>` copies every skill subfolder of the chosen
@@ -22,7 +22,7 @@ from pathlib import Path
 
 
 _TESTBED_ROOT = Path(__file__).resolve().parents[2]
-INTERFACES_DIR = _TESTBED_ROOT / "interfaces"
+PLATFORMS_DIR = _TESTBED_ROOT / "platforms"
 
 
 @dataclass
@@ -34,12 +34,12 @@ class SkillsSetup:
 
 
 def _skills_root(project: str) -> Path:
-    """The project's base skills dir: interfaces/<project>/skills/."""
-    return INTERFACES_DIR / project / "skills"
+    """The project's base skills dir: platforms/<project>/skills/."""
+    return PLATFORMS_DIR / project / "skills"
 
 
 def _bundle_dir(project: str, name: str, version: int, version_root: Path | None) -> Path:
-    """Resolve a bundle version folder. Version 0 → base (in interfaces);
+    """Resolve a bundle version folder. Version 0 → base (in platforms);
     version > 0 → session-local under version_root."""
     if version and version_root is not None:
         return Path(version_root) / "skills" / name / f"v{version}"

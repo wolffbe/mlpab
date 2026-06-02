@@ -35,7 +35,7 @@ HOOK_SCRIPT = Path(__file__).resolve().parent / "hooks" / "log_tool_call.py"
 # Tools blocked for both researcher and engineer: scheduling/async (end the
 # `-p` turn or run unobservably), nested subagents (cost-attribution loss),
 # plan/worktree modes (unused), and a few meta tools. `mcp__*` tools stay
-# allowed — including whichever interface MCP servers are loaded.
+# allowed — including whichever platform MCP servers are loaded.
 COMMON_DENY = [
     # Background scheduling / async — calling these in -p ends the turn.
     "ScheduleWakeup",
@@ -201,9 +201,9 @@ class ClaudeResult:
     stderr_path: Path
 
 
-# Baseline outbound hosts every engineer needs regardless of interface:
-# Claude itself (api.anthropic.com) + loopback for any local interface server.
-# Interface-specific hosts come from each `interfaces/<name>/<type>/config.yaml`
+# Baseline outbound hosts every engineer needs regardless of platform:
+# Claude itself (api.anthropic.com) + loopback for any local platform server.
+# Platform-specific hosts come from each `platforms/<platform>/<interface>/config.yaml`
 # via the `allowed_domains:` key.
 BASE_ALLOWED_DOMAINS = (
     "127.0.0.1", "localhost",
@@ -229,7 +229,7 @@ def _write_settings(
     bypassPermissions — soft (prompt + cwd) only.
 
     Network is unrestricted (no `allowedDomains`); `allowLocalBinding`
-    covers interface servers (mlkit binds 127.0.0.1:8765). `.claude/`
+    covers platform servers (mlkit binds 127.0.0.1:8765). `.claude/`
     state lands inside `boundary` via the HOME redirect in :func:`run`.
     """
     # Engineer's world = its challenge folder (`run_dir`). Each challenge is
@@ -261,7 +261,7 @@ def _write_settings(
     # block — so we explicitly opt back out with allowRead/Write `["/"]`,
     # then layer just the network allowlist. Result:
     #   - Outbound: only baseline (Claude API + loopback) + whatever the
-    #     interface declares in its `allowed_domains:` config. No pypi /
+    #     platform declares in its `allowed_domains:` config. No pypi /
     #     HF / kaggle / github / arbitrary HTTPS during the run.
     #   - Filesystem: unrestricted. Confinement falls to the PreToolUse
     #     hook (path-based deny for Read/Write/Edit, enforced regardless
@@ -323,7 +323,7 @@ def run(
     Always forwards a Keychain OAuth token (when present) since the
     redirected HOME has no on-disk credentials. `auth="login"` additionally
     strips ANTHROPIC_API_KEY so OAuth wins; `auth="api-key"` keeps both
-    and lets claude-code pick. `extra_env` layers interface credentials.
+    and lets claude-code pick. `extra_env` layers platform credentials.
     """
     if shutil.which("claude") is None:
         raise RuntimeError("`claude` CLI not found on PATH. Install Claude Code first.")
@@ -375,7 +375,7 @@ def run(
     # Skip pip cache (per-run venv inherits via .pth; cache dir unwritable).
     env["PIP_NO_CACHE_DIR"] = "1"
 
-    # Interface credentials override inherited values.
+    # Platform credentials override inherited values.
     if extra_env:
         env.update({k: v for k, v in extra_env.items() if v})
 

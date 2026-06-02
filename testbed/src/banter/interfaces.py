@@ -1,14 +1,14 @@
-"""Resolve a chosen (interface, type, version) for an engineer run.
+"""Resolve a chosen (platform, interface, version) for an engineer run.
 
 Two locations, with one job each:
 
-    interfaces/<name>/<type>/config.yaml   — CONFIG: where the interface lives,
-                                              how to build it, how to run it,
-                                              which credential keys it needs, and
-                                              the base (version 0) prompt.
+    platforms/<platform>/<interface>/config.yaml — CONFIG: where the interface
+                                              lives, how to build it, how to run
+                                              it, which credential keys it needs,
+                                              and the base (version 0) prompt.
 
-    interfaces/<name>/<type>/               — BINARY: the built artifact only
-                                              (e.g. interfaces/hopsworks/cli/hops).
+    platforms/<platform>/<interface>/        — BINARY: the built artifact only
+                                              (e.g. platforms/hopsworks/cli/hops).
                                               SDK interfaces build nothing (they
                                               pip-install per run) and so have no
                                               folder here. `none` has no folder.
@@ -16,7 +16,7 @@ Two locations, with one job each:
 The config manifest carries NO versions. Its `prompt:` is version 0 — the base.
 Improved versions are created and live INSIDE an autoresearch session:
 
-    <version_root>/interfaces/<name>/<type>/v<n>/version.yaml
+    <version_root>/platforms/<platform>/<interface>/v<n>/version.yaml
 
 where `<version_root>` is the autoresearch session directory. A version.yaml
 overrides the base manifest (a refined `prompt:`, and optionally `binary`,
@@ -43,24 +43,24 @@ from typing import Any
 import yaml
 
 
-TYPES = ("cli", "mcp", "sdk", "none")
+INTERFACES = ("cli", "mcp", "sdk", "none")
 _TESTBED_ROOT = Path(__file__).resolve().parents[2]
 
 # Single unified tree. For each interface the config, the checked-out source
 # code, and the built binary all live together — that IS the base (v0) version:
-#     interfaces/<project>/<type>/config.yaml   (config: build/run/keys/prompt)
-#     interfaces/<project>/<type>/...           (source code + built artifact)
-# A project also holds its own skills + research configs:
-#     interfaces/<project>/skills/<bundle>/<version>/<skill>/SKILL.md
-#     interfaces/<project>/autoresearch/*.yaml
-#     interfaces/<project>/benchmark/*.yaml
-INTERFACES_DIR = _TESTBED_ROOT / "interfaces"
+#     platforms/<platform>/<interface>/config.yaml (config: build/run/keys/prompt)
+#     platforms/<platform>/<interface>/...          (source code + built artifact)
+# A platform also holds its own skills + research configs:
+#     platforms/<platform>/skills/<bundle>/<version>/<skill>/SKILL.md
+#     platforms/<platform>/autoresearch/*.yaml
+#     platforms/<platform>/benchmark/*.yaml
+PLATFORMS_DIR = _TESTBED_ROOT / "platforms"
 
 
 @dataclass
 class InterfaceSetup:
-    name: str
-    type: str
+    platform: str
+    interface: str
     prompt_fragment: str
     version: int
     hash: str
@@ -80,8 +80,8 @@ class InterfaceSetup:
 @dataclass
 class InterfaceStatus:
     """Outcome of an interface preflight check."""
-    name: str
-    type: str
+    platform: str
+    interface: str
     ok: bool
     installed: bool
     authenticated: bool
@@ -92,8 +92,8 @@ class InterfaceStatus:
     @property
     def message(self) -> str:
         if self.ok:
-            return f"{self.name}/{self.type}: ready"
-        msg = f"{self.name}/{self.type}: {self.reason}"
+            return f"{self.platform}/{self.interface}: ready"
+        msg = f"{self.platform}/{self.interface}: {self.reason}"
         if self.fix_command:
             msg += f"\n  → Run: {self.fix_command}"
         return msg
@@ -104,54 +104,56 @@ class InterfaceStatus:
 # ---------------------------------------------------------------------------
 
 
-# Per-(name,type) override of an interface's home directory. Autoresearch sets
-# this (via set_interface_home / `banter run --interface-dir`) so the engineer
-# builds + uses the increment's OWN interface copy (results/autoresearch/<run>/
-# <inc>/interface/) instead of the committed interfaces/<name>/<type>/. Safe as
-# process-global state: each `banter run` process handles exactly one interface.
+# Per-(platform,interface) override of an interface's home directory.
+# Autoresearch sets this (via set_interface_home / `banter run --interface-dir`)
+# so the engineer builds + uses the increment's OWN interface copy
+# (results/autoresearch/<run>/<inc>/interface/) instead of the committed
+# platforms/<platform>/<interface>/. Safe as process-global state: each
+# `banter run` process handles exactly one interface.
 _INTERFACE_HOME: dict[tuple[str, str], Path] = {}
 
 
-def set_interface_home(name: str, type_: str, home: Path) -> None:
+def set_interface_home(platform: str, interface: str, home: Path) -> None:
     """Point this interface's home at `home` (the per-increment copy) for this
     process — config.yaml, $INTERFACE_DIR, build, install all resolve there."""
-    _INTERFACE_HOME[(name, type_)] = Path(home)
+    _INTERFACE_HOME[(platform, interface)] = Path(home)
 
 
-def manifest_path(name: str, type_: str) -> Path:
-    return bin_dir(name, type_) / "config.yaml"
+def manifest_path(platform: str, interface: str) -> Path:
+    return bin_dir(platform, interface) / "config.yaml"
 
 
-def name_type_from_config(config_path: str | Path) -> tuple[str, str]:
-    """Infer (project name, type) from an interface config path like
-    `interfaces/<project>/<type>/config.yaml`."""
+def platform_interface_from_config(config_path: str | Path) -> tuple[str, str]:
+    """Infer (platform, interface) from an interface config path like
+    `platforms/<platform>/<interface>/config.yaml`."""
     p = Path(config_path)
-    type_ = p.parent.name
-    name = p.parent.parent.name
-    if type_ not in TYPES:
+    interface = p.parent.name
+    platform = p.parent.parent.name
+    if interface not in INTERFACES:
         raise ValueError(
-            f"Unknown interface type {type_!r} from {config_path!r}. "
-            "Expected a path like interfaces/<project>/<type>/config.yaml"
+            f"Unknown interface {interface!r} from {config_path!r}. "
+            "Expected a path like platforms/<platform>/<interface>/config.yaml"
         )
-    return name, type_
+    return platform, interface
 
 
-def bin_dir(name: str, type_: str) -> Path:
+def bin_dir(platform: str, interface: str) -> Path:
     """The interface's home: config.yaml + checked-out code + built binary.
 
-    Honors a per-(name,type) override set via `set_interface_home` (autoresearch's
-    per-increment interface copy); otherwise the committed interfaces/<name>/<type>/.
+    Honors a per-(platform,interface) override set via `set_interface_home`
+    (autoresearch's per-increment interface copy); otherwise the committed
+    platforms/<platform>/<interface>/.
     """
-    return _INTERFACE_HOME.get((name, type_), INTERFACES_DIR / name / type_)
+    return _INTERFACE_HOME.get((platform, interface), PLATFORMS_DIR / platform / interface)
 
 
-def version_dir(version_root: Path, name: str, type_: str, version: int) -> Path:
+def version_dir(version_root: Path, platform: str, interface: str, version: int) -> Path:
     """Session-local directory for an improved interface version."""
-    return Path(version_root) / "interfaces" / name / type_ / f"v{version}"
+    return Path(version_root) / "platforms" / platform / interface / f"v{version}"
 
 
-def load_manifest(name: str, type_: str) -> dict[str, Any]:
-    p = manifest_path(name, type_)
+def load_manifest(platform: str, interface: str) -> dict[str, Any]:
+    p = manifest_path(platform, interface)
     if not p.exists():
         return {}
     return yaml.safe_load(p.read_text()) or {}
@@ -163,23 +165,23 @@ def load_manifest(name: str, type_: str) -> dict[str, Any]:
 
 
 def _load_version_override(
-    version_root: Path | None, name: str, type_: str, version: int
+    version_root: Path | None, platform: str, interface: str, version: int
 ) -> dict[str, Any]:
     """Read a session-local version.yaml, or {} for base (v0) / when absent."""
     if not version or version_root is None:
         return {}
-    vp = version_dir(version_root, name, type_, version) / "version.yaml"
+    vp = version_dir(version_root, platform, interface, version) / "version.yaml"
     if not vp.exists():
         return {}
     return yaml.safe_load(vp.read_text()) or {}
 
 
 def _resolved_config(
-    name: str, type_: str, version: int, version_root: Path | None
+    platform: str, interface: str, version: int, version_root: Path | None
 ) -> dict[str, Any]:
     """Merge base manifest defaults with a session-local version override."""
-    manifest = load_manifest(name, type_)
-    override = _load_version_override(version_root, name, type_, version)
+    manifest = load_manifest(platform, interface)
+    override = _load_version_override(version_root, platform, interface, version)
     merged: dict[str, Any] = {
         "binary": manifest.get("binary"),
         "runtime_install": manifest.get("runtime_install") or [],
@@ -187,7 +189,7 @@ def _resolved_config(
         "prompt": manifest.get("prompt"),
         # Optional accounting overrides: the invokable CLI command (for cli_calls)
         # and the importable SDK module (for sdk_calls). Default below to `binary`
-        # and the project `name` respectively, so existing configs are unchanged.
+        # and the `platform` respectively, so existing configs are unchanged.
         "cli_command": manifest.get("cli_command"),
         "sdk_module": manifest.get("sdk_module"),
         # Shell steps run per run in the run venv to START the servers the engineer
@@ -204,7 +206,7 @@ def _resolved_config(
 
 
 def _interface_dir_for(
-    name: str, type_: str, version: int, version_root: Path | None, binary: str | None
+    platform: str, interface: str, version: int, version_root: Path | None, binary: str | None
 ) -> Path:
     """The directory to expose as $INTERFACE_DIR — where the binary to use lives.
 
@@ -212,10 +214,10 @@ def _interface_dir_for(
     otherwise the base binary dir is reused.
     """
     if binary and version and version_root is not None:
-        vd = version_dir(version_root, name, type_, version)
+        vd = version_dir(version_root, platform, interface, version)
         if (vd / binary).exists():
             return vd
-    return bin_dir(name, type_)
+    return bin_dir(platform, interface)
 
 
 # ---------------------------------------------------------------------------
@@ -223,38 +225,38 @@ def _interface_dir_for(
 # ---------------------------------------------------------------------------
 
 
-def _auto_prompt(name: str, type_: str, binary: str | None) -> str:
+def _auto_prompt(platform: str, interface: str, binary: str | None) -> str:
     """Generate a sensible default prompt when the config doesn't supply one."""
-    cap = name.capitalize()
-    if type_ == "cli" and binary:
+    cap = platform.capitalize()
+    if interface == "cli" and binary:
         return (
             f"The {cap} `{binary}` CLI is installed and authenticated. "
             f"Use `{binary} <subcommand>` for all {cap} operations."
         )
-    if type_ == "sdk":
+    if interface == "sdk":
         return f"The {cap} Python SDK is installed. Import and use it for all {cap} operations."
-    if type_ == "mcp":
+    if interface == "mcp":
         return f"You have access to the {cap} MCP server. Use the provided MCP tools for all {cap} operations."
     return ""
 
 
-def _prompt_for(name: str, type_: str, version: int, version_root: Path | None) -> str:
-    cfg = _resolved_config(name, type_, version, version_root)
+def _prompt_for(platform: str, interface: str, version: int, version_root: Path | None) -> str:
+    cfg = _resolved_config(platform, interface, version, version_root)
     text = cfg.get("prompt")
     if text:
         return text.strip()
-    return _auto_prompt(name, type_, cfg.get("binary"))
+    return _auto_prompt(platform, interface, cfg.get("binary"))
 
 
 def prompt_hash_for(
-    name: str, type_: str, version: int | None = None, version_root: Path | None = None
+    platform: str, interface: str, version: int | None = None, version_root: Path | None = None
 ) -> str:
-    if name == "none" and type_ == "none":
+    if platform == "none" and interface == "none":
         return ""
-    if not load_manifest(name, type_):
+    if not load_manifest(platform, interface):
         return ""
     chosen = version or 0
-    text = _prompt_for(name, type_, chosen, version_root)
+    text = _prompt_for(platform, interface, chosen, version_root)
     if not text:
         return ""
     return hashlib.sha256(text.encode()).hexdigest()[:8]
@@ -265,15 +267,15 @@ def prompt_hash_for(
 # ---------------------------------------------------------------------------
 
 
-def keys_for(name: str, type_: str) -> dict[str, str]:
+def keys_for(platform: str, interface: str) -> dict[str, str]:
     """Return the manifest's declared credential keys as {name: value}.
 
     Accepts both a mapping (`keys: {NAME: value}`) and a list
     (`keys: [{name: NAME, value: ...}]`). Missing values normalise to "".
     """
-    if name == "none" and type_ == "none":
+    if platform == "none" and interface == "none":
         return {}
-    raw = load_manifest(name, type_).get("keys") or {}
+    raw = load_manifest(platform, interface).get("keys") or {}
     out: dict[str, str] = {}
     if isinstance(raw, dict):
         for k, v in raw.items():
@@ -286,11 +288,11 @@ def keys_for(name: str, type_: str) -> dict[str, str]:
     return out
 
 
-def _resolved_keys(name: str, type_: str, env: dict[str, str] | None = None) -> dict[str, str]:
+def _resolved_keys(platform: str, interface: str, env: dict[str, str] | None = None) -> dict[str, str]:
     """Key values to inject into the engineer env: manifest value, else env."""
     base = env if env is not None else os.environ
     out: dict[str, str] = {}
-    for k, v in keys_for(name, type_).items():
+    for k, v in keys_for(platform, interface).items():
         out[k] = v or base.get(k, "")
     return {k: v for k, v in out.items() if v}
 
@@ -300,22 +302,22 @@ def _resolved_keys(name: str, type_: str, env: dict[str, str] | None = None) -> 
 # ---------------------------------------------------------------------------
 
 
-def _compute_hash(name: str, type_: str, version: int, version_root: Path | None) -> str:
+def _compute_hash(platform: str, interface: str, version: int, version_root: Path | None) -> str:
     """sha256 over manifest bytes + version override bytes + binary bytes + version."""
     h = hashlib.sha256()
-    mp = manifest_path(name, type_)
+    mp = manifest_path(platform, interface)
     if mp.exists():
         h.update(mp.read_bytes())
         h.update(b"\0")
     if version and version_root is not None:
-        vp = version_dir(version_root, name, type_, version) / "version.yaml"
+        vp = version_dir(version_root, platform, interface, version) / "version.yaml"
         if vp.exists():
             h.update(vp.read_bytes())
             h.update(b"\0")
-    cfg = _resolved_config(name, type_, version, version_root)
+    cfg = _resolved_config(platform, interface, version, version_root)
     binary = cfg.get("binary")
     if binary:
-        bpath = _interface_dir_for(name, type_, version, version_root, binary) / binary
+        bpath = _interface_dir_for(platform, interface, version, version_root, binary) / binary
         if bpath.is_file():
             h.update(bpath.read_bytes())
             h.update(b"\0")
@@ -323,98 +325,98 @@ def _compute_hash(name: str, type_: str, version: int, version_root: Path | None
     return h.hexdigest()[:8]
 
 
-def _check_known(name: str, type_: str, version: int | None, version_root: Path | None) -> int:
-    """Validate type/version and return the chosen version int. Raises ValueError."""
-    if type_ not in TYPES:
-        raise ValueError(f"Unknown interface type {type_!r}; expected one of {TYPES}")
-    manifest = load_manifest(name, type_)
+def _check_known(platform: str, interface: str, version: int | None, version_root: Path | None) -> int:
+    """Validate interface/version and return the chosen version int. Raises ValueError."""
+    if interface not in INTERFACES:
+        raise ValueError(f"Unknown interface {interface!r}; expected one of {INTERFACES}")
+    manifest = load_manifest(platform, interface)
     if not manifest:
         raise ValueError(
-            f"No config for {name!r}/{type_!r} at {manifest_path(name, type_)}. "
-            f"Create it (interfaces/{name}/{type_}/config.yaml) — preflight builds the binary."
+            f"No config for {platform!r}/{interface!r} at {manifest_path(platform, interface)}. "
+            f"Create it (platforms/{platform}/{interface}/config.yaml) — preflight builds the binary."
         )
     chosen = version or 0
     if chosen and version_root is None:
         raise ValueError(
-            f"Interface {name!r}/{type_!r} v{chosen} requires --version-root "
+            f"Interface {platform!r}/{interface!r} v{chosen} requires --version-root "
             f"(versions live inside an autoresearch session)."
         )
-    if chosen and not (version_dir(version_root, name, type_, chosen) / "version.yaml").exists():
+    if chosen and not (version_dir(version_root, platform, interface, chosen) / "version.yaml").exists():
         raise ValueError(
-            f"Interface {name!r}/{type_!r} has no version {chosen} under "
-            f"{version_dir(version_root, name, type_, chosen)}."
+            f"Interface {platform!r}/{interface!r} has no version {chosen} under "
+            f"{version_dir(version_root, platform, interface, chosen)}."
         )
     return chosen
 
 
 def variant_for(
-    name: str,
-    type_: str,
+    platform: str,
+    interface: str,
     version: int | None = None,
     version_root: Path | None = None,
 ) -> tuple[int, str]:
     """Return (version, hash). version None → 0 (base manifest)."""
-    if name == "none" and type_ == "none":
+    if platform == "none" and interface == "none":
         return 0, ""
-    chosen = _check_known(name, type_, version, version_root)
-    return chosen, _compute_hash(name, type_, chosen, version_root)
+    chosen = _check_known(platform, interface, version, version_root)
+    return chosen, _compute_hash(platform, interface, chosen, version_root)
 
 
 def setup(
-    name: str,
-    type_: str,
+    platform: str,
+    interface: str,
     run_dir: Path,
     venv_python: Path,
     version: int | None = None,
     version_root: Path | None = None,
 ) -> InterfaceSetup:
-    if type_ not in TYPES:
-        raise ValueError(f"Unknown interface type {type_!r}; expected one of {TYPES}")
+    if interface not in INTERFACES:
+        raise ValueError(f"Unknown interface {interface!r}; expected one of {INTERFACES}")
 
-    if name == "none" and type_ == "none":
-        return InterfaceSetup(name="none", type="none", prompt_fragment="", version=0, hash="")
+    if platform == "none" and interface == "none":
+        return InterfaceSetup(platform="none", interface="none", prompt_fragment="", version=0, hash="")
 
-    chosen = _check_known(name, type_, version, version_root)
-    cfg = _resolved_config(name, type_, chosen, version_root)
+    chosen = _check_known(platform, interface, version, version_root)
+    cfg = _resolved_config(platform, interface, chosen, version_root)
     binary = cfg.get("binary")
     runtime_install = cfg.get("runtime_install") or []
     mcp_servers = cfg.get("mcp_servers") or {}
-    prompt_fragment = _prompt_for(name, type_, chosen, version_root)
+    prompt_fragment = _prompt_for(platform, interface, chosen, version_root)
     # The "use the interface as-is" rule is the engineer prompt's default
     # (baked into engineer.md, stripped only for none/none) — not appended
     # here. This fragment carries just the interface's own `prompt:` prose.
-    hash_ = _compute_hash(name, type_, chosen, version_root)
-    interface_dir = _interface_dir_for(name, type_, chosen, version_root, binary)
+    hash_ = _compute_hash(platform, interface, chosen, version_root)
+    interface_dir = _interface_dir_for(platform, interface, chosen, version_root, binary)
 
     # Guard: if runtime steps reference $INTERFACE_DIR (pre-built binary), it must
     # exist. Preflight builds it before we get here; this is a backstop.
     if binary and runtime_install and any("$INTERFACE_DIR" in s for s in runtime_install):
         if not (interface_dir / binary).exists():
             raise RuntimeError(
-                f"Interface {name!r}/{type_!r} v{chosen} binary '{binary}' not found at "
+                f"Interface {platform!r}/{interface!r} v{chosen} binary '{binary}' not found at "
                 f"{interface_dir / binary}. Preflight should have built it; "
-                f"check interfaces/{name}/{type_}/config.yaml install steps."
+                f"check platforms/{platform}/{interface}/config.yaml install steps."
             )
 
     if runtime_install:
         _run_install(runtime_install, cwd=run_dir, venv_python=venv_python, interface_dir=interface_dir)
 
     return InterfaceSetup(
-        name=name,
-        type=type_,
+        platform=platform,
+        interface=interface,
         prompt_fragment=prompt_fragment,
         version=chosen,
         hash=hash_,
-        # `binary` may be a built artifact for any type (e.g. an SDK wheel); only
-        # a CLI's binary is an invokable command worth tracking as cli_calls.
+        # `binary` may be a built artifact for any interface (e.g. an SDK wheel);
+        # only a CLI's binary is an invokable command worth tracking as cli_calls.
         # cli_calls match the invokable command (`cli_command`, else the binary
         # name — true for bare binaries like `hops`, but a wheel needs the
         # explicit field). sdk_calls match the importable module (`sdk_module`,
-        # else the project name — true when the package == the project name).
-        cli_binary=(cfg.get("cli_command") or binary) if type_ == "cli" else None,
-        sdk_module=(cfg.get("sdk_module") or name) if type_ == "sdk" else None,
+        # else the platform name — true when the package == the platform name).
+        cli_binary=(cfg.get("cli_command") or binary) if interface == "cli" else None,
+        sdk_module=(cfg.get("sdk_module") or platform) if interface == "sdk" else None,
         mcp_servers=mcp_servers,
-        keys=_resolved_keys(name, type_),
+        keys=_resolved_keys(platform, interface),
         serve=cfg.get("serve") or [],
         teardown=cfg.get("teardown") or [],
         allowed_domains=list(cfg.get("allowed_domains") or []),
@@ -442,8 +444,8 @@ def _make_check_venv(target: Path) -> Path:
 
 
 def preflight(
-    name: str,
-    type_: str,
+    platform: str,
+    interface: str,
     version: int | None = None,
     version_root: Path | None = None,
     *,
@@ -464,33 +466,33 @@ def preflight(
         `auth_command`, login is satisfied only when every declared key is set.
       * Test — the `test_command` exits 0.
     """
-    config_fix = f"check interfaces/{name}/{type_}/config.yaml (build/install steps)"
-    setup_fix = "make setup  (or: banter setup " + f"interfaces/{name}/{type_}/config.yaml)"
+    config_fix = f"check platforms/{platform}/{interface}/config.yaml (build/install steps)"
+    setup_fix = "make setup  (or: banter setup " + f"platforms/{platform}/{interface}/config.yaml)"
 
-    if name == "none" and type_ == "none":
-        return InterfaceStatus(name, type_, ok=True, installed=True, authenticated=True)
-    if type_ not in TYPES:
+    if platform == "none" and interface == "none":
+        return InterfaceStatus(platform, interface, ok=True, installed=True, authenticated=True)
+    if interface not in INTERFACES:
         return InterfaceStatus(
-            name, type_, ok=False, installed=False, authenticated=False,
-            reason=f"unknown interface type {type_!r}",
+            platform, interface, ok=False, installed=False, authenticated=False,
+            reason=f"unknown interface {interface!r}",
         )
 
     # 1) installed? Build the base binary on demand if it's missing.
     try:
-        chosen = _check_known(name, type_, version, version_root)
+        chosen = _check_known(platform, interface, version, version_root)
     except ValueError as e:
         return InterfaceStatus(
-            name, type_, ok=False, installed=False, authenticated=False,
+            platform, interface, ok=False, installed=False, authenticated=False,
             reason=str(e), fix_command=config_fix,
         )
-    cfg = _resolved_config(name, type_, chosen, version_root)
+    cfg = _resolved_config(platform, interface, chosen, version_root)
     binary = cfg.get("binary")
     runtime_install = cfg.get("runtime_install") or []
     uses_prebuilt = bool(
         binary and runtime_install and any("$INTERFACE_DIR" in s for s in runtime_install)
     )
     bpath = (
-        _interface_dir_for(name, type_, chosen, version_root, binary) / binary
+        _interface_dir_for(platform, interface, chosen, version_root, binary) / binary
         if uses_prebuilt else None
     )
 
@@ -500,17 +502,17 @@ def preflight(
     # don't overlap. The interface is installed fresh into a throwaway venv for
     # the checks below, and into each engineer's per-run venv at run time.
     artifact_missing = bpath is not None and not bpath.exists()
-    if artifact_missing and auto_build and load_manifest(name, type_).get("install"):
+    if artifact_missing and auto_build and load_manifest(platform, interface).get("install"):
         try:
-            build(name, type_)
+            build(platform, interface)
         except Exception as e:  # build is shell-out heavy; surface failures
             return InterfaceStatus(
-                name, type_, ok=False, installed=False, authenticated=False,
+                platform, interface, ok=False, installed=False, authenticated=False,
                 reason=f"build failed: {e}", fix_command=config_fix,
             )
     if bpath is not None and not bpath.exists():
         return InterfaceStatus(
-            name, type_, ok=False, installed=False, authenticated=False,
+            platform, interface, ok=False, installed=False, authenticated=False,
             reason=f"binary {binary!r} missing at {bpath}", fix_command=config_fix,
         )
 
@@ -520,7 +522,7 @@ def preflight(
     # preflight runs only the build + `test_command`; LOGIN is verified per
     # challenge (interfaces.login_status). check_login=True (single-challenge form)
     # additionally checks login here.
-    keys = keys_for(name, type_)
+    keys = keys_for(platform, interface)
     base_env = dict(env) if env is not None else dict(os.environ)
     merged_env = dict(base_env)
     missing = []
@@ -531,13 +533,13 @@ def preflight(
         else:
             missing.append(k)
 
-    manifest = load_manifest(name, type_)
+    manifest = load_manifest(platform, interface)
     auth_command = manifest.get("auth_command") if check_login else None
     test_command = manifest.get("test_command")
     # No auth_command → login is satisfied only when every declared key is present.
     if check_login and not auth_command and keys and missing:
         return InterfaceStatus(
-            name, type_, ok=False, installed=True, authenticated=False,
+            platform, interface, ok=False, installed=True, authenticated=False,
             missing_keys=missing,
             reason=f"missing credential key(s): {', '.join(missing)}",
             fix_command=setup_fix,
@@ -545,7 +547,7 @@ def preflight(
     # Nothing to verify in a venv (no login to check here, no test) → done.
     if not auth_command and not test_command:
         return InterfaceStatus(
-            name, type_, ok=True, installed=True, authenticated=True, missing_keys=missing,
+            platform, interface, ok=True, installed=True, authenticated=True, missing_keys=missing,
         )
 
     # Only stand up a throwaway venv when there's actually something to install
@@ -559,11 +561,11 @@ def preflight(
             try:
                 _run_install(
                     runtime_install, cwd=tmp, venv_python=check_python,
-                    interface_dir=_interface_dir_for(name, type_, chosen, version_root, binary),
+                    interface_dir=_interface_dir_for(platform, interface, chosen, version_root, binary),
                 )
             except Exception as e:
                 return InterfaceStatus(
-                    name, type_, ok=False, installed=False, authenticated=False,
+                    platform, interface, ok=False, installed=False, authenticated=False,
                     reason=f"interface install failed: {e}", fix_command=config_fix,
                 )
             check_bin = str(check_python.parent)
@@ -572,19 +574,19 @@ def preflight(
             check_bin = str(_TESTBED_ROOT / ".venv" / "bin")
         # The interface command/module lives in the (throwaway) venv; expose its
         # bin — and the interface dir, for bare binaries — on PATH for the checks.
-        path_parts = [str(bin_dir(name, type_)), check_bin, merged_env.get("PATH", "")]
+        path_parts = [str(bin_dir(platform, interface)), check_bin, merged_env.get("PATH", "")]
         merged_env["PATH"] = os.pathsep.join(p for p in path_parts if p)
 
         if auth_command and not _run_check(auth_command, merged_env, timeout_s):
             return InterfaceStatus(
-                name, type_, ok=False, installed=True, authenticated=False,
+                platform, interface, ok=False, installed=True, authenticated=False,
                 missing_keys=missing,
                 reason=f"login check failed (`{auth_command}` returned non-zero or timed out)",
                 fix_command=setup_fix,
             )
         if test_command and not _run_check(test_command, merged_env, timeout_s):
             return InterfaceStatus(
-                name, type_, ok=False, installed=True, authenticated=True,
+                platform, interface, ok=False, installed=True, authenticated=True,
                 missing_keys=missing,
                 reason=f"interface did not run reliably (`{test_command}` returned non-zero or timed out)",
                 fix_command=config_fix,
@@ -594,7 +596,7 @@ def preflight(
             shutil.rmtree(tmp, ignore_errors=True)
 
     return InterfaceStatus(
-        name, type_, ok=True, installed=True, authenticated=True, missing_keys=missing,
+        platform, interface, ok=True, installed=True, authenticated=True, missing_keys=missing,
     )
 
 
@@ -636,8 +638,8 @@ def _run_check(command: str, env: dict[str, str], timeout_s: int) -> bool:
 
 
 def login_status(
-    name: str,
-    type_: str,
+    platform: str,
+    interface: str,
     *,
     venv_python: Path,
     keys: dict[str, str] | None = None,
@@ -648,10 +650,10 @@ def login_status(
     is re-verified for EVERY challenge here (so expired creds are caught
     mid-session and each run authenticates in its own venv).
     """
-    if name == "none" and type_ == "none":
-        return InterfaceStatus(name, type_, ok=True, installed=True, authenticated=True)
-    setup_fix = "make setup  (or: banter setup " + f"interfaces/{name}/{type_}/config.yaml)"
-    declared = keys_for(name, type_)
+    if platform == "none" and interface == "none":
+        return InterfaceStatus(platform, interface, ok=True, installed=True, authenticated=True)
+    setup_fix = "make setup  (or: banter setup " + f"platforms/{platform}/{interface}/config.yaml)"
+    declared = keys_for(platform, interface)
     env = dict(os.environ)
     missing = []
     for k, dv in declared.items():
@@ -661,52 +663,52 @@ def login_status(
         else:
             missing.append(k)
 
-    auth_command = load_manifest(name, type_).get("auth_command")
+    auth_command = load_manifest(platform, interface).get("auth_command")
     if not auth_command:
         # No auth_command → login is satisfied only when all declared keys exist.
         if declared and missing:
             return InterfaceStatus(
-                name, type_, ok=False, installed=True, authenticated=False,
+                platform, interface, ok=False, installed=True, authenticated=False,
                 missing_keys=missing,
                 reason=f"missing credential key(s): {', '.join(missing)}", fix_command=setup_fix,
             )
-        return InterfaceStatus(name, type_, ok=True, installed=True, authenticated=True)
+        return InterfaceStatus(platform, interface, ok=True, installed=True, authenticated=True)
 
     env["PATH"] = os.pathsep.join(
-        [str(bin_dir(name, type_)), str(venv_python.parent), env.get("PATH", "")]
+        [str(bin_dir(platform, interface)), str(venv_python.parent), env.get("PATH", "")]
     )
     env["VIRTUAL_ENV"] = str(venv_python.parent.parent)
     if not _run_check(auth_command, env, timeout_s):
         return InterfaceStatus(
-            name, type_, ok=False, installed=True, authenticated=False, missing_keys=missing,
+            platform, interface, ok=False, installed=True, authenticated=False, missing_keys=missing,
             reason=f"login check failed (`{auth_command}` returned non-zero or timed out)",
             fix_command=setup_fix,
         )
     return InterfaceStatus(
-        name, type_, ok=True, installed=True, authenticated=True, missing_keys=missing,
+        platform, interface, ok=True, installed=True, authenticated=True, missing_keys=missing,
     )
 
 
-def build(name: str, type_: str) -> Path:
+def build(platform: str, interface: str) -> Path:
     """Check out the interface's repo into its folder and build it (no AI).
 
-    The interface code is checked out INTO interfaces/<name>/<type>/ — that dir
-    is both the checkout and the build/artifact location ($INTERFACE_DIR). A
-    `repo:` that points at a local path (e.g. a `fake_repos/...` fake repo) is
-    copied in; a URL is git-cloned. Then the config's `install:` steps run there.
-    Idempotent. Returns the interface dir. Run automatically by preflight when
-    the binary is missing.
+    The interface code is checked out INTO platforms/<platform>/<interface>/ —
+    that dir is both the checkout and the build/artifact location
+    ($INTERFACE_DIR). A `repo:` that points at a local path (e.g. a
+    `fake_repos/...` fake repo) is copied in; a URL is git-cloned. Then the
+    config's `install:` steps run there. Idempotent. Returns the interface dir.
+    Run automatically by preflight when the binary is missing.
     """
-    if name == "none" and type_ == "none":
+    if platform == "none" and interface == "none":
         return bin_dir("none", "none")
-    manifest = load_manifest(name, type_)
+    manifest = load_manifest(platform, interface)
     if not manifest:
-        raise FileNotFoundError(f"No config at {manifest_path(name, type_)}")
+        raise FileNotFoundError(f"No config at {manifest_path(platform, interface)}")
 
     repo = manifest.get("repo")
     ref = manifest.get("ref", "main")
     install_steps = manifest.get("install") or []
-    iface_dir = bin_dir(name, type_)   # holds config.yaml + (committed) source + artifact
+    iface_dir = bin_dir(platform, interface)   # holds config.yaml + (committed) source + artifact
     iface_dir.mkdir(parents=True, exist_ok=True)
     venv_bin = _TESTBED_ROOT / ".venv" / "bin"
 

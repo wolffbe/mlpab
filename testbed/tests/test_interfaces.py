@@ -15,17 +15,17 @@ class InterfaceTestBase(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
         self.root = Path(self._tmp.name)
-        self.ifaces = self.root / "interfaces"
+        self.ifaces = self.root / "platforms"
         # Redirect the single unified tree at the temp dir.
-        self._orig = interfaces.INTERFACES_DIR
-        interfaces.INTERFACES_DIR = self.ifaces
+        self._orig = interfaces.PLATFORMS_DIR
+        interfaces.PLATFORMS_DIR = self.ifaces
 
     def tearDown(self) -> None:
-        interfaces.INTERFACES_DIR = self._orig
+        interfaces.PLATFORMS_DIR = self._orig
         self._tmp.cleanup()
 
-    def write_manifest(self, name: str, type_: str, text: str) -> Path:
-        p = self.ifaces / name / type_ / "config.yaml"
+    def write_manifest(self, platform: str, interface: str, text: str) -> Path:
+        p = self.ifaces / platform / interface / "config.yaml"
         _write(p, text)
         return p
 
@@ -151,14 +151,14 @@ class PreflightTests(InterfaceTestBase):
 class PreflightModuleTests(InterfaceTestBase):
     def test_none_requirement_passes(self):
         preflight.preflight(
-            [preflight.Requirement(interface="none", mode="none")],
+            [preflight.Requirement(platform="none", interface="none")],
             auth="api-key", model="claude-sonnet-4-6", probe_skills=False,
         )
 
     def test_missing_interface_raises(self):
         with self.assertRaises(preflight.PreflightError):
             preflight.preflight(
-                [preflight.Requirement(interface="ghost", mode="cli")],
+                [preflight.Requirement(platform="ghost", interface="cli")],
                 auth="api-key", model="claude-sonnet-4-6", probe_skills=False,
             )
 

@@ -11,9 +11,9 @@ The researcher drives individual challenge evaluations internally via the
 `run --challenge ...` form (not part of the everyday surface).
 
 Examples:
-    banter interfaces/none/benchmark/config.yaml
-    banter interfaces/mlkit/benchmark/cli/config.yaml
-    banter interfaces/hopsworks/autoresearch/rq1.yaml
+    banter platforms/none/benchmark/config.yaml
+    banter platforms/mlkit/benchmark/cli/config.yaml
+    banter platforms/hopsworks/autoresearch/rq1.yaml
     make setup
 """
 from __future__ import annotations
@@ -97,8 +97,8 @@ def main() -> None:
 @main.command("run")
 @click.argument("config", required=False, default=None, metavar="[CONFIG.yaml]")
 @click.option("--challenge", default=None, help="MLE-bench competition id (single-run form).")
-@click.option("--interface", "interface_name", default=None, help="Interface name, e.g. `hopsworks`, `none`.")
-@click.option("--mode", type=click.Choice(interfaces.TYPES), default=None, help="Interface type.")
+@click.option("--platform", "platform", default=None, help="Platform name, e.g. `hopsworks`, `none`.")
+@click.option("--interface", "interface", type=click.Choice(interfaces.INTERFACES), default=None, help="Interface (cli/mcp/sdk/none).")
 @click.option("--interface-version", "interface_version", type=int, default=None,
               help="Interface version. Omit/0 → base config; >0 → a session version.")
 @click.option("--version-root", "version_root", type=click.Path(path_type=Path), default=None,
@@ -117,7 +117,7 @@ def main() -> None:
 @click.option("--skills", default="none", show_default=True, help="Skill bundle name under skills/, or `none`.")
 @click.option("--skills-version", "skills_version", type=int, default=None, help="Pin a skill bundle version.")
 @click.option("--docs", default="none", show_default=True,
-              help="Docs bundle under interfaces/<project>/docs/, or `none`. "
+              help="Docs bundle under platforms/<platform>/docs/, or `none`. "
                    "Bundle is copied into `<challenge>/docs/` for the engineer to browse.")
 @click.option("--task", default="no_task", show_default=True, help="ML task / challenge group (folder in the run path).")
 @click.option("--model", default=runner.DEFAULT_MODEL, show_default=True)
@@ -134,8 +134,8 @@ def main() -> None:
 def run(
     config: str | None,
     challenge: str | None,
-    interface_name: str | None,
-    mode: str | None,
+    platform: str | None,
+    interface: str | None,
     interface_version: int | None,
     version_root: Path | None,
     interface_dir: Path | None,
@@ -165,17 +165,17 @@ def run(
 
     if challenge is None:
         raise click.UsageError("Pass a CONFIG file (e.g. `banter configs/...yaml`) or use --challenge.")
-    if interface_name is None:
-        raise click.UsageError("--interface is required for the single-challenge form.")
-    if mode is None:
-        mode = "none" if interface_name == "none" else None
-        if mode is None:
-            raise click.UsageError("--mode is required for non-`none` interfaces.")
+    if platform is None:
+        raise click.UsageError("--platform is required for the single-challenge form.")
+    if interface is None:
+        interface = "none" if platform == "none" else None
+        if interface is None:
+            raise click.UsageError("--interface is required for non-`none` platforms.")
 
     spec = runner.RunSpec(
         challenge_id=challenge,
-        interface=interface_name,
-        mode=mode,
+        platform=platform,
+        interface=interface,
         skills=skills,
         docs=docs,
         model=model,
@@ -194,7 +194,7 @@ def run(
     )
     row = runner.run(spec)
     click.echo(
-        f"\n=== {challenge} [{row.interface}/{row.type}, skills={row.skills}] "
+        f"\n=== {challenge} [{row.platform}/{row.interface}, skills={row.skills}] "
         f"done in {row.eng_wall_time_s:.1f}s "
         f"({row.eng_total_tokens} tokens, ${row.eng_cost_usd:.4f}); medal={row.medal} ===\n"
         f"run dir: {row.run_dir}"
@@ -234,21 +234,21 @@ def _dispatch_config(config_path: Path, runs_root: Path, assume_yes: bool = Fals
 
 @main.command("prepare-version")
 @click.argument("interface_dir", type=click.Path(path_type=Path))
-@click.option("--interface", "interface_name", required=True,
-              help="Interface name (e.g. mlkit).")
-@click.option("--mode", required=True, type=click.Choice(interfaces.TYPES),
-              help="Interface type (cli/mcp/sdk).")
+@click.option("--platform", "platform", required=True,
+              help="Platform name (e.g. mlkit).")
+@click.option("--interface", "interface", required=True, type=click.Choice(interfaces.INTERFACES),
+              help="Interface (cli/mcp/sdk).")
 @click.option("--force", is_flag=True, default=False,
               help="Overwrite an existing target directory.")
 def prepare_version(
-    interface_dir: Path, interface_name: str, mode: str, force: bool,
+    interface_dir: Path, platform: str, interface: str, force: bool,
 ) -> None:
     """Auto-populate an autoresearch version's interface copy + build it.
 
     INTERFACE_DIR is the target — typically `<run>/v<N>/interface`. The
     parent dir's name (e.g. `v3`) determines N: when N>0 the copy comes from
     the PREVIOUS version's `v<N-1>/interface`; when N=0 (or there's no
-    previous), it comes from the committed `interfaces/<name>/<type>/` — copied
+    previous), it comes from the committed `platforms/<platform>/<interface>/` — copied
     in, NEVER edited in place. The interface is BUILT in the copy so it's
     immediately runnable.
 
@@ -280,7 +280,7 @@ def prepare_version(
         if prev.is_dir():
             src = prev
     if src is None:
-        src = TESTBED_ROOT / "interfaces" / interface_name / mode
+        src = TESTBED_ROOT / "platforms" / platform / interface
     if not src.is_dir():
         raise click.ClickException(f"source interface dir not found: {src}")
 
@@ -293,9 +293,9 @@ def prepare_version(
     # Build the interface IN the copy so the folder is in a runnable state (the
     # researcher then just edits source for v>0; `banter run --interface-dir`
     # force-rebuilds before each run so edits take effect).
-    interfaces.set_interface_home(interface_name, mode, target)
+    interfaces.set_interface_home(platform, interface, target)
     try:
-        interfaces.build(interface_name, mode)
+        interfaces.build(platform, interface)
     except Exception as e:
         raise click.ClickException(f"build failed in {target}: {e}")
     built = [w.name for w in target.glob("*.whl")]
@@ -464,13 +464,13 @@ def setup(manifest: Path | None) -> None:
     click.echo(f"Claude Code default model: {runner.DEFAULT_MODEL}")
     _setup_kaggle()
     _setup_claude_auth()
-    click.echo("\nDone. Try: banter interfaces/none/benchmark/config.yaml")
+    click.echo("\nDone. Try: banter platforms/none/benchmark/config.yaml")
 
 
-def _detect_name_type(config_path: Path) -> tuple[str, str]:
-    """Infer (project, type) from interfaces/<project>/<type>/config.yaml."""
+def _detect_platform_interface(config_path: Path) -> tuple[str, str]:
+    """Infer (platform, interface) from platforms/<platform>/<interface>/config.yaml."""
     try:
-        return interfaces.name_type_from_config(config_path)
+        return interfaces.platform_interface_from_config(config_path)
     except ValueError as e:
         raise click.ClickException(str(e))
 
@@ -524,12 +524,12 @@ def _setup_claude_auth() -> None:
 def _setup_interface_keys(manifest_path: Path) -> None:
     if not manifest_path.exists():
         raise click.ClickException(f"Manifest not found: {manifest_path}")
-    name, type_ = _detect_name_type(manifest_path)
-    keys = interfaces.keys_for(name, type_)
+    platform, interface = _detect_platform_interface(manifest_path)
+    keys = interfaces.keys_for(platform, interface)
     if not keys:
-        click.echo(f"  {name}/{type_}: no `keys:` declared in the config.")
+        click.echo(f"  {platform}/{interface}: no `keys:` declared in the config.")
         return
-    click.secho(f"  Credentials for {name}/{type_}:", bold=True)
+    click.secho(f"  Credentials for {platform}/{interface}:", bold=True)
     updated: dict[str, str] = {}
     for k, cur in keys.items():
         shown = "(set)" if cur else "(empty)"

@@ -71,7 +71,7 @@ Specifically, these are FORBIDDEN:
 The only sanctioned tool you use to evaluate a version is:
 
 ```bash
-{banter_bin} run --interface <name> --mode <mode> --runs-root {runs_root}/v<N> ...
+{banter_bin} run --platform <name> --interface <cli|sdk|mcp> --runs-root {runs_root}/v<N> ...
 ```
 
 If you want to know whether your v<N> edits work, RUN that version (one
@@ -150,7 +150,7 @@ Every version has its OWN copy of the interface that the engineer builds + uses 
 {runs_root}/v<N>/interface/   ← the interface for version N (full source + config.yaml)
 ```
 
-The committed base lives at `{testbed_root}/interfaces/<name>/<type>/` (config.yaml, source, etc.) and is your **read-only starting point**. You NEVER edit the committed base; you only edit copies under `{runs_root}/v<N>/interface/`.
+The committed base lives at `{testbed_root}/platforms/<name>/<interface>/` (config.yaml, source, etc.) and is your **read-only starting point**. You NEVER edit the committed base; you only edit copies under `{runs_root}/v<N>/interface/`.
 
 **`v0/interface` is created and built for you** before you start (a copy of the committed original — or of a prev run/version, if `prev_run`+`prev_version` are set in the config). Run the baseline against it directly; do NOT call `prepare-version` for v0 and do NOT edit it.
 
@@ -164,7 +164,7 @@ For each NEW version N (N > 0):
    starts as a runnable clone of `v<N-1>`.
    ```bash
    {banter_bin} prepare-version {runs_root}/v<N>/interface \
-     --interface {first_iface_name} --mode {first_iface_mode}
+     --platform {first_iface_name} --interface {first_iface_mode}
    ```
 
 2. **Edit the source** in `{runs_root}/v<N>/interface/` — this is the ONLY thing you do by hand. You may change the implementation files, `runtime_install`, the `binary` name, the install steps in `config.yaml`, the `auth_command`/`test_command`, the credential `keys` block — **anything except the `prompt:` field**, which the engineer reads and you must not alter. You do NOT need to rebuild, install, or clean up — every `banter run --interface-dir` force-rebuilds your edits and tears the engineer venv down at the end.
@@ -178,13 +178,13 @@ For each NEW version N (N > 0):
 
 Each per-challenge result lands as one row in `{runs_root}/results.csv`, tagged with `run="{run_id}"` and `version="v<N>"`.
 
-### Skill bundles (per project; base in interfaces, versions run-local)
+### Skill bundles (per project; base in platforms, versions run-local)
 
-The base (v0) bundle is committed in the project's interface tree; improved
+The base (v0) bundle is committed in the project's platform tree; improved
 versions you create live run-locally (like interface versions):
 
 ```
-{testbed_root}/interfaces/<project>/skills/<bundle>/<skill_name>/SKILL.md   # base (v0)
+{testbed_root}/platforms/<project>/skills/<bundle>/<skill_name>/SKILL.md   # base (v0)
 {runs_root}/skills/<bundle>/v<n>/<skill_name>/SKILL.md                      # run v>0
 ```
 
@@ -262,7 +262,7 @@ column (`v0`, `v1`, …) is how you compare increments.
 
 Column groups:
 
-- **Identity:** `run`, `version`, `task`, `challenge`, `interface`, `type`, `skills`.
+- **Identity:** `run`, `version`, `task`, `challenge`, `platform`, `interface`, `skills`.
 - **Grading (per challenge):** `score` (0.0–1.0, the primary quality signal),
   `medal` (gold/silver/bronze/None), `valid_submission` (0/1).
 - **Per-run metrics:**
@@ -351,7 +351,7 @@ Setup is already done (every interface built, logged in, and tested with no AI
 before you started, from the `make setup` keys). Per version you only: copy via
 `banter prepare-version` (above) → edit the SOURCE under
 `{runs_root}/v<N>/interface/` (never `prompt:`, never the committed base under
-`{testbed_root}/interfaces/`) → evaluate with
+`{testbed_root}/platforms/`) → evaluate with
 `--interface-dir {runs_root}/v<N>/interface --runs-root {runs_root}/v<N>`.
 
 ### If a `banter run` fails preflight or login
@@ -409,7 +409,7 @@ for version 0 with `--change baseline`, ending with `--observations` and
 For each version (and, when tasks are defined, for each task in turn):
 
 1. **Analyse all runs** — read `{testbed_root}/results/autoresearch/results.csv`,
-   filter to `run == "{run_id}"`, group rows by `interface`+`type` (and task).
+   filter to `run == "{run_id}"`, group rows by `platform`+`interface` (and task).
    Inspect representative `<run_dir>/stream.log`.
    Look for patterns: does one interface score worse, burn more tokens, or fall
    back to local Python instead of using the remote platform?
@@ -420,7 +420,7 @@ For each version (and, when tasks are defined, for each task in turn):
 
 3. **Implement** — `banter prepare-version` (command above) to set up the new
    version's `interface/` copy, then edit the SOURCE in that copy (never
-   `prompt:`, never the committed base under `{testbed_root}/interfaces/`). ONE
+   `prompt:`, never the committed base under `{testbed_root}/platforms/`). ONE
    change per version for clean attribution.
 
 4. **Evaluate** — re-run ALL {runs_per_version} pairs (the eval block under

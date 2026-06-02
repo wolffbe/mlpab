@@ -1,10 +1,10 @@
 """One-shot benchmark runner.
 
-Runs a list of (challenge × interface × skills) entries once each, prints a
+Runs a list of (challenge × platform × skills) entries once each, prints a
 summary, and writes detailed results.
 
 Layout (under the caller-supplied `runs_root`):
-    results/benchmark/<id>__<iface>__<mode>__<skills>__no_prev_run__no_prev_v/
+    results/benchmark/<id>__<platform>__<interface>__<skills>__no_prev_run__no_prev_v/
         <task>/<challenge>/        # the engineer run + its artifacts
         results.csv                # one row per challenge (incl. `task`)
     results/benchmark/results.csv  # global rollup: one row per run
@@ -21,13 +21,13 @@ Config format (YAML):
     # Option A — explicit run list
     runs:
       - challenge: aerial-cactus-identification
+        platform: none
         interface: none
-        mode: none
         skills: none
 
     # Option B — Cartesian matrix
     # challenges: [aerial-cactus-identification]
-    # interfaces: [{name: mlkit, mode: cli}]
+    # interfaces: [{platform: mlkit, interface: cli}]
     # skills: [none]
 
     max_seconds: 3600  # per-engineer-run wall-clock cap in SECONDS (legacy: `max_min`, `timeout_s`)
@@ -53,8 +53,8 @@ from banter import claude_runner, interfaces, preflight as preflight_mod, result
 @dataclass
 class RunEntry:
     challenge: str
+    platform: str
     interface: str
-    mode: str
     skills: str = "none"
     docs: str = "none"
     interface_version: int | None = None
@@ -85,14 +85,14 @@ def _parse_runs(data: dict[str, Any]) -> list[RunEntry]:
         entries = []
         for r in data["runs"]:
             if r.get("config"):
-                name, mode = interfaces.name_type_from_config(r["config"])
+                platform, interface = interfaces.platform_interface_from_config(r["config"])
             else:
-                name, mode = r["interface"], r.get("mode", "none")
+                platform, interface = r["platform"], r.get("interface", "none")
             entries.append(
                 RunEntry(
                     challenge=r["challenge"],
-                    interface=name,
-                    mode=mode,
+                    platform=platform,
+                    interface=interface,
                     skills=r.get("skills", "none"),
                     docs=r.get("docs", "none"),
                     interface_version=r.get("interface_version", r.get("version")),
@@ -103,8 +103,8 @@ def _parse_runs(data: dict[str, Any]) -> list[RunEntry]:
             )
         return entries
 
-    # Cartesian matrix fallback. Each interface entry references its config
-    # (`config:`) or gives name+mode, and may pin a `version:` (+ `session:`).
+    # Cartesian matrix fallback. Each platform entry references its config
+    # (`config:`) or gives platform+interface, and may pin a `version:` (+ `session:`).
     if data.get("tasks"):
         challenge_task = [(c, str(t)) for t, cs in data["tasks"].items() for c in cs]
     else:
@@ -119,9 +119,9 @@ def _parse_runs(data: dict[str, Any]) -> list[RunEntry]:
                     f"benchmark `interfaces` entries must be mappings, got {iface!r}"
                 )
             if iface.get("config"):
-                name, mode = interfaces.name_type_from_config(iface["config"])
+                platform, interface = interfaces.platform_interface_from_config(iface["config"])
             else:
-                name, mode = iface["name"], iface.get("mode", "none")
+                platform, interface = iface["platform"], iface.get("interface", "none")
             for sk in skills_list:
                 if isinstance(sk, str):
                     sk_name, sk_version = sk, None
@@ -133,8 +133,8 @@ def _parse_runs(data: dict[str, Any]) -> list[RunEntry]:
                 entries.append(
                     RunEntry(
                         challenge=ch,
-                        interface=name,
-                        mode=mode,
+                        platform=platform,
+                        interface=interface,
                         skills=sk_name,
                         docs=data.get("docs", "none"),
                         interface_version=iface.get("version"),
@@ -197,8 +197,8 @@ def run_benchmark(
     # Fail fast, once, over the union of requirements before doing any work.
     reqs = [
         preflight_mod.Requirement(
+            platform=e.platform,
             interface=e.interface,
-            mode=e.mode,
             interface_version=e.interface_version,
             version_root=_version_root_for(e.session),
             skills=e.skills,
@@ -207,7 +207,7 @@ def run_benchmark(
         for e in config.runs
     ]
     try:
-        # Build + test the interfaces once at session start (login is checked per
+        # Build + test the platforms once at session start (login is checked per
         # challenge by the runner, in each run's own venv).
         preflight_mod.preflight(
             reqs, auth=config.engineer_auth, model=config.engineer_model, check_login=False,
@@ -230,7 +230,7 @@ def run_benchmark(
     # The config FILENAME stem names the results folder; else auto-increment.
     run_id = config_name or results.next_session_id(parent)
     # results/benchmark/<config-name>/. Each entry nests under its own
-    # <interface>/<type>/<skills>/ subtree (so multiple interfaces in one
+    # <platform>/<interface>/<skills>/ subtree (so multiple platforms in one
     # config don't collide on shared <task>/<challenge> dirs). Overwrite a
     # pre-existing config folder, but confirm first.
     run_path = parent / run_id
@@ -282,17 +282,17 @@ def run_benchmark(
             skills_tag += f" v{entry.skills_version}"
         print(
             f"\n[benchmark {n}/{total}] {entry.challenge} | "
-            f"{entry.interface}/{entry.mode}{version_tag} | skills={skills_tag}"
+            f"{entry.platform}/{entry.interface}{version_tag} | skills={skills_tag}"
         )
-        # Nest by interface/type/skills so concurrent interfaces in one config
+        # Nest by platform/interface/skills so concurrent platforms in one config
         # never share a <task>/<challenge> dir. `none` is a literal segment.
-        leaf_root = run_path / entry.interface / entry.mode / (entry.skills or "none")
+        leaf_root = run_path / entry.platform / entry.interface / (entry.skills or "none")
         leaf_roots.add(leaf_root)
         try:
             spec = runner.RunSpec(
                 challenge_id=entry.challenge,
+                platform=entry.platform,
                 interface=entry.interface,
-                mode=entry.mode,
                 skills=entry.skills,
                 docs=entry.docs,
                 model=config.engineer_model,
@@ -313,7 +313,7 @@ def run_benchmark(
                 f"wall={row.total_wall_time_s:.1f}s  cost=${row.total_cost:.4f}"
             )
         except Exception as exc:
-            label = f"{entry.challenge}/{entry.interface}/{entry.mode}"
+            label = f"{entry.challenge}/{entry.platform}/{entry.interface}"
             print(f"[benchmark] FAILED {label}: {exc}", file=sys.stderr)
             failed.append(f"{label}: {exc}")
 
@@ -353,13 +353,13 @@ def _print_summary(rows: list[results.Row], failed: list[str], rollup_csv: Path)
     print("=" * w)
     if rows:
         print(
-            f"{'challenge':<35} {'iface/type':<20} {'skills':<18} "
+            f"{'challenge':<35} {'platform/interface':<20} {'skills':<18} "
             f"{'score':<8} {'tokens':<8} {'wall_s':<7} cost"
         )
         print("-" * w)
         for r in rows:
             print(
-                f"{r.challenge:<35} {r.interface}/{r.type:<18} {r.skills:<18} "
+                f"{r.challenge:<35} {r.platform}/{r.interface:<18} {r.skills:<18} "
                 f"{str(r.score or ''):<8} {r.total_tokens:<8} {r.total_wall_time_s:<7.1f} ${r.total_cost:.4f}"
             )
     if failed:

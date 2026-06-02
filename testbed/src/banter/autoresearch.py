@@ -11,7 +11,7 @@ via `banter prepare-version`, then edits source). `banter run --interface-dir
 v<N>/interface` force-rebuilds the edits + the engineer uses them.
 
 Layout under `results/autoresearch/`:
-    <run_id>__<iface>__<mode>__<skills>__<prev_run_seg>__<prev_version_seg>/
+    <run_id>__<platform>__<interface>__<skills>__<prev_run_seg>__<prev_version_seg>/
         prompt.txt         # researcher prompt (for debugging)
         transcript.jsonl   # raw researcher stream-json
         stream.log         # human-readable live researcher view (also used as transcript)
@@ -85,19 +85,19 @@ class Budget:
 
 @dataclass
 class InterfaceRef:
-    name: str
-    mode: str
+    platform: str
+    interface: str
     version: int | None = None      # None/0 → base manifest; >0 → a session version
     # Autoresearch session that produced a pinned `version` > 0 (e.g. RQ3 pinning
     # an RQ1 winner). None means "this session" / base.
     session: str | None = None
-    # The interface config path this ref came from (when referenced by `config:`).
+    # The platform config path this ref came from (when referenced by `config:`).
     config: str | None = None
 
     def __str__(self) -> str:
         v = f" v{self.version}" if self.version is not None else ""
         s = f" @{self.session}" if self.session else ""
-        return f"{self.name}/{self.mode}{v}{s}"
+        return f"{self.platform}/{self.interface}{v}{s}"
 
 
 _VALID_IMPROVE_SCOPES = {"interface", "skills"}
@@ -111,7 +111,7 @@ class AutoresearchConfig:
     # dimension on results.csv, not a separate per-task version chain.
     tasks: dict[str, list[str]]
     challenges: list[str]                # flattened union of all tasks (derived)
-    interfaces: list[InterfaceRef]       # interfaces run side-by-side per increment
+    interfaces: list[InterfaceRef]       # platforms run side-by-side per increment
     skills: str                          # starting skill bundle name, or "none"
     docs: str                            # docs bundle name, or "none"
     goals: list[Goal]
@@ -158,35 +158,35 @@ def _parse_goal(entry: Any) -> Goal:
 
 
 def _parse_interfaces(data: dict) -> list[InterfaceRef]:
-    """Parse `interfaces`. Each entry references an interface either by its
-    config file (`config: interfaces/<name>/<type>/config.yaml`) — the
-    preferred, explicit form — or by `name` + `mode`. Optional `version` +
-    `session` say where to start (base v0, or a version pinned from a session).
+    """Parse `interfaces`. Each entry references a platform either by its
+    config file (`config: platforms/<platform>/<interface>/config.yaml`) — the
+    preferred, explicit form — or by `platform` + `interface`. Optional `version`
+    + `session` say where to start (base v0, or a version pinned from a session).
     Accepts legacy `starting_interfaces` / `starting_interface`."""
     raw = data.get("interfaces") or data.get("starting_interfaces")
     if raw is None and "starting_interface" in data:
         single = data["starting_interface"]
         raw = [single] if isinstance(single, dict) else []
     if not raw:
-        return [InterfaceRef(name="none", mode="none")]
+        return [InterfaceRef(platform="none", interface="none")]
     out: list[InterfaceRef] = []
     for entry in raw:
         if not isinstance(entry, dict):
             raise ValueError(
                 f"`interfaces` entries must be mappings with `config:` "
-                f"(or `name`+`mode`); got {entry!r}"
+                f"(or `platform`+`interface`); got {entry!r}"
             )
         config_ref = entry.get("config")
         if config_ref:
-            name, mode = interfaces.name_type_from_config(config_ref)
+            platform, interface = interfaces.platform_interface_from_config(config_ref)
         else:
-            name, mode = entry.get("name", "none"), entry.get("mode", "none")
+            platform, interface = entry.get("platform", "none"), entry.get("interface", "none")
         version = entry.get("version")
         if version is not None:
             version = int(version)
         out.append(
             InterfaceRef(
-                name=name, mode=mode, version=version,
+                platform=platform, interface=interface, version=version,
                 session=entry.get("session"), config=config_ref,
             )
         )
@@ -287,7 +287,7 @@ def _recent_results_table(runs_root: Path, n: int = 40) -> str:
     if not rows:
         return "(no results yet)"
     header = (
-        f"{'challenge':<35} {'iface/mode':<18} {'skills':<18} {'ver':<4} "
+        f"{'challenge':<35} {'platform/interface':<18} {'skills':<18} {'ver':<4} "
         f"{'score':<8} {'tokens':<8} {'wall_s':<7} {'py_calls':<5} run_dir"
     )
     sep = "-" * 150
@@ -295,7 +295,7 @@ def _recent_results_table(runs_root: Path, n: int = 40) -> str:
     for row in rows[-n:]:
         lines.append(
             f"{row.get('challenge_id', '?'):<35} "
-            f"{row.get('interface', '?')}/{row.get('mode', '?'):<16} "
+            f"{row.get('platform', '?')}/{row.get('interface', '?'):<16} "
             f"{row.get('skills', '?'):<18} "
             f"{row.get('version', ''):<4} "
             f"{row.get('score', ''):<8} "
@@ -308,26 +308,26 @@ def _recent_results_table(runs_root: Path, n: int = 40) -> str:
 
 
 def _scan_interfaces(testbed_root: Path) -> str:
-    """List configured interfaces (interfaces/<project>/<type>/config.yaml). The
+    """List configured platforms (platforms/<project>/<interface>/config.yaml). The
     base IS version 0; higher versions are created session-locally."""
-    idir = testbed_root / "interfaces"
+    idir = testbed_root / "platforms"
     if not idir.exists():
         return "  (none)"
     lines = []
     for project in sorted(p for p in idir.iterdir() if p.is_dir()):
-        for type_ in ("cli", "mcp", "sdk", "none"):
-            cfg = project / type_ / "config.yaml"
+        for interface in ("cli", "mcp", "sdk", "none"):
+            cfg = project / interface / "config.yaml"
             if not cfg.is_file():
                 continue
             manifest = yaml.safe_load(cfg.read_text()) or {}
             has_bin = " (binary)" if manifest.get("binary") else ""
-            lines.append(f"  {project.name}/{type_}  base=v0{has_bin}")
+            lines.append(f"  {project.name}/{interface}  base=v0{has_bin}")
     return "\n".join(lines) or "  (none)"
 
 
 def _scan_skills(testbed_root: Path, project: str) -> str:
-    """List a project's base skill bundles (interfaces/<project>/skills/)."""
-    sdir = testbed_root / "interfaces" / project / "skills"
+    """List a project's base skill bundles (platforms/<project>/skills/)."""
+    sdir = testbed_root / "platforms" / project / "skills"
     lines = ["  none  (control — no skills injected into the engineer)"]
     if not sdir.exists():
         return "\n".join(lines)
@@ -384,7 +384,7 @@ def build_researcher_prompt(
     else:
         challenges_lines = "\n".join(f"  - {c}" for c in config.challenges)
     avail_interfaces = _scan_interfaces(testbed_root)
-    avail_skills = _scan_skills(testbed_root, config.interfaces[0].name if config.interfaces else "none")
+    avail_skills = _scan_skills(testbed_root, config.interfaces[0].platform if config.interfaces else "none")
     recent_results = _recent_results_table(runs_root)
     n_challenges = len(config.challenges)
     n_interfaces = len(config.interfaces)
@@ -473,7 +473,7 @@ def build_researcher_prompt(
                     f"{banter_bin} run \\\n"
                     f"  --task {task} \\\n"
                     f"  --challenge {c} \\\n"
-                    f"  --interface {iface.name} --mode {iface.mode} \\\n"
+                    f"  --platform {iface.platform} --interface {iface.interface} \\\n"
                     f"  --skills {config.skills} \\\n"
                     f"  --docs {config.docs} \\\n"
                     f"  --interface-dir {runs_root}/v<N>/interface \\\n"
@@ -528,8 +528,8 @@ def build_researcher_prompt(
         ),
         scope_desc=scope_desc,
         scope_deny=scope_deny,
-        first_iface_name=first_iface.name,
-        first_iface_mode=first_iface.mode,
+        first_iface_name=first_iface.platform,
+        first_iface_mode=first_iface.interface,
         next_iface_version=next_iface_version,
         run_dir_example=run_dir_example,
         banter_bin=banter_bin,
@@ -604,14 +604,14 @@ def run_autoresearch(
             "`banter` not found on PATH or in .venv. Install it (e.g. `make install`)."
         )
 
-    # The researcher only kicks in once every required interface is built, set
+    # The researcher only kicks in once every required platform is built, set
     # up, authenticated, and tested — deterministically, no AI — and any skill
     # is accessible. Fail fast before spawning the researcher otherwise.
     from banter import preflight as preflight_mod
     reqs = [
         preflight_mod.Requirement(
-            interface=i.name,
-            mode=i.mode,
+            platform=i.platform,
+            interface=i.interface,
             interface_version=i.version,
             version_root=_version_root_for(testbed_root, i.session),
             skills=config.skills,
@@ -619,7 +619,7 @@ def run_autoresearch(
         for i in config.interfaces
     ]
     try:
-        # Build + test the interfaces once at session start (login is checked per
+        # Build + test the platforms once at session start (login is checked per
         # challenge by the runner, in each run's own venv).
         preflight_mod.preflight(
             reqs, auth=config.engineer_auth, model=config.engineer_model, check_login=False,
@@ -659,7 +659,7 @@ def run_autoresearch(
         run_id = results_mod.next_session_id(parent)
 
     # One folder per config: results/autoresearch/<run_id>/. Inside it, one
-    # sub-tree per interface — <interface>/<type>/<skills>/ — and EACH leaf is
+    # sub-tree per platform — <platform>/<interface>/<skills>/ — and EACH leaf is
     # its own researcher (run sequentially), with v<N>/<task>/<challenge>/
     # underneath. Overwrite a pre-existing config folder, but confirm first.
     config_root = parent / run_id
@@ -669,16 +669,16 @@ def run_autoresearch(
         return
     config_root.mkdir(parents=True, exist_ok=True)
 
-    iface_list = config.interfaces or [InterfaceRef(name="none", mode="none")]
+    iface_list = config.interfaces or [InterfaceRef(platform="none", interface="none")]
     skills_seg = config.skills or "none"
     print(f"[autoresearch] config={run_id}  "
           f"interfaces={[str(i) for i in iface_list]}\n  dir={config_root}", flush=True)
 
-    # Each interface is an independent experiment with its own researcher,
+    # Each platform is an independent experiment with its own researcher,
     # results.csv, and report under its leaf — no combined rollup at the root.
     for n, iface in enumerate(iface_list, 1):
-        iface_root = config_root / iface.name / iface.mode / skills_seg
-        print(f"\n[autoresearch] === interface {n}/{len(iface_list)}: {iface} "
+        iface_root = config_root / iface.platform / iface.interface / skills_seg
+        print(f"\n[autoresearch] === platform {n}/{len(iface_list)}: {iface} "
               f"→ {iface_root.relative_to(config_root)} ===", flush=True)
         _run_one_interface(
             replace(config, interfaces=[iface]),
@@ -696,9 +696,9 @@ def _run_one_interface(
     run_id: str,
     banter_bin: Path,
 ) -> None:
-    """Run ONE interface's researcher, rooted at its leaf dir `run_path`
-    (`<config>/<interface>/<type>/<skills>/`). `config` is narrowed to that
-    single interface; `parent` is `results/autoresearch/` (for prev-run lookup).
+    """Run ONE platform's researcher, rooted at its leaf dir `run_path`
+    (`<config>/<platform>/<interface>/<skills>/`). `config` is narrowed to that
+    single platform; `parent` is `results/autoresearch/` (for prev-run lookup).
     """
     i0 = config.interfaces[0] if config.interfaces else None
     run_path.mkdir(parents=True, exist_ok=True)
@@ -719,12 +719,12 @@ def _run_one_interface(
     # immediately runnable. The researcher prepares v1+ via
     # `banter prepare-version`; between runs they only edit source — the
     # system handles copy / build / install / uninstall.
-    if i0 is not None and i0.name != "none":
+    if i0 is not None and i0.platform != "none":
         incr0 = run_path / "v0" / "interface"
         src: Path | None = None
         if config.prev_run is not None and config.prev_version is not None:
             # Resolve the prev config's matching leaf in the nested tree:
-            #   <parent>/<prev_run>/<iface>/<type>/<skills>/v<prev_version>/interface
+            #   <parent>/<prev_run>/<platform>/<interface>/<skills>/v<prev_version>/interface
             prev_config = parent / str(config.prev_run)
             if not prev_config.is_dir():
                 # Back-compat: match an old flat dir by its leading id segment.
@@ -739,7 +739,7 @@ def _run_one_interface(
                 )
             skills_seg = config.skills or "none"
             prev_iface = (
-                prev_config / i0.name / i0.mode / skills_seg
+                prev_config / i0.platform / i0.interface / skills_seg
                 / f"v{config.prev_version}" / "interface"
             )
             if not prev_iface.is_dir():
@@ -748,7 +748,7 @@ def _run_one_interface(
                 )
             src = prev_iface
         else:
-            base = testbed_root / "interfaces" / i0.name / i0.mode
+            base = testbed_root / "platforms" / i0.platform / i0.interface
             if base.is_dir():
                 src = base
         if src is not None and not incr0.exists():
@@ -756,9 +756,9 @@ def _run_one_interface(
             shutil.copytree(src, incr0)
             for w in incr0.glob("*.whl"):
                 w.unlink()
-            interfaces.set_interface_home(i0.name, i0.mode, incr0)
+            interfaces.set_interface_home(i0.platform, i0.interface, incr0)
             try:
-                interfaces.build(i0.name, i0.mode)
+                interfaces.build(i0.platform, i0.interface)
             except Exception as e:
                 raise RuntimeError(f"[autoresearch] v0 build failed in {incr0}: {e}")
             print(

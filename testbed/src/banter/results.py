@@ -1,6 +1,6 @@
 """results.csv writer.
 
-One row per (challenge, interface, mode, skills, auth) run. Token/cost columns
+One row per (challenge, platform, interface, skills, auth) run. Token/cost columns
 come from the stream-json transcript's `result` event — Claude Code reports
 `total_cost_usd` and aggregated `usage` there. Command counts are derived
 from the same transcript by walking each `tool_use` block. Medal/score come
@@ -117,7 +117,7 @@ def rolling_avg_col(metric: str) -> str | None:
 # Per-run rollup (benchmark): one row per <run> folder, averaging its
 # per-challenge rows. Written to results/benchmark/results.csv.
 COMBO_SUMMARY_FIELDS = (
-    ["combo", "interface", "type", "skills", "n_runs"]
+    ["combo", "platform", "interface", "skills", "n_runs"]
     + [f"avg_{m}" for m in AGG_METRICS]
     + ["dir"]   # the run folder
 )
@@ -189,8 +189,8 @@ def roll_up_combos(parent: Path) -> list[dict[str, Any]]:
         first = runs[0]
         rows.append({
             "combo": d.name,
+            "platform": first.get("platform", ""),
             "interface": first.get("interface", ""),
-            "type": first.get("type", ""),
             "skills": first.get("skills", ""),
             **_agg_runs(runs),
             "dir": str(d),
@@ -215,8 +215,8 @@ def roll_up_combos(parent: Path) -> list[dict[str, Any]]:
 # appear in the benchmark CSV; `BENCHMARK_FIELDS` is the .keys() view.
 _BENCHMARK_VIEW = {
     "started_at": "started_at",
+    "platform": "platform",
     "interface": "interface",
-    "type": "type",
     "skills": "skills",
     "prev_run": "prev_run",
     "prev_version": "prev_version",
@@ -298,8 +298,8 @@ FIELDS = [
     # — the same string that names the increment's filesystem dir.
     "run",
     "version",
-    "interface",
-    "type",            # interface type: cli/mcp/sdk/none
+    "platform",
+    "interface",       # interface: cli/mcp/sdk/none
     "skills",
     "prev_run",        # carried from autoresearch config; "" if not a continuation
     "prev_version",    # e.g. "v2" — last version of `prev_run` we continue from
@@ -397,8 +397,8 @@ class Row:
     # in the documented order.
     run: str                # autoresearch run id (empty for benchmark rows)
     version: str            # `v<N>` (e.g. "v2"); "" for benchmark rows
-    interface: str          # interface NAME, e.g. "mlkit" or "none"
-    type: str               # interface TYPE: cli/mcp/sdk/none
+    platform: str           # platform NAME, e.g. "mlkit" or "none"
+    interface: str          # interface: cli/mcp/sdk/none
     skills: str             # skill bundle name or "none"
     prev_run: str           # autoresearch config continuation hint; "" if none
     prev_version: str       # e.g. "v2"; "" if none
@@ -659,7 +659,7 @@ def aggregate_commands(
 
     Each `assistant` event carries a `message.content` list; tool calls are
     blocks with `type=="tool_use"`. `cli_binary` promotes matching Bash calls
-    to cli_calls; `sdk_module` (typically the interface name when mode=sdk)
+    to cli_calls; `sdk_module` (typically the platform name when interface=sdk)
     promotes python invocations that import or `-m`-run that module to
     sdk_calls. When a script file is run we also peek it (relative to
     `run_dir`) for SDK use.

@@ -73,7 +73,7 @@ def _write_runs(combo_dir: Path, *, task, score, tokens):
             row = {k: "" for k in fields}
             # Benchmark uses plain (unprefixed) metric names.
             row.update(
-                task=task, challenge=ch, interface="hopsworks", type="cli", skills="none",
+                task=task, challenge=ch, platform="hopsworks", interface="cli", skills="none",
                 score=score, total_tokens=tokens, wall_time_s=100, cost_usd=0.5,
             )
             w.writerow(row)
@@ -90,7 +90,7 @@ class RollUpCombosTests(unittest.TestCase):
             csv_rows = list(csv.DictReader(f))
         self.assertEqual({r["combo"] for r in csv_rows},
                          {"0_hopsworks_cli_no_skills_no_session_v0", "0_hopsworks_sdk_no_skills_no_session_v0"})
-        self.assertEqual({r["interface"] for r in csv_rows}, {"hopsworks"})
+        self.assertEqual({r["platform"] for r in csv_rows}, {"hopsworks"})
         self.assertEqual(csv_rows[0]["n_runs"], "2")
         self.assertIn("dir", csv_rows[0])
 
@@ -103,7 +103,7 @@ class RowSchemaTests(unittest.TestCase):
         # `started_at` is first (every row records when the engineer started),
         # then identity, then work cols, then metrics.
         self.assertEqual(results.FIELDS[0], "started_at")
-        self.assertEqual(results.FIELDS[1:6], ["run", "version", "interface", "type", "skills"])
+        self.assertEqual(results.FIELDS[1:6], ["run", "version", "platform", "interface", "skills"])
         self.assertEqual(results.FIELDS[6:8], ["prev_run", "prev_version"])
         # `incr` is gone — `increment` is now itself a plain integer.
         self.assertNotIn("incr", results.FIELDS)
@@ -119,7 +119,7 @@ class RowSchemaTests(unittest.TestCase):
         row = results.Row(
             started_at="2026-05-28T00:00:00+00:00",
             run="7", version="v2",
-            interface="mlkit", type="cli", skills="none",
+            platform="mlkit", interface="cli", skills="none",
             prev_run="3", prev_version="4",
             task="image_classification", challenge="aerial",
             valid_submission=1, score=0.99, medal="gold",
@@ -138,7 +138,7 @@ class RowSchemaTests(unittest.TestCase):
         self.assertEqual(w["prev_run"], "3")
         self.assertEqual(w["prev_version"], "4")
         self.assertEqual(w["challenge"], "aerial")
-        self.assertEqual(w["type"], "cli")
+        self.assertEqual(w["interface"], "cli")
         self.assertAlmostEqual(float(w["score"]), 0.99)
         self.assertEqual(w["medal"], "gold")
         self.assertAlmostEqual(float(w["eng_cost_usd"]), 0.4)
@@ -167,7 +167,7 @@ class RowSchemaTests(unittest.TestCase):
         # those columns to plain names.
         row = results.Row(
             started_at="2026-05-28T00:00:00+00:00",
-            run="", version="", interface="i", type="t", skills="none",
+            run="", version="", platform="i", interface="t", skills="none",
             prev_run="", prev_version="",
             task="img", challenge="c1",
             valid_submission=1, score=0.5, medal=None,
@@ -265,7 +265,7 @@ class CommandClassificationTests(unittest.TestCase):
 class RollingAverageTests(unittest.TestCase):
     def _row(self, rd, *, cli=0, wall=0.0):
         return results.Row(
-            started_at="t", run="", version="", interface="mlkit", type="cli",
+            started_at="t", run="", version="", platform="mlkit", interface="cli",
             skills="none", prev_run="", prev_version="", task="no_task",
             challenge="c", run_dir=rd, cli_calls=cli, eng_wall_time_s=wall,
             total_wall_time_s=wall)
