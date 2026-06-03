@@ -375,6 +375,19 @@ def run(
     # Skip pip cache (per-run venv inherits via .pth; cache dir unwritable).
     env["PIP_NO_CACHE_DIR"] = "1"
 
+    # Keep long foreground commands (model training) SYNCHRONOUS. Claude Code
+    # auto-moves a foreground Bash command to a background task once it exceeds
+    # the Bash tool's max timeout (default 600s). In `-p` mode the completion
+    # notification never re-invokes the model, so the engineer can only
+    # blind-poll a task-output file it can't even read (it lives outside the
+    # boundary) — which has wedged whole runs in an `until [ -f … ]` wait.
+    # Raising both Bash timeouts to the engineer's entire `claude -p` budget
+    # means a foreground command runs to completion (or dies with the session
+    # at `timeout_s`) instead of detaching. No mid-run backgrounding.
+    bash_timeout_ms = str(int(timeout_s) * 1000)
+    env["BASH_DEFAULT_TIMEOUT_MS"] = bash_timeout_ms
+    env["BASH_MAX_TIMEOUT_MS"] = bash_timeout_ms
+
     # Platform credentials override inherited values.
     if extra_env:
         env.update({k: v for k, v in extra_env.items() if v})

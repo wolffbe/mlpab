@@ -13,6 +13,7 @@ from pathlib import Path
 from unittest import mock
 
 from banter import claude_runner
+from banter.hooks import log_tool_call as hook
 
 
 # ---------------------------------------------------------------------------
@@ -332,6 +333,58 @@ class EngineerEnvConstructionTests(unittest.TestCase):
             env = self._invoke(auth="api-key", token="sk-ant-oat01-FALLBACK")["env"]
         self.assertEqual(env["ANTHROPIC_API_KEY"], "sk-ant-api01-USER")
         self.assertEqual(env["CLAUDE_CODE_OAUTH_TOKEN"], "sk-ant-oat01-FALLBACK")
+
+    def test_bash_timeouts_pinned_to_run_budget(self):
+        # Long foreground commands must stay synchronous: both Bash timeouts
+        # are pinned to the engineer's whole `claude -p` budget (default
+        # timeout_s = 3600s → 3_600_000 ms) so Claude Code never auto-moves a
+        # training command to a background task mid-run.
+        env = self._invoke()["env"]
+        self.assertEqual(env["BASH_DEFAULT_TIMEOUT_MS"], str(60 * 60 * 1000))
+        self.assertEqual(env["BASH_MAX_TIMEOUT_MS"], str(60 * 60 * 1000))
+
+
+# ---------------------------------------------------------------------------
+# 3) PreToolUse hook — boundary path checks
+# ---------------------------------------------------------------------------
+
+class HookTaskOutputAllowanceTests(unittest.TestCase):
+    """The boundary hook denies reads outside the engineer's cwd, EXCEPT for
+    Claude Code's own background-task output files for THIS run — otherwise an
+    auto-backgrounded command leaves the agent blind to its own output. The
+    allowance is scoped by the cwd slug embedded in the task path, so a
+    sibling challenge's task output stays denied.
+    """
+
+    def _check(self, path: str, boundary: str, cwd: str) -> str | None:
+        with mock.patch.dict(os.environ, {"TESTBED_BOUNDARY": boundary}, clear=False), \
+             mock.patch("os.getcwd", return_value=cwd):
+            return hook._path_violates_boundary(path)
+
+    def test_allows_own_background_task_output(self):
+        cwd = "/runs/v0/image_classification/aerial-cactus"
+        slug = cwd.replace("/", "-")
+        path = f"/private/tmp/claude-501/{slug}/9a78-uuid/tasks/btph5a74.output"
+        self.assertIsNone(self._check(path, boundary=cwd, cwd=cwd))
+
+    def test_denies_sibling_challenge_task_output(self):
+        cwd = "/runs/v0/image_classification/aerial-cactus"
+        other = "/runs/v0/image_classification/some-other-challenge"
+        other_slug = other.replace("/", "-")
+        path = f"/private/tmp/claude-501/{other_slug}/uuid/tasks/x.output"
+        self.assertIsNotNone(self._check(path, boundary=cwd, cwd=cwd))
+
+    def test_denies_non_task_file_outside_boundary(self):
+        cwd = "/runs/v0/image_classification/aerial-cactus"
+        # Same temp tree, but not a /tasks/*.output file → still denied.
+        slug = cwd.replace("/", "-")
+        path = f"/private/tmp/claude-501/{slug}/uuid/some_other_file.txt"
+        self.assertIsNotNone(self._check(path, boundary=cwd, cwd=cwd))
+
+    def test_in_boundary_path_still_allowed(self):
+        cwd = "/runs/v0/image_classification/aerial-cactus"
+        self.assertIsNone(self._check(f"{cwd}/submission/submission.csv",
+                                      boundary=cwd, cwd=cwd))
 
 
 if __name__ == "__main__":

@@ -49,6 +49,16 @@ Environment and constraints (detected on this machine):
 - Run training in the FOREGROUND and let it finish; never launch background or
   daemon processes that could outlive your command. Do not call `Bash` with
   `run_in_background: true` — chain commands synchronously instead.
+- **Never write an open-ended wait loop** such as
+  `until [ -f submission/submission.csv ]; do sleep 5; done` or
+  `while true; do …; done`. Run the training command itself in the foreground
+  and let that single command block until it returns — do NOT spawn the work
+  and then poll for its output. For a long command, pass the `Bash` tool a
+  large explicit `timeout` so it runs to completion in one synchronous call.
+- If a command is ever moved to a background task and you are handed a
+  task-output file path, `Read` that exact path to inspect progress or errors —
+  do not blind-wait for a notification. But keeping the command in the
+  foreground (above) is what you should actually do, so this never arises.
 - Keep the model small and training short (a few epochs) so your single attempt
   completes well within the time budget. Speed matters more than squeezing out
   the last bit of accuracy.

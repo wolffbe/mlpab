@@ -103,9 +103,21 @@ def _path_violates_boundary(file_path: str) -> str | None:
     if boundary:
         b = os.path.realpath(boundary)
         if not (p == b or p.startswith(b + "/")):
-            # Allow reading from ~/.claude (Claude's own config).
             home = _real_home()
-            if not p.startswith(home + "/.claude/"):
+            # Allowed escapes — both are Claude Code's OWN infrastructure, not
+            # user data:
+            #   1. ~/.claude (Claude's config + tokens we already trust).
+            #   2. Background-task output files. When Claude auto-moves a long
+            #      foreground command to a background task, it writes the output
+            #      to <tmp>/claude-*/<cwd-slug>/<session>/tasks/<id>.output —
+            #      outside the boundary. Denying the read leaves the agent
+            #      blind to its own command. The path embeds the cwd slug, so
+            #      this allowance stays scoped to THIS run's own tasks.
+            cwd_slug = os.getcwd().replace(os.sep, "-")
+            is_task_output = (
+                "/tasks/" in p and p.endswith(".output") and cwd_slug in p
+            )
+            if not p.startswith(home + "/.claude/") and not is_task_output:
                 return f"path is outside the engineer boundary ({b})"
     # Always block dotfiles + dot-dirs at $HOME root (secrets), regardless of
     # whether a boundary is set. Catches ~/.ssh, ~/.aws, ~/.gnupg, .kaggle,

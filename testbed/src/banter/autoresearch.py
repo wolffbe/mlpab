@@ -914,6 +914,22 @@ def _run_one_interface(
     # their stream.log but don't print to stdout (the researcher captures it).
     # The FileTailer below surfaces those logs live in this terminal instead.
     env["BANTER_NESTED"] = "1"
+    # Keep each `banter run` the researcher launches SYNCHRONOUS. Claude Code
+    # auto-backgrounds a foreground Bash command once it exceeds the Bash tool's
+    # max timeout (default 600s); a single `banter run` (preflight + engineer +
+    # grade) runs far longer, so without this the researcher detaches it to a
+    # background task — and because `-p` notifications never re-invoke the
+    # model, it then falls into a blind `wc -l` poll loop on a task-output file
+    # that froze the moment the engineer phase redirected its output into
+    # stream.log. Cap both Bash timeouts at the whole session budget (always
+    # ≥ one run) so no `banter run` ever auto-backgrounds.
+    _bash_cap_s = (
+        config.budget.max_seconds
+        if config.budget.max_seconds != float("inf")
+        else 8 * 3600
+    )
+    env["BASH_DEFAULT_TIMEOUT_MS"] = str(int(_bash_cap_s) * 1000)
+    env["BASH_MAX_TIMEOUT_MS"] = str(int(_bash_cap_s) * 1000)
 
     # Give the researcher a `normalized_composite` MCP tool over the global
     # experiments table, scoped to THIS leaf (config + platform/interface/skills)

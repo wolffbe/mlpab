@@ -238,6 +238,19 @@ output, redirect to a file and inspect the run's `stream.log` afterwards:
 tail -60 {runs_root}/v<N>/<task>/<challenge>/stream.log
 ```
 
+**`banter run` is SYNCHRONOUS — never poll for it.** Each call blocks until the
+engineer finishes and the row is written; just let it return and read the
+results afterward. Do NOT launch a run and then loop on `wc -l` / `tail` of any
+`tasks/<id>.output` file waiting for it to grow — that file FREEZES the instant
+the engineer phase begins (its live output is redirected into the per-challenge
+`stream.log`), so polling it spins forever and burns your whole turn budget. If
+you ever see a `banter run` get moved to a background task with an ID, treat it
+as a fault, not normal: read the engineer's `stream.log` (path = the run dir) to
+watch progress instead. If a run's `stream.log` has not changed for several
+minutes, the run is WEDGED — stop it and move on to the next
+`(version, task, challenge)` rather than waiting; a missing row is a result you
+can act on, an infinite poll is not. Never sit in a tight polling loop.
+
 **Before every `banter run` invocation**, confirm your working directory IS the
 autoresearch run dir — this is the sandbox boundary. If `pwd` doesn't match
 `{runs_root}`, STOP and investigate (something has gone wrong; do not proceed
