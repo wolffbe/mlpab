@@ -19,9 +19,11 @@ Improved versions are created and live INSIDE an autoresearch session:
     <version_root>/platforms/<platform>/<interface>/v<n>/version.yaml
 
 where `<version_root>` is the autoresearch session directory. A version.yaml
-overrides the base manifest (a refined `prompt:`, and optionally `binary`,
-`runtime_install`, or `mcp_servers`); it may ship its own binary copy, else the
-base binary is reused. Version 0 always refers to the base manifest and needs no
+overrides the base manifest (optionally `binary`, `runtime_install`, or
+`mcp_servers`); it may ship its own binary copy, else the base binary is reused.
+The `prompt:` is the ONE field that is NOT overridable — it is frozen to the
+committed base across all versions (the researcher improves interface SOURCE,
+not the prompt). Version 0 always refers to the base manifest and needs no
 folder anywhere.
 
 `banter run` selects a version with `--interface-version <n>` plus
@@ -198,7 +200,11 @@ def _resolved_config(
         "serve": manifest.get("serve") or [],
         "teardown": manifest.get("teardown") or [],
     }
-    for key in ("binary", "runtime_install", "mcp_servers", "prompt",
+    # NOTE: `prompt` is deliberately NOT overridable. The engineer-facing prompt
+    # is frozen to the committed base (see `_prompt_for`/`_committed_prompt`):
+    # the researcher improves interface SOURCE, never the prompt. A `prompt:` in
+    # a version.yaml override (or an autoresearch interface-dir copy) is ignored.
+    for key in ("binary", "runtime_install", "mcp_servers",
                 "cli_command", "sdk_module", "serve", "teardown"):
         if key in override:
             merged[key] = override[key]
@@ -240,7 +246,34 @@ def _auto_prompt(platform: str, interface: str, binary: str | None) -> str:
     return ""
 
 
+def _committed_prompt(platform: str, interface: str) -> str | None:
+    """The engineer-facing prompt AS COMMITTED at platforms/<p>/<i>/config.yaml.
+
+    Read straight from the committed tree — NOT via bin_dir/load_manifest, which
+    honor `set_interface_home` and would pick up an autoresearch interface-dir
+    copy whose `prompt:` the researcher may have edited. The prompt is FROZEN
+    across versions: the researcher's job is to improve interface SOURCE, never
+    the prompt the engineer reads. Edits to `prompt:` in a version copy or a
+    version.yaml override are deliberately ignored.
+    """
+    p = PLATFORMS_DIR / platform / interface / "config.yaml"
+    if not p.exists():
+        return None
+    m = yaml.safe_load(p.read_text()) or {}
+    return m.get("prompt")
+
+
 def _prompt_for(platform: str, interface: str, version: int, version_root: Path | None) -> str:
+    # FROZEN: always the committed base prompt, regardless of version / home
+    # redirect. This is what makes a prompt-only "improvement" a no-op.
+    # `is not None` (not truthiness): an intentionally EMPTY committed prompt must
+    # also freeze to empty — falling through here would let the home-redirected
+    # copy's edited prompt leak back in.
+    committed = _committed_prompt(platform, interface)
+    if committed is not None:
+        return committed.strip()
+    # No committed prompt key at all (legacy / dynamically-homed interface): fall
+    # back to the resolved config, then an auto-generated default.
     cfg = _resolved_config(platform, interface, version, version_root)
     text = cfg.get("prompt")
     if text:
@@ -260,6 +293,112 @@ def prompt_hash_for(
     if not text:
         return ""
     return hashlib.sha256(text.encode()).hexdigest()[:8]
+
+
+# ---------------------------------------------------------------------------
+# Source fingerprint — "did the interface SOURCE actually change?"
+# ---------------------------------------------------------------------------
+
+# Build output + plumbing, not interface SOURCE: excluded from the fingerprint
+# so prompt/config tweaks and rebuilt wheels don't count as a "real" change.
+_FINGERPRINT_EXCLUDE_DIRS = {
+    "__pycache__", ".git", "build", "dist", ".claude", ".github", "Library",
+}
+_FINGERPRINT_EXCLUDE_SUFFIXES = (".whl", ".pyc", ".pyo", ".egg-link")
+# `pyproject.toml` is generated at build time; the `.banter-src-hash` marker is
+# our own cache key. `config.yaml` is NOT excluded — it is hashed with only the
+# (frozen) `prompt:` removed, so a prompt-only edit is a no-op but a real config
+# edit (install steps, binary, runtime_install, teardown, …) counts as a change.
+_FINGERPRINT_EXCLUDE_NAMES = {"pyproject.toml", ".banter-src-hash"}
+
+
+def _config_fingerprint_bytes(config_path: Path) -> bytes:
+    """Bytes for the root `config.yaml` MINUS the frozen `prompt:` field.
+
+    Lets `source_fingerprint` treat a prompt-only edit as no change (the prompt
+    is frozen) while still detecting real plumbing edits (install steps, binary,
+    runtime_install, teardown, …) — which the researcher prompt lists as a valid
+    lever. Falls back to raw bytes if the YAML can't be parsed.
+    """
+    try:
+        data = yaml.safe_load(config_path.read_text())
+        if isinstance(data, dict):
+            data.pop("prompt", None)
+            return yaml.safe_dump(data, sort_keys=True).encode()
+    except Exception:
+        pass
+    return config_path.read_bytes()
+
+
+def source_fingerprint(interface_dir: Path) -> str:
+    """A stable hash of an interface's SOURCE tree.
+
+    Excludes build artifacts (wheels, `build/`, `*.egg-info`, `__pycache__`),
+    the generated `pyproject.toml`, and Claude/VCS plumbing. The root
+    `config.yaml` is hashed with its frozen `prompt:` stripped, so two interface
+    copies with the same fingerprint have identical source AND identical build
+    plumbing — only the prompt or rebuilt binaries differ.
+    """
+    interface_dir = Path(interface_dir)
+    h = hashlib.sha256()
+    for f in sorted(p for p in interface_dir.rglob("*") if p.is_file()):
+        rel = f.relative_to(interface_dir)
+        if set(rel.parts) & _FINGERPRINT_EXCLUDE_DIRS:
+            continue
+        if any(part.endswith(".egg-info") for part in rel.parts):
+            continue
+        if f.name in _FINGERPRINT_EXCLUDE_NAMES or f.suffix in _FINGERPRINT_EXCLUDE_SUFFIXES:
+            continue
+        # Root config.yaml: hash everything except the frozen prompt. A nested
+        # config.yaml deeper in the source tree is hashed normally (it's source).
+        payload = (
+            _config_fingerprint_bytes(f) if str(rel) == "config.yaml" else f.read_bytes()
+        )
+        h.update(str(rel).encode())
+        h.update(b"\0")
+        h.update(payload)
+        h.update(b"\0")
+    return h.hexdigest()
+
+
+def assert_source_changed(
+    interface_dir: Path, version_label: str | None, fp: str | None = None
+) -> None:
+    """Refuse an autoresearch IMPROVEMENT version that didn't change the source.
+
+    For `v<N>` with N>0 and a sibling `v<N-1>/interface` present, raise
+    `ValueError` if the source is byte-identical to the previous version. Because
+    the prompt is frozen and `config.yaml` is excluded from the fingerprint, a
+    version that only re-worded the prompt (or changed nothing) is caught here —
+    before the engineer runs — instead of silently re-measuring `v<N-1>`.
+
+    Baselines (`v0`), non-autoresearch runs (no version label), and the first
+    version after a continuation (no sibling on disk) are not constrained.
+
+    `fp` may carry this dir's already-computed fingerprint (the caller often
+    needs it too) to avoid hashing the tree twice.
+    """
+    if not version_label:
+        return
+    label = str(version_label).lstrip("v")
+    if not label.isdigit():
+        return
+    n = int(label)
+    if n <= 0:
+        return
+    interface_dir = Path(interface_dir)
+    prev = interface_dir.parent.parent / f"v{n - 1}" / "interface"
+    if not prev.is_dir():
+        return
+    cur = fp if fp is not None else source_fingerprint(interface_dir)
+    if cur == source_fingerprint(prev):
+        raise ValueError(
+            f"interface source for {version_label} is identical to v{n - 1} "
+            f"(only config.yaml/prompt or build artifacts differ). The engineer "
+            f"prompt is FROZEN — to make {version_label} count, improve the "
+            f"interface SOURCE under {interface_dir} (e.g. src/python/...) and "
+            f"re-run. A prompt-only change is not a valid version."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -411,14 +550,17 @@ def setup(
         prompt_fragment=prompt_fragment,
         version=chosen,
         hash=hash_,
-        # `binary` may be a built artifact for any interface (e.g. an SDK wheel);
-        # only a CLI's binary is an invokable command worth tracking as cli_calls.
-        # cli_calls match the invokable command (`cli_command`, else the binary
-        # name — true for bare binaries like `hops`, but a wheel needs the
-        # explicit field). sdk_calls match the importable module (`sdk_module`,
-        # else the platform name — true when the package == the platform name).
-        cli_binary=(cfg.get("cli_command") or binary) if interface == "cli" else None,
-        sdk_module=(cfg.get("sdk_module") or platform) if interface == "sdk" else None,
+        # Resolve BOTH the CLI command and the SDK module for EVERY interface
+        # (not just the active one), so the engineer hook + the command counter
+        # can detect and block CROSS-INTERFACE escapes — e.g. `import hopsworks`
+        # while the CLI is under test, or a `hops` call while the SDK is under
+        # test. Which one is "on-interface" is decided from `interface`.
+        #   cli_binary: the invokable command (`cli_command`; for a CLI the bare
+        #     binary name also works, but a wheel needs the explicit field).
+        #   sdk_module: the importable module (`sdk_module`, else the platform
+        #     name — true when the package == the platform name).
+        cli_binary=cfg.get("cli_command") or (binary if interface == "cli" else None),
+        sdk_module=cfg.get("sdk_module") or platform,
         mcp_servers=mcp_servers,
         keys=_resolved_keys(platform, interface),
         serve=cfg.get("serve") or [],
@@ -833,15 +975,34 @@ def build(platform: str, interface: str) -> Path:
             shutil.copytree(local, iface_dir, dirs_exist_ok=True)
         else:
             src = iface_dir / "src"
-            if (src / ".git").exists():
-                subprocess.run(["git", "-C", str(src), "pull"], check=True)
-            else:
-                src.parent.mkdir(parents=True, exist_ok=True)
+            # Pin the source to `ref` — a FIXED COMMIT SHA (preferred, for
+            # reproducibility) or a branch/tag. Once checked out we NEVER
+            # `git pull`: the tree stays at the pinned commit, so (1) the
+            # experiment isn't confounded by upstream drift mid-session, and
+            # (2) a researcher's local edits to a per-version copy are never
+            # clobbered or merged with origin. To refresh the base, delete src/.
+            if not (src / ".git").exists():
+                src.mkdir(parents=True, exist_ok=True)
+                subprocess.run(["git", "-C", str(src), "init", "-q"], check=True)
                 subprocess.run(
-                    ["git", "clone", "--depth", "1", "--branch", ref, repo, str(src)],
+                    ["git", "-C", str(src), "remote", "add", "origin", repo], check=True
+                )
+                # Fetch just the pinned ref at depth 1 (GitHub serves a reachable
+                # SHA this way), then check it out detached.
+                subprocess.run(
+                    ["git", "-C", str(src), "fetch", "--depth", "1", "origin", ref],
                     check=True,
                 )
+                subprocess.run(
+                    ["git", "-C", str(src), "checkout", "-q", "FETCH_HEAD"], check=True
+                )
             src_cwd = src
+        # Always strip a cloned/copied repo's own agent instructions (.claude/,
+        # CLAUDE.md, .mcp.json) — e.g. hopsworks-api ships a .claude/ — so they're
+        # never auto-loaded as directives by the engineer/researcher working in
+        # or near the interface source.
+        from banter import docs as _docs
+        _docs.strip_agent_plumbing(src_cwd)
 
     # `package:` in config.yaml IS the build manifest — write the pyproject.toml
     # the build needs into the build dir (not committed). Lets the committed

@@ -241,6 +241,7 @@ _BENCHMARK_VIEW = {
     "bash_calls": "bash_calls",
     "skill_calls": "skill_calls",
     "other_tool_calls": "other_tool_calls",
+    "error": "error",
     "run_dir": "run_dir",
 }
 
@@ -372,6 +373,11 @@ FIELDS = [
     "keep",               # 0/1 — did the researcher keep this change?
     "observations",       # qualitative findings from the engineer transcripts
     "proposed_changes",   # what to try next
+    # Failure reason for a DEAD run (no valid submission): the run is recorded
+    # with all numeric metrics zeroed and this string set, so the researcher
+    # sees a comparable score-0 row + why it crashed (vs a graceful give-up,
+    # which floors a real submission with a low but non-zero score).
+    "error",
     # Pointer to the engineer's per-challenge artifacts dir (transcript, stream.log, submission, grading.json, …).
     "run_dir",
 ]
@@ -456,6 +462,8 @@ class Row:
     keep: int = 0              # 0 / 1
     observations: str = ""
     proposed_changes: str = ""
+    # Failure reason for a dead run (no valid submission); "" for normal runs.
+    error: str = ""
     run_dir: str = ""
 
 
@@ -647,6 +655,82 @@ def _classify_tool_use(
             return "sdk"
         return "python"
     return "bash"
+
+
+# Patterns that mean an interface tool runs python/compute LOCALLY instead of
+# delegating to the remote platform. A researcher could "win" an interface by
+# adding such a tool — laundering local compute as mcp/cli usage. We flag these
+# in the engineer-facing entry-point files (MCP tools, CLI commands).
+_LOCAL_EXEC_PATTERNS = [
+    ("subprocess", re.compile(r"\bsubprocess\b")),
+    ("os.system", re.compile(r"\bos\.system\s*\(")),
+    ("os.popen", re.compile(r"\bos\.popen\s*\(")),
+    ("Popen", re.compile(r"\bPopen\s*\(")),
+    ("exec(", re.compile(r"(?<![A-Za-z_.])exec\s*\(")),
+    ("runpy", re.compile(r"\brunpy\b")),
+    ("sys.executable", re.compile(r"\bsys\.executable\b")),
+]
+
+
+def audit_interface_local_exec(
+    interface_src: Path | str | None,
+    baseline_src: Path | str | None = None,
+) -> list[dict[str, Any]]:
+    """Flag engineer-facing interface tools that execute python/compute LOCALLY.
+
+    Scans the MCP-tool (`**/mcp/tools/*.py`) and CLI-command (`**/cli/commands/*.py`)
+    source under `interface_src` for local-execution patterns (subprocess, exec,
+    runpy, …). When `baseline_src` (the v0 interface source) is given, only files
+    the researcher CHANGED or added are flagged — an unchanged upstream file that
+    happens to use subprocess is not the researcher's laundering and is skipped.
+
+    Returns `[{"file": <relpath>, "patterns": [...]}, ...]` (empty = clean).
+    The remote-only contract: interface tools must delegate to the cluster, never
+    run the work locally.
+    """
+    flagged: list[dict[str, Any]] = []
+    if not interface_src:
+        return flagged
+    src = Path(interface_src)
+    if not src.exists():
+        return flagged
+    base = Path(baseline_src) if baseline_src else None
+    for path in sorted(src.rglob("*.py")):
+        rel = path.relative_to(src).as_posix()
+        tagged = f"/{rel}"
+        if "/build/" in tagged or "/tests/" in tagged or "/test/" in tagged:
+            continue  # built copies + test fixtures aren't engineer-facing
+        is_entrypoint = "/mcp/tools/" in tagged or "/cli/commands/" in tagged
+        # WITH a v0 baseline we can scan ALL researcher-changed source (covers
+        # SDK-interface laundering too) and flag only ADDED patterns — low false
+        # positives. WITHOUT a baseline we can only safely scan the narrow MCP/CLI
+        # entry points (scanning all source would flag legit upstream subprocess).
+        if base is None and not is_entrypoint:
+            continue
+        try:
+            text = path.read_text(errors="ignore")
+        except OSError:
+            continue
+        hits = [name for name, rx in _LOCAL_EXEC_PATTERNS if rx.search(text)]
+        if not hits:
+            continue
+        if base is not None:
+            counterpart = base / rel
+            base_text = ""
+            try:
+                if counterpart.exists():
+                    base_text = counterpart.read_text(errors="ignore")
+            except OSError:
+                base_text = ""
+            if base_text == text:
+                continue  # unchanged file — not researcher-introduced
+            # Flag only patterns the researcher ADDED (not already in baseline).
+            hits = [name for name, rx in _LOCAL_EXEC_PATTERNS
+                    if rx.search(text) and not rx.search(base_text)]
+            if not hits:
+                continue
+        flagged.append({"file": rel, "patterns": hits})
+    return flagged
 
 
 def aggregate_commands(

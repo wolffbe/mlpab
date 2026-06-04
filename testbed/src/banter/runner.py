@@ -244,6 +244,12 @@ def detect_environment() -> str:
 _UNDER_TEST_RE = re.compile(
     r"<!--UNDER_TEST_START-->\n(.*?)\n<!--UNDER_TEST_END-->", re.DOTALL
 )
+# The inverse: content kept ONLY when NO interface is under test (none/none,
+# where the engineer trains its own model locally). Stripped when an interface
+# is under test (everything must run remotely on the platform).
+_LOCAL_ONLY_RE = re.compile(
+    r"<!--LOCAL_ONLY_START-->\n(.*?)\n<!--LOCAL_ONLY_END-->", re.DOTALL
+)
 
 
 def _build_prompt(
@@ -255,8 +261,10 @@ def _build_prompt(
     template = TASK_PROMPT_PATH.read_text()
     if interface_under_test:
         template = _UNDER_TEST_RE.sub(lambda m: m.group(1), template)
+        template = _LOCAL_ONLY_RE.sub("", template)
     else:
         template = _UNDER_TEST_RE.sub("", template)
+        template = _LOCAL_ONLY_RE.sub(lambda m: m.group(1), template)
     template = re.sub(r"\n{3,}", "\n\n", template)
     if docs_name and docs_name != "none":
         docs_block = (
@@ -287,15 +295,67 @@ def run(spec: RunSpec) -> results.Row:
     # `prepare-version` and this run, so any wheel in the copy is potentially
     # stale. Drop it; preflight will rebuild + test.
     if spec.interface_dir is not None:
-        interfaces.set_interface_home(spec.platform, spec.interface, spec.interface_dir)
-        for w in list(Path(spec.interface_dir).glob("*.whl")):
+        idir = Path(spec.interface_dir)
+        interfaces.set_interface_home(spec.platform, spec.interface, idir)
+        # ENFORCE: an autoresearch improvement version (vN, N>0) must actually
+        # change the interface SOURCE vs the previous version. The prompt is
+        # frozen and config.yaml is excluded, so a prompt-only (or no-op) edit
+        # is refused here — before the engineer runs — rather than silently
+        # re-measuring v(N-1). Baselines / non-autoresearch runs are unaffected.
+        # Compute the source fingerprint ONCE and reuse it for both the
+        # change-check and the rebuild cache (hashing the tree — for Hopsworks a
+        # full upstream checkout — is not free).
+        fp = interfaces.source_fingerprint(idir)
+        try:
+            interfaces.assert_source_changed(idir, spec.version, fp=fp)
+        except ValueError as e:
+            raise preflight_mod.PreflightError(str(e))
+        # Rebuild only when the source changed since the last build in this copy
+        # (cache keyed on the source fingerprint). Repeated challenges within a
+        # version — or an unchanged interface — reuse the existing wheel instead
+        # of paying the full wheel build every run.
+        marker = idir / ".banter-src-hash"
+        wheels = list(idir.glob("*.whl"))
+        if not (wheels and marker.exists() and marker.read_text().strip() == fp):
+            for w in wheels:
+                try:
+                    w.unlink()
+                except OSError:
+                    pass
+            st = interfaces.preflight(
+                spec.platform, spec.interface, check_login=False, timeout_s=spec.timeout_s
+            )
+            if not st.ok:
+                raise preflight_mod.PreflightError(st.message)
+            marker.write_text(fp)
+
+        # Laundering audit: flag engineer-facing interface tools the researcher
+        # added/changed that run python LOCALLY (remote-only contract: tools must
+        # delegate to the cluster). Diff vN against the v0 baseline so unchanged
+        # upstream subprocess use isn't flagged. Surfaced as a warning + a
+        # per-version `interface_audit.json` artifact — visibility, not a hard
+        # block; the researcher/owner judges. Skipped for v0 (it IS the baseline).
+        _vtail = str(spec.version or "").rsplit("_", 1)[-1].lstrip("v")
+        ver = int(_vtail) if _vtail.isdigit() else 0
+        if ver > 0:
             try:
-                w.unlink()
-            except OSError:
-                pass
-        st = interfaces.preflight(spec.platform, spec.interface, check_login=False, timeout_s=spec.timeout_s)
-        if not st.ok:
-            raise preflight_mod.PreflightError(st.message)
+                # Repo-backed interfaces put source under `interface/src`; local /
+                # in-place interfaces have it directly under `interface/`.
+                cur_src = (idir / "src") if (idir / "src").exists() else idir
+                v0_iface = idir.parent.parent / "v0" / "interface"
+                base_src = (v0_iface / "src") if (v0_iface / "src").exists() else v0_iface
+                flagged = results.audit_interface_local_exec(
+                    cur_src, base_src if base_src.exists() else None
+                )
+                if flagged:
+                    (idir / "interface_audit.json").write_text(json.dumps(flagged, indent=2))
+                    print("[banter] WARNING: interface tool(s) execute LOCAL python "
+                          "— possible laundering of local compute as interface usage:",
+                          file=sys.stderr)
+                    for f in flagged:
+                        print(f"  - {f['file']}: {', '.join(f['patterns'])}", file=sys.stderr)
+            except Exception:
+                pass  # audit is best-effort; never block a run on it
 
     # Fail fast, upfront: the platform must be installed + login must work, and
     # any chosen skill bundle must be accessible to the engineer in a run.
@@ -371,7 +431,17 @@ def run(spec: RunSpec) -> results.Row:
         # per challenge. In benchmark / standalone runs there's no upstream
         # copy and we fetch directly into the challenge dir.
         share = spec.runs_root.parent if (spec.runs_root.parent / "docs").is_dir() else None
-        docs_setup = docs_mod.apply(spec.docs, run_dir, share_from=share)
+        # When sharing from the run-level clone the spec is unused (APFS copy);
+        # otherwise resolve the docs name → its repo URL/path (+ pinned ref).
+        if share is not None:
+            docs_spec, docs_ref = spec.docs, None
+        else:
+            try:
+                docs_spec = docs_mod.resolve(spec.docs, spec.platform)
+                docs_ref = docs_mod.resolve_ref(spec.docs, spec.platform)
+            except ValueError as e:
+                raise preflight_mod.PreflightError(f"docs {spec.docs!r}: {e}")
+        docs_setup = docs_mod.apply(docs_spec, run_dir, share_from=share, ref=docs_ref)
         if docs_setup.files:
             print(
                 f"[banter] docs {docs_setup.spec!r}: {len(docs_setup.files)} files "
@@ -380,9 +450,18 @@ def run(spec: RunSpec) -> results.Row:
             )
 
         # Start fresh: stop any servers a previous (possibly crashed) run left
-        # running and clear leaked state, then start the servers THIS run needs
-        # (e.g. the MCP HTTP server claude connects to at launch) in the run venv.
-        base_keys_env = {**os.environ, **interface_setup.keys}
+        # running and clear leaked state (incl. platform-side artifacts the agent
+        # created — see the interface `teardown:` step), then start the servers
+        # THIS run needs (e.g. the MCP HTTP server claude connects to at launch).
+        # `BANTER_PLATFORM_DIR` points teardown/serve steps at the COMMITTED
+        # platforms/<platform>/ dir (e.g. for a teardown.py cleanup script) — it
+        # is NOT the per-version interface copy, so the cleanup logic is fixed
+        # infrastructure, immune to interface edits.
+        base_keys_env = {
+            **os.environ,
+            **interface_setup.keys,
+            "BANTER_PLATFORM_DIR": str(interfaces.PLATFORMS_DIR / spec.platform),
+        }
         _run_aux(interface_setup.teardown, run_dir, base_keys_env)
         if interface_setup.serve:
             serve_env = dict(base_keys_env)
@@ -422,6 +501,7 @@ def run(spec: RunSpec) -> results.Row:
             extra_env=interface_setup.keys,
             version_dir=version_dir,
             allowed_domains=interface_setup.allowed_domains,
+            interface=interface_setup.interface,
         )
 
         if cr.exit_code != 0:
@@ -435,10 +515,17 @@ def run(spec: RunSpec) -> results.Row:
         (run_dir / "grading.json").write_text(json.dumps(grading, indent=2))
 
         usage = results.parse_transcript_usage(cr.transcript_path)
+        # Counting classifies by the ACTIVE interface only: a `hops`/`import
+        # hopsworks` call is `cli_calls`/`sdk_calls` ONLY when that interface is
+        # under test. (The interface_setup markers are resolved for ALL
+        # interfaces to feed the cross-interface enforcement HOOK, but for
+        # counting we must not relabel an off-interface call as on-interface.)
+        count_cli = interface_setup.cli_binary if interface_setup.interface == "cli" else None
+        count_sdk = interface_setup.sdk_module if interface_setup.interface == "sdk" else None
         counts = results.aggregate_commands(
             cr.transcript_path,
-            cli_binary=interface_setup.cli_binary,
-            sdk_module=interface_setup.sdk_module,
+            cli_binary=count_cli,
+            sdk_module=count_sdk,
             run_dir=run_dir,
         )
         # Rebuild commands.jsonl from the transcript so it's always populated even
@@ -446,8 +533,8 @@ def run(spec: RunSpec) -> results.Row:
         results.write_commands_log(
             cr.transcript_path,
             run_dir / "commands.jsonl",
-            cli_binary=interface_setup.cli_binary,
-            sdk_module=interface_setup.sdk_module,
+            cli_binary=count_cli,
+            sdk_module=count_sdk,
             run_dir=run_dir,
         )
         # mle-bench grading report → Row fields. Booleans stored 0/1 so they
@@ -512,6 +599,31 @@ def run(spec: RunSpec) -> results.Row:
             **slim_grading,
         )
 
+        # A DEAD run produced NO valid submission (engineer crashed / timed out
+        # before writing any submission.csv). Record it as a comparable score-0
+        # row with ALL numeric metrics zeroed and an `error` reason set — so the
+        # researcher sees the failure (and why) without misleading partial counts
+        # (the old SDK-v1 row had sdk_calls=11 / llm_calls=1 from a crash). NOTE:
+        # a graceful "give up" still ships a floor submission (copy of
+        # sample_submission), so it grades with a low but non-zero score and is
+        # NOT zeroed — that low score is itself the signal.
+        if not row.valid_submission:
+            row.error = str(grading.get("error")
+                            or "no valid submission produced (engineer crashed, "
+                               "timed out, or wrote no submission.csv)")[:1000]
+            row.score = 0.0
+            for _f in ("eng_wall_time_s", "eng_input_tokens", "eng_output_tokens",
+                       "eng_total_tokens", "eng_cost_usd", "total_wall_time_s",
+                       "total_tokens", "total_cost", "llm_calls", "cli_calls",
+                       "mcp_calls", "sdk_calls", "python_calls", "bash_calls",
+                       "skill_calls", "other_tool_calls"):
+                setattr(row, _f, 0)
+            print(
+                f"[banter] DEAD run (no valid submission) for {run_dir} — recording "
+                f"a zeroed score-0 row with error; artifacts kept on disk.",
+                file=sys.stderr,
+            )
+
         # Autoresearch writes ONE exploded row straight into the global
         # results/autoresearch/experiments.csv (no per-run results.csv).
         # Benchmark keeps its per-session results.csv.
@@ -546,7 +658,11 @@ def run(spec: RunSpec) -> results.Row:
         # engineer pip-installed) and the copied skill bundle, so nothing persists
         # into other runs. Results/artifacts (transcript, stream.log, submission,
         # grading) stay.
-        _run_aux(interface_setup.teardown, run_dir, {**os.environ, **interface_setup.keys})
+        _run_aux(interface_setup.teardown, run_dir, {
+            **os.environ,
+            **interface_setup.keys,
+            "BANTER_PLATFORM_DIR": str(interfaces.PLATFORMS_DIR / spec.platform),
+        })
         shutil.rmtree(run_dir / "venv", ignore_errors=True)
         shutil.rmtree(run_dir / ".claude" / "skills", ignore_errors=True)
         # Claude Code's built-in sandbox is per-session config (the

@@ -121,8 +121,11 @@ def main() -> None:
 @click.option("--skills", default="none", show_default=True, help="Skill bundle name under skills/, or `none`.")
 @click.option("--skills-version", "skills_version", type=int, default=None, help="Pin a skill bundle version.")
 @click.option("--docs", default="none", show_default=True,
-              help="Docs bundle under platforms/<platform>/docs/, or `none`. "
-                   "Bundle is copied into `<challenge>/docs/` for the engineer to browse.")
+              help="Any name selects the platform's docs config at "
+                   "platforms/<platform>/docs/config.yaml (its `repo:` is "
+                   "git-cloned); also accepts a raw git URL, or `none`. "
+                   "Materialized read-only at `<challenge>/docs/` for the engineer "
+                   "(and `<run>/docs/` for the researcher).")
 @click.option("--task", default="no_task", show_default=True, help="ML task / challenge group (folder in the run path).")
 @click.option("--model", default=runner.DEFAULT_MODEL, show_default=True)
 @click.option("--auth", type=click.Choice(runner.AUTH_MODES),

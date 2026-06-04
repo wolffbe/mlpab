@@ -98,7 +98,7 @@ ANNOTATION_FIELDS = [
     "hypothesis", "change", "verdict", "verdict_reason",
     "keep", "observations", "proposed_changes",
 ]
-RESULT_FIELDS = METRICS + ["valid_submission", "medal"] + ANNOTATION_FIELDS + ["run_dir"]
+RESULT_FIELDS = METRICS + ["valid_submission", "medal"] + ANNOTATION_FIELDS + ["error", "run_dir"]
 
 EXPERIMENT_FIELDS = DESIGN_FIELDS + GRAIN_FIELDS + RESULT_FIELDS
 
@@ -469,7 +469,14 @@ def attribute_researcher(
                 and r.get("platform") == platform
                 and r.get("interface") == interface)
 
-    leaf = [r for r in rows if is_leaf(r)]
+    # DEAD rows (no valid submission) were written with ALL metrics zeroed and
+    # an `error` set — they must STAY zeroed. Exclude them from researcher
+    # attribution so the shared overhead lands only on rows that produced a
+    # result, and the dead row's `total_*` isn't resurrected above zero.
+    def is_dead(r: dict) -> bool:
+        return bool((r.get("error") or "").strip())
+
+    leaf = [r for r in rows if is_leaf(r) and not is_dead(r)]
     n = len(leaf) or 1
     for r in leaf:
         # Per-row researcher share (equal split across the leaf's rows).

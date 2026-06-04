@@ -732,7 +732,13 @@ def _run_one_interface(
     # Docs are static across versions.
     if config.docs and config.docs != "none":
         from banter import docs as docs_mod
-        docs_setup = docs_mod.apply(config.docs, run_path)
+        docs_platform = config.interfaces[0].platform if config.interfaces else None
+        try:
+            docs_url = docs_mod.resolve(config.docs, docs_platform)
+            docs_ref = docs_mod.resolve_ref(config.docs, docs_platform)
+        except ValueError as e:
+            raise RuntimeError(f"[autoresearch] docs {config.docs!r}: {e}")
+        docs_setup = docs_mod.apply(docs_url, run_path, ref=docs_ref)
         print(f"[autoresearch] docs {config.docs!r}: {len(docs_setup.files)} "
               f"files at {run_path / 'docs'}", flush=True)
 
@@ -817,6 +823,26 @@ def _run_one_interface(
             "---\n"
         )
 
+    # Persistent STUDY notes — the researcher's memory of the INTERFACE SOURCE
+    # (what it has read, what each file does, the weaknesses it found). Separate
+    # from the changelog (which records changes + outcomes): this accumulates
+    # understanding of the code so the researcher doesn't re-study the same
+    # source after context compaction. Persists across versions (lives in the
+    # run dir) and is re-read at the start of every version.
+    study_md = run_path / "STUDY.md"
+    if not study_md.exists():
+        study_md.write_text(
+            f"# Autoresearch run `{run_id}` — source study notes\n\n"
+            "Your accumulating understanding of the INTERFACE SOURCE under "
+            "`v<N>/interface/src/`. Re-read this at the start of every version "
+            "and append as you study more, so source knowledge survives context "
+            "compaction. The engineer prompt is frozen — improvements must be "
+            "made to this source.\n\n"
+            "## Source map\n"
+            "_(file path → what it does → weaknesses spotted / ideas)_\n\n"
+            "---\n"
+        )
+
     # (Per-run analysis.ipynb retired — the single global notebook does the math.)
 
     # The raw stream-json transcript is no longer kept in the run dir (nothing
@@ -876,10 +902,18 @@ def _run_one_interface(
         f"## Interfaces\n{iface_md}\n\n"
         f"## Optimization goals\n{goals_md}\n\n"
         "## Structure\n"
-        "- `v<N>/interface/` — the interface source for increment N.\n"
+        "- `v<N>/interface/` — the interface for increment N; the REAL source is\n"
+        "  under `v<N>/interface/src/` — study + edit THAT to improve the interface.\n"
         "- `v<N>/<task>/<challenge>/` — per-challenge engineer artifacts.\n"
         "- `CHANGELOG.md` — your long-term memory: append an entry after EVERY version.\n"
+        "- `STUDY.md` — your source-study memory: what you've read + learned about\n"
+        "  the interface source. Re-read before each version; keep it current.\n"
         "- `researcher.log` — human-readable view of your own run.\n"
+        "\n## The prompt is FROZEN\n"
+        "The engineer's task prompt AND the interface `prompt:` field are fixed.\n"
+        "Editing `prompt:` in a version copy has no effect (it's read from the\n"
+        "committed base), and a version whose only change is the prompt/config is\n"
+        "refused at run time. Improvements MUST be source changes.\n"
         "- Results go to the GLOBAL `results/autoresearch/experiments.csv` (one row per\n"
         "  version/task/challenge); use the `normalized_composite` MCP tool to score versions.\n"
     )

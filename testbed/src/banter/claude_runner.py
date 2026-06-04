@@ -55,6 +55,18 @@ COMMON_DENY = [
 # ML task. Researcher keeps them — may look up library docs.
 ENGINEER_ONLY_DENY = ["WebFetch", "WebSearch"]
 
+# Compute libraries whose LOCAL execution the engineer hook forbids. The
+# remote-only model: model training must be pushed to the Hopsworks cluster as
+# a remote Job via the interface, never run on this machine. A locally-executed
+# python command that imports any of these is blocked (the engineer is told to
+# go remote or give up). Light glue (pandas/numpy/csv/json — downloading remote
+# results, formatting submission.csv) is intentionally NOT here. Overridable per
+# run via `compute_deny`; surfaced to the hook as TESTBED_COMPUTE_DENY.
+DEFAULT_COMPUTE_DENY = [
+    "torch", "torchvision", "tensorflow", "keras", "sklearn", "scikit_learn",
+    "xgboost", "lightgbm", "catboost", "jax", "flax", "transformers",
+]
+
 
 def deny_patterns_for(boundary: Path) -> list[str]:
     """Build `permissions.deny` patterns that DO fire under `bypassPermissions`.
@@ -192,6 +204,17 @@ _RATE_LIMIT_TOKENS = (
     "internal server error", "bad gateway", "service unavailable", "gateway timeout",
 )
 
+# Auth failures. The injected CLAUDE_CODE_OAUTH_TOKEN can expire mid-session on a
+# long run (a multi-hour researcher session died on a 401). On these we re-pull a
+# fresh token from the Keychain (Claude Code refreshes it there) and retry a
+# bounded number of times — distinct from the rate-limit backoff loop.
+_AUTH_ERROR_TOKENS = (
+    "401", "invalid authentication", "authentication_error",
+    "unauthorized", "invalid x-api-key", "invalid bearer token", "oauth token",
+)
+# How many times to refresh-and-retry on an auth error before giving up.
+AUTH_RETRY_MAX_ATTEMPTS = 3
+
 
 @dataclass
 class ClaudeResult:
@@ -317,6 +340,8 @@ def run(
     extra_env: dict[str, str] | None = None,
     version_dir: Path | None = None,
     allowed_domains: list[str] | None = None,
+    interface: str | None = None,
+    compute_deny: list[str] | None = None,
 ) -> ClaudeResult:
     """Spawn `claude -p` (the engineer).
 
@@ -365,6 +390,14 @@ def run(
         env["TESTBED_CLI_BINARY"] = cli_binary
     if sdk_module:
         env["TESTBED_SDK_MODULE"] = sdk_module
+    # Remote-only enforcement: only for the real delegation interfaces. The hook
+    # needs the active interface (so a non-active interface's use is an escape)
+    # plus the compute libraries whose LOCAL execution is forbidden (training
+    # must run remotely). A none/none baseline gets none of this — it trains
+    # locally by design — so the hook no-ops for it.
+    if interface in ("cli", "mcp", "sdk"):
+        env["TESTBED_INTERFACE"] = interface
+        env["TESTBED_COMPUTE_DENY"] = ",".join(compute_deny or DEFAULT_COMPUTE_DENY)
 
     # Activate per-run venv so claude's python/pip find ML deps via .pth.
     venv_bin = run_dir / "venv" / "bin"
@@ -462,6 +495,8 @@ def run_with_retry(
 
     start = time.monotonic()
     attempt = 0
+    auth_attempts = 0
+    rl_attempts = 0   # rate-limit retries only — drives the backoff exponent
     exit_code = 1
     # Buffer stderr to a temp file outside the run dir; we only move it into
     # place at the END if it has actual content.
@@ -525,16 +560,40 @@ def run_with_retry(
                         proc.kill()
                     raise
 
-        if exit_code == 0 or not _last_result_is_rate_limited(transcript_path):
+        if exit_code == 0:
             break
+        # Auth failure (e.g. the OAuth token expired mid-session): re-pull a
+        # fresh token from the Keychain and retry, up to a small bound. Checked
+        # before rate-limit so a 401 doesn't fall into the 6h backoff loop.
+        if _last_result_is_auth_error(transcript_path) and auth_attempts < AUTH_RETRY_MAX_ATTEMPTS:
+            auth_attempts += 1
+            # Only retry if a DIFFERENT (refreshed) token was obtained — retrying
+            # the identical expired token would just fail again immediately.
+            if not _refresh_oauth_token(env):
+                print(
+                    f"[{log_prefix}] auth error on attempt {attempt}; no fresh "
+                    f"Keychain token available — giving up.",
+                    flush=True,
+                )
+                break
+            print(
+                f"[{log_prefix}] auth error on attempt {attempt} "
+                f"(auth-retry {auth_attempts}/{AUTH_RETRY_MAX_ATTEMPTS}); re-pulled a "
+                f"fresh Keychain token, retrying.",
+                flush=True,
+            )
+            continue
+        if not _last_result_is_rate_limited(transcript_path):
+            break
+        rl_attempts += 1
         elapsed = time.monotonic() - start
         backoff = min(
-            RATE_LIMIT_BASE_BACKOFF_S * (2 ** (attempt - 1)),
+            RATE_LIMIT_BASE_BACKOFF_S * (2 ** (rl_attempts - 1)),
             RATE_LIMIT_MAX_BACKOFF_S,
         )
         if elapsed + backoff > RATE_LIMIT_RETRY_WINDOW_S:
             print(
-                f"[{log_prefix}] rate-limited after {attempt} attempts "
+                f"[{log_prefix}] rate-limited after {rl_attempts} attempts "
                 f"({elapsed:.0f}s elapsed); {RATE_LIMIT_RETRY_WINDOW_S // 3600}h retry budget "
                 f"exhausted, giving up.",
                 flush=True,
@@ -564,11 +623,11 @@ def run_with_retry(
     return exit_code, time.monotonic() - start
 
 
-def _last_result_is_rate_limited(transcript_path: Path) -> bool:
-    """Inspect the last `result` event in the stream-json transcript and
-    decide whether the run stopped on a 429/529-style condition."""
+def _last_result_error_blob(transcript_path: Path) -> str | None:
+    """Lowercased error text of the last `result` event when it is an error,
+    else None. Shared by the rate-limit and auth-error classifiers."""
     if not transcript_path.exists():
-        return False
+        return None
     last_result: dict[str, Any] | None = None
     for line in transcript_path.read_text().splitlines():
         if not line.strip():
@@ -580,8 +639,39 @@ def _last_result_is_rate_limited(transcript_path: Path) -> bool:
         if event.get("type") == "result":
             last_result = event
     if not last_result or not last_result.get("is_error"):
-        return False
-    blob = " ".join(
+        return None
+    return " ".join(
         str(last_result.get(k) or "") for k in ("api_error_status", "subtype", "result")
     ).lower()
-    return any(token in blob for token in _RATE_LIMIT_TOKENS)
+
+
+def _last_result_is_rate_limited(transcript_path: Path) -> bool:
+    """The last `result` stopped on a 429/529-style / transient-5xx condition."""
+    blob = _last_result_error_blob(transcript_path)
+    return bool(blob) and any(t in blob for t in _RATE_LIMIT_TOKENS)
+
+
+def _last_result_is_auth_error(transcript_path: Path) -> bool:
+    """The last `result` stopped on a 401/authentication condition."""
+    blob = _last_result_error_blob(transcript_path)
+    return bool(blob) and any(t in blob for t in _AUTH_ERROR_TOKENS)
+
+
+def _refresh_oauth_token(env: dict[str, str]) -> bool:
+    """Re-pull the OAuth token from the Keychain (Claude Code refreshes it
+    there) and update both the env and the BANTER_TOKEN_CACHE file in place.
+    Returns True only if a DIFFERENT token was obtained — retrying with the
+    identical (still-expired) token is pointless, so the caller stops then."""
+    fresh = oauth_token_from_keychain()
+    if not fresh or fresh == env.get("CLAUDE_CODE_OAUTH_TOKEN"):
+        return False
+    env["CLAUDE_CODE_OAUTH_TOKEN"] = fresh
+    cache = env.get(TOKEN_CACHE_ENV)
+    if cache:
+        try:
+            p = Path(cache)
+            p.write_text(fresh)
+            p.chmod(0o600)
+        except OSError:
+            pass
+    return True

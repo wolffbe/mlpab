@@ -64,6 +64,314 @@ def classify(tool_name: str, tool_input: dict) -> str:
     return "bash"
 
 
+# --- Remote-only / single-interface enforcement -------------------------------
+# Everything must run on the platform; local model training is forbidden and the
+# engineer must stay on the interface under test. These helpers parse a Bash
+# command into segments, find each segment's executable, and extract the python
+# payload (inline `-c`, referenced `.py` files, `-m module`) so we can tell
+# LOCAL execution of a compute library apart from a script merely written to be
+# shipped to the cluster.
+
+def _is_env_assign(tok: str) -> bool:
+    if "=" not in tok or tok.startswith("="):
+        return False
+    head = tok.split("=", 1)[0]
+    return bool(head) and (head[0].isalpha() or head[0] == "_") and all(
+        c.isalnum() or c == "_" for c in head
+    )
+
+
+def _split(text: str) -> list:
+    try:
+        return shlex.split(text)
+    except ValueError:
+        return text.split()
+
+
+def _segments(command: str) -> list:
+    """Split a command into command segments at shell separators (`;`, `&&`,
+    `||`, `|`, `&`, newline), returning each as a token list.
+
+    Splits the RAW string char-by-char respecting quotes — `shlex.split` does
+    NOT treat `;`/`&&`/`|` as separators (it keeps `foo;` and `true;python` as
+    single tokens), so a token-membership test misses every separator that isn't
+    space-delimited (`cd x; python y`, `true&&python y`). Quote-awareness keeps
+    an inline `python -c "import os; os.system(...)"` body as ONE segment (the
+    `;` is inside quotes), so payload extraction stays intact.
+    """
+    raw_segs: list[str] = []
+    cur: list[str] = []
+    quote: str | None = None
+    i, n = 0, len(command)
+    while i < n:
+        c = command[i]
+        if quote:
+            cur.append(c)
+            if c == quote:
+                quote = None
+            i += 1
+            continue
+        if c in ("'", '"'):
+            quote = c
+            cur.append(c)
+            i += 1
+            continue
+        if c in "&|" and i + 1 < n and command[i + 1] == c:   # && or ||
+            raw_segs.append("".join(cur)); cur = []; i += 2; continue
+        if c in ";\n&|":                                       # ; & | newline
+            raw_segs.append("".join(cur)); cur = []; i += 1; continue
+        cur.append(c)
+        i += 1
+    raw_segs.append("".join(cur))
+    out: list = []
+    for seg in raw_segs:
+        toks = _split(seg)
+        if toks:
+            out.append(toks)
+    return out
+
+
+def _seg_exec(tokens: list, depth: int = 0) -> str | None:
+    """The executable token of a segment, skipping env-assignment prefixes,
+    `env [-i] [VAR=VAL]...` and `uv run` wrappers, and recursing into
+    `bash -c "<script>"`."""
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if _is_env_assign(tok):
+            i += 1
+            continue
+        if depth < 2 and tok in ("bash", "sh", "zsh") and i + 2 < len(tokens) and tokens[i + 1] == "-c":
+            return _seg_exec(_split(tokens[i + 2]), depth + 1)
+        # `env [-i|--unset=..] [VAR=VAL]... cmd ...` → the real command follows.
+        if tok in ("env", "/usr/bin/env") and depth < 3:
+            j = i + 1
+            while j < len(tokens) and (_is_env_assign(tokens[j]) or tokens[j].startswith("-")):
+                j += 1
+            i = j
+            continue
+        # `uv run [-flags] python ...` → skip the `uv run` wrapper.
+        if tok == "uv" and i + 1 < len(tokens) and tokens[i + 1] == "run" and depth < 3:
+            j = i + 2
+            while j < len(tokens) and tokens[j].startswith("-"):
+                j += 1
+            i = j
+            continue
+        return tok
+    return None
+
+
+def _interp_basename(tok: str) -> str:
+    return tok.rsplit("/", 1)[-1]
+
+
+# A python interpreter basename: python, python3, python3.11, python2.7, …
+_PYTHON_INTERP_RE = re.compile(r"^python(\d+(\.\d+)*)?$")
+
+
+def _is_python_tok(tok: str) -> bool:
+    base = _interp_basename(tok)
+    return (
+        tok in PYTHON_PREFIXES
+        or bool(_PYTHON_INTERP_RE.match(base))
+        or base in ("pip", "pip3")
+        or tok.endswith(".py")
+    )
+
+
+def _executes_local_python(command: str) -> bool:
+    """True if any segment runs local python — interpreter, `.py` script, OR
+    `pip` (versioned interpreters and absolute paths included). All of it is
+    off-interface in CLI/MCP mode: the engineer never needs to install, because
+    banter (autoresearch) builds + installs the interface AND its dependencies
+    into the run venv before the engineer starts."""
+    for seg in _segments(command):
+        ex = _seg_exec(seg)
+        if ex and _is_python_tok(ex):
+            return True
+    return False
+
+
+def _is_cli_tok(tok: str, cli_binary: str) -> bool:
+    return tok == cli_binary or tok.endswith(f"/{cli_binary}")
+
+
+def _python_payloads(command: str) -> tuple[str, list]:
+    """What python actually EXECUTES locally in this command.
+
+    Returns `(payload_text, unreadable_scripts)`:
+      - `payload_text` — concatenated inline `-c` bodies, `-m module` (synthetic
+        import), and the contents of the executed `.py` SCRIPT (the first `.py`
+        token after the interpreter; trailing `.py` ARGS are not treated as
+        executed code). Empty when no python runs locally — a script merely
+        created with `Write` is never flagged. `cd` is tracked so
+        `cd work && python train.py` resolves train.py.
+      - `unreadable_scripts` — executed `.py` scripts we could NOT read (so their
+        imports can't be verified). The caller fails CLOSED on these in SDK mode.
+    """
+    texts: list = []
+    unreadable: list = []
+    curdir = os.getcwd()
+    for seg in _segments(command):
+        ex = _seg_exec(seg)
+        if ex == "cd" and len(seg) > 1:
+            target = seg[1]
+            curdir = target if os.path.isabs(target) else os.path.normpath(os.path.join(curdir, target))
+            continue
+        if not (ex and _is_python_tok(ex)):
+            continue
+        if "-c" in seg:
+            j = seg.index("-c")
+            if j + 1 < len(seg):
+                texts.append(seg[j + 1])
+            continue
+        if "-m" in seg:
+            j = seg.index("-m")
+            if j + 1 < len(seg):
+                texts.append("import " + seg[j + 1])
+            continue
+        # `python script.py [args]` — the script is the FIRST .py token; later
+        # .py tokens are arguments (e.g. `--config c.py`), not executed code.
+        script = next((t for t in seg if t.endswith(".py")), None)
+        if script is None:
+            continue
+        path = script if os.path.isabs(script) else os.path.join(curdir, script)
+        try:
+            with open(path, errors="ignore") as f:
+                texts.append(f.read())
+        except OSError:
+            unreadable.append(script)
+    return "\n".join(texts), unreadable
+
+
+def _imported_modules(text: str) -> set:
+    """Root module names imported by `text`. Handles `import a, b.c as d`,
+    `from x.y import z`, and statements separated by `;` or newlines — so
+    comma-lists like `import hopsworks, sklearn` are fully covered."""
+    mods: set = set()
+    for stmt in re.split(r"[;\n]", text):
+        s = stmt.strip()
+        if s.startswith("import "):
+            for part in s[len("import "):].split(","):
+                head = part.strip().split()
+                if head:
+                    root = head[0].split(".")[0]
+                    if root:
+                        mods.add(root)
+        elif s.startswith("from "):
+            after = s[len("from "):].split(" import ")[0].strip()
+            root = after.split(".")[0]
+            if root:
+                mods.add(root)
+    # Dynamic imports with a string-literal module name:
+    # `__import__("torch")`, `importlib.import_module('sklearn')`.
+    for m in re.finditer(r"""(?:__import__|import_module)\(\s*['"]([\w.]+)""", text):
+        mods.add(m.group(1).split(".")[0])
+    return mods
+
+
+def _imports_any(text: str, modules: list) -> str | None:
+    """Return the first module in `modules` that `text` imports, else None."""
+    imported = _imported_modules(text)
+    for mod in modules:
+        if mod in imported:
+            return mod
+    return None
+
+
+# What is the ONLY sanctioned way to do work in each mode (for messages).
+_ONLY = {
+    "cli": "the `hops` CLI",
+    "mcp": "the MCP tools (`mcp__hopsworks__*`)",
+    "sdk": "the `hopsworks` Python SDK (no ML libraries)",
+}
+
+
+def enforce(tool_name: str, tool_input: dict) -> str | None:
+    """Return a denial reason if this call escapes the remote-only / single-
+    interface contract, else None. Reads the active interface + markers from env
+    (set by claude_runner): TESTBED_INTERFACE, TESTBED_SDK_MODULE,
+    TESTBED_CLI_BINARY, TESTBED_COMPUTE_DENY.
+
+    Contract (everything runs on Hopsworks; nothing runs locally):
+      - CLI mode → only `hops`; NO local python at all.
+      - MCP mode → only MCP tools; NO local python, NO `hops`.
+      - SDK mode → only `hopsworks` python; NO ML libraries, NO `hops`, NO MCP.
+      - ML libraries are blocked locally in EVERY mode.
+    Basic bash (cp/mkdir/ls/cat …) stays allowed so the floor submission can be
+    written and data inspected.
+    """
+    interface = os.environ.get("TESTBED_INTERFACE") or None
+    # Enforce ONLY for the real delegation interfaces. A none/none baseline
+    # (interface "none" or unset) trains locally by design — never blocked.
+    if interface not in ("cli", "mcp", "sdk"):
+        return None
+    cli_binary = os.environ.get("TESTBED_CLI_BINARY") or None
+    compute_deny = [m for m in (os.environ.get("TESTBED_COMPUTE_DENY") or "").split(",") if m]
+    use_only = _ONLY.get(interface, f"the {interface} interface")
+
+    # MCP tools are only legitimate in MCP mode.
+    if tool_name.startswith("mcp__"):
+        if interface != "mcp":
+            return (
+                f"DENIED: MCP tools are off-interface in {interface!r} mode. "
+                f"Use only {use_only} for Hopsworks operations."
+            )
+        return None
+    if tool_name != "Bash":
+        return None
+
+    command = (tool_input.get("command") or "").strip()
+    if not command:
+        return None
+
+    # 1) ML libraries may never be executed locally — training stays remote.
+    payload, unreadable = _python_payloads(command)
+    if payload and compute_deny:
+        lib = _imports_any(payload, compute_deny)
+        if lib:
+            return (
+                f"DENIED: local execution of ML library {lib!r} is forbidden. "
+                f"Training must run on Hopsworks — push it to the cluster as a "
+                f"remote Job via {use_only}. If that's not possible, STOP and "
+                f"report the missing capability; do NOT train locally."
+            )
+
+    # 1b) SDK mode allows python, so we must READ an executed script to confirm
+    #     it imports no ML library. If we can't read it, fail CLOSED — otherwise
+    #     `python train.py` with an unresolvable path would skip the check. (In
+    #     CLI/MCP mode rule 2 blocks all local python regardless, so this only
+    #     matters for SDK.)
+    if interface == "sdk" and unreadable:
+        return (
+            f"DENIED: cannot read local script(s) {', '.join(unreadable)} to verify "
+            f"they don't train locally. Run python from your working directory so "
+            f"the script is readable, drive the SDK inline (`python -c ...`), or "
+            f"push the work to Hopsworks as a remote Job."
+        )
+
+    # 2) In CLI / MCP modes, ANY local python is off-interface (only the CLI /
+    #    the MCP tools may do work). SDK mode IS python, so it's allowed there
+    #    (restricted to no-ML by rule 1).
+    if interface in ("cli", "mcp") and _executes_local_python(command):
+        return (
+            f"DENIED: local python is off-interface in {interface!r} mode. "
+            f"Use only {use_only} to run work on Hopsworks. Basic shell "
+            f"(cp/mkdir) is fine for writing the floor submission."
+        )
+
+    # 3) The `hops` CLI is off-interface unless the CLI is under test.
+    if cli_binary and interface != "cli":
+        for seg in _segments(command):
+            ex = _seg_exec(seg)
+            if ex and _is_cli_tok(ex, cli_binary):
+                return (
+                    f"DENIED: the {cli_binary!r} CLI is off-interface in "
+                    f"{interface!r} mode. Use only {use_only}."
+                )
+    return None
+
+
 # Tool-input flags that escape our intended boundaries. Blocking via hook
 # (the only mechanism available — settings.json can't deny by parameter).
 FORBIDDEN_FLAGS = {
@@ -147,6 +455,13 @@ def main() -> int:
         if tool_input.get(flag) is True:
             print(msg, file=sys.stderr, flush=True)
             return 2  # non-zero → block the tool call
+
+    # Remote-only / single-interface enforcement: block local compute and any
+    # escape to an interface other than the one under test.
+    reason = enforce(tool_name, tool_input)
+    if reason:
+        print(reason, file=sys.stderr, flush=True)
+        return 2
 
     # Path-based deny for Read/Write/Edit. Enforces what `permissions.deny`
     # silently skips under bypassPermissions.

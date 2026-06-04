@@ -6,7 +6,12 @@ files there to understand the task, the target, and the required submission
 format.
 
 Your goal is to produce a valid `submission/submission.csv` against the
-competition's metric in a single attempt. Concretely:
+competition's metric in a single attempt.
+
+{fragment}
+
+<!--LOCAL_ONLY_START-->
+Concretely:
 
 1. Explore `data/` to understand the schema, the target, and the sample
    submission format.
@@ -14,54 +19,93 @@ competition's metric in a single attempt. Concretely:
    into the current environment).
 3. Generate predictions for the test set and write them to
    `submission/submission.csv` in exactly the format the competition expects.
-
-{fragment}
+<!--LOCAL_ONLY_END-->
 
 <!--UNDER_TEST_START-->
+## Restrictions — everything runs on the platform, nothing runs locally
+
+All real work — feature engineering, model training, inference — MUST run on the
+PLATFORM, driven through the interface described above (e.g. as a remote job).
+**Nothing is computed on this machine.** The interface and every dependency it
+needs are **already installed** — you never install anything yourself.
+
+**These rules are HARD-ENFORCED.** A violating command is rejected before it runs
+(you'll get a `DENIED: …` message explaining why). Don't fight it or look for a
+way around it — adapt, or give up cleanly (below).
+
+**You may ONLY use the interface under test** (exactly one of these applies to
+this run — the section above tells you which):
+- **CLI mode** → only the platform's CLI command. No local Python at all.
+- **MCP mode** → only the `mcp__…__*` tools. No local Python, no CLI.
+- **SDK mode** → only the platform's Python SDK (`import` it to drive the
+  platform — not to compute locally). No CLI, no MCP tools.
+
+**Always BLOCKED (every mode):**
+- Local model training / ML libraries (`torch`, `tensorflow`, `keras`,
+  `sklearn`, `xgboost`, `lightgbm`, …) — training must be a remote job.
+- Any interface other than the one under test.
+- In CLI and MCP mode: **all** local Python, including `pip` / `python -m pip`
+  (there is nothing to install — it's done for you).
+
+**Allowed in every mode:**
+- Inspecting the task: `cat`, `head`, `ls`, and the `Read` tool on `data/`.
+- Writing the submission: `mkdir`, `cp` (e.g. the floor submission below).
+
+## One attempt — then give up cleanly
+
+Make **one** attempt with the interface exactly as it is. You are a probe: the
+researcher reads your result and improves the interface for the next run.
+
+- If the interface **cannot** run the work remotely (the capability is missing,
+  a command/tool doesn't exist, it errors), **do NOT build a workaround and do
+  NOT debug at length.** STOP, write the floor submission (below), and in your
+  final message state plainly **what capability the interface is missing**. That
+  report is exactly what the researcher needs.
+- **You MUST always end with a graded submission.** Giving up does NOT mean
+  producing nothing. If you can't get real predictions from the platform, copy
+  `data/sample_submission.csv` to `submission/submission.csv` as the floor
+  result — a valid, low score the researcher can act on:
+  ```bash
+  mkdir -p submission && cp data/sample_submission.csv submission/submission.csv
+  ```
+
 ## The interface is what's being measured — do NOT route around it
 
-The interface above is the unit under test. The researcher is iterating its
-source to improve it; your job is to **USE the interface as-is** and report
-what it produces. The score the interface earns is the data the researcher
-needs.
+The interface above is the unit under test. Your job is to **USE it as-is** and
+report what it produces. The score the interface earns is the data the
+researcher needs.
 
 - A trivial or low-quality prediction from the interface is **NOT a bug**.
-  All-zeros, all-0.5, all-NaN, low-AUC, etc. from the interface are valid
-  experimental results. Submit them.
-- **DO NOT write your own training script** when the interface produces a
-  poor result. That defeats the experiment — the researcher would see a
-  great score that has nothing to do with the interface.
-- A "bug" that justifies redoing work means YOUR driver code crashed
-  (Python exception, failed install, malformed submission file). It does
-  NOT mean "the interface returned predictions I don't like."
-- If the interface is genuinely broken (raises, can't be called, returns
-  wrong shape), still produce SOMETHING that grades — e.g. copy
-  `data/sample_submission.csv` to `submission/submission.csv` so the
-  competition can score it. That's the floor result; the researcher will
-  see it and know the interface is broken at this version.
+  All-zeros, all-0.5, low-AUC, etc. from the interface (or the floor submission)
+  are valid experimental results. Submit them.
+- **DO NOT train your own model** to rescue a poor interface result — and you
+  can't anyway (local ML is blocked). That would defeat the experiment.
+- Keep any remote job small and short (a few epochs) so your single attempt
+  finishes within the time budget. Speed beats squeezing out accuracy.
 
 Faithfully exercise the interface and ship its output as the submission.
-Do not try to outperform it.
 <!--UNDER_TEST_END-->
 
 Environment and constraints (detected on this machine):
 {environment}
-- Run training in the FOREGROUND and let it finish; never launch background or
+- Run commands in the FOREGROUND and let them finish; never launch background or
   daemon processes that could outlive your command. Do not call `Bash` with
   `run_in_background: true` — chain commands synchronously instead.
 - **Never write an open-ended wait loop** such as
   `until [ -f submission/submission.csv ]; do sleep 5; done` or
-  `while true; do …; done`. Run the training command itself in the foreground
-  and let that single command block until it returns — do NOT spawn the work
-  and then poll for its output. For a long command, pass the `Bash` tool a
-  large explicit `timeout` so it runs to completion in one synchronous call.
+  `while true; do …; done`. Run the command itself in the foreground and let
+  that single command block until it returns — do NOT spawn work and then poll
+  for its output. For a long command, pass the `Bash` tool a large explicit
+  `timeout` so it runs to completion in one synchronous call.
 - If a command is ever moved to a background task and you are handed a
   task-output file path, `Read` that exact path to inspect progress or errors —
   do not blind-wait for a notification. But keeping the command in the
   foreground (above) is what you should actually do, so this never arises.
+<!--LOCAL_ONLY_START-->
 - Keep the model small and training short (a few epochs) so your single attempt
   completes well within the time budget. Speed matters more than squeezing out
   the last bit of accuracy.
+<!--LOCAL_ONLY_END-->
 
 ## Sandbox boundary — read before troubleshooting any "permission denied"
 
@@ -69,8 +113,8 @@ You run with a tightly-scoped sandbox. The ONLY restriction that actually
 limits you is on READS — write freely inside your cwd.
 
 - **Your boundary = your current working directory.** Read + write freely
-  inside it. `./submission/submission.csv`, `./model.pt`, `./.hf/...`,
-  `./.tmp/...`, `./venv/...` — all reachable. Use relative paths.
+  inside it. `./submission/submission.csv`, `./.tmp/...`, `./venv/...` — all
+  reachable. Use relative paths.
 - **Shared infrastructure reachable through indirection**: `./venv/` resolves
   to the shared Python libs (via .pth), `./data/` is a symlink to the
   mle-bench cache. You don't address these by absolute path; just use the
@@ -87,12 +131,14 @@ rejected before it runs — do not use them):
 - `dangerouslyDisableSandbox: true`
 - `run_in_background: true`
 
+<!--LOCAL_ONLY_START-->
 For tools that try to write to `/tmp` or `~/.cache` (HF, Torch, Triton), point
 them at cwd via env vars BEFORE invoking, not after a failure:
 ```bash
 HF_HOME=$PWD/.hf TORCH_HOME=$PWD/.torch TMPDIR=$PWD/.tmp \
   python train_model.py
 ```
+<!--LOCAL_ONLY_END-->
 
 **STOP reasoning about sandbox internals.** Do NOT speculate about
 denyWithinAllow rules, `.git/HEAD/objects/refs` denies, `"."` not expanding
@@ -108,13 +154,15 @@ pathlib.Path("submission").mkdir(exist_ok=True)  # 2. ensure dir
 with open("submission/submission.csv", "w") as f: ...  # 3. relative write
 ```
 
-Make a SINGLE attempt at the challenge. Train one model end to end and write
-`submission/submission.csv` exactly once — do not iterate over multiple models,
-tune hyperparameters, or regenerate the submission to chase a higher score.
-Whatever that one attempt scores is the result; a mediocre score is acceptable.
+Make a SINGLE attempt at the challenge and write `submission/submission.csv`
+exactly once — do not iterate over multiple approaches, tune, or regenerate the
+submission to chase a higher score. Whatever that one attempt scores is the
+result; a mediocre score is acceptable.
+<!--LOCAL_ONLY_START-->
 The only reason to redo work is an error — a bug, a crash, a failed install — in
-which case fix it and continue. Once a valid `submission/submission.csv` exists,
-you are done.
+which case fix it and continue.
+<!--LOCAL_ONLY_END-->
+Once a valid `submission/submission.csv` exists, you are done.
 
 Work autonomously end to end. When you are done, the file
 `submission/submission.csv` must exist and be valid for grading.
