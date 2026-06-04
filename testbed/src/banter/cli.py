@@ -467,8 +467,9 @@ def budget_check(start: int, max_seconds: float, ledger: Path | None, as_json: b
             "stop": over,
         }))
     else:
+        cap = "unlimited" if max_seconds == float("inf") else f"{max_seconds:.0f}s cap"
         click.echo(
-            f"compute {compute:.0f}s / {max_seconds:.0f}s cap "
+            f"compute {compute:.0f}s / {cap} "
             f"(rate-limit waits excluded: {waited:.0f}s) -> {'STOP' if over else 'CONTINUE'}"
         )
     raise SystemExit(3 if over else 0)

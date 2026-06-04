@@ -67,6 +67,58 @@ DEFAULT_COMPUTE_DENY = [
     "xgboost", "lightgbm", "catboost", "jax", "flax", "transformers",
 ]
 
+# Bootstrapped into the engineer's run venv (as `_banter_apilog.py` + a `.pth`
+# that imports it): it wraps `requests.Session.send` to append every outbound
+# request's {method, path} to the file named by BANTER_API_LOG. The Hopsworks
+# SDK, the `hops` CLI, and the MCP server all run in this venv and all use
+# `requests`, so this captures every REST call to the cluster for endpoint-
+# coverage scoring. Best-effort — wrapped so it can never break startup/requests.
+# NOTE: we use a `.pth` import line (executed by `site` for EVERY site dir), NOT
+# `sitecustomize.py` — a base interpreter (e.g. Homebrew python) often ships its
+# own stdlib `sitecustomize.py` that precedes the venv on sys.path and would
+# shadow ours, silently disabling the shim.
+_API_LOG_SHIM = r'''
+import os as _os
+_banter_log = _os.environ.get("BANTER_API_LOG")
+if _banter_log:
+    try:
+        import json as _json, time as _time, threading as _thr
+        from urllib.parse import urlsplit as _urlsplit
+        import requests as _rq
+        _banter_lock = _thr.Lock()
+        _banter_orig_send = _rq.Session.send
+        def _banter_send(self, request, **kw):
+            try:
+                with _banter_lock, open(_banter_log, "a") as _f:
+                    _f.write(_json.dumps({
+                        "ts": _time.time(),
+                        "method": (getattr(request, "method", "") or "").upper(),
+                        "path": _urlsplit(getattr(request, "url", "") or "").path,
+                    }) + "\n")
+            except Exception:
+                pass
+            return _banter_orig_send(self, request, **kw)
+        _rq.Session.send = _banter_send
+    except Exception:
+        pass
+'''
+
+
+def _install_api_log_shim(venv_dir: Path) -> None:
+    """Bootstrap the request-logging shim into the run venv's OWN site-packages
+    (not the shared base venv) so only the engineer's python is instrumented.
+
+    Uses a `.pth` import line rather than `sitecustomize.py`: `site` executes
+    `.pth` `import` lines for every site dir it adds, so this fires even when the
+    base interpreter ships its own `sitecustomize.py` (which would shadow a
+    venv-local one on sys.path). Best-effort."""
+    for sp in (venv_dir / "lib").glob("python*/site-packages"):
+        try:
+            (sp / "_banter_apilog.py").write_text(_API_LOG_SHIM)
+            (sp / "_banter_apilog.pth").write_text("import _banter_apilog\n")
+        except OSError:
+            pass
+
 
 def deny_patterns_for(boundary: Path) -> list[str]:
     """Build `permissions.deny` patterns that DO fire under `bypassPermissions`.
@@ -376,7 +428,7 @@ def run(
     if auth == "login":
         env.pop("ANTHROPIC_API_KEY", None)
     if not env.get("ANTHROPIC_API_KEY") and not env.get("CLAUDE_CODE_OAUTH_TOKEN"):
-        print("[claude_runner] WARNING: no auth available (no ANTHROPIC_API_KEY, "
+        print("[banter] WARNING: no auth available (no ANTHROPIC_API_KEY, "
               "no token in env/cache/Keychain). Engineer will fail. Re-run "
               "banter from a shell where `claude /login` has been run.",
               flush=True)
@@ -404,19 +456,28 @@ def run(
     if venv_bin.is_dir():
         env["PATH"] = f"{venv_bin}{os.pathsep}{env.get('PATH', '')}"
         env["VIRTUAL_ENV"] = str(run_dir / "venv")
+        # REST-endpoint coverage: log every outbound request from the engineer's
+        # SDK/CLI/MCP (all use `requests` in this venv) to api_calls.jsonl, which
+        # `results.endpoint_hits` scores against the configured white/blacklist.
+        env["BANTER_API_LOG"] = str(run_dir / "api_calls.jsonl")
+        _install_api_log_shim(run_dir / "venv")
 
     # Skip pip cache (per-run venv inherits via .pth; cache dir unwritable).
     env["PIP_NO_CACHE_DIR"] = "1"
 
-    # Keep long foreground commands (model training) SYNCHRONOUS. Claude Code
-    # auto-moves a foreground Bash command to a background task once it exceeds
-    # the Bash tool's max timeout (default 600s). In `-p` mode the completion
-    # notification never re-invokes the model, so the engineer can only
-    # blind-poll a task-output file it can't even read (it lives outside the
-    # boundary) — which has wedged whole runs in an `until [ -f … ]` wait.
-    # Raising both Bash timeouts to the engineer's entire `claude -p` budget
-    # means a foreground command runs to completion (or dies with the session
-    # at `timeout_s`) instead of detaching. No mid-run backgrounding.
+    # Keep long foreground commands (e.g. a remote training job the engineer
+    # waits on) SYNCHRONOUS. Two SEPARATE Claude Code mechanisms matter here:
+    #   1) Auto-backgrounding — a long foreground Bash command is auto-moved to a
+    #      background task. In `-p` mode its completion NEVER re-invokes the
+    #      model, so the agent blind-polls a frozen task-output file and wedges.
+    #      `BASH_MAX_TIMEOUT_MS` does NOT control this (it only governs the KILL
+    #      timeout); the only reliable switch is CLAUDE_CODE_DISABLE_BACKGROUND_TASKS.
+    #   2) Kill timeout — how long a foreground command may run before being
+    #      killed. Raise both Bash timeouts to the whole `claude -p` budget so a
+    #      long job runs to completion instead of being killed.
+    # We want NO backgrounding at all (the PreToolUse hook also denies the
+    # explicit `run_in_background` flag), so disable it outright.
+    env["CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"] = "1"
     bash_timeout_ms = str(int(timeout_s) * 1000)
     env["BASH_DEFAULT_TIMEOUT_MS"] = bash_timeout_ms
     env["BASH_MAX_TIMEOUT_MS"] = bash_timeout_ms
@@ -449,7 +510,7 @@ def run(
         stderr_path=stderr_path,
         timeout_s=timeout_s,
         on_line=streaming.make_printer("engineer"),
-        log_prefix="claude_runner",
+        log_prefix="banter",
     )
 
     # `run_with_retry` only writes stderr_path when there's actual stderr
@@ -471,7 +532,7 @@ def run_with_retry(
     stderr_path: Path,
     timeout_s: int | None = None,
     on_line: Callable[[str], None] | None = None,
-    log_prefix: str = "claude_runner",
+    log_prefix: str = "banter",
 ) -> tuple[int, float]:
     """Run a `claude -p` subprocess with exponential rate-limit back-off.
 

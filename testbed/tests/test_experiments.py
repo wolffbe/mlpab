@@ -191,6 +191,45 @@ class AppendRunTests(unittest.TestCase):
         self.assertEqual(float(r["total_wall_time_s"]), 20.0)     # 10 + 10
         self.assertEqual(float(r["total_cost"]), 3.0)             # 1 + 2
 
+    def test_attribute_researcher_excludes_dead_rows(self):
+        # A DEAD row (no valid submission) was written zeroed with an `error`; a
+        # live row produced a result. Researcher overhead must land ONLY on the
+        # live row (full share, not split with the dead one), and the dead row's
+        # total_* must STAY zero (not resurrected by attribution).
+        dead = _run_row("v0", "tabular", "a", score=0.0)
+        dead["valid_submission"] = "0"
+        dead["error"] = "no valid submission produced"
+        for c in ("eng_input_tokens", "eng_output_tokens", "eng_total_tokens",
+                  "eng_wall_time_s", "eng_cost_usd", "total_tokens",
+                  "total_wall_time_s", "total_cost"):
+            dead[c] = "0"
+        experiments.append_run(self.results_root, self.cfg, dead)
+
+        live = _run_row("v1", "tabular", "a", score=0.7)
+        live["eng_input_tokens"] = "100"
+        live["eng_output_tokens"] = "50"
+        live["eng_total_tokens"] = "150"
+        live["eng_wall_time_s"] = "10"
+        live["eng_cost_usd"] = "1.0"
+        live["total_tokens"] = "150"
+        live["total_wall_time_s"] = "10"
+        live["total_cost"] = "1.0"
+        experiments.append_run(self.results_root, self.cfg, live)
+
+        experiments.attribute_researcher(self.results_root, self.cfg, "hopsworks", "cli", {
+            "input_tokens": 200, "output_tokens": 100, "total_tokens": 300,
+            "wall_s": 20.0, "cost_usd": 4.0,
+        })
+        rows = {r["version"]: r for r in self._rows()}
+        # Live row gets the FULL researcher share (÷1, not ÷2).
+        self.assertEqual(float(rows["v1"]["res_total_tokens"]), 300.0)
+        self.assertEqual(float(rows["v1"]["total_tokens"]), 450.0)   # 150 + 300
+        self.assertEqual(float(rows["v1"]["total_cost"]), 5.0)       # 1 + 4
+        # Dead row is untouched: no researcher share, totals stay zero.
+        self.assertEqual(rows["v0"]["res_total_tokens"], "")
+        self.assertEqual(float(rows["v0"]["total_tokens"]), 0.0)
+        self.assertEqual(float(rows["v0"]["total_cost"]), 0.0)
+
     def test_append_filters_goals_to_row_interface(self):
         # A config maximizing all delegation metrics; the mcp row should record
         # only mcp_calls among them.

@@ -35,10 +35,11 @@ experiment. Tools must delegate to the remote platform.
   versions, call the **`normalized_composite` MCP tool** (see "Scoring versions").
 - Changelog (per-version narrative, your memory): {changelog_path} — re-read at
   the start of every version; append a section after EVERY version (MANDATORY).
-- Study notes (what you've learned about the source, your memory): {runs_root}/STUDY.md
-  — re-read at the start of every version; append what you studied as you read
-  the interface source, so you don't re-study the same code after context
-  compaction (MANDATORY to keep current).
+- Source-study notes (what you've learned about the source) live IN your project
+  memory `{runs_root}/.claude/CLAUDE.md` (its "Source study" section) — it is
+  auto-loaded as system context every turn, so source knowledge survives
+  compaction with no manual re-read. Append what you studied as you read the
+  interface source (MANDATORY to keep current). There is NO separate STUDY.md.
 - Final report: {runs_root}/report.md
 
 ## Hierarchy
@@ -47,7 +48,7 @@ its CHALLENGES. {hierarchy_note}
 
 ## Goals
 {goals_lines}
-
+{endpoints_block}
 ## Budget
 - **Iterations include the v0 baseline as step 1.** `v0` (baseline) + improvements `v1..v{max_versions}`.
 - **Last version index (ABSOLUTE)**: `v{max_versions}` — INCLUSIVE upper bound across the whole continuation chain, NOT a count of new versions. Start at `{start_version}` and stop after `v{max_versions}`.
@@ -449,9 +450,9 @@ Read every run's `stream.log` and `grading.json` to understand engineer
 behaviour PER INTERFACE (and PER TASK). **Then STUDY the interface source** under
 `{runs_root}/v0/interface/src/`: read the command/SDK/MCP implementations the
 engineer actually used, and find where it struggled (a confusing `--help`, a bad
-default, a tool that failed, a type mismatch). Record what you learned in
-`{runs_root}/STUDY.md` (file paths + what each does + the weaknesses you spotted)
-so it survives context compaction. Then append the v0 baseline section to
+default, a tool that failed, a type mismatch). Record what you learned in the
+"Source study" section of `{runs_root}/.claude/CLAUDE.md` (file paths + what each
+does + the weaknesses you spotted) so it survives compaction. Then append the v0 baseline section to
 `{changelog_path}` (files = "baseline", plus your first SOURCE-change hypothesis
 for v1).
 
@@ -459,14 +460,15 @@ for v1).
 
 For each version (and, when tasks are defined, for each task in turn):
 
-1. **Analyse** — re-read `{runs_root}/STUDY.md` and `{changelog_path}` to recall
+1. **Analyse** — re-read your project memory `{runs_root}/.claude/CLAUDE.md`
+   (source-study notes) and `{changelog_path}` to recall
    what you already studied and tried. Call the `normalized_composite` MCP tool
    to score every version so far, and read representative `<run_dir>/stream.log`
    files to see engineer behaviour. Look for patterns: does one interface score
    worse, burn more tokens, or fall back to local Python instead of using the
    platform? The goal with the lowest normalized contribution is where to push.
-   If you need to understand the source more deeply, read it and append to
-   `{runs_root}/STUDY.md`.
+   If you need to understand the source more deeply, read it and append to the
+   "Source study" section of `{runs_root}/.claude/CLAUDE.md`.
 
 2. **Hypothesize** — ONE specific, testable **source** change to ONE interface
    (or, in a skills-only run, to the skill bundle). Example: "the `hops fg
@@ -492,9 +494,10 @@ For each version (and, when tasks are defined, for each task in turn):
    - regression → drop the new version (pin the previous one)
 
 6. **Record (MANDATORY)** — append a section to `{changelog_path}` using the
-   template above, AND update `{runs_root}/STUDY.md` with anything new you
-   learned about the source, BEFORE starting the next version. These two files
-   are your only memory across context compaction.
+   template above, AND update the "Source study" section of
+   `{runs_root}/.claude/CLAUDE.md` with anything new you learned about the
+   source, BEFORE starting the next version. CHANGELOG.md (the change/outcome
+   narrative) and CLAUDE.md (source-study notes) are your memory across compaction.
 
 **Budget tracking**: count every `banter run`. Stop when total runs ≥
 {total_runs}.

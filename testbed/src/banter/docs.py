@@ -5,7 +5,7 @@ Configured in autoresearch / benchmark / `banter run` via the `docs:` field
 
   - any name (preferred) → selects the platform's SINGLE docs config at
     `platforms/<platform>/docs/config.yaml`, whose `repo:` is the GitHub URL to
-    download, e.g. `docs: userdocs`;
+    download, e.g. `docs: hopsworks-docs`;
   - a raw git URL (back-compat), e.g.
     `docs: https://github.com/logicalclocks/logicalclocks.github.io`;
   - a local path (test fixtures / pre-downloaded mirror);

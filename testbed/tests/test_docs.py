@@ -34,18 +34,18 @@ class DocsResolveTests(unittest.TestCase):
         url = "https://github.com/logicalclocks/logicalclocks.github.io"
         self._write_docs_config("hopsworks", f"repo: {url}\n")
         # ANY non-none/non-url name selects the platform's single docs config.
-        self.assertEqual(docs.resolve("userdocs", "hopsworks"), url)
+        self.assertEqual(docs.resolve("hopsworks-docs", "hopsworks"), url)
         self.assertEqual(docs.resolve("anything", "hopsworks"), url)
 
     def test_local_path_in_config_resolved_relative(self):
         mirror = self.root / "mirror"
         mirror.mkdir()
         self._write_docs_config("hopsworks", f"path: {mirror}\n")
-        self.assertEqual(docs.resolve("userdocs", "hopsworks"), str(mirror.resolve()))
+        self.assertEqual(docs.resolve("hopsworks-docs", "hopsworks"), str(mirror.resolve()))
 
     def test_unknown_name_without_config_raises(self):
         with self.assertRaises(ValueError):
-            docs.resolve("userdocs", "hopsworks")  # no config written
+            docs.resolve("hopsworks-docs", "hopsworks")  # no config written
 
     def test_resolve_ref_reads_pinned_commit(self):
         sha = "9e7d9103722d565b9fe6a940231d638494c8c741"
@@ -53,11 +53,11 @@ class DocsResolveTests(unittest.TestCase):
             "hopsworks",
             f"repo: https://github.com/logicalclocks/logicalclocks.github.io\nref: {sha}\n",
         )
-        self.assertEqual(docs.resolve_ref("userdocs", "hopsworks"), sha)
+        self.assertEqual(docs.resolve_ref("hopsworks-docs", "hopsworks"), sha)
 
     def test_resolve_ref_none_when_unpinned_or_url_or_none(self):
         self._write_docs_config("hopsworks", "repo: https://example.com/x\n")
-        self.assertIsNone(docs.resolve_ref("userdocs", "hopsworks"))   # no ref
+        self.assertIsNone(docs.resolve_ref("hopsworks-docs", "hopsworks"))   # no ref
         self.assertIsNone(docs.resolve_ref("none", "hopsworks"))
         self.assertIsNone(docs.resolve_ref("https://example.com/x", "hopsworks"))
 

@@ -35,6 +35,7 @@ AGG_METRICS = [
     "total_wall_time_s", "total_tokens", "total_cost",
     "llm_calls", "cli_calls", "mcp_calls", "sdk_calls", "python_calls",
     "bash_calls", "other_tool_calls", "skill_calls",
+    "whitelist_hits", "blacklist_hits",
     "platform_invocations",
     # `valid_submission` is the only grading bool we keep in FIELDS; averaging
     # it gives the valid-submission rate across a combo's runs.
@@ -61,6 +62,10 @@ CALL_COUNT_DIRECTIONS: dict[str, str] = {
     "bash_calls": "minimize",
     "skill_calls": "maximize",
     "other_tool_calls": "minimize",
+    # REST-endpoint coverage (computed by `endpoint_hits`, NOT aggregate_commands):
+    # distinct whitelisted endpoints hit (more = better), forbidden calls (fewer).
+    "whitelist_hits": "maximize",
+    "blacklist_hits": "minimize",
 }
 CALL_COUNT_COLS = tuple(CALL_COUNT_DIRECTIONS)
 
@@ -241,6 +246,8 @@ _BENCHMARK_VIEW = {
     "bash_calls": "bash_calls",
     "skill_calls": "skill_calls",
     "other_tool_calls": "other_tool_calls",
+    "whitelist_hits": "whitelist_hits",
+    "blacklist_hits": "blacklist_hits",
     "error": "error",
     "run_dir": "run_dir",
 }
@@ -351,6 +358,9 @@ FIELDS = [
     "bash_calls",
     "skill_calls",
     "other_tool_calls",
+    # REST-endpoint coverage (from the venv API-log shim; see `endpoint_hits`).
+    "whitelist_hits",
+    "blacklist_hits",
     # Per-category rolling cumulative averages of the counts above (the mean of
     # each count across rows up to and including the row). Recomputed by
     # `append` on every write so they stay correct as rows are added/replaced.
@@ -362,6 +372,8 @@ FIELDS = [
     "bash_calls_avg",
     "skill_calls_avg",
     "other_tool_calls_avg",
+    "whitelist_hits_avg",
+    "blacklist_hits_avg",
     # Per-increment annotations the researcher fills in after evaluating the
     # increment (via `banter annotate-increment`). Every challenge row in the
     # same (session, increment) carries the same annotation — denormalised
@@ -438,6 +450,9 @@ class Row:
     bash_calls: int = 0
     skill_calls: int = 0
     other_tool_calls: int = 0
+    # REST-endpoint coverage (from the venv API-log shim; see `endpoint_hits`).
+    whitelist_hits: int = 0
+    blacklist_hits: int = 0
     # Rolling cumulative averages across results.csv rows (the mean of the
     # corresponding raw column up to and including each row). All filled by
     # `append` at write time, so they're left as None on a fresh Row.
@@ -454,6 +469,8 @@ class Row:
     bash_calls_avg: float | None = None
     skill_calls_avg: float | None = None
     other_tool_calls_avg: float | None = None
+    whitelist_hits_avg: float | None = None
+    blacklist_hits_avg: float | None = None
     # Per-increment annotations (researcher fills in via `banter annotate-increment`).
     hypothesis: str = ""
     change: str = ""
@@ -731,6 +748,102 @@ def audit_interface_local_exec(
                 continue
         flagged.append({"file": rel, "patterns": hits})
     return flagged
+
+
+def _parse_endpoint_patterns(patterns: list[str] | None) -> list[tuple[str, str, "re.Pattern[str]"]]:
+    """Parse `"<METHOD> <path-regex>"` strings into (source, method, compiled
+    regex). `source` is the original string (kept for the covered/missed report).
+    A missing method means "any method". Unparseable entries are skipped.
+
+    The path regex is END-anchored (`(?:rx)/?$`, with an optional trailing
+    slash) and matched with `.search`. This prevents a prefix pattern from
+    over-matching a deeper path — e.g. the feature-view `POST .../featureview`
+    pattern must NOT also match the training-dataset
+    `.../featureview/{name}/version/{v}/trainingdatasets` POST — without forcing
+    a brittle start-anchor on the exact base prefix.
+    """
+    out: list[tuple[str, str, Any]] = []
+    for p in patterns or []:
+        s = str(p).strip()
+        if not s:
+            continue
+        parts = s.split(None, 1)
+        if len(parts) == 2 and parts[0].isalpha():
+            method, rx = parts[0].upper(), parts[1].strip()
+        else:
+            method, rx = "", s
+        try:
+            out.append((s, method, re.compile(rf"(?:{rx})/?$")))
+        except re.error:
+            continue
+    return out
+
+
+def _read_api_log(api_log: Path | str) -> list[tuple[str, str]]:
+    """Read the per-run API log into (METHOD, path) rows. Missing → []."""
+    p = Path(api_log)
+    if not p.exists():
+        return []
+    rows: list[tuple[str, str]] = []
+    for line in p.read_text().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            e = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        rows.append((str(e.get("method", "")).upper(), str(e.get("path", ""))))
+    return rows
+
+
+def endpoint_coverage(
+    api_log: Path | str,
+    whitelist: list[str] | None,
+    blacklist: list[str] | None,
+) -> dict[str, Any]:
+    """Full REST endpoint-coverage breakdown from the per-run API log (written by
+    the venv shim). Drives BOTH the `whitelist_hits`/`blacklist_hits` metrics AND
+    the per-run `endpoint_coverage.json` the researcher reads to see WHICH
+    lifecycle steps the engineer reached.
+
+    Returns: `whitelist_hits` (# distinct whitelist patterns hit), `blacklist_hits`
+    (# log rows matching any blacklist pattern), `total_whitelist`, and the
+    `covered`/`missed` pattern-source lists (a `missed` endpoint = a capability
+    the interface must expose).
+    """
+    rows = _read_api_log(api_log)
+
+    def hit(method: str, rx: "re.Pattern[str]", m: str, path: str) -> bool:
+        return (not method or method == m) and bool(rx.search(path))
+
+    wl = _parse_endpoint_patterns(whitelist)
+    covered = [src for src, method, rx in wl if any(hit(method, rx, m, p) for m, p in rows)]
+    covered_set = set(covered)
+    missed = [src for src, _m, _rx in wl if src not in covered_set]
+    bl = _parse_endpoint_patterns(blacklist)
+    blacklist_hits = sum(
+        1 for m, p in rows if any(hit(method, rx, m, p) for _s, method, rx in bl)
+    )
+    return {
+        "whitelist_hits": len(covered),
+        "blacklist_hits": blacklist_hits,
+        "total_whitelist": len(wl),
+        "covered": covered,
+        "missed": missed,
+    }
+
+
+def endpoint_hits(
+    api_log: Path | str,
+    whitelist: list[str] | None,
+    blacklist: list[str] | None,
+) -> dict[str, int]:
+    """The two scored metrics (see `endpoint_coverage` for the full breakdown):
+    `whitelist_hits` = # distinct whitelist patterns hit ≥once; `blacklist_hits`
+    = # log rows matching any blacklist pattern."""
+    c = endpoint_coverage(api_log, whitelist, blacklist)
+    return {"whitelist_hits": c["whitelist_hits"], "blacklist_hits": c["blacklist_hits"]}
 
 
 def aggregate_commands(

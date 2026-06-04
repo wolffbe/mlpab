@@ -833,7 +833,7 @@ def _run_check(command: str, env: dict[str, str], timeout_s: int) -> bool:
         )
         if proc.returncode != 0:
             print(
-                f"[interfaces] check FAILED (exit {proc.returncode}): {command}\n"
+                f"[banter] check FAILED (exit {proc.returncode}): {command}\n"
                 f"--- captured output ---\n{proc.stdout.decode('utf-8', 'replace')}"
                 f"\n--- end ---",
                 file=_sys.stderr, flush=True,
@@ -843,13 +843,13 @@ def _run_check(command: str, env: dict[str, str], timeout_s: int) -> bool:
     except subprocess.TimeoutExpired as e:
         out = (e.output or b"").decode("utf-8", "replace") if e.output else "(no output)"
         print(
-            f"[interfaces] check TIMED OUT after {timeout_s}s: {command}\n"
+            f"[banter] check TIMED OUT after {timeout_s}s: {command}\n"
             f"--- captured output before timeout ---\n{out}\n--- end ---",
             file=_sys.stderr, flush=True,
         )
         return False
     except OSError as e:
-        print(f"[interfaces] check OS error: {command}: {e}", file=_sys.stderr, flush=True)
+        print(f"[banter] check OS error: {command}: {e}", file=_sys.stderr, flush=True)
         return False
 
 

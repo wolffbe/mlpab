@@ -537,6 +537,28 @@ def run(spec: RunSpec) -> results.Row:
             sdk_module=count_sdk,
             run_dir=run_dir,
         )
+        # Load the experiment config ONCE (reused below for the row append). The
+        # endpoints policy drives REST-endpoint coverage scoring of the per-run
+        # API log (written by the venv shim).
+        exp_cfg = None
+        if spec.experiment_config:
+            try:
+                from banter import autoresearch as ar_mod
+                exp_cfg = ar_mod.load_config(Path(spec.experiment_config))
+            except Exception:
+                exp_cfg = None
+        _endpoints = exp_cfg.endpoints if exp_cfg is not None else {"whitelist": [], "blacklist": []}
+        _wl, _bl = _endpoints.get("whitelist"), _endpoints.get("blacklist")
+        endpoint_cov = results.endpoint_coverage(run_dir / "api_calls.jsonl", _wl, _bl)
+        endpoint_counts = {
+            "whitelist_hits": endpoint_cov["whitelist_hits"],
+            "blacklist_hits": endpoint_cov["blacklist_hits"],
+        }
+        # Per-run coverage breakdown the researcher reads (covered/missed target
+        # endpoints) to see WHICH lifecycle steps the engineer reached — a missed
+        # endpoint is a capability the interface must expose. Only when configured.
+        if _wl or _bl:
+            (run_dir / "endpoint_coverage.json").write_text(json.dumps(endpoint_cov, indent=2))
         # mle-bench grading report → Row fields. Booleans stored 0/1 so they
         # average into rates at rollup; thresholds kept as-is (may be None).
         _b = lambda x: int(bool(x))  # noqa: E731
@@ -596,6 +618,7 @@ def run(spec: RunSpec) -> results.Row:
             llm_calls=usage.get("llm_calls", 0),
             run_dir=str(run_dir),
             **counts,
+            **endpoint_counts,
             **slim_grading,
         )
 
@@ -616,7 +639,8 @@ def run(spec: RunSpec) -> results.Row:
                        "eng_total_tokens", "eng_cost_usd", "total_wall_time_s",
                        "total_tokens", "total_cost", "llm_calls", "cli_calls",
                        "mcp_calls", "sdk_calls", "python_calls", "bash_calls",
-                       "skill_calls", "other_tool_calls"):
+                       "skill_calls", "other_tool_calls",
+                       "whitelist_hits", "blacklist_hits"):
                 setattr(row, _f, 0)
             print(
                 f"[banter] DEAD run (no valid submission) for {run_dir} — recording "
@@ -626,14 +650,8 @@ def run(spec: RunSpec) -> results.Row:
 
         # Autoresearch writes ONE exploded row straight into the global
         # results/autoresearch/experiments.csv (no per-run results.csv).
-        # Benchmark keeps its per-session results.csv.
-        exp_cfg = None
-        if spec.experiment_config:
-            from banter import autoresearch as ar_mod
-            try:
-                exp_cfg = ar_mod.load_config(Path(spec.experiment_config))
-            except Exception:
-                exp_cfg = None
+        # Benchmark keeps its per-session results.csv. `exp_cfg` was loaded once
+        # above (for endpoint scoring) and is reused here.
         if exp_cfg is not None:
             from banter import experiments as experiments_mod
             results_root = _results_root_from(spec.runs_root)

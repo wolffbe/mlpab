@@ -294,6 +294,15 @@ class EngineerEnvConstructionTests(unittest.TestCase):
         self.assertEqual(env["CLAUDE_CODE_OAUTH_TOKEN"], "sk-ant-oat01-TOKEN")
         self.assertNotIn("ANTHROPIC_API_KEY", env)  # login strips it
 
+    def test_background_tasks_disabled_and_bash_timeouts_raised(self):
+        # Auto-backgrounding a long command wedges `-p` mode (no completion
+        # re-invoke). Disable it outright; raising BASH_*_TIMEOUT_MS alone does
+        # NOT prevent backgrounding (only the kill).
+        env = self._invoke()["env"]
+        self.assertEqual(env["CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"], "1")
+        self.assertIn("BASH_MAX_TIMEOUT_MS", env)
+        self.assertIn("BASH_DEFAULT_TIMEOUT_MS", env)
+
     def test_warns_when_no_auth_available(self):
         # No API key, no Keychain token, no token cache → warn (don't raise).
         import io

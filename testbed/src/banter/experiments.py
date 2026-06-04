@@ -46,6 +46,8 @@ METRICS = [
     # Tool-call counts (python_calls follows llm_calls).
     "llm_calls", "python_calls", "cli_calls", "mcp_calls", "sdk_calls",
     "bash_calls", "skill_calls", "other_tool_calls",
+    # REST-endpoint coverage metrics.
+    "whitelist_hits", "blacklist_hits",
 ]
 
 # Engineer columns (written live by the runner) and their researcher / total

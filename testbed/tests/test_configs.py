@@ -68,7 +68,9 @@ budget: {max_cycles: 2}
         self.assertEqual(cfg.interfaces[0].platform, "hopsworks")
         self.assertEqual(cfg.budget.max_increments, 2)
 
-    def test_max_seconds_defaults_to_8h(self):
+    def test_max_seconds_defaults_to_unlimited(self):
+        # No max_seconds/max_min in config → UNLIMITED compute budget (no silent
+        # cap); the run is bounded only by `iterations`.
         p = _write(
             """
 improve: interface
@@ -80,7 +82,7 @@ budget: {max_increments: 3}
 """
         )
         cfg = ar.load_config(p)
-        self.assertEqual(cfg.budget.max_seconds, 8 * 3600.0)
+        self.assertEqual(cfg.budget.max_seconds, float("inf"))
 
     def test_max_seconds_override(self):
         p = _write(

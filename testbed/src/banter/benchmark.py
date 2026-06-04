@@ -191,7 +191,7 @@ def run_benchmark(
 ) -> None:
     total = len(config.runs)
     if total == 0:
-        print("[benchmark] No runs configured.", file=sys.stderr)
+        print("[banter] No runs configured.", file=sys.stderr)
         return
 
     # Fail fast, once, over the union of requirements before doing any work.
@@ -218,7 +218,7 @@ def run_benchmark(
             reqs, auth=config.engineer_auth, model=config.engineer_model, check_login=False,
         )
     except preflight_mod.PreflightError as e:
-        print(f"\n[benchmark] preflight failed:\n{e}", file=sys.stderr)
+        print(f"\n[banter] preflight failed:\n{e}", file=sys.stderr)
         raise
 
     # Pre-download every challenge's dataset NOW, while we're still in the
@@ -227,7 +227,7 @@ def run_benchmark(
     from banter import mlebench_wrapper
     challenges = sorted({e.challenge for e in config.runs})
     for n, comp in enumerate(challenges, 1):
-        print(f"[benchmark] preparing data {n}/{len(challenges)}: {comp}", flush=True)
+        print(f"[banter] preparing data {n}/{len(challenges)}: {comp}", flush=True)
         mlebench_wrapper.download_competition(comp, runner.DEFAULT_DATA_ROOT)
 
     parent = runs_root / "benchmark"
@@ -240,7 +240,7 @@ def run_benchmark(
     # pre-existing config folder, but confirm first.
     run_path = parent / run_id
     if not results.confirm_overwrite(run_path, assume_yes):
-        print(f"[benchmark] {run_path} exists — overwrite declined. Aborting.", flush=True)
+        print(f"[banter] {run_path} exists — overwrite declined. Aborting.", flush=True)
         return
     run_path.mkdir(parents=True, exist_ok=True)
 
@@ -274,7 +274,7 @@ def run_benchmark(
         with empty_nb.open("w") as f:
             _nbf.write(nb, f)
 
-    print(f"[benchmark] run={run_id}  runs={total}  dir={run_path}")
+    print(f"[banter] run={run_id}  runs={total}  dir={run_path}")
 
     completed: list[results.Row] = []
     failed: list[str] = []
@@ -314,12 +314,12 @@ def run_benchmark(
             row = runner.run(spec)
             completed.append(row)
             print(
-                f"[benchmark] score={row.score}  tokens={row.total_tokens}  "
+                f"[banter] score={row.score}  tokens={row.total_tokens}  "
                 f"wall={row.total_wall_time_s:.1f}s  cost=${row.total_cost:.4f}"
             )
         except Exception as exc:
             label = f"{entry.challenge}/{entry.platform}/{entry.interface}"
-            print(f"[benchmark] FAILED {label}: {exc}", file=sys.stderr)
+            print(f"[banter] FAILED {label}: {exc}", file=sys.stderr)
             failed.append(f"{label}: {exc}")
 
     # The runner appends each row into its leaf's results.csv. Combine them
@@ -346,9 +346,9 @@ def run_benchmark(
         from banter import notebook as notebook_mod
         nb_path = notebook_mod.build_benchmark_notebook(run_path, run_id)
         if nb_path is not None:
-            print(f"[benchmark] wrote analysis notebook: {nb_path}", flush=True)
+            print(f"[banter] wrote analysis notebook: {nb_path}", flush=True)
     except Exception as e:
-        print(f"[benchmark] notebook generation skipped: {e}", flush=True)
+        print(f"[banter] notebook generation skipped: {e}", flush=True)
 
 
 def _print_summary(rows: list[results.Row], failed: list[str], rollup_csv: Path) -> None:

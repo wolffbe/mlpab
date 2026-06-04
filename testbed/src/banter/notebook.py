@@ -122,7 +122,7 @@ def build_benchmark_notebook(
         try:
             client.execute()
         except Exception as e:
-            print(f"[notebook] pre-execution failed ({type(e).__name__}: {e}); "
+            print(f"[banter] pre-execution failed ({type(e).__name__}: {e}); "
                   f"writing unexecuted notebook.", flush=True)
         finally:
             try:
