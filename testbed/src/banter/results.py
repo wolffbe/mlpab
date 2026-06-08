@@ -1,10 +1,9 @@
 """results.csv writer.
 
-One row per (challenge, platform, interface, skills, auth) run. Token/cost columns
-come from the stream-json transcript's `result` event — Claude Code reports
-`total_cost_usd` and aggregated `usage` there. Command counts are derived
-from the same transcript by walking each `tool_use` block. Medal/score come
-from the MLE-bench grader.
+One row per (challenge, platform, interface, skills, auth) run. Token/cost
+columns come from the stream-json transcript's `result` event (Claude Code's
+`total_cost_usd` + aggregated `usage`); command counts from walking each
+`tool_use` block in the same transcript; medal/score from the MLE-bench grader.
 """
 from __future__ import annotations
 
@@ -23,10 +22,9 @@ _PYTHON_PREFIXES = ("python", "python3", "uv run python", "uv run", "pip", "pip3
 _PY_INTERPRETER_BASENAMES = ("python", "python3", "pip", "pip3")
 
 
-# High-level (one row per session) summary schemas. These live at the top of
-# each runner's results tree: results/<benchmark|autoresearch>/results.csv.
-# Metrics averaged at every results.csv level — one per numeric per-run column
-# in FIELDS, so the rollups reflect ALL per-run metrics. `platform_invocations`
+# One-row-per-session summary schemas, at the top of each runner's results tree:
+# results/<benchmark|autoresearch>/results.csv. One metric per numeric per-run
+# FIELDS column, so rollups reflect ALL per-run metrics. `platform_invocations`
 # is the derived remote-platform delegation total (cli + mcp + sdk calls).
 AGG_METRICS = [
     "score",
@@ -37,22 +35,16 @@ AGG_METRICS = [
     "bash_calls", "other_tool_calls", "skill_calls",
     "whitelist_hits", "blacklist_hits",
     "platform_invocations",
-    # `valid_submission` is the only grading bool we keep in FIELDS; averaging
-    # it gives the valid-submission rate across a combo's runs.
+    # Only grading bool kept in FIELDS; its average is the valid-submission rate.
     "valid_submission",
 ]
 
-# Canonical metrics that are ALWAYS tracked + charted in every autoresearch
-# run, with their natural improvement direction. The autoresearch config's
-# `goals` list only decides WHICH of these (or others) the researcher
-# optimizes for; charts are produced for the full TRACKED_METRICS set
-# regardless of what the config picks. Order = chart order in the notebook.
-# Per-category tool-call counts tracked on every (engineer) run. Each gets a
-# cumulative running ("rolling") average column `<cat>_avg` — the mean of that
-# count across results.csv rows up to and including the row, recomputed on every
-# append/replace (see `recompute_rolling_averages`). Directions are cosmetic
-# (chart-title labels); more interface use (cli/mcp/sdk/skill) is "good",
-# self-written code (python/bash) and raw turn count are "bad".
+# Per-category tool-call counts tracked on every (engineer) run, with their
+# improvement direction. Each gets a cumulative rolling-average column `<cat>_avg`
+# (mean of the count across results.csv rows up to and including the row),
+# recomputed on every append/replace (see `recompute_rolling_averages`).
+# Directions are cosmetic chart-title labels: more interface use
+# (cli/mcp/sdk/skill) is "good", self-written code (python/bash) is "bad".
 CALL_COUNT_DIRECTIONS: dict[str, str] = {
     "llm_calls": "minimize",
     "cli_calls": "maximize",
@@ -62,30 +54,31 @@ CALL_COUNT_DIRECTIONS: dict[str, str] = {
     "bash_calls": "minimize",
     "skill_calls": "maximize",
     "other_tool_calls": "minimize",
-    # REST-endpoint coverage (computed by `endpoint_hits`, NOT aggregate_commands):
+    # REST-endpoint coverage (from `endpoint_hits`, NOT aggregate_commands):
     # distinct whitelisted endpoints hit (more = better), forbidden calls (fewer).
     "whitelist_hits": "maximize",
     "blacklist_hits": "minimize",
 }
 CALL_COUNT_COLS = tuple(CALL_COUNT_DIRECTIONS)
 
-# One chart per tracked metric. Wall time + every call category additionally
-# carry a rolling cumulative average, drawn as a dotted overlay on the same
-# chart (see `rolling_avg_col`) rather than as a separate diagram.
+# Metrics ALWAYS tracked + charted in every autoresearch run, with improvement
+# direction. Config `goals` only picks WHICH the researcher optimizes for; charts
+# cover the full set regardless. Order = chart order. One chart per metric; wall
+# time + every call category also carry a rolling cumulative average drawn as a
+# dotted overlay on the same chart (see `rolling_avg_col`), not a separate diagram.
 TRACKED_METRICS: list[tuple[str, str]] = [
     ("score", "maximize"),
     ("total_tokens", "minimize"),
     ("eng_wall_time_s", "minimize"),
-    # Charted for visibility only (not an optimization target) — eng + researcher
-    # wall time is partly controller overhead, so it gets a neutral `observe`
-    # label rather than minimize/maximize.
+    # `observe` (neutral, not an optimization target): eng + researcher wall time
+    # is partly controller overhead, so charted for visibility only.
     ("total_wall_time_s", "observe"),
     ("total_cost", "minimize"),
     *((c, d) for c, d in CALL_COUNT_DIRECTIONS.items()),
 ]
 
-# Benchmark CSV uses plain metric names (no `eng_`/`total_` prefix since
-# there's no researcher). Same canonical list, different wall-time name.
+# Benchmark CSV: same canonical list, plain metric names (no `eng_`/`total_`
+# prefix since there's no researcher) and a different wall-time name.
 BENCHMARK_TRACKED_METRICS: list[tuple[str, str]] = [
     ("score", "maximize"),
     ("total_tokens", "minimize"),
@@ -95,12 +88,11 @@ BENCHMARK_TRACKED_METRICS: list[tuple[str, str]] = [
 ]
 
 
-# Metric column → its rolling-average column. Rolling averages are an
-# AUTORESEARCH-only concept (a cumulative average across runs accumulates across
-# versions); benchmark is a single session of independent (task, challenge)
-# rows with nothing to accumulate, so it has no `*_avg` columns. This map plus
-# `CALL_COUNT_COLS` is the single source of raw→avg pairs, used both for chart
-# overlays (`rolling_avg_col`) and for the recompute (`_rolling_pairs`).
+# Metric column → its rolling-average column. Rolling averages are
+# AUTORESEARCH-only (a cumulative average accumulating across versions); benchmark
+# is independent (task, challenge) rows with nothing to accumulate, so no `*_avg`
+# columns. This map plus `CALL_COUNT_COLS` is the single source of raw→avg pairs,
+# used for chart overlays (`rolling_avg_col`) and the recompute (`_rolling_pairs`).
 _ROLLING_AVG_OF = {
     "score": "score_avg",
     "total_tokens": "total_tokens_avg",
@@ -111,16 +103,16 @@ _ROLLING_AVG_OF = {
 
 
 def rolling_avg_col(metric: str) -> str | None:
-    """The rolling-average column to overlay (dotted) on `metric`'s chart, or
-    None when the metric has no rolling average."""
+    """The dotted rolling-average column to overlay on `metric`'s chart, or None
+    when the metric has no rolling average."""
     if metric in _ROLLING_AVG_OF:
         return _ROLLING_AVG_OF[metric]
     if metric in CALL_COUNT_COLS:
         return f"{metric}_avg"
     return None
 
-# Per-run rollup (benchmark): one row per <run> folder, averaging its
-# per-challenge rows. Written to results/benchmark/results.csv.
+# Per-run rollup (benchmark): one row per <run> folder averaging its per-challenge
+# rows. Written to results/benchmark/results.csv.
 COMBO_SUMMARY_FIELDS = (
     ["combo", "platform", "interface", "skills", "n_runs"]
     + [f"avg_{m}" for m in AGG_METRICS]
@@ -208,16 +200,16 @@ def roll_up_combos(parent: Path) -> list[dict[str, Any]]:
     return rows
 
 
-# The runner appends each challenge row directly to `<run>/results.csv`
-# (one CSV per session, tagged with `session` + `increment`); the notebook
-# computes its own per-increment means from those raw rows.
+# The runner appends each challenge row directly to `<run>/results.csv` (one CSV
+# per session, tagged with `session` + `increment`); the notebook computes its own
+# per-increment means from those raw rows.
 
 
-# Benchmark CSV has no researcher (no eng/res split needed) and no increments,
-# so it uses plain column names (`wall_time_s`, `total_tokens`, …) rather than
-# the autoresearch `eng_*` / `res_*` / `total_*` triple. Mapping from the
-# autoresearch Row's fields → benchmark column names. Listed in the order they
-# appear in the benchmark CSV; `BENCHMARK_FIELDS` is the .keys() view.
+# Benchmark CSV has no researcher (no eng/res split) and no increments, so it uses
+# plain column names (`wall_time_s`, `total_tokens`, …) instead of the
+# autoresearch `eng_*`/`res_*`/`total_*` triple. Maps autoresearch Row fields →
+# benchmark column names, in benchmark-CSV order; `BENCHMARK_FIELDS` is the
+# .keys() view.
 _BENCHMARK_VIEW = {
     "started_at": "started_at",
     "platform": "platform",
@@ -230,9 +222,8 @@ _BENCHMARK_VIEW = {
     "valid_submission": "valid_submission",
     "score": "score",
     "medal": "medal",
-    # Engineer metrics: drop the `eng_` prefix in the benchmark CSV. Benchmark
-    # has NO `*_avg` rolling columns — a benchmark session is one run of
-    # independent (task, challenge) rows, with nothing to accumulate across.
+    # Engineer metrics: drop the `eng_` prefix. Benchmark has NO `*_avg` rolling
+    # columns — one run of independent (task, challenge) rows, nothing to accumulate.
     "wall_time_s": "eng_wall_time_s",
     "input_tokens": "eng_input_tokens",
     "output_tokens": "eng_output_tokens",
@@ -274,11 +265,10 @@ def next_session_id(parent: Path) -> str:
 def confirm_overwrite(path: Path, assume_yes: bool = False) -> bool:
     """If `path` exists, confirm before removing it; return True to proceed.
 
-    Returns True when the dir is absent (nothing to do) or the user agreed
-    (the dir is then removed so the caller can recreate it fresh). Returns
-    False only when the user declined at the prompt. `assume_yes` (the CLI
-    `-y/--yes` flag) skips the prompt and overwrites. A non-interactive stdin
-    without `assume_yes` is treated as a decline — never silently clobber.
+    True when the dir is absent (nothing to do) or the user agreed (the dir is
+    then removed so the caller recreates it fresh); False only on decline.
+    `assume_yes` (CLI `-y/--yes`) skips the prompt and overwrites. Non-interactive
+    stdin without `assume_yes` is treated as a decline — never silently clobber.
     """
     if not path.exists():
         return True
@@ -300,10 +290,10 @@ def confirm_overwrite(path: Path, assume_yes: bool = False) -> bool:
 
 
 FIELDS = [
-    # When the engineer's `claude -p` started (UTC ISO-8601). One per row.
+    # Engineer's `claude -p` start (UTC ISO-8601). One per row.
     "started_at",
-    # Run / version identity (autoresearch). `version` is `v<N>` (e.g. `v2`)
-    # — the same string that names the increment's filesystem dir.
+    # Run / version identity (autoresearch). `version` is `v<N>` (e.g. `v2`) —
+    # same string that names the increment's filesystem dir.
     "run",
     "version",
     "platform",
@@ -314,12 +304,12 @@ FIELDS = [
     # The work this row covers.
     "task",
     "challenge",
-    # Grading (slim set — full breakdown is in the per-challenge `grading.json`).
+    # Grading (slim — full breakdown in the per-challenge `grading.json`).
     "valid_submission",
     "score",
     "medal",
-    # Engineer-side wall/tokens/cost — per-challenge values from the
-    # engineer's `claude -p`.
+    # Engineer-side wall/tokens/cost: per-challenge values from the engineer's
+    # `claude -p`.
     "eng_wall_time_s",
     "eng_input_tokens",
     "eng_output_tokens",
@@ -327,23 +317,22 @@ FIELDS = [
     "eng_cost_usd",
     # Researcher-side contribution attributed to this row. The researcher's
     # `claude -p` runs ONCE per autoresearch session; at end-of-session
-    # `autoresearch.run_autoresearch` parses its transcript and distributes
-    # the totals equally across all rows of the session. Empty/0 for
-    # benchmark rows (no researcher).
+    # `autoresearch.run_autoresearch` parses its transcript and distributes the
+    # totals equally across all rows. Empty/0 for benchmark rows (no researcher).
     "res_wall_time_s",
     "res_input_tokens",
     "res_output_tokens",
     "res_total_tokens",
     "res_cost_usd",
-    # Combined totals = eng_* + res_*. Pre-computed so the CSV is
-    # self-contained (no need to derive them downstream). Config budgets
-    # (`max_cost_usd`, `max_seconds`) check against these, not the engineer alone.
+    # Combined totals = eng_* + res_*. Pre-computed so the CSV is self-contained.
+    # Config budgets (`max_cost_usd`, `max_seconds`) check against these, not the
+    # engineer alone.
     "total_wall_time_s",
     "total_tokens",
     "total_cost",
     # Rolling cumulative averages across rows (filled by `append`; the dotted
-    # "average across all runs" line on each chart). `total_*` are recomputed
-    # after the researcher backfill in autoresearch.
+    # "average across all runs" line per chart). `total_*` are recomputed after
+    # the researcher backfill in autoresearch.
     "score_avg",
     "total_tokens_avg",
     "total_cost_avg",
@@ -361,9 +350,9 @@ FIELDS = [
     # REST-endpoint coverage (from the venv API-log shim; see `endpoint_hits`).
     "whitelist_hits",
     "blacklist_hits",
-    # Per-category rolling cumulative averages of the counts above (the mean of
-    # each count across rows up to and including the row). Recomputed by
-    # `append` on every write so they stay correct as rows are added/replaced.
+    # Per-category rolling cumulative averages of the counts above (mean across
+    # rows up to and including the row). Recomputed by `append` on every write so
+    # they stay correct as rows are added/replaced.
     "llm_calls_avg",
     "cli_calls_avg",
     "mcp_calls_avg",
@@ -375,9 +364,9 @@ FIELDS = [
     "whitelist_hits_avg",
     "blacklist_hits_avg",
     # Per-increment annotations the researcher fills in after evaluating the
-    # increment (via `banter annotate-increment`). Every challenge row in the
-    # same (session, increment) carries the same annotation — denormalised
-    # so a single CSV is the full record.
+    # increment (via `banter annotate-increment`). Every challenge row in the same
+    # (session, increment) carries the same annotation — denormalised so a single
+    # CSV is the full record.
     "hypothesis",         # one-line rationale for the change
     "change",             # what was modified vs. the previous increment
     "verdict",            # positive | negative | neutral
@@ -385,12 +374,12 @@ FIELDS = [
     "keep",               # 0/1 — did the researcher keep this change?
     "observations",       # qualitative findings from the engineer transcripts
     "proposed_changes",   # what to try next
-    # Failure reason for a DEAD run (no valid submission): the run is recorded
-    # with all numeric metrics zeroed and this string set, so the researcher
-    # sees a comparable score-0 row + why it crashed (vs a graceful give-up,
-    # which floors a real submission with a low but non-zero score).
+    # Failure reason for a DEAD run (no valid submission): recorded with all
+    # numeric metrics zeroed and this string set, so the researcher sees a
+    # comparable score-0 row + why it crashed (vs a graceful give-up, which floors
+    # a real submission with a low but non-zero score).
     "error",
-    # Pointer to the engineer's per-challenge artifacts dir (transcript, stream.log, submission, grading.json, …).
+    # Pointer to the engineer's per-challenge artifacts dir (engineer.log, submission, grading.json, …).
     "run_dir",
 ]
 
@@ -401,18 +390,18 @@ BENCHMARK_FIELDS = list(_BENCHMARK_VIEW.keys())
 def _benchmark_view(row_dict: dict[str, Any]) -> dict[str, Any]:
     """Project an autoresearch Row dict into the benchmark column set.
 
-    Renames `eng_*` → plain names, drops everything that isn't a benchmark
-    column (session/increment/res_*/total_*/annotations).
+    Renames `eng_*` → plain names, drops non-benchmark columns
+    (session/increment/res_*/total_*/annotations).
     """
     return {dest: row_dict.get(src, "") for dest, src in _BENCHMARK_VIEW.items()}
 
 
 @dataclass
 class Row:
-    # UTC ISO-8601 timestamp recorded when the engineer's `claude -p` started.
+    # UTC ISO-8601 recorded when the engineer's `claude -p` started.
     started_at: str
-    # Identity. Field order MATCHES `FIELDS` so csv.DictWriter emits columns
-    # in the documented order.
+    # Identity. Field order MATCHES `FIELDS` so csv.DictWriter emits columns in
+    # the documented order.
     run: str                # autoresearch run id (empty for benchmark rows)
     version: str            # `v<N>` (e.g. "v2"); "" for benchmark rows
     platform: str           # platform NAME, e.g. "mlkit" or "none"
@@ -453,9 +442,9 @@ class Row:
     # REST-endpoint coverage (from the venv API-log shim; see `endpoint_hits`).
     whitelist_hits: int = 0
     blacklist_hits: int = 0
-    # Rolling cumulative averages across results.csv rows (the mean of the
-    # corresponding raw column up to and including each row). All filled by
-    # `append` at write time, so they're left as None on a fresh Row.
+    # Rolling cumulative averages across results.csv rows (mean of the raw column
+    # up to and including each row). All filled by `append` at write time, so
+    # left None on a fresh Row.
     score_avg: float | None = None
     total_tokens_avg: float | None = None
     total_cost_avg: float | None = None
@@ -487,10 +476,9 @@ class Row:
 def parse_transcript_usage(transcript_path: Path) -> dict[str, Any]:
     """Token + cost totals from Claude Code's stream-json transcript.
 
-    Claude Code emits assistant messages carrying a `message.usage` block per
-    turn, and a final `result` event with `total_cost_usd` and aggregated
-    `usage`. We prefer the `result` event when present and fall back to
-    summing per-turn usages otherwise.
+    Claude Code emits per-turn assistant messages carrying `message.usage`, plus a
+    final `result` event with `total_cost_usd` and aggregated `usage`. Prefer the
+    `result` event; fall back to summing per-turn usages.
     """
     totals = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "cost_usd": 0.0, "llm_calls": 0}
     if not transcript_path.exists():
@@ -545,9 +533,9 @@ def _is_python_first(first: str) -> bool:
 
 def _sdk_import_pattern(module: str) -> re.Pattern[str]:
     m = re.escape(module)
-    # Matches `import <m>`, `from <m> ...`, or `python -m <m>...`. `\b` (not
-    # `\s`) before the keyword so quoting chars like `"`/`'` don't block the
-    # match — `python -c "import <m>"` is the common case.
+    # Matches `import <m>`, `from <m> ...`, or `python -m <m>...`. `\b` (not `\s`)
+    # before the keyword so quoting chars (`"`/`'`) don't block the match — the
+    # common case is `python -c "import <m>"`.
     return re.compile(rf"\b(?:import|from)\s+{m}\b|-m\s+{m}\b")
 
 
@@ -586,12 +574,10 @@ def _is_env_var_assignment(tok: str) -> bool:
 def _executable_tokens(tokens: list[str], depth: int = 0) -> list[str]:
     """Yield the executable token of each command SEGMENT in `tokens`.
 
-    Walks the token list tracking command-segment boundaries (`;`, `&&`,
-    `||`, `|`, `&`, etc.), skipping environment-variable-assignment prefixes
-    (`FOO=bar python script.py` → python is the executable). When a segment
-    starts with `bash`/`sh`/`zsh -c "<script>"`, recursively scans the
-    quoted inner script so e.g. `bash -c "python train.py"` is correctly
-    classified as a python call.
+    Tracks segment boundaries (`;`, `&&`, `||`, `|`, `&`, etc.), skips env-var
+    assignment prefixes (`FOO=bar python script.py` → python is the executable),
+    and for a `bash`/`sh`/`zsh -c "<script>"` segment recursively scans the quoted
+    inner script (so `bash -c "python train.py"` is classified as a python call).
     """
     out: list[str] = []
     expect_exec = True
@@ -641,10 +627,10 @@ def _classify_tool_use(
     command = (tool_input.get("command") or "").strip()
     if not command:
         return "bash"
-    # Engineers commonly write multi-line bash scripts where the python
-    # invocation isn't the first token (env-var assignments first, or
-    # cd/setup lines before the actual call). `shlex.split` strips newlines,
-    # so split by line first; within a line, segment by `;`/`&&`/`||`/`|`.
+    # Engineers often write multi-line bash where the python call isn't the first
+    # token (env-var assignments, or cd/setup lines before it). `shlex.split`
+    # strips newlines, so split by line first; within a line, segment by
+    # `;`/`&&`/`||`/`|`.
     exec_tokens: list[str] = []
     tokens: list[str] = []
     for line in command.splitlines():
@@ -661,8 +647,8 @@ def _classify_tool_use(
         return "bash"
     if not exec_tokens:
         return "bash"
-    # Priority: cli (interface usage) > python (counts even when nested in
-    # a bash script) > bash (pure shell utilities).
+    # Priority: cli (interface usage) > python (counts even when nested in bash) >
+    # bash (pure shell utilities).
     def _is_cli(tok: str) -> bool:
         return bool(cli_binary) and (tok == cli_binary or tok.endswith(f"/{cli_binary}"))
     if any(_is_cli(t) for t in exec_tokens):
@@ -674,10 +660,10 @@ def _classify_tool_use(
     return "bash"
 
 
-# Patterns that mean an interface tool runs python/compute LOCALLY instead of
+# Patterns meaning an interface tool runs python/compute LOCALLY instead of
 # delegating to the remote platform. A researcher could "win" an interface by
-# adding such a tool — laundering local compute as mcp/cli usage. We flag these
-# in the engineer-facing entry-point files (MCP tools, CLI commands).
+# adding such a tool — laundering local compute as mcp/cli usage. Flagged in the
+# engineer-facing entry-point files (MCP tools, CLI commands).
 _LOCAL_EXEC_PATTERNS = [
     ("subprocess", re.compile(r"\bsubprocess\b")),
     ("os.system", re.compile(r"\bos\.system\s*\(")),
@@ -695,15 +681,15 @@ def audit_interface_local_exec(
 ) -> list[dict[str, Any]]:
     """Flag engineer-facing interface tools that execute python/compute LOCALLY.
 
-    Scans the MCP-tool (`**/mcp/tools/*.py`) and CLI-command (`**/cli/commands/*.py`)
+    Scans MCP-tool (`**/mcp/tools/*.py`) and CLI-command (`**/cli/commands/*.py`)
     source under `interface_src` for local-execution patterns (subprocess, exec,
-    runpy, …). When `baseline_src` (the v0 interface source) is given, only files
-    the researcher CHANGED or added are flagged — an unchanged upstream file that
-    happens to use subprocess is not the researcher's laundering and is skipped.
+    runpy, …). When `baseline_src` (the v0 interface source) is given, flag only
+    files the researcher CHANGED or added — an unchanged upstream file using
+    subprocess isn't laundering and is skipped.
 
     Returns `[{"file": <relpath>, "patterns": [...]}, ...]` (empty = clean).
-    The remote-only contract: interface tools must delegate to the cluster, never
-    run the work locally.
+    Enforces the remote-only contract: interface tools must delegate to the
+    cluster, never run the work locally.
     """
     flagged: list[dict[str, Any]] = []
     if not interface_src:
@@ -718,10 +704,10 @@ def audit_interface_local_exec(
         if "/build/" in tagged or "/tests/" in tagged or "/test/" in tagged:
             continue  # built copies + test fixtures aren't engineer-facing
         is_entrypoint = "/mcp/tools/" in tagged or "/cli/commands/" in tagged
-        # WITH a v0 baseline we can scan ALL researcher-changed source (covers
+        # WITH a v0 baseline, scan ALL researcher-changed source (covers
         # SDK-interface laundering too) and flag only ADDED patterns — low false
-        # positives. WITHOUT a baseline we can only safely scan the narrow MCP/CLI
-        # entry points (scanning all source would flag legit upstream subprocess).
+        # positives. WITHOUT a baseline, scan only the narrow MCP/CLI entry points
+        # (scanning all source would flag legit upstream subprocess).
         if base is None and not is_entrypoint:
             continue
         try:
@@ -741,7 +727,7 @@ def audit_interface_local_exec(
                 base_text = ""
             if base_text == text:
                 continue  # unchanged file — not researcher-introduced
-            # Flag only patterns the researcher ADDED (not already in baseline).
+            # Flag only patterns the researcher ADDED (absent from baseline).
             hits = [name for name, rx in _LOCAL_EXEC_PATTERNS
                     if rx.search(text) and not rx.search(base_text)]
             if not hits:
@@ -752,15 +738,14 @@ def audit_interface_local_exec(
 
 def _parse_endpoint_patterns(patterns: list[str] | None) -> list[tuple[str, str, "re.Pattern[str]"]]:
     """Parse `"<METHOD> <path-regex>"` strings into (source, method, compiled
-    regex). `source` is the original string (kept for the covered/missed report).
-    A missing method means "any method". Unparseable entries are skipped.
+    regex). `source` is the original string (kept for the covered/missed report);
+    missing method = "any method"; unparseable entries skipped.
 
-    The path regex is END-anchored (`(?:rx)/?$`, with an optional trailing
-    slash) and matched with `.search`. This prevents a prefix pattern from
-    over-matching a deeper path — e.g. the feature-view `POST .../featureview`
-    pattern must NOT also match the training-dataset
-    `.../featureview/{name}/version/{v}/trainingdatasets` POST — without forcing
-    a brittle start-anchor on the exact base prefix.
+    The path regex is END-anchored (`(?:rx)/?$`, optional trailing slash) and
+    matched with `.search`, so a prefix pattern can't over-match a deeper path —
+    e.g. feature-view `POST .../featureview` must NOT also match the
+    training-dataset `.../featureview/{name}/version/{v}/trainingdatasets` POST —
+    without forcing a brittle start-anchor on the exact base prefix.
     """
     out: list[tuple[str, str, Any]] = []
     for p in patterns or []:
@@ -779,12 +764,15 @@ def _parse_endpoint_patterns(patterns: list[str] | None) -> list[tuple[str, str,
     return out
 
 
-def _read_api_log(api_log: Path | str) -> list[tuple[str, str]]:
-    """Read the per-run API log into (METHOD, path) rows. Missing → []."""
+def _read_api_log(api_log: Path | str) -> list[tuple[str, str, str]]:
+    """Read the per-run API log into (METHOD, path, src) rows. Missing → [].
+
+    `src` ∈ {mcp, cli, sdk, other} is the interface the call came through (set by
+    the venv shim); "" for legacy logs without attribution."""
     p = Path(api_log)
     if not p.exists():
         return []
-    rows: list[tuple[str, str]] = []
+    rows: list[tuple[str, str, str]] = []
     for line in p.read_text().splitlines():
         line = line.strip()
         if not line:
@@ -793,7 +781,11 @@ def _read_api_log(api_log: Path | str) -> list[tuple[str, str]]:
             e = json.loads(line)
         except json.JSONDecodeError:
             continue
-        rows.append((str(e.get("method", "")).upper(), str(e.get("path", ""))))
+        rows.append((
+            str(e.get("method", "")).upper(),
+            str(e.get("path", "")),
+            str(e.get("src", "")),
+        ))
     return rows
 
 
@@ -801,29 +793,45 @@ def endpoint_coverage(
     api_log: Path | str,
     whitelist: list[str] | None,
     blacklist: list[str] | None,
+    interface: str | None = None,
 ) -> dict[str, Any]:
     """Full REST endpoint-coverage breakdown from the per-run API log (written by
     the venv shim). Drives BOTH the `whitelist_hits`/`blacklist_hits` metrics AND
     the per-run `endpoint_coverage.json` the researcher reads to see WHICH
     lifecycle steps the engineer reached.
 
+    `interface` ATTRIBUTES whitelist coverage: when set (cli/mcp/sdk), a target
+    endpoint counts as covered only if hit THROUGH that interface (the shim's
+    `src` tag) — hand-rolled `requests` ("other") and server-side Job calls (never
+    logged) don't count, so `whitelist_hits` reflects real interface usage.
+    `interface=None` counts any logged call (back-compat / unattributed logs).
+    Blacklist is NOT attribution-filtered: a forbidden call is a violation however
+    made.
+
     Returns: `whitelist_hits` (# distinct whitelist patterns hit), `blacklist_hits`
-    (# log rows matching any blacklist pattern), `total_whitelist`, and the
-    `covered`/`missed` pattern-source lists (a `missed` endpoint = a capability
-    the interface must expose).
+    (# log rows matching any blacklist pattern), `total_whitelist`, the
+    `covered`/`missed` pattern-source lists (a `missed` endpoint = a capability the
+    interface must expose), and the original `whitelist`/`blacklist` patterns
+    scored against — so the persisted `endpoint_coverage.json` stays self-contained
+    after the raw `api_calls.jsonl` is discarded.
     """
     rows = _read_api_log(api_log)
+    # Whitelist coverage scores only calls through the interface under test (the
+    # shim's `src` tag); blacklist sees every call.
+    wl_rows = [
+        (m, p) for m, p, so in rows if interface is None or so == interface
+    ]
 
     def hit(method: str, rx: "re.Pattern[str]", m: str, path: str) -> bool:
         return (not method or method == m) and bool(rx.search(path))
 
     wl = _parse_endpoint_patterns(whitelist)
-    covered = [src for src, method, rx in wl if any(hit(method, rx, m, p) for m, p in rows)]
+    covered = [src for src, method, rx in wl if any(hit(method, rx, m, p) for m, p in wl_rows)]
     covered_set = set(covered)
     missed = [src for src, _m, _rx in wl if src not in covered_set]
     bl = _parse_endpoint_patterns(blacklist)
     blacklist_hits = sum(
-        1 for m, p in rows if any(hit(method, rx, m, p) for _s, method, rx in bl)
+        1 for m, p, _so in rows if any(hit(method, rx, m, p) for _s, method, rx in bl)
     )
     return {
         "whitelist_hits": len(covered),
@@ -831,6 +839,8 @@ def endpoint_coverage(
         "total_whitelist": len(wl),
         "covered": covered,
         "missed": missed,
+        "whitelist": list(whitelist or []),
+        "blacklist": list(blacklist or []),
     }
 
 
@@ -838,11 +848,12 @@ def endpoint_hits(
     api_log: Path | str,
     whitelist: list[str] | None,
     blacklist: list[str] | None,
+    interface: str | None = None,
 ) -> dict[str, int]:
     """The two scored metrics (see `endpoint_coverage` for the full breakdown):
-    `whitelist_hits` = # distinct whitelist patterns hit ≥once; `blacklist_hits`
-    = # log rows matching any blacklist pattern."""
-    c = endpoint_coverage(api_log, whitelist, blacklist)
+    `whitelist_hits` = # distinct whitelist patterns hit ≥once THROUGH `interface`;
+    `blacklist_hits` = # log rows matching any blacklist pattern."""
+    c = endpoint_coverage(api_log, whitelist, blacklist, interface=interface)
     return {"whitelist_hits": c["whitelist_hits"], "blacklist_hits": c["blacklist_hits"]}
 
 
@@ -854,12 +865,11 @@ def aggregate_commands(
 ) -> dict[str, int]:
     """Count tool calls by category from the stream-json transcript.
 
-    Each `assistant` event carries a `message.content` list; tool calls are
-    blocks with `type=="tool_use"`. `cli_binary` promotes matching Bash calls
-    to cli_calls; `sdk_module` (typically the platform name when interface=sdk)
-    promotes python invocations that import or `-m`-run that module to
-    sdk_calls. When a script file is run we also peek it (relative to
-    `run_dir`) for SDK use.
+    Tool calls are `type=="tool_use"` blocks in each `assistant` event's
+    `message.content`. `cli_binary` promotes matching Bash calls to cli_calls;
+    `sdk_module` (typically the platform name when interface=sdk) promotes python
+    invocations that import or `-m`-run that module to sdk_calls; a run script file
+    is also peeked (relative to `run_dir`) for SDK use.
     """
     counts = {
         "cli_calls": 0,
@@ -915,9 +925,9 @@ def write_commands_log(
 ) -> None:
     """Render one JSONL line per tool call from the stream-json transcript.
 
-    Mirrors the (currently flaky) PreToolUse hook so commands.jsonl is always
-    populated — the hook is best-effort. Each line carries the tool name,
-    category bucket, raw tool_input, and the assistant event's timestamp.
+    Mirrors the (flaky, best-effort) PreToolUse hook so commands.jsonl is always
+    populated. Each line carries the tool name, category bucket, raw tool_input,
+    and the assistant event's timestamp.
     """
     if not transcript_path.exists():
         commands_log.write_text("")
@@ -959,18 +969,184 @@ def write_commands_log(
     commands_log.write_text("\n".join(lines) + ("\n" if lines else ""))
 
 
-def append(results_csv: Path, row: Row, fields: list[str] | None = None) -> None:
-    """Write `row` to results.csv. If a previous row has the same `run_dir`
-    (i.e. the same combo was re-run), it's replaced rather than appended, so
-    each combo has at most one row at any time.
+# Substrings marking a client-side failure worth flagging at the top of the
+# collected log (the engineer otherwise only sees "No such tool available").
+_CRASH_MARKERS = (
+    "Traceback (most recent call last)",
+    "Connection failed",
+    "Connection closed",
+    "Server disconnected",
+)
 
-    `fields` narrows the column set. `None` (default) writes the full
-    autoresearch schema. Pass `BENCHMARK_FIELDS` for benchmark: columns are
-    renamed and trimmed via `_benchmark_view`.
+
+def _slug_for(path: Path) -> str:
+    """Claude Code keys its per-project cache dir on the cwd, with every path
+    separator turned into a dash (e.g. /a/b → -a-b)."""
+    return str(Path(path).resolve()).replace("/", "-")
+
+
+def _flatten_text(content: Any) -> str:
+    """tool_result `content` is either a string or a list of {type,text} blocks."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(
+            b.get("text", "") for b in content if isinstance(b, dict)
+        )
+    return ""
+
+
+def _mcp_server_log(caches_dir: Path, run_dir: Path, server: str) -> list[str]:
+    """Lines Claude buried for one stdio MCP server during THIS run, oldest first.
+
+    Each `mcp-logs-<server>/*.jsonl` line is either a dict (debug/error events with
+    a timestamp) or a bare `"Server stderr: ..."` string carrying the server's own
+    stdout/stderr — including a startup traceback that kills the process before any
+    tool registers. Both are surfaced.
+    """
+    out: list[str] = []
+    # Cache dir is keyed on the engineer's cwd (the challenge dir); fall back to a
+    # glob so a layout change doesn't silently drop the logs.
+    candidates = [caches_dir / _slug_for(run_dir) / f"mcp-logs-{server}"]
+    candidates += [
+        p for p in caches_dir.glob(f"*/mcp-logs-{server}") if p not in candidates
+    ]
+    for logdir in candidates:
+        if not logdir.is_dir():
+            continue
+        for jf in sorted(logdir.glob("*.jsonl")):
+            for line in jf.read_text(errors="replace").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    out.append(line)
+                    continue
+                if isinstance(rec, str):
+                    out.append(rec)
+                    continue
+                if isinstance(rec, dict):
+                    ts = rec.get("timestamp", "")
+                    body = (
+                        rec.get("message")
+                        or rec.get("error")
+                        or rec.get("debug")
+                        or json.dumps(rec, default=str)
+                    )
+                    out.append(f"{ts} {body}".strip() if ts else str(body))
+    return out
+
+
+def _transcript_crashes(transcript_path: Path) -> list[str]:
+    """Errored / traceback-bearing tool results from the engineer transcript.
+
+    Covers the cli (`hops …` subprocess) and sdk (`import hopsworks`) paths, where
+    a client crash surfaces as a Python traceback or an errored tool result rather
+    than in a separate server log."""
+    out: list[str] = []
+    if not transcript_path.exists():
+        return out
+    for line in transcript_path.read_text(errors="replace").splitlines():
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if event.get("type") != "user":
+            continue
+        for block in (event.get("message") or {}).get("content") or []:
+            if not isinstance(block, dict) or block.get("type") != "tool_result":
+                continue
+            text = _flatten_text(block.get("content"))
+            is_err = bool(block.get("is_error"))
+            if not text:
+                continue
+            if is_err or any(m in text for m in _CRASH_MARKERS):
+                out.append(text.strip()[:4000])
+    return out
+
+
+def collect_client_logs(
+    run_dir: Path,
+    boundary: Path,
+    interface: str,
+    platform: str,
+    mcp_servers: dict[str, Any] | None = None,
+    transcript_path: Path | None = None,
+) -> dict[str, Any]:
+    """Write `<run_dir>/<platform>_client.logs` for a cli/mcp/sdk run.
+
+    The interface client's runtime output is otherwise scattered and, for mcp,
+    effectively invisible: Claude launches the stdio server and buries its stderr +
+    connection status under
+    `<HOME>/Library/Caches/claude-cli-nodejs/<cwd-slug>/mcp-logs-<server>/*.jsonl`.
+    A server that crashes at startup leaves the engineer with only "No such tool
+    available", reading like an empty interface rather than a crash. This
+    aggregates, per run:
+
+    - **mcp** — every `mcp-logs-<server>` line for the run's servers.
+    - **cli / sdk** — errored / traceback-bearing tool results from the
+      transcript (the client runs in-process / as a subprocess there).
+
+    Always written for these interfaces (so each version has it). Returns
+    ``{"path", "crashed", "markers"}``; ``crashed`` is True when any crash marker
+    was seen, so the caller can warn.
+    """
+    out_path = run_dir / f"{platform}_client.logs"
+    if interface not in ("cli", "mcp", "sdk"):
+        return {"path": str(out_path), "crashed": False, "markers": []}
+
+    caches_dir = Path(boundary) / "Library" / "Caches" / "claude-cli-nodejs"
+    sections: list[str] = []
+    body_for_scan: list[str] = []
+
+    if interface == "mcp":
+        for server in sorted((mcp_servers or {}).keys()):
+            lines = _mcp_server_log(caches_dir, run_dir, server)
+            header = f"===== MCP server: {server} ====="
+            if lines:
+                sections.append(header + "\n" + "\n".join(lines))
+                body_for_scan.extend(lines)
+            else:
+                sections.append(header + "\n(no server log captured)")
+
+    crashes = _transcript_crashes(transcript_path) if transcript_path else []
+    if crashes:
+        sections.append(
+            "===== client errors (engineer transcript) =====\n"
+            + "\n---\n".join(crashes)
+        )
+        body_for_scan.extend(crashes)
+
+    blob = "\n".join(body_for_scan)
+    markers = [m for m in _CRASH_MARKERS if m in blob]
+    crashed = bool(markers)
+
+    head = (
+        f"# {platform} client log ({interface} interface)\n"
+        f"# crashed={crashed}"
+        + (f"  markers={markers}" if markers else "")
+        + "\n\n"
+    )
+    out_path.write_text(head + ("\n\n".join(sections) if sections else "(no client output captured)\n"))
+    return {"path": str(out_path), "crashed": crashed, "markers": markers}
+
+
+def append(results_csv: Path, row: Row, fields: list[str] | None = None) -> None:
+    """Write `row` to results.csv. A previous row with the same `run_dir` (same
+    combo re-run) is replaced rather than appended, so each combo has at most one
+    row at any time.
+
+    `fields` narrows the column set. `None` (default) writes the full autoresearch
+    schema. Pass `BENCHMARK_FIELDS` for benchmark: columns are renamed and trimmed
+    via `_benchmark_view`.
     """
     cols = fields if fields is not None else FIELDS
-    # Detect benchmark by column-list equality (callers import BENCHMARK_FIELDS
-    # so either `is` or `==` works; `==` is robust across module re-imports).
+    # Detect benchmark by column-list equality (callers import BENCHMARK_FIELDS, so
+    # either `is` or `==` works; `==` is robust across module re-imports).
     use_benchmark_view = cols == BENCHMARK_FIELDS
     results_csv.parent.mkdir(parents=True, exist_ok=True)
     raw = asdict(row)
@@ -983,10 +1159,9 @@ def append(results_csv: Path, row: Row, fields: list[str] | None = None) -> None
                 if r.get("run_dir") == new_row.get("run_dir"):
                     continue  # replaced by new_row below
                 kept.append(r)
-    # Rolling averages: recompute the cumulative running mean of each tracked
-    # raw column over the rows in file order (kept first, the new/replacement
-    # row last) so the `*_avg` columns stay correct after an append OR a
-    # replace. Blank raw values don't contribute.
+    # Rolling averages: recompute the cumulative running mean of each tracked raw
+    # column in file order (kept first, new/replacement row last) so `*_avg` stays
+    # correct after append OR replace. Blank raw values don't contribute.
     ordered = kept + [new_row]
     recompute_rolling_averages(ordered, cols)
     with results_csv.open("w", newline="") as fw:
@@ -997,19 +1172,19 @@ def append(results_csv: Path, row: Row, fields: list[str] | None = None) -> None
 
 
 def _rolling_pairs(cols: list[str]) -> list[tuple[str, str]]:
-    """(raw_col, avg_col) pairs to recompute, filtered to those present in
-    `cols`. Derived from the single `_ROLLING_AVG_OF` map plus the per-category
-    call counts — so benchmark (whose schema has no `*_avg` columns) yields an
-    empty list and the recompute is a no-op there."""
+    """(raw_col, avg_col) pairs to recompute, filtered to those present in `cols`.
+    Derived from the single `_ROLLING_AVG_OF` map plus the per-category call counts
+    — so benchmark (no `*_avg` columns) yields an empty list and the recompute is a
+    no-op there."""
     pairs = list(_ROLLING_AVG_OF.items()) + [(c, f"{c}_avg") for c in CALL_COUNT_COLS]
     return [(r, a) for r, a in pairs if r in cols and a in cols]
 
 
 def recompute_rolling_averages(ordered: list[dict[str, Any]], cols: list[str]) -> None:
-    """In-place fill each rolling `*_avg` column with the cumulative running
-    mean of its raw column across `ordered` (file order). Skips pairs whose
-    columns aren't in the active schema; blank/None raw values are excluded
-    from the running mean (a blank row carries the mean-so-far forward)."""
+    """In-place fill each rolling `*_avg` column with the cumulative running mean
+    of its raw column across `ordered` (file order). Skips pairs whose columns
+    aren't in the active schema; blank/None raw values are excluded (a blank row
+    carries the mean-so-far forward)."""
     for raw_col, avg_col in _rolling_pairs(cols):
         running_sum = 0.0
         running_n = 0
@@ -1022,5 +1197,3 @@ def recompute_rolling_averages(ordered: list[dict[str, Any]], cols: list[str]) -
                 running_sum += x
                 running_n += 1
             r[avg_col] = f"{running_sum / running_n:.4f}" if running_n else ""
-
-

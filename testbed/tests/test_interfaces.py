@@ -69,6 +69,68 @@ class AccountingFieldsTests(InterfaceTestBase):
         self.assertEqual(cfg["teardown"], ["echo bye"])
 
 
+class BaseCleanTests(InterfaceTestBase):
+    """The base .venv must stay free of the interface package so each per-run /
+    check venv installs the wheel fresh (console scripts + extras)."""
+
+    def test_dist_name_from_wheel_binary(self):
+        # `<dist>-<version>-...whl` → first '-'-delimited token is the dist name.
+        self.assertEqual(
+            interfaces._interface_dist_name(
+                {}, "hopsworks", "hopsworks-0-py3-none-any.whl"),
+            "hopsworks",
+        )
+
+    def test_dist_name_falls_back_to_sdk_module_then_platform(self):
+        self.assertEqual(
+            interfaces._interface_dist_name({"sdk_module": "hsfs"}, "hopsworks", None),
+            "hsfs",
+        )
+        self.assertEqual(
+            interfaces._interface_dist_name({}, "hopsworks", None), "hopsworks")
+
+    def test_ensure_base_clean_noop_for_none(self):
+        # No-op for the null interface — and must not shell out to pip.
+        import unittest.mock as mock
+        with mock.patch.object(interfaces.subprocess, "run") as run:
+            interfaces.ensure_base_clean("none", "none")
+        run.assert_not_called()
+
+    def test_ensure_base_clean_uninstalls_when_present(self):
+        import unittest.mock as mock
+        self.write_manifest(
+            "svc", "sdk", "binary: svc_pkg-0-py3-none-any.whl\nprompt: hi\n")
+        calls = []
+
+        def fake_run(cmd, *a, **k):
+            calls.append(cmd)
+            # Emulate `pip show <dist>` → present (exit 0); uninstall → exit 0.
+            return mock.Mock(returncode=0)
+
+        with mock.patch.object(interfaces.subprocess, "run", side_effect=fake_run):
+            interfaces.ensure_base_clean("svc", "sdk", 0, None)
+
+        # A `pip show svc_pkg` probe followed by a `pip uninstall -y svc_pkg`.
+        self.assertTrue(any("show" in c and "svc_pkg" in c for c in calls))
+        self.assertTrue(
+            any("uninstall" in c and "-y" in c and "svc_pkg" in c for c in calls))
+
+    def test_ensure_base_clean_skips_uninstall_when_absent(self):
+        import unittest.mock as mock
+        self.write_manifest(
+            "svc", "sdk", "binary: svc_pkg-0-py3-none-any.whl\nprompt: hi\n")
+        calls = []
+
+        def fake_run(cmd, *a, **k):
+            calls.append(cmd)
+            return mock.Mock(returncode=1)  # `pip show` → not present
+
+        with mock.patch.object(interfaces.subprocess, "run", side_effect=fake_run):
+            interfaces.ensure_base_clean("svc", "sdk", 0, None)
+
+        self.assertFalse(any("uninstall" in c for c in calls))
+
+
 class VersionResolutionTests(InterfaceTestBase):
     def test_base_version_is_zero(self):
         self.write_manifest("svc", "sdk", "prompt: base prompt\n")

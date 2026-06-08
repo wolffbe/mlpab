@@ -1,14 +1,14 @@
 """Manager Claude (the researcher) that iteratively improves the engineer's interface.
 
-Hierarchy: a RUN contains multiple INCREMENTS; each increment spans multiple
-TASKS (ML task types); each task spans its CHALLENGES.
+Hierarchy: a RUN has many INCREMENTS; each spans many TASKS (ML task types);
+each task spans its CHALLENGES.
 
 The researcher MODIFIES THE INTERFACE handed to the engineer (never the engineer
-prompt). Each increment has its own copy of the interface at `v<N>/interface/`
-(v0 is auto-seeded from the committed base — or from a `prev_run`+
-`prev_version` continuation — and pre-built; v>0 the researcher prepares
-via `banter prepare-version`, then edits source). `banter run --interface-dir
-v<N>/interface` force-rebuilds the edits + the engineer uses them.
+prompt). Each increment has its own interface copy at `v<N>/interface/` (v0
+auto-seeded from the committed base — or a `prev_run`+`prev_version`
+continuation — and pre-built; v>0 prepared via `banter prepare-version`, then
+source-edited). `banter run --interface-dir v<N>/interface` force-rebuilds the
+edits and the engineer uses them.
 
 Layout under `results/autoresearch/`:
     experiments.csv        # GLOBAL table: one row per (config, version, task,
@@ -21,10 +21,9 @@ Layout under `results/autoresearch/`:
         report.md          # final report (researcher writes at the end)
         v0/, v1/, …
             interface/     # the per-version interface copy (built)
-            <task>/<challenge>/   # one engineer run + its artifacts (incl. stream.log)
-    (No per-run results.csv and no raw transcript — results go to the global
-     experiments.csv; the researcher scores versions via the `normalized_composite`
-     MCP tool.)
+            <task>/<challenge>/   # one engineer run + its artifacts (incl. engineer.log)
+    (No per-run results.csv or raw transcript — results go to the global
+     experiments.csv; versions scored via the `normalized_composite` MCP tool.)
 
 Budget is graceful: `budget.max_seconds` caps COMPUTE time (wall clock minus
 rate-limit waiting). The researcher runs `banter budget-check` BEFORE each new
@@ -62,22 +61,20 @@ class Goal:
 
 @dataclass
 class Budget:
-    # `iterations` is the TOTAL number of versions, INCLUDING the v0 baseline as
-    # the first step. v0 is always created (fresh from the committed base, or
-    # seeded from `prev_run`/`prev_version`); v1..v<iterations-1> are the
-    # researcher's improvements. iterations=4 → v0, v1, v2, v3.
+    # `iterations` = TOTAL versions INCLUDING the v0 baseline. v0 is always
+    # created (fresh from the committed base, or seeded from `prev_run`/
+    # `prev_version`); v1..v<iterations-1> are improvements. iterations=4 → v0..v3.
     iterations: int = 11
-    # `max_cost_usd` caps the COMBINED engineer + researcher spend (total_cost).
-    # `max_seconds` caps the session's COMPUTE time — wall clock minus time spent
-    # waiting on rate limits (recorded in the rate-limit ledger). Both default to
-    # UNLIMITED when the config doesn't set them — no silent cap is imposed; the
-    # run is then bounded only by `iterations`. Graceful: the researcher checks
-    # `banter budget-check` before each new version and stops when exceeded.
+    # `max_cost_usd` caps COMBINED engineer + researcher spend (total_cost).
+    # `max_seconds` caps COMPUTE time — wall clock minus rate-limit waiting
+    # (from the ledger). Both default UNLIMITED (no silent cap; run bounded only
+    # by `iterations`). Graceful: researcher checks `banter budget-check` before
+    # each new version and stops when exceeded.
     max_cost_usd: float = float("inf")
     max_seconds: float = float("inf")
 
-    # `max_increments` = improvement versions on top of v0 = iterations - 1.
-    # Retained as a derived property so existing code/prompts keep working.
+    # `max_increments` = improvements on top of v0 = iterations - 1. Derived
+    # property kept so existing code/prompts keep working.
     @property
     def max_increments(self) -> int:
         return max(0, self.iterations - 1)
@@ -93,10 +90,10 @@ class InterfaceRef:
     platform: str
     interface: str
     version: int | None = None      # None/0 → base manifest; >0 → a session version
-    # Autoresearch session that produced a pinned `version` > 0 (e.g. RQ3 pinning
-    # an RQ1 winner). None means "this session" / base.
+    # Session that produced a pinned `version` > 0 (e.g. RQ3 pinning an RQ1
+    # winner). None means "this session" / base.
     session: str | None = None
-    # The platform config path this ref came from (when referenced by `config:`).
+    # Platform config path this ref came from (when referenced by `config:`).
     config: str | None = None
 
     def __str__(self) -> str:
@@ -110,10 +107,10 @@ _VALID_IMPROVE_SCOPES = {"interface", "skills"}
 
 @dataclass
 class AutoresearchConfig:
-    # tasks: ML task type → its challenges. The unifying structure across all
-    # RQ configs (RQ1 = one challenge per task; RQ2 = several; RQ3 = same as
-    # RQ1 with skills). Each version spans ALL tasks; `task` is a grouping
-    # dimension on results.csv, not a separate per-task version chain.
+    # tasks: ML task type → its challenges. Unifying structure across all RQ
+    # configs (RQ1 = one challenge/task; RQ2 = several; RQ3 = RQ1 with skills).
+    # Each version spans ALL tasks; `task` is a grouping dimension on
+    # results.csv, not a separate per-task version chain.
     tasks: dict[str, list[str]]
     challenges: list[str]                # flattened union of all tasks (derived)
     interfaces: list[InterfaceRef]       # platforms run side-by-side per increment
@@ -122,24 +119,24 @@ class AutoresearchConfig:
     goals: list[Goal]
     budget: Budget
     improve: list[str]              # subset of {"interface", "skills"}
-    # The engineer is the controlled instance; the researcher controls it.
-    # Defaults: the engineer (smaller, cheaper, fast iterations) runs Sonnet;
-    # the researcher (planner / harder reasoning over many runs) runs Opus.
+    # Engineer is the controlled instance; the researcher controls it. Defaults:
+    # engineer (cheap, fast iterations) runs Sonnet; researcher (planner / harder
+    # reasoning over many runs) runs Opus.
     engineer_model: str = "claude-sonnet-4-6"
     engineer_auth: str = "api-key"
     researcher_model: str = "claude-opus-4-5"
     researcher_auth: str = "api-key"
-    # Pin this run's id (the `run` column + run-dir prefix). When unset
-    # (None) the id auto-increments: `next_session_id(results/autoresearch)`.
-    # Useful when you want stable, named runs (e.g. `run: rq1-cli-skills-v2`).
+    # Pin this run's id (`run` column + run-dir prefix). Unset (None) →
+    # auto-increment via `next_session_id(results/autoresearch)`. Useful for
+    # stable, named runs (e.g. `run: rq1-cli-skills-v2`).
     run: int | str | None = None
-    # Take a PAST version as the base for further improvement. v0 is seeded
-    # from `results/autoresearch/<prev_run's folder>/v<prev_version>/interface`
-    # instead of the committed base. Both must be set together, or neither.
+    # Take a PAST version as the base for further improvement. v0 is seeded from
+    # `results/autoresearch/<prev_run's folder>/v<prev_version>/interface`
+    # instead of the committed base. Both set together, or neither.
     prev_run: int | None = None
     prev_version: int | None = None
     # Experiment-design metadata (set by generated treatment configs). All
-    # optional, defaulting to None so existing configs are unaffected. When
+    # optional, default None so existing configs are unaffected. When
     # `experiment` is set, the end-of-run hook propagates this treatment's
     # outcome into the master `results/experiments.csv` table.
     experiment: int | None = None
@@ -151,9 +148,9 @@ class AutoresearchConfig:
     # Absolute path of the config file this was loaded from. The experiment
     # table keys off this (the config IS the treatment's identity).
     config_path: str | None = None
-    # REST-endpoint coverage policy: `{"whitelist": [pat, …], "blacklist": [pat, …]}`
-    # where each pattern is "<METHOD> <path-regex>". Drives the `whitelist_hits`
-    # (maximize) / `blacklist_hits` (minimize) metrics. Empty = no scoring.
+    # REST-endpoint coverage policy: `{"whitelist": [pat, …], "blacklist": [pat, …]}`,
+    # each pattern "<METHOD> <path-regex>". Drives `whitelist_hits` (maximize) /
+    # `blacklist_hits` (minimize). Empty = no scoring.
     endpoints: dict = field(default_factory=lambda: {"whitelist": [], "blacklist": []})
 
 
@@ -169,9 +166,9 @@ _MINIMIZE_METRICS = {
 
 
 def _as_pattern_list(v: Any) -> list[str]:
-    """Coerce an `endpoints.whitelist`/`blacklist` config value to a list of
-    pattern strings. A bare string is ONE pattern (not split into characters);
-    None → []; a list passes through (stringified)."""
+    """Coerce an `endpoints.whitelist`/`blacklist` value to a list of pattern
+    strings. Bare string → ONE pattern (not split); None → []; list →
+    stringified pass-through."""
     if v is None:
         return []
     if isinstance(v, str):
@@ -192,11 +189,11 @@ def _parse_goal(entry: Any) -> Goal:
 
 
 def _parse_interfaces(data: dict) -> list[InterfaceRef]:
-    """Parse `interfaces`. Each entry references a platform either by its
-    config file (`config: platforms/<platform>/<interface>/config.yaml`) — the
-    preferred, explicit form — or by `platform` + `interface`. Optional `version`
-    + `session` say where to start (base v0, or a version pinned from a session).
-    Accepts legacy `starting_interfaces` / `starting_interface`."""
+    """Parse `interfaces`. Each entry references a platform by config file
+    (`config: platforms/<platform>/<interface>/config.yaml`, preferred) or by
+    `platform` + `interface`. Optional `version` + `session` say where to start
+    (base v0, or a version pinned from a session). Accepts legacy
+    `starting_interfaces` / `starting_interface`."""
     raw = data.get("interfaces") or data.get("starting_interfaces")
     if raw is None and "starting_interface" in data:
         single = data["starting_interface"]
@@ -231,6 +228,10 @@ def load_config(path: Path) -> AutoresearchConfig:
     with open(path) as f:
         data = yaml.safe_load(f) or {}
     goals = [_parse_goal(g) for g in (data.get("goals") or [])]
+    endpoints = {
+        "whitelist": _as_pattern_list((data.get("endpoints") or {}).get("whitelist")),
+        "blacklist": _as_pattern_list((data.get("endpoints") or {}).get("blacklist")),
+    }
     bud = data.get("budget") or {}
     raw_improve = data.get("improve") or ["interface", "skills"]
     if isinstance(raw_improve, str):
@@ -242,9 +243,9 @@ def load_config(path: Path) -> AutoresearchConfig:
             f"Invalid `improve` values: {invalid}. "
             f"Must be a subset of {sorted(_VALID_IMPROVE_SCOPES)}."
         )
-    # tasks: ML task type → its challenges. Canonical key is `tasks`; we accept
-    # the legacy `challenge_groups`, and a flat `challenges:` list (wrapped as a
-    # single "all" task) for back-compat.
+    # tasks: ML task type → challenges. Canonical key `tasks`; legacy
+    # `challenge_groups` and a flat `challenges:` list (wrapped as one "all"
+    # task) accepted for back-compat.
     raw_tasks = data.get("tasks") or data.get("challenge_groups")
     tasks: dict[str, list[str]] = {}
     if raw_tasks:
@@ -273,14 +274,11 @@ def load_config(path: Path) -> AutoresearchConfig:
         skills=data.get("skills", data.get("starting_skills", "none")),
         docs=data.get("docs", "none"),
         goals=goals,
-        endpoints={
-            "whitelist": _as_pattern_list((data.get("endpoints") or {}).get("whitelist")),
-            "blacklist": _as_pattern_list((data.get("endpoints") or {}).get("blacklist")),
-        },
+        endpoints=endpoints,
         budget=Budget(
             # `iterations` = total versions incl. v0 (preferred). Legacy
-            # `max_increments`/`max_cycles`/`max_runs` counted improvements on
-            # top of v0, so iterations = that + 1. Default 11 (= old default 10).
+            # `max_increments`/`max_cycles`/`max_runs` counted improvements over
+            # v0, so iterations = that + 1. Default 11 (= old default 10).
             iterations=(
                 int(bud["iterations"]) if "iterations" in bud
                 else int(bud.get("max_increments", bud.get("max_cycles", bud.get("max_runs", 10)))) + 1
@@ -295,10 +293,9 @@ def load_config(path: Path) -> AutoresearchConfig:
             ),
         ),
         improve=improve,
-        # `engineer_model`/`researcher_model` are research knobs in the config.
-        # Auth is a machine/setup concern: it defaults to BANTER_AUTH (what
-        # `make setup` chose) unless the config explicitly overrides it.
-        # (`model`/`auth` are accepted as legacy fallbacks.)
+        # `*_model` are research knobs in the config. Auth is a machine/setup
+        # concern: defaults to BANTER_AUTH (what `make setup` chose) unless the
+        # config overrides it. (`model`/`auth` accepted as legacy fallbacks.)
         engineer_model=data.get("engineer_model", data.get("model", "claude-sonnet-4-6")),
         engineer_auth=data.get(
             "engineer_auth", data.get("auth", os.environ.get("BANTER_AUTH", "api-key"))
@@ -332,8 +329,8 @@ def load_config(path: Path) -> AutoresearchConfig:
 
 
 def _scan_interfaces(testbed_root: Path) -> str:
-    """List configured platforms (platforms/<project>/<interface>/config.yaml). The
-    base IS version 0; higher versions are created session-locally."""
+    """List configured platforms (platforms/<project>/<interface>/config.yaml).
+    Base IS version 0; higher versions are created session-locally."""
     idir = testbed_root / "platforms"
     if not idir.exists():
         return "  (none)"
@@ -373,16 +370,16 @@ def _scan_skills(testbed_root: Path, project: str) -> str:
 
 
 def _current_version(testbed_root: Path, iface: InterfaceRef) -> int:  # noqa: ARG001
-    """The base version is always 0 — improved versions live run-local,
-    not in the committed config. Args kept for future per-interface lookup."""
+    """Base version is always 0 — improved versions live run-local, not in the
+    committed config. Args kept for future per-interface lookup."""
     return 0
 
 
 def _fragment(testbed_root: Path, name: str, **kw: Any) -> str:
     """Load a prompt fragment from prompts/fragments/<name>, formatting if needed.
 
-    All researcher prompt wording lives under prompts/ — the code only selects
-    and fills fragments, it does not hold prose.
+    All researcher prompt wording lives under prompts/; the code only selects
+    and fills fragments, holding no prose.
     """
     p = testbed_root / "prompts" / "fragments" / name
     text = p.read_text().rstrip("\n") if p.exists() else ""
@@ -396,13 +393,14 @@ def build_researcher_prompt(
     run_id: str,
     banter_bin: Path,
 ) -> str:
+    # Bullets, NOT numbered — order isn't a priority ranking; goals are
+    # optimized JOINTLY (see the prompt's joint-optimization note).
     goals_lines = "\n".join(
-        f"  {i + 1}. {g.direction.upper()} `{g.metric}`"
-        for i, g in enumerate(config.goals)
+        f"  - {g.direction.upper()} `{g.metric}`" for g in config.goals
     )
-    # Endpoint-coverage targets: so the researcher knows WHAT `whitelist_hits`
-    # measures (the target REST endpoints) and that a missed one is a capability
-    # the interface must expose. Empty when no `endpoints:` configured.
+    # Endpoint-coverage targets: tell the researcher WHAT `whitelist_hits`
+    # measures (target REST endpoints) and that a miss is a capability the
+    # interface must expose. Empty when no `endpoints:` configured.
     _wl = (config.endpoints or {}).get("whitelist") or []
     _bl = (config.endpoints or {}).get("blacklist") or []
 
@@ -482,42 +480,41 @@ def build_researcher_prompt(
         "unlimited" if config.budget.max_seconds == float("inf")
         else f"{config.budget.max_seconds:.0f} s of compute"
     )
-    # COMPUTE-time budget enforcement is GRACEFUL: the prompt gives the
-    # researcher a `banter budget-check` command that compares (now - start -
-    # rate_limit_waits) against max_seconds. Time spent waiting on rate limits
-    # (recorded in the ledger by run_with_retry) is EXCLUDED, so only actual
-    # computation counts. The researcher runs it before each new version and
-    # stops at the version boundary when exceeded (no hard subprocess kill).
+    # COMPUTE-time budget is GRACEFUL: `banter budget-check` compares
+    # (now - start - rate_limit_waits) against max_seconds. Rate-limit waits
+    # (logged in the ledger by run_with_retry) are EXCLUDED, so only computation
+    # counts. Researcher runs it before each new version, stopping at the version
+    # boundary when exceeded (no hard subprocess kill).
     session_start_epoch = int(time.time())
-    # `banter budget-check --max-seconds` takes a float; pass the literal `inf`
-    # for an unlimited budget (avoids `int(inf)` and reads as always-CONTINUE).
+    # `--max-seconds` takes a float; pass literal `inf` for unlimited (avoids
+    # `int(inf)`, reads as always-CONTINUE).
     max_seconds_arg = (
         "inf" if config.budget.max_seconds == float("inf")
         else str(int(config.budget.max_seconds))
     )
     ledger_path = runs_root / ".rate_limit_wait_s"
 
-    # Per-increment annotations live in `results.csv` columns, filled by
-    # `banter annotate-increment`; CHANGELOG.md is the human-readable companion.
+    # Per-increment annotations live in `results.csv` columns (filled by
+    # `banter annotate-increment`); CHANGELOG.md is the human-readable companion.
     changelog_path = runs_root / "CHANGELOG.md"
     first_iface = config.interfaces[0]
     _, next_iface_version = iface_versions[str(first_iface)]
 
     _ex_task = next(iter(config.tasks), "no_task") if config.tasks else "no_task"
     _ex_challenge = config.challenges[0] if config.challenges else "challenge-id"
-    # Clean run-dir hierarchy: <run>/v<N>/<task>/<challenge>/.
-    # v0 = a copy of the committed original (or a prev session/increment
-    # when continuing); v>0 = the researcher's edited copy of v<N-1>.
+    # Run-dir hierarchy: <run>/v<N>/<task>/<challenge>/. v0 = copy of the
+    # committed original (or a prev session/increment when continuing);
+    # v>0 = the researcher's edited copy of v<N-1>.
     run_dir_example = f"{runs_root}/v<N>/{_ex_task}/{_ex_challenge}/"
 
     # Eval command: each increment runs the engineer against its OWN interface
-    # copy at <run>/v<N>/interface (set up via `banter prepare-version`,
-    # except v0 which is auto-prepared at run start). --interface-dir points
-    # at that copy; the runner force-rebuilds + the engineer uses it.
+    # copy at <run>/v<N>/interface (set up via `banter prepare-version`, except
+    # v0 auto-prepared at run start). --interface-dir points there; the runner
+    # force-rebuilds and the engineer uses it.
     eval_block_lines = []
     task_items = list(config.tasks.items()) or [("no_task", config.challenges or ["<challenge>"])]
-    # All autoresearch records results straight into the global
-    # results/autoresearch/experiments.csv via this flag (no per-run results.csv).
+    # Records results straight into the global results/autoresearch/
+    # experiments.csv via this flag (no per-run results.csv).
     exp_flag = f" \\\n  --experiment-config {config.config_path}" if config.config_path else ""
     for iface in config.interfaces:
         for task, task_challenges in task_items:
@@ -540,9 +537,9 @@ def build_researcher_prompt(
                 )
     eval_block = "\n".join(eval_block_lines)
 
-    # v0 is the baseline (always present — fresh or seeded from prev_run/
+    # v0 = baseline (always present — fresh or seeded from prev_run/
     # prev_version). v1..v<max_increments> are improvements ON TOP of v0.
-    # max_increments=3 → v0, v1, v2, v3 (1 baseline + 3 improvements).
+    # max_increments=3 → v0..v3 (1 baseline + 3 improvements).
     start_version = 1                              # first improvement
     last_version_idx = config.budget.max_increments
     new_versions_count = config.budget.max_increments + 1  # incl. v0
@@ -574,12 +571,14 @@ def build_researcher_prompt(
         starting_skills=config.skills,
         skills_note=skills_note,
         docs_block=(
-            f"\n## Reference docs\n\nA docs bundle (`{config.docs}`) is "
-            f"materialized at `{runs_root}/docs/`. Browse these files when "
-            f"you need to look up how the interface works (API surfaces, "
-            f"behavior, examples). They are static — not edited across "
-            f"versions, not measured. The engineer gets its own copy at "
-            f"`<challenge>/docs/` per run.\n"
+            f"\n## Reference docs (yours to study — the engineer never sees them)\n\n"
+            f"A docs bundle (`{config.docs}`) is materialized at `{runs_root}/docs/` "
+            f"FOR YOU. Study them to learn the platform's core concepts and how its "
+            f"capabilities map to your goals (and to the coverage targets, if any). "
+            f"They are static — not edited across versions, not measured. **The "
+            f"engineer does NOT receive these docs**: its only guide is the interface "
+            f"itself, so fold what you learn here into the interface's own "
+            f"self-description (names, `--help`, docstrings, errors).\n"
             if config.docs != "none"
             else "\n## Reference docs\n\nNo docs bundle configured for this "
                  "session (`docs: none`). Work from the interface source "
@@ -607,11 +606,11 @@ def build_researcher_prompt(
 
 
 def _display_event(event: dict[str, Any], log_path: Path | None = None) -> None:
-    """Print a human-readable line for a stream-json event from the researcher,
-    mirroring it to `log_path` (the session's stream.log) when given.
+    """Print a human-readable line for a researcher stream-json event, mirroring
+    to `log_path` (the session's researcher.log) when given.
 
     Assistant lines share the engineer's formatter (`streaming.assistant_lines`);
-    the `result` event keeps the researcher's richer finish summary.
+    `result` events keep the researcher's richer finish summary.
     """
     etype = event.get("type")
     if etype == "assistant":
@@ -653,8 +652,8 @@ def run_autoresearch(
     if shutil.which("claude") is None:
         raise RuntimeError("`claude` CLI not found on PATH. Install Claude Code first.")
 
-    # `banter` runs outside the venv — prefer the one on PATH (host install),
-    # falling back to a venv copy if present.
+    # `banter` runs outside the venv — prefer PATH (host install), fall back to
+    # a venv copy if present.
     found = shutil.which("banter")
     venv_banter = testbed_root / ".venv" / "bin" / "banter"
     banter_bin = Path(found) if found else venv_banter
@@ -663,9 +662,9 @@ def run_autoresearch(
             "`banter` not found on PATH or in .venv. Install it (e.g. `make install`)."
         )
 
-    # The researcher only kicks in once every required platform is built, set
-    # up, authenticated, and tested — deterministically, no AI — and any skill
-    # is accessible. Fail fast before spawning the researcher otherwise.
+    # The researcher only starts once every required platform is built, set up,
+    # authenticated, and tested (deterministically, no AI) and any skill is
+    # accessible. Fail fast before spawning it otherwise.
     from banter import preflight as preflight_mod
     reqs = [
         preflight_mod.Requirement(
@@ -678,11 +677,11 @@ def run_autoresearch(
         for i in config.interfaces
     ]
     try:
-        # Build + test the platforms once at session start (login is checked per
+        # Build + test the platforms once at session start (login checked per
         # challenge by the runner, in each run's own venv).
         # cleanup_build: this upfront check builds each interface only to verify
-        # it; the artifacts are deleted afterwards so the committed source folder
-        # stays source-only. The real build/install happens per version (v0/vN).
+        # it, deleting the artifacts after so the committed source folder stays
+        # source-only. Real build/install happens per version (v0/vN).
         preflight_mod.preflight(
             reqs, auth=config.engineer_auth, model=config.engineer_model, check_login=False,
             cleanup_build=True,
@@ -693,9 +692,8 @@ def run_autoresearch(
         )
 
     # Pre-download every (task, challenge) dataset NOW, before the researcher
-    # spawns. The researcher's tool-permission `deny` patterns block writes
-    # outside <run>/, so it can't populate <testbed>/cache itself. Idempotent:
-    # skips already-prepared competitions.
+    # spawns: its `deny` patterns block writes outside <run>/, so it can't
+    # populate <testbed>/cache itself. Idempotent: skips already-prepared comps.
     from banter import mlebench_wrapper, runner as runner_mod
     all_challenges: list[str] = []
     if config.tasks:
@@ -712,8 +710,8 @@ def run_autoresearch(
     parent.mkdir(parents=True, exist_ok=True)
 
     # The config FILENAME stem names the results folder (e.g. `rq1`,
-    # `test-skills`). An explicit `run:` in the config overrides it; otherwise
-    # fall back to the legacy auto-increment id when no name was passed in.
+    # `test-skills`). Explicit `run:` overrides it; else fall back to the legacy
+    # auto-increment id when no name was passed in.
     if config_name:
         run_id = config_name
     elif config.run is not None:
@@ -721,10 +719,10 @@ def run_autoresearch(
     else:
         run_id = results_mod.next_session_id(parent)
 
-    # One folder per config: results/autoresearch/<run_id>/. Inside it, one
-    # sub-tree per platform — <platform>/<interface>/<skills>/ — and EACH leaf is
-    # its own researcher (run sequentially), with v<N>/<task>/<challenge>/
-    # underneath. Overwrite a pre-existing config folder, but confirm first.
+    # One folder per config: results/autoresearch/<run_id>/. Inside, one sub-tree
+    # per platform (<platform>/<interface>/<skills>/); EACH leaf is its own
+    # researcher (run sequentially) with v<N>/<task>/<challenge>/ underneath.
+    # Overwrite a pre-existing config folder, but confirm first.
     config_root = parent / run_id
     if not results_mod.confirm_overwrite(config_root, assume_yes):
         print(f"[banter] {config_root} exists — overwrite declined. Aborting.",
@@ -746,14 +744,14 @@ def run_autoresearch(
           f"interfaces={[str(i) for i in iface_list]}\n  dir={config_root}", flush=True)
 
     # Each platform is an independent experiment with its own researcher,
-    # results.csv, and report under its leaf — no combined rollup at the root.
+    # results.csv, and report under its leaf — no combined root rollup.
     from banter import experiments as _exp
     for n, iface in enumerate(iface_list, 1):
         iface_root = config_root / iface.platform / iface.interface / skills_seg
         print(f"\n[banter] === platform {n}/{len(iface_list)}: {iface} "
               f"→ {iface_root.relative_to(config_root)} ===", flush=True)
-        # Per-leaf goals: keep only THIS interface's delegation (`*_calls`) goal —
-        # you can't maximize cli/mcp/sdk calls simultaneously on one interface.
+        # Per-leaf goals: keep only THIS interface's delegation (`*_calls`)
+        # goal — can't maximize cli/mcp/sdk calls simultaneously on one interface.
         leaf_goal_pairs = _exp.goals_for_interface(
             [(g.metric, g.direction) for g in config.goals], iface.interface)
         leaf_goals = [Goal(metric=m, direction=d) for m, d in leaf_goal_pairs]
@@ -775,15 +773,15 @@ def _run_one_interface(
 ) -> None:
     """Run ONE platform's researcher, rooted at its leaf dir `run_path`
     (`<config>/<platform>/<interface>/<skills>/`). `config` is narrowed to that
-    single platform; `parent` is `results/autoresearch/` (for prev-run lookup).
+    platform; `parent` is `results/autoresearch/` (for prev-run lookup).
     """
     i0 = config.interfaces[0] if config.interfaces else None
     run_path.mkdir(parents=True, exist_ok=True)
 
     # Clone the docs bundle (git URL in `config.docs`) ONCE at the run root.
-    # The researcher browses these at `<run>/docs/`; each engineer gets its
-    # own APFS-cloned copy at `<challenge>/docs/` (cheap COW — no re-fetch).
-    # Docs are static across versions.
+    # Researcher browses these at `<run>/docs/`; each engineer gets its own
+    # APFS-cloned copy at `<challenge>/docs/` (cheap COW, no re-fetch). Docs are
+    # static across versions.
     if config.docs and config.docs != "none":
         from banter import docs as docs_mod
         docs_platform = config.interfaces[0].platform if config.interfaces else None
@@ -796,12 +794,11 @@ def _run_one_interface(
         print(f"[banter] docs {config.docs!r}: {len(docs_setup.files)} "
               f"files at {run_path / 'docs'}", flush=True)
 
-    # v0 is the original interface for this session — auto-created here
-    # (no AI), copied from EITHER a previous session/increment (when `prev_*` is
-    # set in the config) OR the committed base. Then built in place so it's
-    # immediately runnable. The researcher prepares v1+ via
-    # `banter prepare-version`; between runs they only edit source — the
-    # system handles copy / build / install / uninstall.
+    # v0 = this session's original interface, auto-created here (no AI), copied
+    # from EITHER a previous session/increment (when `prev_*` is set) OR the
+    # committed base, then built in place so it's immediately runnable. The
+    # researcher prepares v1+ via `banter prepare-version`; between runs it only
+    # edits source — the system handles copy / build / install / uninstall.
     if i0 is not None and i0.platform != "none":
         incr0 = run_path / "v0" / "interface"
         src: Path | None = None
@@ -810,7 +807,7 @@ def _run_one_interface(
             #   <parent>/<prev_run>/<platform>/<interface>/<skills>/v<prev_version>/interface
             prev_config = parent / str(config.prev_run)
             if not prev_config.is_dir():
-                # Back-compat: match an old flat dir by its leading id segment.
+                # Back-compat: match an old flat dir by leading id segment.
                 flat = [
                     d for d in parent.iterdir()
                     if d.is_dir() and d.name.split("__", 1)[0] == str(config.prev_run)
@@ -852,17 +849,15 @@ def _run_one_interface(
     prompt = build_researcher_prompt(config, testbed_root, run_path, run_id, banter_bin)
     (run_path / "prompt.txt").write_text(prompt)
 
-    # Autoresearch writes results straight to the GLOBAL
-    # results/autoresearch/experiments.csv (one row per version/task/challenge,
-    # appended live by each `banter run`). No per-run results.csv — the single
-    # global results/autoresearch/analysis.ipynb does the math. Stale rows for
-    # this leaf are cleared at session start in `run_autoresearch`.
+    # Results go straight to the GLOBAL results/autoresearch/experiments.csv
+    # (one row per version/task/challenge, appended live by each `banter run`).
+    # No per-run results.csv — the single global analysis.ipynb does the math.
+    # Stale rows for this leaf are cleared at session start in `run_autoresearch`.
 
-    # Pre-create CHANGELOG.md so it shows up next to report.md from the start.
-    # The researcher appends one section per increment describing what changed
-    # and what happened; it's also the long-term memory the researcher reads
-    # BEFORE planning the next increment (so it doesn't repeat ideas it
-    # already tried, even after context compaction).
+    # Pre-create CHANGELOG.md so it sits next to report.md from the start. The
+    # researcher appends one section per increment (what changed + what
+    # happened); it's also long-term memory read BEFORE planning the next
+    # increment, so ideas aren't repeated even after context compaction.
     changelog_md = run_path / "CHANGELOG.md"
     if not changelog_md.exists():
         goals_md_lines = "\n".join(
@@ -877,40 +872,39 @@ def _run_one_interface(
             "---\n"
         )
 
-    # Source-study notes are kept IN the project memory (CLAUDE.md below), not a
-    # separate STUDY.md — CLAUDE.md is auto-loaded as system context every turn,
-    # so source knowledge survives context compaction without a manual re-read.
+    # Source-study notes live IN project memory (CLAUDE.md below), not a separate
+    # STUDY.md — CLAUDE.md is auto-loaded as system context every turn, so source
+    # knowledge survives context compaction without a manual re-read.
 
     # (Per-run analysis.ipynb retired — the single global notebook does the math.)
 
-    # The raw stream-json transcript is no longer kept in the run dir (nothing
-    # reads it, and we don't want the researcher loading it as context). It's
-    # streamed to a throwaway temp file (human-readable view stays in stream.log)
-    # and removed when the session ends. The researcher's memory is CHANGELOG.md.
+    # The raw stream-json transcript isn't kept in the run dir (nothing reads it,
+    # and we don't want the researcher loading it as context). Streamed to a
+    # throwaway temp file (human-readable view stays in researcher.log) and
+    # removed at session end. The researcher's memory is CHANGELOG.md.
     import tempfile
     _tf = tempfile.NamedTemporaryFile(prefix="banter-researcher-", suffix=".jsonl", delete=False)
     _tf.close()
     transcript_path = Path(_tf.name)
     stderr_path = run_path / "researcher.stderr.log"
 
-    # Set up a project-scoped `.claude/` INSIDE the autoresearch run dir so
-    # the researcher's settings, hooks, and memory live alongside its results
-    # — same place the engineer's per-challenge `.claude/` lives. With
-    # `cwd=run_path` below, claude-code discovers `<run>/.claude/` as the
-    # project root: anything Claude writes (settings, project memory) lands
-    # here too, not in `<testbed>/.claude/`.
+    # Project-scoped `.claude/` INSIDE the run dir so the researcher's settings,
+    # hooks, and memory live alongside its results (same place the engineer's
+    # per-challenge `.claude/` lives). With `cwd=run_path` below, claude-code
+    # discovers `<run>/.claude/` as the project root: anything Claude writes
+    # (settings, project memory) lands here, not in `<testbed>/.claude/`.
     claude_dir = run_path / ".claude"
     claude_dir.mkdir(parents=True, exist_ok=True)
     # No researcher command log (commands.jsonl): the researcher's own tool calls
     # aren't measured (only the engineer's are, via its per-challenge transcript),
-    # and we keep the run dir free of context the researcher might load. The
-    # PreToolUse hook still enforces confinement; it just skips logging when
-    # TESTBED_COMMAND_LOG is unset.
-    # Researcher confinement is tool-layer only (permissions.deny). No kernel
-    # sandbox — Claude Code's `allowWrite` has a depth cutoff that breaks
-    # deep mkdir/file ops the spawned `banter run` subprocesses need to do
-    # inside `<run>/v<N>/<task>/<challenge>/`. The deny patterns catch the
-    # common escape vectors (`../`, `$HOME/.*` dotfiles, `cd ..` in bash).
+    # and we keep the run dir free of context it might load. The PreToolUse hook
+    # still enforces confinement; it just skips logging when TESTBED_COMMAND_LOG
+    # is unset.
+    # Confinement is tool-layer only (permissions.deny). No kernel sandbox —
+    # Claude Code's `allowWrite` has a depth cutoff that breaks the deep
+    # mkdir/file ops the spawned `banter run` subprocesses need inside
+    # `<run>/v<N>/<task>/<challenge>/`. Deny patterns catch the common escape
+    # vectors (`../`, `$HOME/.*` dotfiles, `cd ..` in bash).
     (claude_dir / "settings.json").write_text(json.dumps({
         "hooks": {
             "PreToolUse": [{
@@ -927,8 +921,8 @@ def _run_one_interface(
         },
     }, indent=2))
     # Project-scoped memory: loaded as system context by claude-code on every
-    # tool invocation. Gives the researcher persistent notes that survive
-    # context compaction and are visible if you re-open the run dir later.
+    # tool invocation. Persistent notes that survive context compaction and stay
+    # visible if you re-open the run dir later.
     goals_md = "\n".join(f"- **{g.direction}**(`{g.metric}`)" for g in config.goals)
     iface_md = ", ".join(str(i) for i in config.interfaces)
     (claude_dir / "CLAUDE.md").write_text(
@@ -943,7 +937,8 @@ def _run_one_interface(
         "- `v<N>/interface/` — the interface for increment N; the REAL source is\n"
         "  under `v<N>/interface/src/` — study + edit THAT to improve the interface.\n"
         "- `v<N>/<task>/<challenge>/` — per-challenge engineer artifacts.\n"
-        "- `CHANGELOG.md` — your long-term memory: append an entry after EVERY version.\n"
+        "- `CHANGELOG.md` — your long-term memory; auto-written per version by\n"
+        "  `banter annotate-version` (read it; don't hand-edit it).\n"
         "- `researcher.log` — human-readable view of your own run.\n"
         "\n## The prompt is FROZEN\n"
         "The engineer's task prompt AND the interface `prompt:` field are fixed.\n"
@@ -967,10 +962,9 @@ def _run_one_interface(
     env["HOME"] = str(run_path.resolve())
     # OAuth token side-channel. Claude Code's Bash tool strips
     # CLAUDE_CODE_OAUTH_TOKEN before spawning children, so the engineer's
-    # `banter run` can't inherit it from the researcher. We write the JWT
-    # to `<run>/.claude-oauth` (mode 0600) and point BANTER_TOKEN_CACHE
-    # at it — BANTER_* vars DO survive the Bash hop. Cache lives inside
-    # the run dir, so it disappears when the run is removed.
+    # `banter run` can't inherit it. Write the JWT to `<run>/.claude-oauth`
+    # (mode 0600) and point BANTER_TOKEN_CACHE at it — BANTER_* vars DO survive
+    # the Bash hop. Cache lives in the run dir, so it vanishes when the run is removed.
     token = claude_runner.oauth_token_from_keychain()
     if token:
         cache_path = claude_runner.write_token_cache(token, run_path.resolve())
@@ -982,39 +976,47 @@ def _run_one_interface(
     env["PATH"] = f"{venv_bin}{os.pathsep}{env.get('PATH', '')}"
     env.setdefault("KAGGLE_CONFIG_DIR", str(testbed_root / ".kaggle"))
     # (No TESTBED_COMMAND_LOG for the researcher — see above.)
-    # Rate-limit-wait ledger for the compute-time budget. `run_with_retry`
-    # (this researcher AND every engineer subprocess it spawns — BANTER_* vars
-    # survive the Bash hop) appends each rate-limit sleep here; `banter
-    # budget-check` subtracts the total from wall clock so only compute counts.
+    # Rate-limit-wait ledger for the compute-time budget. `run_with_retry` (this
+    # researcher AND every engineer subprocess it spawns — BANTER_* vars survive
+    # the Bash hop) appends each rate-limit sleep here; `banter budget-check`
+    # subtracts the total from wall clock so only compute counts.
     env[claude_runner.RATE_LIMIT_LEDGER_ENV] = str(run_path / ".rate_limit_wait_s")
-    # Mark engineer subprocesses the researcher spawns as nested: they write
-    # their stream.log but don't print to stdout (the researcher captures it).
-    # The FileTailer below surfaces those logs live in this terminal instead.
+    # Mark engineer subprocesses as nested: they write engineer.log but don't
+    # print to stdout (researcher captures it). The FileTailer below surfaces
+    # those logs live in this terminal instead.
     env["BANTER_NESTED"] = "1"
     # Keep each `banter run` the researcher launches SYNCHRONOUS. A single
-    # `banter run` (preflight + engineer + grade, where the engineer may wait on
-    # a multi-minute remote job) runs far longer than the Bash tool's default
-    # timeout. Two SEPARATE Claude Code mechanisms must be handled:
-    #   1) Auto-backgrounding — Claude Code auto-moves the long command to a
+    # `banter run` (preflight + engineer + grade, engineer may wait on a
+    # multi-minute remote job) runs far past the Bash tool's default timeout.
+    # Two SEPARATE Claude Code mechanisms to handle:
+    #   1) Auto-backgrounding — Claude Code moves the long command to a
     #      background task. In `-p` mode the completion notification NEVER
     #      re-invokes the model, so the researcher falls into a blind `wc -l`
     #      poll loop on a task-output file that froze when the engineer phase
-    #      redirected its output into stream.log. `BASH_MAX_TIMEOUT_MS` does NOT
+    #      redirected output into engineer.log. `BASH_MAX_TIMEOUT_MS` does NOT
     #      prevent this — only CLAUDE_CODE_DISABLE_BACKGROUND_TASKS does.
-    #   2) Kill timeout — cap both Bash timeouts at the session budget so a long
-    #      `banter run` runs to completion instead of being killed.
+    #   2) Kill timeout — size both Bash timeouts so a long `banter run`
+    #      completes instead of being killed (see rate-limit note below).
     env["CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"] = "1"
     _bash_cap_s = (
         config.budget.max_seconds
         if config.budget.max_seconds != float("inf")
         else 8 * 3600
     )
+    # Rate-limit waiting must NOT count against this hard kill timeout. Each
+    # `banter run` spawns an engineer whose `run_with_retry` SLEEPS on rate-limit
+    # backoff INSIDE that Bash command, so those sleeps accrue to its wall clock.
+    # Capping the Bash timeout at exactly the compute budget would let sustained
+    # rate-limiting kill a healthy run. Add the rate-limit retry window so
+    # waiting never trips the kill — the REAL compute budget is enforced
+    # gracefully by `banter budget-check`, which already subtracts those waits.
+    _bash_cap_s += claude_runner.RATE_LIMIT_RETRY_WINDOW_S
     env["BASH_DEFAULT_TIMEOUT_MS"] = str(int(_bash_cap_s) * 1000)
     env["BASH_MAX_TIMEOUT_MS"] = str(int(_bash_cap_s) * 1000)
 
     # Give the researcher a `normalized_composite` MCP tool over the global
     # experiments table, scoped to THIS leaf (config + platform/interface/skills)
-    # and its configured goals. Dependency-free stdio server (`banter.research_mcp`).
+    # and its goals. Dependency-free stdio server (`banter.research_mcp`).
     from banter import experiments as experiments_mod
     results_root = parent.parent
     leaf_iface = config.interfaces[0] if config.interfaces else None
@@ -1039,9 +1041,9 @@ def _run_one_interface(
     }, indent=2))
 
     # `--settings` + `--setting-sources` mirror the engineer's setup
-    # (claude_runner.run) — `-p` mode silently skips project settings unless
-    # asked explicitly, so the hook config in <run>/.claude/settings.json
-    # would otherwise be ignored.
+    # (claude_runner.run): `-p` mode silently skips project settings unless asked
+    # explicitly, so the hook config in <run>/.claude/settings.json would
+    # otherwise be ignored.
     settings_file = (claude_dir / "settings.json").resolve()
     cmd = [
         "claude",
@@ -1075,9 +1077,9 @@ def _run_one_interface(
     print(f"[banter] run dir: {run_path}", flush=True)
     print()
 
-    # The researcher's own stream view is saved to the session's researcher.log
-    # and printed live (emit() honors BANTER_QUIET for stdout, always writes it).
-    # (Engineer per-challenge logs are `stream.log`; the researcher's is distinct.)
+    # The researcher's own stream view is saved to researcher.log and printed
+    # live (emit() honors BANTER_QUIET for stdout, always writes the file).
+    # (Engineer per-challenge logs are `engineer.log`; this one is distinct.)
     researcher_log = run_path / "researcher.log"
 
     def _on_line(raw_line: str) -> None:
@@ -1087,26 +1089,26 @@ def _run_one_interface(
             return
         _display_event(event, researcher_log)
 
-    # Surface nested engineer runs live: tail every engineer stream.log that
+    # Surface nested engineer runs live: tail every engineer.log that
     # appears under the session dir (excluding the researcher's own).
     tailer = None
     if not streaming.quiet():
         tailer = streaming.FileTailer(
-            run_path, "**/stream.log", exclude=(researcher_log,)
+            run_path, "**/engineer.log", exclude=(researcher_log,)
         )
         tailer.start()
 
-    # Researcher Claude shares the engineer's rate-limit retry helper: 6h
-    # budget, exponential back-off on 429/529/5xx/overloaded.
+    # Shares the engineer's rate-limit retry helper: 6h budget, exponential
+    # back-off on 429/529/5xx/overloaded.
     researcher_wall_s = 0.0
     researcher_usage: dict[str, float] = {}
     try:
         _, researcher_wall_s = claude_runner.run_with_retry(
             cmd=cmd,
-            # cwd = the autoresearch run dir so claude-code project-scopes to
-            # <run>/.claude/. The researcher prompt already uses absolute paths
-            # everywhere ({runs_root}, {testbed_root}/.venv/bin/banter, …) so
-            # nothing breaks from the shift away from testbed_root.
+            # cwd = the run dir so claude-code project-scopes to <run>/.claude/.
+            # The prompt already uses absolute paths everywhere ({runs_root},
+            # {testbed_root}/.venv/bin/banter, …) so nothing breaks from the
+            # shift away from testbed_root.
             cwd=run_path,
             env=env,
             transcript_path=transcript_path,
@@ -1120,8 +1122,8 @@ def _run_one_interface(
         if tailer is not None:
             tailer.stop()
             tailer.join(timeout=2)
-        # Read the researcher's token/cost usage from the transcript BEFORE
-        # discarding it, then remove the throwaway raw transcript (keep stream.log).
+        # Read token/cost usage from the transcript BEFORE discarding it, then
+        # remove the throwaway raw transcript (keep researcher.log).
         try:
             from banter import results as results_mod
             u = results_mod.parse_transcript_usage(transcript_path)
@@ -1140,7 +1142,7 @@ def _run_one_interface(
             pass
 
     # Distribute the researcher's tokens + wall time + cost across this leaf's
-    # rows in the global experiments table (shared overhead → total_* = eng_* + res_*).
+    # rows in the global table (shared overhead → total_* = eng_* + res_*).
     try:
         from banter import experiments as experiments_mod
         i0 = config.interfaces[0] if config.interfaces else None
@@ -1152,10 +1154,10 @@ def _run_one_interface(
     except Exception as e:
         print(f"[banter] researcher attribution skipped: {e}", flush=True)
 
-    # Rows were appended live to results/autoresearch/experiments.csv by the
-    # runner (engineer-side metrics); `attribute_researcher` just filled the
-    # researcher's share. (Re)generate AND EXECUTE the global analysis notebook
-    # so its diagrams reflect the final, attributed numbers.
+    # Rows were appended live to experiments.csv by the runner (engineer-side
+    # metrics); `attribute_researcher` filled the researcher's share. (Re)generate
+    # AND EXECUTE the global analysis notebook so its diagrams reflect the final,
+    # attributed numbers.
     try:
         from banter import experiments
         nb = experiments.build_global_notebook(testbed_root, execute=True)

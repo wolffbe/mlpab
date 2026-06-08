@@ -1,25 +1,26 @@
 """Per-treatment autoresearch configs → a global results table + analysis notebook.
 
-The autoresearch **config files are the source of truth** — one hand-edited
-config per treatment under `platforms/<platform>/autoresearch/…`.
+**Config files are the source of truth** — one hand-edited config per treatment
+under `platforms/<platform>/autoresearch/…`.
 
-`results/autoresearch/experiments.csv` is the **global, factual overview** — NOT
-computed. The runner appends one EXPLODED row per `(treatment, version, task,
-challenge)` LIVE via `append_run()` (design metadata + the raw engineer metrics);
-`attribute_researcher()` fills the researcher's share at session end, and
-`clear_treatment()` drops a treatment's old rows when it is re-run. Only
-treatments that have actually run appear.
+`results/autoresearch/experiments.csv` is the **global, factual overview** (NOT
+computed): the runner appends one EXPLODED row per `(treatment, version, task,
+challenge)` LIVE via `append_run()` (design metadata + raw engineer metrics);
+`attribute_researcher()` fills the researcher's share at session end;
+`clear_treatment()` drops a treatment's old rows on re-run. Only treatments that
+actually ran appear.
 
-All derived math — the normalized composite, the best version per treatment,
-baseline-vs-best deltas, cross-treatment aggregation and charts — lives in the
+All derived math — normalized composite, best version per treatment,
+baseline-vs-best deltas, cross-treatment aggregation, charts — lives in the
 single global `results/autoresearch/analysis.ipynb` (`build_global_notebook()`),
-which reuses `aggregate_by_version` / `normalized_composite` / `best_version`.
+reusing `aggregate_by_version` / `normalized_composite` / `best_version`.
 """
 from __future__ import annotations
 
 import csv
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -29,10 +30,10 @@ from typing import Any
 # ---------------------------------------------------------------------------
 
 # Numeric per-run metric columns. `score`/`python_calls`/`total_tokens` are the
-# engineer-side optimization metrics (what the goals reference). Wall time and
-# cost are split engineer / researcher / total: the runner writes the engineer
-# side live; the researcher's shared overhead is distributed across the leaf's
-# rows at session end (`attribute_researcher`), and `total_* = eng_* + res_*`.
+# engineer-side optimization metrics (referenced by goals). Wall time and cost
+# split engineer / researcher / total: runner writes engineer side live; the
+# researcher's shared overhead is distributed across the leaf's rows at session
+# end (`attribute_researcher`), with `total_* = eng_* + res_*`.
 METRICS = [
     "score",
     # Tokens — engineer / researcher / total, each with input·output·total.
@@ -50,8 +51,8 @@ METRICS = [
     "whitelist_hits", "blacklist_hits",
 ]
 
-# Engineer columns (written live by the runner) and their researcher / total
-# counterparts, paired for the session-end attribution (total = eng + res).
+# Engineer columns (written live) with researcher / total counterparts, paired
+# for session-end attribution (total = eng + res).
 _ATTR_PAIRS = [
     ("eng_input_tokens", "res_input_tokens", "total_input_tokens"),
     ("eng_output_tokens", "res_output_tokens", "total_output_tokens"),
@@ -69,8 +70,8 @@ _RES_FROM = {
 }
 
 # Treatment-level design columns (repeated on every exploded row). `goals` and
-# `budget` are JSON arrays (e.g. ["python_calls:min","score:max"] and
-# ["iterations:4","max_seconds:28800"]). `config` is the treatment's identity.
+# `budget` are JSON arrays (e.g. ["python_calls:min","score:max"],
+# ["iterations:4","max_seconds:28800"]); `config` is the treatment's identity.
 DESIGN_FIELDS = [
     "experiment",
     "research_question",
@@ -92,10 +93,10 @@ DESIGN_FIELDS = [
 # `claude -p` for this (version, challenge) began.
 GRAIN_FIELDS = ["version", "task", "challenge", "started_at"]
 
-# Per-version researcher annotations (filled by `banter annotate-version` after a
-# version's runs finish). They are denormalized — the same values land on every
-# challenge row of that (treatment, version) — so a single CSV is the full
-# record. `verdict` ∈ positive|negative|neutral; `keep` ∈ 0|1.
+# Per-version researcher annotations (filled by `banter annotate-version` once a
+# version's runs finish). Denormalized — identical values land on every challenge
+# row of that (treatment, version), so one CSV is the full record.
+# verdict ∈ positive|negative|neutral; keep ∈ 0|1.
 ANNOTATION_FIELDS = [
     "hypothesis", "change", "verdict", "verdict_reason",
     "keep", "observations", "proposed_changes",
@@ -147,10 +148,10 @@ def composite_breakdown(
 ) -> dict[int, dict[str, Any]]:
     """Per version: the composite J plus each goal's normalized contribution.
 
-    Each goal metric is min-max normalized across versions to [0, 1] (1 = best
-    in its direction). The composite is the equal-weight sum of contributions.
-    A goal with no spread contributes 0 to every version. Exposing the per-goal
-    contributions lets the researcher see WHAT is driving the score.
+    Each goal metric is min-max normalized across versions to [0, 1] (1 = best in
+    its direction); the composite is the equal-weight sum of contributions. A goal
+    with no spread contributes 0 to every version. Per-goal contributions let the
+    researcher see WHAT is driving the score.
     """
     versions = sorted(per_version)
     contrib: dict[int, dict[str, float]] = {v: {} for v in versions}
@@ -164,8 +165,8 @@ def composite_breakdown(
         for v in versions:
             x = vals[v]
             if x is None or span == 0:
-                # Missing value → worst (0) so every version sums the SAME goals
-                # (composites stay comparable). No spread → 0 for all (no signal).
+                # Missing → worst (0) so every version sums the SAME goals
+                # (composites comparable); no spread → 0 for all (no signal).
                 contrib[v][metric] = 0.0
                 continue
             norm = (x - lo) / span                # 0..1, higher = larger
@@ -182,8 +183,8 @@ def normalized_composite(
     per_version: dict[int, dict[str, float | None]],
     goals: list[tuple[str, str]],
 ) -> dict[int, float]:
-    """Composite objective J(version), higher = better — the equal-weight sum of
-    each goal's normalized contribution (see `composite_breakdown`)."""
+    """Composite objective J(version), higher = better — equal-weight sum of each
+    goal's normalized contribution (see `composite_breakdown`)."""
     return {v: b["composite"] for v, b in composite_breakdown(per_version, goals).items()}
 
 
@@ -192,8 +193,8 @@ def best_version(
     goals: list[tuple[str, str]],
 ) -> int | None:
     """The version maximizing the normalized composite. Ties break to the LOWER
-    version: when no goal separates the versions (e.g. all metrics flat, or only
-    a v0 baseline), the honest "best" is the baseline, not a later no-op version."""
+    version: when no goal separates versions (all metrics flat, or only a v0
+    baseline), the honest "best" is the baseline, not a later no-op version."""
     if not per_version:
         return None
     J = normalized_composite(per_version, goals)
@@ -271,11 +272,11 @@ def _optvar_for_count(n: int) -> str:
 
 
 def goals_for_interface(goals: list[tuple[str, str]], interface: str) -> list[tuple[str, str]]:
-    """Drop delegation goals (`cli_calls`/`mcp_calls`/`sdk_calls`) that don't
-    match `interface`. An engineer uses ONE interface, so only that interface's
-    call count is achievable — maximizing all three at once is impossible. The
-    interface's own `*_calls` goal is kept; the others are removed. Non-delegation
-    goals (score, tokens, python_calls, …) pass through unchanged."""
+    """Drop delegation goals (`cli_calls`/`mcp_calls`/`sdk_calls`) not matching
+    `interface`. An engineer uses ONE interface, so only its call count is
+    achievable (maximizing all three at once is impossible): keep that interface's
+    own `*_calls` goal, drop the rest. Non-delegation goals (score, tokens,
+    python_calls, …) pass through unchanged."""
     keep = f"{interface}_calls"
     return [(m, d) for (m, d) in goals if m not in _DELEGATION_METRICS or m == keep]
 
@@ -293,12 +294,12 @@ def _config_rel_path(platform: str, rq: int, treatment: int, interface: str, opt
 
 
 def table_path(results_root: Path) -> Path:
-    # Lives at the base of the autoresearch results tree.
+    # At the base of the autoresearch results tree.
     return results_root / "autoresearch" / "experiments.csv"
 
 
 def _config_rel(cfg: "Any", results_root: Path) -> str:
-    """The treatment config path relative to the testbed root (= results_root's
+    """Treatment config path relative to the testbed root (= results_root's
     parent) — the row's identity in the global table."""
     if cfg.config_path:
         try:
@@ -352,18 +353,128 @@ def _write_table(results_root: Path, rows: list[dict]) -> Path:
     return path
 
 
+# ---------------------------------------------------------------------------
+# CHANGELOG.md — the researcher's per-version narrative memory. NOT hand-
+# maintained: regenerated as a deterministic side-effect of `annotate-version`
+# from the same structured fields (hypothesis/change/verdict/…) plus the version's
+# recorded metrics, so an entry exists after EVERY version without relying on the
+# researcher to remember to write one.
+# ---------------------------------------------------------------------------
+
+_VER_HEADING = re.compile(r"^## v(\d+)\b", re.M)
+# Trailing horizontal-rule + whitespace ending a section (the `---` separator),
+# stripped so sections re-join with a uniform separator.
+_TRAILING_RULE = re.compile(r"(?:\n?-{3,}\s*)+$")
+
+
+def _metric_cell(rows: list[dict], metric: str) -> str:
+    """Mean of `metric` across a version's challenge rows, formatted compactly
+    (integer-valued metrics like whitelist_hits stay integers)."""
+    nums = [x for x in (_fnum(r.get(metric)) for r in rows) if x is not None]
+    if not nums:
+        return "n/a"
+    mean = sum(nums) / len(nums)
+    if all(float(x).is_integer() for x in nums):
+        return str(int(round(mean))) if len(nums) == 1 else f"{mean:.2f}"
+    return f"{mean:.5g}"
+
+
+def _changelog_section(n: int, rows: list[dict]) -> str:
+    """Render the `## v<N>` markdown section from a version's rows. Annotation
+    fields are denormalized (identical on every row) so the first row carries them;
+    metrics are averaged across challenge rows. No trailing `---`."""
+    a = rows[0]
+    try:
+        goal_metrics = [g.split(":")[0] for g in json.loads(a.get("goals") or "[]")]
+    except (ValueError, TypeError):
+        goal_metrics = []
+    outcome = [f"- {m}: {_metric_cell(rows, m)}" for m in (goal_metrics or ["whitelist_hits", "score"])]
+    n_valid = sum(1 for r in rows if str(r.get("valid_submission", "")).strip() in ("1", "1.0", "True", "true"))
+    outcome.append(f"- valid submissions: {n_valid}/{len(rows)} run(s)")
+
+    def fld(key: str) -> str:
+        return (a.get(key) or "").strip() or "—"
+
+    verdict = fld("verdict")
+    reason = (a.get("verdict_reason") or "").strip()
+    if reason and verdict != "—":
+        verdict = f"{verdict} — {reason}"
+    keep_raw = str(a.get("keep", "")).strip()
+    kept = {"1": "yes", "1.0": "yes", "0": "no", "0.0": "no"}.get(keep_raw, "—")
+    return (
+        f"## v{n}\n\n"
+        f"**Hypothesis:** {fld('hypothesis')}\n\n"
+        f"**Change:** {fld('change')}\n\n"
+        f"**Outcome:**\n" + "\n".join(outcome) + "\n\n"
+        f"**Verdict:** {verdict}  (kept: {kept})\n\n"
+        f"**Observations:** {fld('observations')}\n\n"
+        f"**Next:** {fld('proposed_changes')}"
+    )
+
+
+def _changelog_path_for(results_root: Path, rows: list[dict]) -> Path | None:
+    """The version's CHANGELOG.md lives at the treatment root
+    `<runs_root>/CHANGELOG.md`, where a row's run_dir is
+    `<runs_root>/v<N>/<task>/<challenge>` (so runs_root = run_dir's parents[2])."""
+    run_dir = (rows[0].get("run_dir") or "").strip()
+    if not run_dir:
+        return None
+    rd = Path(run_dir)
+    if not rd.is_absolute():
+        rd = results_root.parent / run_dir
+    try:
+        return rd.resolve().parents[2] / "CHANGELOG.md"
+    except IndexError:
+        return None
+
+
+def write_changelog_entry(results_root: Path, rows: list[dict], version: str) -> Path | None:
+    """Insert/replace the `## v<N>` section in the treatment's CHANGELOG.md from
+    `rows` (one version's challenge rows). Idempotent: re-running replaces that
+    version's section in place; sections stay sorted by version, the preamble
+    (title + Goals) is preserved. Returns the path written, or None when the
+    location can't be resolved (no rows / no run_dir)."""
+    if not rows:
+        return None
+    changelog = _changelog_path_for(results_root, rows)
+    if changelog is None:
+        return None
+    n = int(str(version).lstrip("v") or 0)
+    new_section = _changelog_section(n, rows)
+
+    text = changelog.read_text() if changelog.exists() else "# Autoresearch changelog\n\n---\n"
+    heads = [(int(m.group(1)), m.start()) for m in _VER_HEADING.finditer(text)]
+    if heads:
+        preamble = text[:heads[0][1]]
+        sections: dict[int, str] = {}
+        for i, (vn, start) in enumerate(heads):
+            end = heads[i + 1][1] if i + 1 < len(heads) else len(text)
+            sections[vn] = _TRAILING_RULE.sub("", text[start:end]).strip()
+    else:
+        preamble = text
+        sections = {}
+    sections[n] = new_section
+
+    pre = _TRAILING_RULE.sub("", preamble).rstrip()
+    body = "\n\n---\n\n".join(sections[k] for k in sorted(sections))
+    changelog.parent.mkdir(parents=True, exist_ok=True)
+    changelog.write_text(f"{pre}\n\n---\n\n{body}\n")
+    return changelog
+
+
 def annotate_version(results_root: Path, config_rel: str, version: str,
                      updates: dict, interface: str | None = None) -> int:
     """Fill the per-version annotation columns (hypothesis/change/verdict/…) on
-    every row of `(config_rel, version)` — optionally scoped to one `interface`
-    leaf. The researcher calls `banter annotate-version` once per finished
-    version; values land on all that version's challenge rows. Returns the count
-    of rows updated. `version` matches the stored form (e.g. "v3")."""
+    every row of `(config_rel, version)`, optionally scoped to one `interface`
+    leaf. Called via `banter annotate-version` once per finished version; values
+    land on all that version's challenge rows. Also (re)writes the version's
+    CHANGELOG.md section so the narrative is never missing. Returns the count of
+    rows updated. `version` matches the stored form (e.g. "v3")."""
     path = table_path(results_root)
     if not path.exists():
         return 0
     rows = read_table(results_root)
-    n = 0
+    matched = []
     for r in rows:
         if (r.get("config") == config_rel
                 and str(r.get("version", "")) == str(version)
@@ -371,15 +482,16 @@ def annotate_version(results_root: Path, config_rel: str, version: str,
             for k, v in updates.items():
                 if k in ANNOTATION_FIELDS and v is not None:
                     r[k] = str(v)
-            n += 1
-    if n:
+            matched.append(r)
+    if matched:
         _write_table(results_root, rows)
-    return n
+        write_changelog_entry(results_root, matched, version)
+    return len(matched)
 
 
 def clear_treatment(results_root: Path, cfg: "Any") -> None:
-    """Drop a treatment's existing rows from the global table (called when a
-    treatment is (re)run, so its prior rows don't linger)."""
+    """Drop a treatment's existing rows from the global table (called on (re)run
+    so its prior rows don't linger)."""
     path = table_path(results_root)
     if not path.exists():
         return
@@ -391,24 +503,24 @@ def clear_treatment(results_root: Path, cfg: "Any") -> None:
 def append_run(results_root: Path, cfg: "Any", result_row: dict) -> Path:
     """Append ONE exploded row (`result_row` = a results.Row as a dict) for this
     treatment to the global `experiments.csv`, tagged with the config's design
-    metadata. The runner calls this directly per (version, task, challenge) —
-    there is no per-run results.csv. Creates the file with a header if absent.
+    metadata. Runner calls this per (version, task, challenge) — there is no
+    per-run results.csv. Creates the file with a header if absent.
     """
     config_rel = _config_rel(cfg, results_root)
     row = {k: "" for k in EXPERIMENT_FIELDS}
     row.update(_design_cells(cfg, config_rel))
     # platform/interface come from the ACTUAL run (a config may span several
-    # interfaces, each its own leaf), overriding the design default.
+    # interfaces, each its own leaf), overriding the design defaults.
     if result_row.get("platform"):
         row["platform"] = result_row["platform"]
     if result_row.get("interface"):
         row["interface"] = result_row["interface"]
-    # Goals are interface-specific for delegation metrics: keep only THIS
-    # interface's `*_calls` goal (you can't maximize cli+mcp+sdk at once).
+    # Delegation goals are interface-specific: keep only THIS interface's
+    # `*_calls` goal (can't maximize cli+mcp+sdk at once).
     leaf_goals = goals_for_interface(
         [(g.metric, g.direction) for g in cfg.goals], row["interface"])
     row["goals"] = _goals_str(leaf_goals)
-    # optimization_variable is derived from how many goals this leaf optimizes:
+    # optimization_variable derived from leaf goal count:
     # 1 → univariate, 2 → bivariate, 3 → multivariate.
     row["optimization_variable"] = _optvar_for_count(len(leaf_goals))
     row["version"] = result_row.get("version", "")
@@ -418,7 +530,7 @@ def append_run(results_root: Path, cfg: "Any", result_row: dict) -> Path:
     for col in RESULT_FIELDS:
         row[col] = result_row.get(col, "")
     # `total_input_tokens`/`total_output_tokens` aren't on the engineer Row;
-    # before researcher attribution the total equals the engineer side.
+    # pre-attribution the total equals the engineer side.
     if row.get("total_input_tokens", "") == "":
         row["total_input_tokens"] = result_row.get("eng_input_tokens", "")
     if row.get("total_output_tokens", "") == "":
@@ -433,12 +545,12 @@ def append_run(results_root: Path, cfg: "Any", result_row: dict) -> Path:
             w.writeheader()
         w.writerow({k: row.get(k, "") for k in EXPERIMENT_FIELDS})
 
-    # Regenerate AND execute the global analysis notebook after every appended
-    # row so its diagrams propagate live as the experiment runs. Executing spawns
-    # a Jupyter kernel + re-runs all cells (a few seconds), so it adds overhead
-    # per engineer run — acceptable since each engineer run is minutes long, and
-    # live charts are the point. Best-effort + non-fatal (a kernel/exec failure
-    # must never break the run; the session-end refresh re-executes regardless).
+    # Regenerate AND execute the global notebook after every appended row so
+    # diagrams propagate live. Executing spawns a Jupyter kernel + re-runs all
+    # cells (a few seconds): overhead per engineer run, acceptable since runs are
+    # minutes long and live charts are the point. Best-effort + non-fatal — a
+    # kernel/exec failure must never break the run (session-end refresh re-executes
+    # regardless).
     try:
         build_global_notebook(results_root.parent, execute=True)
     except Exception:
@@ -453,8 +565,8 @@ def attribute_researcher(
     interface: str,
     researcher_usage: dict,
 ) -> Path | None:
-    """Distribute the researcher's tokens + wall time + cost across THIS leaf's
-    rows in the global table (the researcher is shared overhead), and set every
+    """Distribute the researcher's tokens + wall time + cost (shared overhead)
+    across THIS leaf's rows in the global table, setting every
     `total_* = eng_* + res_*`. Called once at session end. `researcher_usage`
     has keys `input_tokens`, `output_tokens`, `total_tokens`, `wall_s`,
     `cost_usd`. Idempotent — totals are recomputed from the stored engineer
@@ -471,10 +583,10 @@ def attribute_researcher(
                 and r.get("platform") == platform
                 and r.get("interface") == interface)
 
-    # DEAD rows (no valid submission) were written with ALL metrics zeroed and
-    # an `error` set — they must STAY zeroed. Exclude them from researcher
-    # attribution so the shared overhead lands only on rows that produced a
-    # result, and the dead row's `total_*` isn't resurrected above zero.
+    # DEAD rows (no valid submission) were written with ALL metrics zeroed and an
+    # `error` set — they must STAY zeroed. Exclude from attribution so shared
+    # overhead lands only on rows that produced a result, and a dead row's
+    # `total_*` isn't resurrected above zero.
     def is_dead(r: dict) -> bool:
         return bool((r.get("error") or "").strip())
 
@@ -634,13 +746,13 @@ else:
 
 def build_global_notebook(testbed_root: Path, execute: bool = False) -> Path:
     """Write `results/autoresearch/analysis.ipynb` — the single global analysis,
-    sitting next to `experiments.csv`, that computes best version /
-    baseline-vs-best / charts. Always runnable: the cells tolerate a missing or
-    empty table, so it executes cleanly at any time (before or after any runs).
+    next to `experiments.csv`, computing best version / baseline-vs-best / charts.
+    Always runnable: cells tolerate a missing/empty table, so it executes cleanly
+    at any time (before or after runs).
 
-    With `execute=True`, the notebook is run in place (kernel cwd = its own dir)
-    and the outputs are embedded. Raises if execution fails (so callers can
-    report it) — writing the (unexecuted) notebook still happens first.
+    With `execute=True`, the notebook runs in place (kernel cwd = its own dir) with
+    outputs embedded. Raises on execution failure (so callers can report it) —
+    writing the unexecuted notebook still happens first.
     """
     from nbformat.v4 import new_notebook, new_markdown_cell, new_code_cell
     import nbformat
@@ -668,7 +780,7 @@ def build_global_notebook(testbed_root: Path, execute: bool = False) -> Path:
         new_code_cell(_NOTEBOOK_BEST),
     ]
     path = results_root / "analysis.ipynb"
-    # Write first so the notebook file exists even if execution is skipped/fails.
+    # Write first so the file exists even if execution is skipped/fails.
     with path.open("w") as f:
         nbformat.write(nb, f)
     if execute:

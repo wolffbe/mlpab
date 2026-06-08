@@ -1,11 +1,9 @@
 """Spawn `claude -p` to drive a challenge.
 
 Sets up a project-scoped .claude/settings.json (PreToolUse hook + sandbox +
-denies), runs `claude -p`, and captures the stream-json transcript. Cost +
-token totals come from the transcript's `result` event.
-
-`run_with_retry` (shared with the autoresearch researcher) handles 429/529
-and 5xx back-off across a 6h budget.
+denies), runs `claude -p`, and captures the stream-json transcript (cost +
+token totals come from its `result` event). `run_with_retry` (shared with the
+autoresearch researcher) handles 429/529 and 5xx back-off across a 6h budget.
 """
 from __future__ import annotations
 
@@ -23,19 +21,18 @@ from banter import streaming
 
 
 TESTBED_ROOT = Path(__file__).resolve().parents[2]
-# Real user home from /etc/passwd, NOT $HOME — autoresearch redirects $HOME
-# into the run dir, so by the time `banter run` loads this module its
-# environ.HOME is already <run>/. Using that as HOME_DIR would emit a
-# denyRead rooted at <run>/, which then blocks the engineer's own writes
-# inside its boundary (parent-dir lookups for open(..., 'w') need read).
+# Real user home from /etc/passwd, NOT $HOME — autoresearch redirects $HOME into
+# the run dir, so environ.HOME is already <run>/ by the time this module loads.
+# Using that as HOME_DIR would root a denyRead at <run>/, blocking the engineer's
+# own writes inside its boundary (open(..,'w') parent-dir lookups need read).
 HOME_DIR = Path(pwd.getpwuid(os.getuid()).pw_dir).resolve()
 # Hook script ships inside the package (src/banter/hooks/).
 HOOK_SCRIPT = Path(__file__).resolve().parent / "hooks" / "log_tool_call.py"
 
-# Tools blocked for both researcher and engineer: scheduling/async (end the
-# `-p` turn or run unobservably), nested subagents (cost-attribution loss),
-# plan/worktree modes (unused), and a few meta tools. `mcp__*` tools stay
-# allowed — including whichever platform MCP servers are loaded.
+# Tools denied for both researcher and engineer: scheduling/async (end the `-p`
+# turn or run unobservably), nested subagents (cost-attribution loss), plan/
+# worktree modes (unused), and a few meta tools. `mcp__*` stay allowed —
+# including whichever platform MCP servers are loaded.
 COMMON_DENY = [
     # Background scheduling / async — calling these in -p ends the turn.
     "ScheduleWakeup",
@@ -52,28 +49,37 @@ COMMON_DENY = [
 ]
 
 # Engineer-only denies. Web access kills reproducibility for the deterministic
-# ML task. Researcher keeps them — may look up library docs.
+# ML task. Researcher keeps them (may look up library docs).
 ENGINEER_ONLY_DENY = ["WebFetch", "WebSearch"]
 
-# Compute libraries whose LOCAL execution the engineer hook forbids. The
-# remote-only model: model training must be pushed to the Hopsworks cluster as
-# a remote Job via the interface, never run on this machine. A locally-executed
-# python command that imports any of these is blocked (the engineer is told to
-# go remote or give up). Light glue (pandas/numpy/csv/json — downloading remote
-# results, formatting submission.csv) is intentionally NOT here. Overridable per
-# run via `compute_deny`; surfaced to the hook as TESTBED_COMPUTE_DENY.
+# Compute libraries whose LOCAL execution the engineer hook forbids. Remote-only
+# model: training must be pushed to the Hopsworks cluster as a remote Job via the
+# interface, never run locally — a local python command importing any of these is
+# blocked (go remote or give up). Light glue (pandas/numpy/csv/json — downloading
+# remote results, formatting submission.csv) is intentionally NOT here. Overridable
+# per run via `compute_deny`; surfaced to the hook as TESTBED_COMPUTE_DENY.
 DEFAULT_COMPUTE_DENY = [
     "torch", "torchvision", "tensorflow", "keras", "sklearn", "scikit_learn",
     "xgboost", "lightgbm", "catboost", "jax", "flax", "transformers",
 ]
 
 # Bootstrapped into the engineer's run venv (as `_banter_apilog.py` + a `.pth`
-# that imports it): it wraps `requests.Session.send` to append every outbound
-# request's {method, path} to the file named by BANTER_API_LOG. The Hopsworks
-# SDK, the `hops` CLI, and the MCP server all run in this venv and all use
-# `requests`, so this captures every REST call to the cluster for endpoint-
-# coverage scoring. Best-effort — wrapped so it can never break startup/requests.
-# NOTE: we use a `.pth` import line (executed by `site` for EVERY site dir), NOT
+# that imports it): wraps `requests.Session.send` to append every outbound
+# request's {method, path, src} to BANTER_API_LOG. The Hopsworks SDK, `hops` CLI,
+# and MCP server all run in this venv and all use `requests`, so this captures
+# every REST call to the cluster for endpoint-coverage scoring. Best-effort —
+# wrapped so it can never break startup/requests.
+#
+# `src` ATTRIBUTES the call to the interface it came THROUGH by walking the stack:
+# a frame in a first-party `.mcp` subtree → "mcp"; `.cli` → "cli"; any other
+# first-party frame → "sdk"; none → "other" (raw `requests` the engineer hand-
+# rolled, NOT via the interface). The scorer counts a whitelist hit only when
+# `src` is the interface under test, so off-interface traffic can't inflate
+# `whitelist_hits`. First-party roots come from BANTER_IFACE_SDK (set by `run()`
+# from the wheel's top_level.txt); the `.mcp`/`.cli` split uses the SDK's in-tree
+# subpackage convention (one wheel ships SDK + CLI + MCP). Server-side Job code
+# runs on the cluster, not this venv, so its calls never reach the shim — by design.
+# NOTE: a `.pth` import line (run by `site` for EVERY site dir), NOT
 # `sitecustomize.py` — a base interpreter (e.g. Homebrew python) often ships its
 # own stdlib `sitecustomize.py` that precedes the venv on sys.path and would
 # shadow ours, silently disabling the shim.
@@ -82,11 +88,35 @@ import os as _os
 _banter_log = _os.environ.get("BANTER_API_LOG")
 if _banter_log:
     try:
-        import json as _json, time as _time, threading as _thr
+        import json as _json, time as _time, threading as _thr, sys as _sys
         from urllib.parse import urlsplit as _urlsplit
         import requests as _rq
         _banter_lock = _thr.Lock()
         _banter_orig_send = _rq.Session.send
+        _banter_roots = set(
+            p for p in (_os.environ.get("BANTER_IFACE_SDK") or "").split(",") if p
+        )
+        def _banter_origin():
+            # Attribute to the interface whose code is on the stack. `.mcp`/`.cli`
+            # subpackages of a first-party root win over the SDK client they wrap;
+            # a request with no first-party frame is "other" (not via the interface).
+            saw_sdk = saw_mcp = saw_cli = False
+            f = _sys._getframe()
+            while f is not None:
+                parts = (f.f_globals.get("__name__") or "").split(".")
+                if parts and parts[0] in _banter_roots:
+                    saw_sdk = True
+                    sub = parts[1] if len(parts) > 1 else ""
+                    if sub == "mcp":
+                        saw_mcp = True
+                    elif sub == "cli":
+                        saw_cli = True
+                f = f.f_back
+            if saw_mcp:
+                return "mcp"
+            if saw_cli:
+                return "cli"
+            return "sdk" if saw_sdk else "other"
         def _banter_send(self, request, **kw):
             try:
                 with _banter_lock, open(_banter_log, "a") as _f:
@@ -94,6 +124,7 @@ if _banter_log:
                         "ts": _time.time(),
                         "method": (getattr(request, "method", "") or "").upper(),
                         "path": _urlsplit(getattr(request, "url", "") or "").path,
+                        "src": _banter_origin(),
                     }) + "\n")
             except Exception:
                 pass
@@ -104,14 +135,34 @@ if _banter_log:
 '''
 
 
+def _first_party_roots(venv_dir: Path) -> list[str]:
+    """First-party package roots of the interface dist (for api-log `src`
+    attribution), read from the installed wheel's `top_level.txt`.
+
+    The interface is the only local-wheel dist that ships an `mcp` and/or `cli`
+    subpackage in-tree (one wheel backs SDK, CLI, and MCP — only the entry point
+    differs). So we pick the dist-info whose top-level packages expose those
+    subpackages and return ALL of its top-level packages. Empty if not found
+    (shim then tags "other")."""
+    for sp in (venv_dir / "lib").glob("python*/site-packages"):
+        for tl in sp.glob("*.dist-info/top_level.txt"):
+            try:
+                pkgs = tl.read_text().split()
+            except OSError:
+                continue
+            for pkg in pkgs:
+                if (sp / pkg / "mcp").is_dir() or (sp / pkg / "cli").is_dir():
+                    return pkgs
+    return []
+
+
 def _install_api_log_shim(venv_dir: Path) -> None:
     """Bootstrap the request-logging shim into the run venv's OWN site-packages
     (not the shared base venv) so only the engineer's python is instrumented.
 
-    Uses a `.pth` import line rather than `sitecustomize.py`: `site` executes
-    `.pth` `import` lines for every site dir it adds, so this fires even when the
-    base interpreter ships its own `sitecustomize.py` (which would shadow a
-    venv-local one on sys.path). Best-effort."""
+    Uses a `.pth` import line, not `sitecustomize.py`: `site` runs `.pth` import
+    lines for every site dir, so this fires even when the base interpreter ships
+    its own `sitecustomize.py` (which would shadow a venv-local one). Best-effort."""
     for sp in (venv_dir / "lib").glob("python*/site-packages"):
         try:
             (sp / "_banter_apilog.py").write_text(_API_LOG_SHIM)
@@ -123,10 +174,10 @@ def _install_api_log_shim(venv_dir: Path) -> None:
 def deny_patterns_for(boundary: Path) -> list[str]:
     """Build `permissions.deny` patterns that DO fire under `bypassPermissions`.
 
-    Covers Bash escape patterns (cd .., cat/ls dotfiles in $HOME) — these
-    are the ones the engineer can't bypass. Read/Write/Edit `file_path`
-    patterns would be silently skipped in bypass mode, so those are
-    enforced by the PreToolUse hook instead (see `hooks/log_tool_call.py`).
+    Covers Bash escape patterns (cd .., cat/ls dotfiles in $HOME) — the ones the
+    engineer can't bypass. Read/Write/Edit `file_path` patterns are silently
+    skipped in bypass mode, so those are enforced by the PreToolUse hook instead
+    (see `hooks/log_tool_call.py`).
     """
     boundary.resolve()  # accepted for future use
     home = str(HOME_DIR)
@@ -155,10 +206,10 @@ def oauth_token_from_keychain() -> str | None:
 
 
 # File-based fallback for the OAuth token. Claude Code's Bash tool strips
-# CLAUDE_CODE_OAUTH_TOKEN from child env, so the chain
-# autoresearch → researcher → bash → banter run → engineer loses it.
-# autoresearch writes the token to <run>/.claude-oauth (mode 0600) and
-# points BANTER_TOKEN_CACHE at it; custom BANTER_* vars survive the hop.
+# CLAUDE_CODE_OAUTH_TOKEN from child env, so the chain autoresearch → researcher
+# → bash → banter run → engineer loses it. autoresearch writes the token to
+# <run>/.claude-oauth (mode 0600) and points BANTER_TOKEN_CACHE at it; custom
+# BANTER_* vars survive the hop.
 TOKEN_CACHE_FILENAME = ".claude-oauth"
 TOKEN_CACHE_ENV = "BANTER_TOKEN_CACHE"
 
@@ -166,8 +217,8 @@ TOKEN_CACHE_ENV = "BANTER_TOKEN_CACHE"
 def write_token_cache(token: str, run_path: Path) -> Path:
     """Write the OAuth token to ``run_path/.claude-oauth`` (mode 0600).
 
-    Returns the cache path. The caller is responsible for forwarding it via
-    the ``BANTER_TOKEN_CACHE`` env var so child banter invocations find it.
+    Returns the cache path. Caller must forward it via the ``BANTER_TOKEN_CACHE``
+    env var so child banter invocations find it.
     """
     cache = run_path / TOKEN_CACHE_FILENAME
     cache.write_text(token)
@@ -190,26 +241,26 @@ def read_token_cache() -> str | None:
 def resolve_oauth_token() -> str | None:
     """Get the OAuth token via the most reliable available path.
 
-    Order: env (already-propagated by upstream), BANTER_TOKEN_CACHE file,
-    Keychain (works from the user's shell but fails silently in some nested
-    subprocess contexts). Returns the token string or None.
+    Order: env (propagated by upstream), BANTER_TOKEN_CACHE file, Keychain (works
+    from the user's shell but fails silently in some nested subprocess contexts).
+    Returns the token string or None.
     """
     return (os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
             or read_token_cache()
             or oauth_token_from_keychain())
 
 
-# Rate-limit / transient-error retry budget. On a matching exit-error we
-# exp-backoff up to RATE_LIMIT_MAX_BACKOFF_S and retry until total wall-clock
-# reaches RATE_LIMIT_RETRY_WINDOW_S, then give up.
+# Rate-limit / transient-error retry budget. On a matching exit-error we exp-
+# backoff up to RATE_LIMIT_MAX_BACKOFF_S and retry until total wall-clock reaches
+# RATE_LIMIT_RETRY_WINDOW_S, then give up.
 RATE_LIMIT_RETRY_WINDOW_S = 6 * 3600
 RATE_LIMIT_BASE_BACKOFF_S = 2
 RATE_LIMIT_MAX_BACKOFF_S = 3600
 
-# When set (by autoresearch), `run_with_retry` appends every rate-limit sleep
-# (in seconds) to this file so the compute-time budget can exclude waiting.
-# Custom BANTER_* vars survive the researcher → Bash → engineer hop, so the
-# researcher and all its engineer subprocesses accumulate into one ledger.
+# When set (by autoresearch), `run_with_retry` appends every rate-limit sleep (in
+# seconds) here so the compute-time budget can exclude waiting. Custom BANTER_*
+# vars survive the researcher → Bash → engineer hop, so the researcher and all its
+# engineer subprocesses accumulate into one ledger.
 RATE_LIMIT_LEDGER_ENV = "BANTER_RATELIMIT_LEDGER"
 
 
@@ -229,8 +280,8 @@ def _record_rate_limit_wait(env: dict[str, str], seconds: float) -> None:
 
 
 def read_rate_limit_wait(ledger: Path) -> float:
-    """Sum the rate-limit-wait ledger (seconds). Missing file → 0.0; any
-    unparseable line is skipped rather than discarding the whole total."""
+    """Sum the rate-limit-wait ledger (seconds). Missing file → 0.0; unparseable
+    lines are skipped rather than discarding the whole total."""
     total = 0.0
     try:
         lines = ledger.read_text().splitlines()
@@ -247,8 +298,8 @@ def read_rate_limit_wait(ledger: Path) -> float:
     return total
 
 
-# Anthropic rate limits (429/529, "overloaded") + transient 5xx. Without 5xx
-# in here, a mid-session 500 burns a whole version on retry.
+# Anthropic rate limits (429/529, "overloaded") + transient 5xx. Without the 5xx
+# tokens, a mid-session 500 burns a whole version on retry.
 _RATE_LIMIT_TOKENS = (
     "rate_limit", "rate limit", "overloaded",
     "429", "529",
@@ -276,9 +327,9 @@ class ClaudeResult:
     stderr_path: Path
 
 
-# Baseline outbound hosts every engineer needs regardless of platform:
-# Claude itself (api.anthropic.com) + loopback for any local platform server.
-# Platform-specific hosts come from each `platforms/<platform>/<interface>/config.yaml`
+# Baseline outbound hosts every engineer needs regardless of platform: Claude
+# itself (api.anthropic.com) + loopback for any local platform server. Platform-
+# specific hosts come from each `platforms/<platform>/<interface>/config.yaml`
 # via the `allowed_domains:` key.
 BASE_ALLOWED_DOMAINS = (
     "127.0.0.1", "localhost",
@@ -295,53 +346,44 @@ def _write_settings(
 ) -> None:
     """Write the engineer's project-scoped `.claude/settings.json`.
 
-    `version_dir` (autoresearch `<run>/v<N>`) overrides the boundary;
-    otherwise it falls back to `run_dir` (benchmark challenge dir).
+    `version_dir` (autoresearch `<run>/v<N>`) overrides the boundary; otherwise
+    falls back to `run_dir` (benchmark challenge dir).
 
-    Confinement: Claude Code's built-in sandbox kernel-confines Bash
-    subprocesses to the boundary. `permissions.deny` adds tool-name and
-    Bash escape denies. Read/Write/Edit are NOT kernel-confined in
-    bypassPermissions — soft (prompt + cwd) only.
+    Confinement: Claude Code's built-in sandbox kernel-confines Bash subprocesses
+    to the boundary. `permissions.deny` adds tool-name and Bash escape denies.
+    Read/Write/Edit are NOT kernel-confined in bypassPermissions — soft (prompt +
+    cwd) only.
 
-    Network is unrestricted (no `allowedDomains`); `allowLocalBinding`
-    covers platform servers (mlkit binds 127.0.0.1:8765). `.claude/`
-    state lands inside `boundary` via the HOME redirect in :func:`run`.
+    Network is unrestricted (no `allowedDomains`); `allowLocalBinding` covers
+    platform servers (mlkit binds 127.0.0.1:8765). `.claude/` state lands inside
+    `boundary` via the HOME redirect in :func:`run`.
     """
-    # Engineer's world = its challenge folder (`run_dir`). Each challenge is
-    # a separate engineer invocation and is isolated from siblings (same
-    # version) and from all other versions / runs. allowRead also reaches
-    # the technical infra the engineer needs to function: ~/.claude, shared
-    # Python libs (where `./venv/` symlinks resolve), the mle-bench cache
-    # (where `./data/` resolves), and the PreToolUse hook script.
-    # `version_dir` is accepted for back-compat but no longer used — it would
-    # leak sibling challenges.
-    # Engineer's world = its challenge folder. Everything it needs lives
-    # inside the boundary: venv (materialized by `runner._make_venv`),
-    # challenge data (cloned by `mlebench_wrapper.prepare`), and the
-    # PreToolUse hook script (copied below). allowRead therefore only needs
-    # the boundary itself plus ~/.claude for Claude Code's own config.
+    # Engineer's world = its challenge folder (`run_dir`); each challenge is a
+    # separate, isolated engineer invocation. Everything it needs lives inside the
+    # boundary: venv (`runner._make_venv`), challenge data (`mlebench_wrapper.prepare`),
+    # and the PreToolUse hook script (copied below). allowRead therefore needs only
+    # the boundary itself plus ~/.claude for Claude Code's own config. `version_dir`
+    # is accepted for back-compat but unused — it would leak sibling challenges.
     _ = version_dir  # accepted for back-compat; not used
     boundary = run_dir.resolve()
     settings_dir = run_dir / ".claude"
     settings_dir.mkdir(parents=True, exist_ok=True)
-    # Copy the hook script into the boundary so the PreToolUse hook can
-    # invoke it without reading outside the sandbox.
+    # Copy the hook script into the boundary so the PreToolUse hook can invoke it
+    # without reading outside the sandbox.
     hooks_dir = settings_dir / "hooks"
     hooks_dir.mkdir(exist_ok=True)
     local_hook = hooks_dir / HOOK_SCRIPT.name
     shutil.copy(HOOK_SCRIPT, local_hook)
     local_hook.chmod(0o755)
-    # Sandbox: NETWORK gated, filesystem FULLY OPEN. Enabling the sandbox at
-    # all triggers default filesystem restrictions even without a `filesystem`
-    # block — so we explicitly opt back out with allowRead/Write `["/"]`,
-    # then layer just the network allowlist. Result:
-    #   - Outbound: only baseline (Claude API + loopback) + whatever the
-    #     platform declares in its `allowed_domains:` config. No pypi /
-    #     HF / kaggle / github / arbitrary HTTPS during the run.
-    #   - Filesystem: unrestricted. Confinement falls to the PreToolUse
-    #     hook (path-based deny for Read/Write/Edit, enforced regardless
-    #     of permission mode) + `permissions.deny` (Bash escape patterns
-    #     + tool-name denies).
+    # Sandbox: NETWORK gated, filesystem FULLY OPEN. Enabling the sandbox triggers
+    # default filesystem restrictions even without a `filesystem` block, so we
+    # explicitly opt back out with allowRead/Write `["/"]`, then layer just the
+    # network allowlist. Result:
+    #   - Outbound: only baseline (Claude API + loopback) + the platform's
+    #     `allowed_domains:`. No pypi / HF / kaggle / github / arbitrary HTTPS.
+    #   - Filesystem: unrestricted. Confinement falls to the PreToolUse hook
+    #     (path-based Read/Write/Edit deny, enforced regardless of permission
+    #     mode) + `permissions.deny` (Bash escapes + tool-name denies).
     domain_list = list(BASE_ALLOWED_DOMAINS) + list(allowed_domains or [])
     settings = {
         "hooks": {
@@ -397,10 +439,10 @@ def run(
 ) -> ClaudeResult:
     """Spawn `claude -p` (the engineer).
 
-    Always forwards a Keychain OAuth token (when present) since the
-    redirected HOME has no on-disk credentials. `auth="login"` additionally
-    strips ANTHROPIC_API_KEY so OAuth wins; `auth="api-key"` keeps both
-    and lets claude-code pick. `extra_env` layers platform credentials.
+    Always forwards a Keychain OAuth token (when present) since the redirected
+    HOME has no on-disk credentials. `auth="login"` additionally strips
+    ANTHROPIC_API_KEY so OAuth wins; `auth="api-key"` keeps both and lets
+    claude-code pick. `extra_env` layers platform credentials.
     """
     if shutil.which("claude") is None:
         raise RuntimeError("`claude` CLI not found on PATH. Install Claude Code first.")
@@ -418,10 +460,9 @@ def run(
     # HOME → boundary so `.claude/` state lands inside the run dir.
     boundary = (version_dir or run_dir).resolve()
     env["HOME"] = str(boundary)
-    # Auth: redirected HOME has no on-disk creds. resolve_oauth_token() tries
-    # env → token cache file → Keychain in order; the cache is what makes the
-    # researcher → bash → banter run → engineer chain work (env is stripped
-    # by Claude Code's Bash tool).
+    # Auth: redirected HOME has no on-disk creds. resolve_oauth_token() tries env →
+    # token cache file → Keychain; the cache is what makes the researcher → bash →
+    # banter run → engineer chain work (env is stripped by Claude Code's Bash tool).
     token = resolve_oauth_token()
     if token:
         env["CLAUDE_CODE_OAUTH_TOKEN"] = token
@@ -434,19 +475,18 @@ def run(
               flush=True)
     env["ANTHROPIC_MODEL"] = model
     env["TESTBED_COMMAND_LOG"] = str(command_log)
-    # The PreToolUse hook reads this to enforce Read/Write/Edit path denies
-    # — those are silently skipped under bypassPermissions, but the hook
-    # fires regardless and rejects calls outside the boundary.
+    # PreToolUse hook reads this to enforce Read/Write/Edit path denies — silently
+    # skipped under bypassPermissions, but the hook fires regardless and rejects
+    # calls outside the boundary.
     env["TESTBED_BOUNDARY"] = str(boundary)
     if cli_binary:
         env["TESTBED_CLI_BINARY"] = cli_binary
     if sdk_module:
         env["TESTBED_SDK_MODULE"] = sdk_module
-    # Remote-only enforcement: only for the real delegation interfaces. The hook
-    # needs the active interface (so a non-active interface's use is an escape)
-    # plus the compute libraries whose LOCAL execution is forbidden (training
-    # must run remotely). A none/none baseline gets none of this — it trains
-    # locally by design — so the hook no-ops for it.
+    # Remote-only enforcement, only for the real delegation interfaces. The hook
+    # needs the active interface (so a non-active interface's use is an escape) plus
+    # the compute libraries whose LOCAL execution is forbidden (training must run
+    # remotely). A none/none baseline trains locally by design, so the hook no-ops.
     if interface in ("cli", "mcp", "sdk"):
         env["TESTBED_INTERFACE"] = interface
         env["TESTBED_COMPUTE_DENY"] = ",".join(compute_deny or DEFAULT_COMPUTE_DENY)
@@ -460,23 +500,38 @@ def run(
         # SDK/CLI/MCP (all use `requests` in this venv) to api_calls.jsonl, which
         # `results.endpoint_hits` scores against the configured white/blacklist.
         env["BANTER_API_LOG"] = str(run_dir / "api_calls.jsonl")
+        # First-party package roots → the shim attributes each call's `src`
+        # (mcp/cli/sdk/other) so coverage counts only calls made THROUGH the
+        # interface under test, not hand-rolled `requests`.
+        roots = _first_party_roots(run_dir / "venv")
+        if roots:
+            env["BANTER_IFACE_SDK"] = ",".join(roots)
+        elif interface in ("cli", "mcp", "sdk"):
+            # No installed dist ships an mcp/cli subpackage → the shim can't
+            # attribute calls and tags everything "other", silently zeroing
+            # whitelist_hits. Warn rather than fail quietly so a misbuilt venv
+            # doesn't look like an engineer that simply never used the interface.
+            print(f"[banter] WARNING: no first-party interface roots in "
+                  f"{run_dir / 'venv'}; API calls will all be attributed 'other' "
+                  f"and whitelist_hits will be 0 for interface {interface!r}.",
+                  flush=True)
         _install_api_log_shim(run_dir / "venv")
 
     # Skip pip cache (per-run venv inherits via .pth; cache dir unwritable).
     env["PIP_NO_CACHE_DIR"] = "1"
 
-    # Keep long foreground commands (e.g. a remote training job the engineer
-    # waits on) SYNCHRONOUS. Two SEPARATE Claude Code mechanisms matter here:
+    # Keep long foreground commands (e.g. a remote training job the engineer waits
+    # on) SYNCHRONOUS. Two SEPARATE Claude Code mechanisms matter:
     #   1) Auto-backgrounding — a long foreground Bash command is auto-moved to a
-    #      background task. In `-p` mode its completion NEVER re-invokes the
-    #      model, so the agent blind-polls a frozen task-output file and wedges.
-    #      `BASH_MAX_TIMEOUT_MS` does NOT control this (it only governs the KILL
-    #      timeout); the only reliable switch is CLAUDE_CODE_DISABLE_BACKGROUND_TASKS.
-    #   2) Kill timeout — how long a foreground command may run before being
-    #      killed. Raise both Bash timeouts to the whole `claude -p` budget so a
-    #      long job runs to completion instead of being killed.
-    # We want NO backgrounding at all (the PreToolUse hook also denies the
-    # explicit `run_in_background` flag), so disable it outright.
+    #      background task. In `-p` mode its completion NEVER re-invokes the model,
+    #      so the agent blind-polls a frozen task-output file and wedges.
+    #      BASH_MAX_TIMEOUT_MS does NOT control this (only the KILL timeout); the
+    #      only reliable switch is CLAUDE_CODE_DISABLE_BACKGROUND_TASKS.
+    #   2) Kill timeout — how long a foreground command may run before being killed.
+    #      Raise both Bash timeouts to the whole `claude -p` budget so a long job
+    #      runs to completion instead of being killed.
+    # We want NO backgrounding at all (the PreToolUse hook also denies the explicit
+    # `run_in_background` flag), so disable it outright.
     env["CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"] = "1"
     bash_timeout_ms = str(int(timeout_s) * 1000)
     env["BASH_DEFAULT_TIMEOUT_MS"] = bash_timeout_ms
@@ -500,8 +555,9 @@ def run(
     if mcp_cfg:
         cmd.extend(["--mcp-config", str(mcp_cfg)])
 
-    # `runner.run` wraps the call in `streaming.tee_to` for stream.log;
-    # full transcript still lands in transcript.jsonl regardless.
+    # `runner.run` wraps this in `streaming.tee_to` for engineer.log; the full
+    # stream-json still lands in transcript.jsonl, which `runner.run` mines for
+    # usage + commands then discards at teardown (not kept per run).
     exit_code, wall = run_with_retry(
         cmd=cmd,
         cwd=run_dir,
@@ -513,8 +569,8 @@ def run(
         log_prefix="banter",
     )
 
-    # `run_with_retry` only writes stderr_path when there's actual stderr
-    # output, so no empty-file cleanup is needed here.
+    # `run_with_retry` only writes stderr_path when there's actual stderr output,
+    # so no empty-file cleanup is needed here.
 
     return ClaudeResult(
         exit_code=exit_code,
@@ -538,17 +594,17 @@ def run_with_retry(
 
     Used by both the engineer and the autoresearch researcher.
 
-    - Appends stdout to `transcript_path` (stream-json). Stderr is buffered
-      to a temp file and only PROMOTED to `stderr_path` if non-empty, so
-      the run dir stays clean when nothing went wrong.
-    - When `on_line` is given, stdout is piped through and each line is
-      forwarded to the callback (for live streaming display).
+    - Appends stdout to `transcript_path` (stream-json). Stderr is buffered to a
+      temp file and PROMOTED to `stderr_path` only if non-empty, keeping the run
+      dir clean when nothing went wrong.
+    - When `on_line` is given, stdout is piped through and each line forwarded to
+      the callback (live streaming display).
     - On rate-limit / 5xx detection in the last `result`, sleeps
-      `min(2 * 2^(attempt-1), 3600)` seconds and retries until the 6h
-      total budget is exhausted.
-    - Each rate-limit sleep is recorded to the `BANTER_RATELIMIT_LEDGER` file
-      (when that env var is set) so the autoresearch compute-time budget can
-      EXCLUDE waiting-on-rate-limit time from the session wall clock.
+      `min(2 * 2^(attempt-1), 3600)`s and retries until the 6h total budget is
+      exhausted.
+    - Each rate-limit sleep is recorded to the `BANTER_RATELIMIT_LEDGER` file (when
+      set) so the autoresearch compute-time budget can EXCLUDE waiting-on-rate-limit
+      time from the session wall clock.
 
     Returns `(exit_code, total_wall_time_s)` including sleep time.
     """
@@ -559,8 +615,8 @@ def run_with_retry(
     auth_attempts = 0
     rl_attempts = 0   # rate-limit retries only — drives the backoff exponent
     exit_code = 1
-    # Buffer stderr to a temp file outside the run dir; we only move it into
-    # place at the END if it has actual content.
+    # Buffer stderr to a temp file outside the run dir; moved into place at the
+    # END only if it has actual content.
     err_tmp = tempfile.NamedTemporaryFile(prefix="banter-err-", delete=False)
     err_tmp_path = Path(err_tmp.name)
     err_tmp.close()
@@ -623,9 +679,9 @@ def run_with_retry(
 
         if exit_code == 0:
             break
-        # Auth failure (e.g. the OAuth token expired mid-session): re-pull a
-        # fresh token from the Keychain and retry, up to a small bound. Checked
-        # before rate-limit so a 401 doesn't fall into the 6h backoff loop.
+        # Auth failure (e.g. OAuth token expired mid-session): re-pull a fresh
+        # Keychain token and retry, up to a small bound. Checked before rate-limit
+        # so a 401 doesn't fall into the 6h backoff loop.
         if _last_result_is_auth_error(transcript_path) and auth_attempts < AUTH_RETRY_MAX_ATTEMPTS:
             auth_attempts += 1
             # Only retry if a DIFFERENT (refreshed) token was obtained — retrying
@@ -666,12 +722,12 @@ def run_with_retry(
             flush=True,
         )
         time.sleep(backoff)
-        # Record the rate-limit wait so the autoresearch compute-time budget
-        # can subtract it from session wall clock (waiting != computing).
+        # Record the rate-limit wait so the autoresearch compute-time budget can
+        # subtract it from session wall clock (waiting != computing).
         _record_rate_limit_wait(env, backoff)
 
-    # Promote the temp stderr buffer to `stderr_path` only if non-empty;
-    # otherwise drop it so the run dir doesn't carry an empty log file.
+    # Promote the temp stderr buffer to `stderr_path` only if non-empty; otherwise
+    # drop it so the run dir doesn't carry an empty log file.
     try:
         if err_tmp_path.exists() and err_tmp_path.stat().st_size > 0:
             stderr_path.parent.mkdir(parents=True, exist_ok=True)
@@ -685,8 +741,8 @@ def run_with_retry(
 
 
 def _last_result_error_blob(transcript_path: Path) -> str | None:
-    """Lowercased error text of the last `result` event when it is an error,
-    else None. Shared by the rate-limit and auth-error classifiers."""
+    """Lowercased error text of the last `result` event when it is an error, else
+    None. Shared by the rate-limit and auth-error classifiers."""
     if not transcript_path.exists():
         return None
     last_result: dict[str, Any] | None = None
@@ -719,10 +775,10 @@ def _last_result_is_auth_error(transcript_path: Path) -> bool:
 
 
 def _refresh_oauth_token(env: dict[str, str]) -> bool:
-    """Re-pull the OAuth token from the Keychain (Claude Code refreshes it
-    there) and update both the env and the BANTER_TOKEN_CACHE file in place.
-    Returns True only if a DIFFERENT token was obtained — retrying with the
-    identical (still-expired) token is pointless, so the caller stops then."""
+    """Re-pull the OAuth token from the Keychain (Claude Code refreshes it there)
+    and update both the env and the BANTER_TOKEN_CACHE file in place. Returns True
+    only if a DIFFERENT token was obtained — retrying with the identical (still-
+    expired) token is pointless, so the caller stops then."""
     fresh = oauth_token_from_keychain()
     if not fresh or fresh == env.get("CLAUDE_CODE_OAUTH_TOKEN"):
         return False

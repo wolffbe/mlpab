@@ -1,5 +1,6 @@
 """Tests for the results hierarchy: session ids, combo rollups, autoresearch."""
 import csv
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -325,6 +326,87 @@ class RollingAverageTests(unittest.TestCase):
         with csvp.open() as f:
             header = next(csv.reader(f))
         self.assertFalse([c for c in header if c.endswith(("_avg", "_avg_s"))])
+
+
+class CollectClientLogsTests(unittest.TestCase):
+    def _run_dir(self):
+        return Path(tempfile.mkdtemp())
+
+    def _transcript(self, run_dir, *events):
+        p = run_dir / "transcript.jsonl"
+        p.write_text("\n".join(json.dumps(e) for e in events) + "\n")
+        return p
+
+    def _mcp_log(self, boundary, run_dir, server, *lines):
+        slug = results._slug_for(run_dir)
+        d = boundary / "Library" / "Caches" / "claude-cli-nodejs" / slug / f"mcp-logs-{server}"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "log.jsonl").write_text("\n".join(lines) + "\n")
+
+    def test_mcp_startup_crash_is_surfaced(self):
+        import json
+        run_dir = self._run_dir()
+        boundary = run_dir  # benchmark-style: HOME == challenge dir
+        self._mcp_log(
+            boundary, run_dir, "hopsworks",
+            json.dumps("Server stderr: Traceback (most recent call last):\n  RuntimeError: Login failed"),
+            json.dumps({"timestamp": "T", "debug": "Connection failed after 2749ms: MCP error -32000: Connection closed"}),
+        )
+        res = results.collect_client_logs(
+            run_dir=run_dir, boundary=boundary, interface="mcp",
+            platform="hopsworks", mcp_servers={"hopsworks": {}},
+            transcript_path=run_dir / "missing.jsonl",
+        )
+        self.assertTrue(res["crashed"])
+        self.assertIn("Traceback (most recent call last)", res["markers"])
+        text = Path(res["path"]).read_text()
+        self.assertTrue(res["path"].endswith("hopsworks_client.logs"))
+        self.assertIn("MCP server: hopsworks", text)
+        self.assertIn("RuntimeError: Login failed", text)
+        self.assertIn("Connection closed", text)
+
+    def test_sdk_traceback_in_transcript_is_captured(self):
+        run_dir = self._run_dir()
+        tr = self._transcript(
+            run_dir,
+            {"type": "user", "message": {"content": [
+                {"type": "tool_result", "is_error": True,
+                 "content": [{"type": "text", "text": "Traceback (most recent call last):\n  hsfs.client.exceptions.RestAPIError: boom"}]},
+            ]}},
+        )
+        res = results.collect_client_logs(
+            run_dir=run_dir, boundary=run_dir, interface="sdk",
+            platform="hopsworks", mcp_servers=None, transcript_path=tr,
+        )
+        self.assertTrue(res["crashed"])
+        text = Path(res["path"]).read_text()
+        self.assertIn("client errors (engineer transcript)", text)
+        self.assertIn("RestAPIError: boom", text)
+
+    def test_clean_run_writes_file_without_crash(self):
+        run_dir = self._run_dir()
+        tr = self._transcript(
+            run_dir,
+            {"type": "user", "message": {"content": [
+                {"type": "tool_result", "content": [{"type": "text", "text": "ok, project created"}]},
+            ]}},
+        )
+        res = results.collect_client_logs(
+            run_dir=run_dir, boundary=run_dir, interface="mcp",
+            platform="hopsworks", mcp_servers={"hopsworks": {}}, transcript_path=tr,
+        )
+        self.assertFalse(res["crashed"])
+        self.assertTrue(Path(res["path"]).exists())
+        self.assertIn("(no server log captured)", Path(res["path"]).read_text())
+
+    def test_none_interface_skips_collection(self):
+        run_dir = self._run_dir()
+        res = results.collect_client_logs(
+            run_dir=run_dir, boundary=run_dir, interface="none",
+            platform="none", mcp_servers=None, transcript_path=None,
+        )
+        self.assertFalse(res["crashed"])
+        self.assertFalse(Path(res["path"]).exists())
 
 
 if __name__ == "__main__":

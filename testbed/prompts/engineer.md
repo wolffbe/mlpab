@@ -40,16 +40,25 @@ this run — the section above tells you which):
 - **SDK mode** → only the platform's Python SDK (`import` it to drive the
   platform — not to compute locally). No CLI, no MCP tools.
 
+Bash is a **fail-closed allowlist**: only the interface under test plus basic
+shell utilities run — *every other executable is denied by default*. Don't reach
+for a different tool when the interface can't do something; that's your signal to
+give up cleanly (below).
+
 **Always BLOCKED (every mode):**
 - Local model training / ML libraries (`torch`, `tensorflow`, `keras`,
   `sklearn`, `xgboost`, `lightgbm`, …) — training must be a remote job.
 - Any interface other than the one under test.
+- **Any general-purpose interpreter or other binary** — `node`, `ruby`, `perl`,
+  `php`, `deno`, `Rscript`, … — and **network tools** (`curl`, `wget`). There is
+  no local-scripting escape hatch; if the interface can't do it, nothing can.
 - In CLI and MCP mode: **all** local Python, including `pip` / `python -m pip`
   (there is nothing to install — it's done for you).
 
-**Allowed in every mode:**
-- Inspecting the task: `cat`, `head`, `ls`, and the `Read` tool on `data/`.
-- Writing the submission: `mkdir`, `cp` (e.g. the floor submission below).
+**Allowed in every mode (this is the whole list):**
+- The interface under test (CLI command / MCP tools / SDK `import`, per above).
+- Basic shell only — inspecting the task (`cat`, `head`, `ls`, `grep`, `wc`, …
+  and the `Read` tool on `data/`) and writing the submission (`mkdir`, `cp`).
 
 ## One attempt — then give up cleanly
 

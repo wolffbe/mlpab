@@ -86,6 +86,20 @@ class EnforceHookTests(unittest.TestCase):
     def test_mcp_hops_blocked(self):
         self.assertIsNotNone(self._enforce("mcp", "Bash", "hops project create x"))
 
+    def test_mcp_native_sdk_blocked(self):
+        # The engineer must NOT drive the SDK natively (locally) in MCP mode —
+        # only the MCP tools may touch the platform. (Shipping SDK code to a
+        # remote Job is server-side and uncounted; using it locally is the escape.)
+        self.assertIsNotNone(
+            self._enforce("mcp", "Bash", 'python -c "import hopsworks; hopsworks.login().get_feature_store()"')
+        )
+
+    def test_cli_native_sdk_blocked(self):
+        # Likewise in CLI mode: only `hops`, never the SDK driven locally.
+        self.assertIsNotNone(
+            self._enforce("cli", "Bash", 'python -c "import hopsworks; fs.create_feature_group()"')
+        )
+
     # --- SDK mode: only hopsworks python, no ML ---
     def test_sdk_hopsworks_python_allowed(self):
         self.assertIsNone(
@@ -100,6 +114,59 @@ class EnforceHookTests(unittest.TestCase):
 
     def test_sdk_mcp_tool_blocked(self):
         self.assertIsNotNone(self._enforce("sdk", "mcp__hopsworks__x"))
+
+    # --- fail-closed allowlist: only the interface + basic shell; everything
+    #     else (node/ruby/curl/stray binaries) denied by default in EVERY mode ---
+    def test_node_blocked_in_every_mode(self):
+        # The field failure: when python was blocked the engineer used `node -e`
+        # to wrangle data locally. The allowlist denies it in all three modes.
+        for iface in ("cli", "mcp", "sdk"):
+            self.assertIsNotNone(self._enforce(iface, "Bash", 'node -e "console.log(1)"'), iface)
+
+    def test_other_interpreters_blocked(self):
+        for cmd in ('ruby -e "puts 1"', "perl -e 'print 1'", 'php -r "echo 1;"', "deno run x.ts"):
+            self.assertIsNotNone(self._enforce("mcp", "Bash", cmd), cmd)
+
+    def test_network_tools_blocked_in_every_mode(self):
+        # curl/wget would hit the REST API directly, bypassing the interface
+        # (and the api_calls log). Denied by the allowlist — not on it.
+        for iface in ("cli", "mcp", "sdk"):
+            self.assertIsNotNone(self._enforce(iface, "Bash", "curl https://host/api"), iface)
+            self.assertIsNotNone(self._enforce(iface, "Bash", "wget https://host/x"), iface)
+
+    def test_unknown_binary_blocked(self):
+        self.assertIsNotNone(self._enforce("mcp", "Bash", "./some_custom_tool --go"))
+
+    def test_bash_c_node_blocked(self):
+        # `bash -c "node …"` — the wrapper is unwrapped and the real exec gated.
+        self.assertIsNotNone(self._enforce("cli", "Bash", 'bash -c "node -e \\"x\\""'))
+
+    def test_which_node_allowed(self):
+        # Probing availability is fine — the exec is `which`, not node.
+        self.assertIsNone(self._enforce("mcp", "Bash", "which ruby node perl jq"))
+
+    def test_basic_shell_inspection_allowed_in_mcp(self):
+        for cmd in ("cat data/train.csv", "head -20 data/train.csv", "wc -l data/train.csv", "ls -la data/"):
+            self.assertIsNone(self._enforce("mcp", "Bash", cmd), cmd)
+
+    def test_pipeline_of_basic_shell_allowed(self):
+        self.assertIsNone(self._enforce("mcp", "Bash", "cat data/train.csv | grep -c , | sort"))
+
+    def test_redirect_not_misparsed_as_off_interface(self):
+        # `2>&1` and `> out` must not split into a bogus segment that gets denied.
+        self.assertIsNone(self._enforce("mcp", "Bash", "cp a b 2>&1"))
+        self.assertIsNone(self._enforce("cli", "Bash", "cat data/train.csv > /tmp/out.txt"))
+
+    def test_mcp_floor_submission_allowed(self):
+        self.assertIsNone(
+            self._enforce("mcp", "Bash", "mkdir -p submission && cp data/sample_submission.csv submission/submission.csv")
+        )
+
+    def test_compound_keywords_not_denied(self):
+        # Shell control-flow keywords are skipped, not treated as binaries.
+        self.assertIsNone(
+            self._enforce("cli", "Bash", 'for f in a b; do cp "$f" out/; done')
+        )
 
     # --- parser-bypass regressions (separators, interpreters, dynamic import) ---
     def test_semicolon_glued_separator_blocked(self):
@@ -172,6 +239,69 @@ class EnforceHookTests(unittest.TestCase):
         # The none/none baseline (interface "none") must NOT be enforced — it
         # legitimately trains locally with torch.
         self.assertIsNone(self._enforce("none", "Bash", 'python -c "import torch; train()"'))
+
+
+class BanterRunForegroundTests(unittest.TestCase):
+    """`banter run` (the researcher's engineer-eval command) must be foreground —
+    never piped (SIGPIPE-kills it mid-build) or backgrounded."""
+
+    def _misuse(self, command):
+        return hook._banter_run_misuse(command)
+
+    # --- blocked: piping / backgrounding ---
+    def test_pipe_to_head_blocked(self):
+        # This is the exact failure from the field: `… 2>&1 | head -300`.
+        self.assertIsNotNone(
+            self._misuse("banter run --task t --challenge c --platform hopsworks 2>&1 | head -300")
+        )
+
+    def test_pipe_to_tail_blocked(self):
+        self.assertIsNotNone(self._misuse("banter run --task t | tail -40"))
+
+    def test_absolute_banter_path_pipe_blocked(self):
+        self.assertIsNotNone(
+            self._misuse("/Users/x/testbed/.venv/bin/banter run --task t | head -5")
+        )
+
+    def test_background_ampersand_blocked(self):
+        self.assertIsNotNone(self._misuse("banter run --task t --challenge c &"))
+
+    def test_background_then_poll_blocked(self):
+        self.assertIsNotNone(self._misuse("banter run --task t & sleep 30"))
+
+    def test_pipe_after_cd_guard_blocked(self):
+        # The cd-guard prefix is fine; the trailing pipe on `banter run` is not.
+        self.assertIsNotNone(
+            self._misuse('cd /run && banter run --task t --challenge c | head -100')
+        )
+
+    # --- allowed: foreground, redirects, other subcommands ---
+    def test_plain_foreground_allowed(self):
+        self.assertIsNone(self._misuse("banter run --task t --challenge c --platform hopsworks"))
+
+    def test_redirect_to_file_allowed(self):
+        # The sanctioned way to cap output: redirect, then read engineer.log.
+        self.assertIsNone(self._misuse("banter run --task t > run.log 2>&1"))
+
+    def test_redirect_to_devnull_allowed(self):
+        self.assertIsNone(self._misuse("banter run --task t --challenge c > /dev/null 2>&1"))
+
+    def test_redirect_then_chained_tail_allowed(self):
+        # `&&` chains a SEPARATE tail of engineer.log — not a pipe of banter run.
+        self.assertIsNone(
+            self._misuse("banter run --task t > run.log 2>&1 && tail -60 v1/t/c/engineer.log")
+        )
+
+    def test_budget_check_piped_not_blocked(self):
+        # Only `banter run` is gated; other subcommands may be piped freely.
+        self.assertIsNone(self._misuse("banter budget-check --start 1 | grep CONTINUE"))
+
+    def test_non_banter_pipe_allowed(self):
+        self.assertIsNone(self._misuse("ls v1 | head -5"))
+
+    def test_2to1_redirect_alone_not_flagged_as_background(self):
+        # `2>&1` without a pipe/`&` must NOT be misread as backgrounding.
+        self.assertIsNone(self._misuse("banter run --task t --challenge c 2>&1"))
 
 
 class PromptModeGatingTests(unittest.TestCase):

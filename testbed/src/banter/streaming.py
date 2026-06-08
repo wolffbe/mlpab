@@ -1,23 +1,20 @@
 """Live terminal display + saved logs of a `claude -p` stream-json transcript.
 
-Both the engineer (`claude_runner.run`) and the researcher (`autoresearch`)
-emit stream-json on stdout. `run_with_retry`'s `on_line` callback forwards each
-raw line here so activity shows up as it happens instead of the run looking
-frozen while everything lands silently in `transcript.jsonl`.
+Engineer (`claude_runner.run`) and researcher (`autoresearch`) both emit
+stream-json on stdout; `run_with_retry`'s `on_line` callback forwards each line
+here so activity shows live instead of the run looking frozen. Per run:
+  * `transcript.jsonl` — raw stream-json; transient (mined for usage + commands,
+                         then discarded at teardown).
+  * `engineer.log`     — one-line-per-event human-readable view mirrored to file;
+                         the KEPT artifact the researcher reads.
 
-Two persistent artifacts per run, both written regardless of terminal output:
-  * `transcript.jsonl` — raw stream-json (written by `run_with_retry`).
-  * `stream.log`       — live one-line-per-event human-readable view that this
-                         module mirrors to a file in the same folder.
+Terminal streaming is on by default; `BANTER_QUIET=1`/`--quiet` silences the
+terminal but still writes `engineer.log`.
 
-Terminal streaming is on by default; `BANTER_QUIET=1` (or `--quiet`) silences
-the terminal but still writes `stream.log`.
-
-Nesting (autoresearch): the researcher launches each engineer run as a
-`banter run --challenge` subprocess whose stdout it captures. Printing engineer
-lines to that stdout would bloat the researcher's context, so under
-`BANTER_NESTED=1` the engineer writes only its `stream.log`; the parent
-autoresearch process tails those files (`FileTailer`) to show them live.
+Nesting (autoresearch): the researcher captures each `banter run` subprocess's
+stdout; printing engineer lines there would bloat its context, so under
+`BANTER_NESTED=1` the engineer writes only `engineer.log` and the parent tails
+those files (`FileTailer`) to show them live.
 """
 from __future__ import annotations
 
@@ -41,9 +38,8 @@ def nested() -> bool:
 
 
 def _wrap_block(text: str, prefix: str) -> list[str]:
-    """Tag every line of `text` with `prefix`. No truncation — the live log
-    shows the full payload verbatim. (transcript.jsonl still has the raw
-    stream-json events for tooling that wants the structured form.)"""
+    """Tag every line of `text` with `prefix`. No truncation — the live log is
+    the durable record (raw transcript.jsonl is discarded at teardown)."""
     raw = text.splitlines() or [""]
     return [f"{prefix} {line}" for line in raw]
 
@@ -51,11 +47,8 @@ def _wrap_block(text: str, prefix: str) -> list[str]:
 def assistant_lines(event: dict[str, Any], label: str) -> list[str]:
     """Readable lines for an `assistant` stream-json event.
 
-    Assistant text is printed verbatim (one terminal line per source line);
-    tool calls expand to the full input (bash command body, thinking text)
-    with per-event line/width caps so we surface what's happening without
-    drowning the terminal in large file reads. Each emitted line carries the
-    same `[label:kind]` prefix for easy grep.
+    Text printed verbatim (one line per source line); tool calls expand to their
+    input (bash body, thinking). Each line carries a `[label:kind]` prefix for grep.
     """
     lines: list[str] = []
     content = (event.get("message") or {}).get("content") or []
@@ -69,8 +62,7 @@ def assistant_lines(event: dict[str, Any], label: str) -> list[str]:
                 if line.strip():
                     lines.append(f"[{label}] {line}")
         elif btype == "thinking":
-            # Surface reasoning so the log updates between tool calls (keeps the
-            # live view moving instead of going silent while the model thinks).
+            # Surface reasoning so the live view keeps moving between tool calls.
             thought = (block.get("thinking") or "").strip()
             if thought:
                 lines.extend(_wrap_block(thought, f"[{label}:thinking]"))
@@ -92,10 +84,8 @@ def assistant_lines(event: dict[str, Any], label: str) -> list[str]:
 def tool_result_lines(event: dict[str, Any], label: str) -> list[str]:
     """Readable lines for tool_result blocks in a `user` stream-json event.
 
-    These are the outputs coming BACK from each tool call; we now surface
-    multiple lines (capped) instead of only the first, so file reads, bash
-    output, and command stdout are actually inspectable in the live log.
-    The verbatim payload always remains in `transcript.jsonl`.
+    The outputs coming BACK from each tool call (file reads, bash/command stdout),
+    surfaced in full so they're inspectable in the durable live log.
     """
     lines: list[str] = []
     content = (event.get("message") or {}).get("content") or []
@@ -133,12 +123,11 @@ def emit(line: str, log_path: Path | None = None) -> None:
 
 
 def make_printer(label: str) -> Callable[[str], None]:
-    """An `on_line` callback that renders each event to stdout.
+    """An `on_line` callback that renders each event to stdout (fd 1).
 
-    Always prints to stdout (fd 1); it does NOT decide visibility or write a
-    file. During an engineer run, `tee_to` captures fd 1/2 into the run's
-    `stream.log` and decides whether to echo to the real terminal (passthrough),
-    so this printer just needs to emit the formatted line.
+    Does NOT decide visibility or write a file: during an engineer run `tee_to`
+    captures fd 1/2 into `engineer.log` and handles terminal echo (passthrough),
+    so this just emits the formatted line.
     """
 
     def _on_line(raw_line: str) -> None:
@@ -163,12 +152,11 @@ def make_printer(label: str) -> Callable[[str], None]:
 def tee_to(log_path: Path, passthrough: bool = True) -> Iterator[None]:
     """Mirror everything written to fd 1 and fd 2 into `log_path` for the block.
 
-    FD-level (not just `sys.stdout`), so it captures the COMPLETE terminal output
-    of the run — Python prints AND subprocess output (mle-bench data prep, pip,
-    the engineer's streamed lines, tracebacks). `passthrough` also echoes it to
-    the real terminal; set it False under autoresearch nesting (where the
-    engineer subprocess's stdout is captured by the researcher) so the researcher
-    context isn't bloated. fds are always restored, even on exception.
+    FD-level (not just `sys.stdout`), so it captures ALL terminal output — Python
+    prints AND subprocess output (pip, streamed engineer lines, tracebacks).
+    `passthrough` also echoes to the real terminal; set False under autoresearch
+    nesting (researcher captures the engineer's stdout) to avoid bloating its
+    context. fds are always restored, even on exception.
     """
     log_path.parent.mkdir(parents=True, exist_ok=True)
     sys.stdout.flush()
@@ -215,9 +203,9 @@ def tee_to(log_path: Path, passthrough: bool = True) -> Iterator[None]:
 class FileTailer(threading.Thread):
     """Background thread that prints lines appended to `root/<glob>` files.
 
-    Used by autoresearch to surface nested engineer `stream.log` files live in
-    the user's terminal. Daemon thread; call `stop()` then `join()` to drain the
-    final lines. Truncated/recreated files (a combo re-run) reset to offset 0.
+    Used by autoresearch to surface nested engineer `engineer.log` files live.
+    Daemon; call `stop()` then `join()` to drain. Truncated/recreated files (a
+    combo re-run) reset to offset 0.
     """
 
     def __init__(self, root: Path, glob: str, exclude: tuple[Path, ...] = (), poll_s: float = 0.5):

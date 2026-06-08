@@ -284,6 +284,85 @@ class AppendRunTests(unittest.TestCase):
         self.assertEqual(rows[0]["config"], "platforms/hopsworks/autoresearch/rq1/t02-cli-bivariate.yaml")
 
 
+class ChangelogEntryTests(unittest.TestCase):
+    """`annotate-version` regenerates the version's CHANGELOG.md section from the
+    same structured fields + metrics, so an entry exists after EVERY version."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.results_root = self.root / "results"
+        self.cfg = _make_cfg(
+            self.root, "platforms/hopsworks/autoresearch/hopsworks-test-ar.yaml",
+            [("whitelist_hits", "maximize"), ("score", "minimize")])
+        # run_dir mirrors the real layout <runs_root>/v<N>/<task>/<challenge>,
+        # so the CHANGELOG resolves to <runs_root>/CHANGELOG.md.
+        self.runs_root = self.results_root / "autoresearch" / "exp" / "hopsworks" / "cli" / "none"
+        self.changelog = self.runs_root / "CHANGELOG.md"
+
+    def _add(self, version, challenge, *, score, wl):
+        row = _run_row(version, "tabular", challenge, score=score,
+                       run_dir=str(self.runs_root / version / "tabular" / challenge))
+        row["whitelist_hits"] = str(wl)
+        experiments.append_run(self.results_root, self.cfg, row)
+
+    def _annotate(self, version, **fields):
+        cfg_rel = experiments._config_rel(self.cfg, self.results_root)
+        return experiments.annotate_version(self.results_root, cfg_rel, version, fields)
+
+    def test_annotate_writes_changelog_section(self):
+        self._add("v0", "a", score=0.21, wl=0)
+        self._annotate("v0", hypothesis="baseline", change="none",
+                       verdict="neutral", verdict_reason="floor only", keep="1",
+                       observations="read-only", proposed_changes="add create tools")
+        self.assertTrue(self.changelog.exists())
+        text = self.changelog.read_text()
+        self.assertIn("## v0", text)
+        self.assertIn("**Hypothesis:** baseline", text)
+        self.assertIn("**Verdict:** neutral — floor only  (kept: yes)", text)
+        self.assertIn("- whitelist_hits: 0", text)
+        self.assertIn("- score: 0.21", text)
+        self.assertIn("add create tools", text)
+
+    def test_metrics_averaged_across_challenges(self):
+        self._add("v0", "a", score=0.2, wl=2)
+        self._add("v0", "b", score=0.4, wl=4)
+        self._annotate("v0", hypothesis="h")
+        text = self.changelog.read_text()
+        self.assertIn("- whitelist_hits: 3.00", text)   # mean(2, 4)
+        self.assertIn("- score: 0.3", text)             # mean(0.2, 0.4)
+        self.assertIn("valid submissions: 2/2 run(s)", text)
+
+    def test_idempotent_replace_and_sorted_insert(self):
+        self._add("v0", "a", score=0.2, wl=0)
+        self._annotate("v0", hypothesis="first")
+        self._annotate("v0", hypothesis="revised")      # re-annotate same version
+        self._add("v1", "a", score=0.1, wl=5)
+        self._annotate("v1", hypothesis="added tools")
+        text = self.changelog.read_text()
+        self.assertEqual(text.count("## v0"), 1)         # replaced, not duplicated
+        self.assertIn("**Hypothesis:** revised", text)
+        self.assertNotIn("**Hypothesis:** first", text)
+        self.assertLess(text.index("## v0"), text.index("## v1"))  # sorted
+
+    def test_missing_optional_fields_render_as_dash(self):
+        self._add("v0", "a", score=0.2, wl=0)
+        self._annotate("v0", hypothesis="h")             # only hypothesis given
+        text = self.changelog.read_text()
+        self.assertIn("**Change:** —", text)
+        self.assertIn("(kept: —)", text)
+
+    def test_preamble_preserved(self):
+        self.runs_root.mkdir(parents=True, exist_ok=True)
+        self.changelog.write_text(
+            "# Autoresearch run `exp` — changelog\n\nintro text\n\n"
+            "## Goals\n- **maximize**(`whitelist_hits`)\n\n---\n")
+        self._add("v0", "a", score=0.2, wl=0)
+        self._annotate("v0", hypothesis="h")
+        text = self.changelog.read_text()
+        self.assertIn("intro text", text)
+        self.assertIn("## Goals", text)
+
+
 class ResearchMcpTests(unittest.TestCase):
     def setUp(self):
         from banter import research_mcp

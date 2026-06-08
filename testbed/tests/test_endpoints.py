@@ -121,6 +121,60 @@ class EndpointCoverageTests(unittest.TestCase):
         self.assertEqual(hits["whitelist_hits"], cov["whitelist_hits"])
         self.assertEqual(hits["blacklist_hits"], cov["blacklist_hits"])
 
+    def test_coverage_embeds_original_patterns(self):
+        # endpoint_coverage.json must be self-contained once api_calls.jsonl is
+        # discarded: it carries the exact whitelist/blacklist it was scored against.
+        log = _log({"method": "POST", "path": "/hopsworks-api/api/project/1/featurestores/9/featuregroups"})
+        cov = results.endpoint_coverage(log, [FG_CREATE, FG_GET], ["DELETE /x"])
+        self.assertEqual(cov["whitelist"], [FG_CREATE, FG_GET])
+        self.assertEqual(cov["blacklist"], ["DELETE /x"])
+
+    def test_coverage_patterns_default_to_empty_lists(self):
+        cov = results.endpoint_coverage(Path("/nope/api.jsonl"), None, None)
+        self.assertEqual(cov["whitelist"], [])
+        self.assertEqual(cov["blacklist"], [])
+
+
+class AttributionTests(unittest.TestCase):
+    """Whitelist coverage is credited only to calls made THROUGH the interface
+    under test (the shim's `src` tag); hand-rolled `requests` ("other") and
+    server-side Job calls (never logged) don't count."""
+
+    FG = {"method": "POST", "path": "/hopsworks-api/api/project/1/featurestores/9/featuregroups"}
+
+    def test_only_active_interface_src_counts(self):
+        log = _log({**self.FG, "src": "mcp"})
+        self.assertEqual(results.endpoint_hits(log, [FG_CREATE], [], interface="mcp")["whitelist_hits"], 1)
+        # Same call attributed to MCP does NOT count for a CLI/SDK run.
+        self.assertEqual(results.endpoint_hits(log, [FG_CREATE], [], interface="cli")["whitelist_hits"], 0)
+        self.assertEqual(results.endpoint_hits(log, [FG_CREATE], [], interface="sdk")["whitelist_hits"], 0)
+
+    def test_other_src_never_counts_when_attributed(self):
+        # A hand-rolled `requests.post(...)` (not via the interface) → src "other".
+        log = _log({**self.FG, "src": "other"})
+        self.assertEqual(results.endpoint_hits(log, [FG_CREATE], [], interface="mcp")["whitelist_hits"], 0)
+        self.assertEqual(results.endpoint_hits(log, [FG_CREATE], [], interface="sdk")["whitelist_hits"], 0)
+
+    def test_no_interface_counts_any_src(self):
+        # Back-compat: interface=None (e.g. none/none baseline or legacy logs)
+        # scores any logged call regardless of attribution.
+        log = _log({**self.FG, "src": "other"})
+        self.assertEqual(results.endpoint_hits(log, [FG_CREATE], [])["whitelist_hits"], 1)
+
+    def test_legacy_log_without_src_counts_only_unattributed(self):
+        # A row with no `src` (legacy shim) reads as "" — counted only when
+        # interface=None, never credited to a specific interface.
+        log = _log(dict(self.FG))  # no "src" key
+        self.assertEqual(results.endpoint_hits(log, [FG_CREATE], [])["whitelist_hits"], 1)
+        self.assertEqual(results.endpoint_hits(log, [FG_CREATE], [], interface="mcp")["whitelist_hits"], 0)
+
+    def test_blacklist_not_attribution_filtered(self):
+        # A forbidden call is a violation however it was made — blacklist counts
+        # every matching row regardless of `src` (even "other").
+        log = _log({"method": "DELETE", "path": "/hopsworks-api/api/project/1", "src": "other"})
+        bl = ["DELETE /hopsworks-api/api/project/[0-9]+$"]
+        self.assertEqual(results.endpoint_hits(log, [], bl, interface="mcp")["blacklist_hits"], 1)
+
 
 class ResearcherPromptEndpointsTests(unittest.TestCase):
     def test_prompt_lists_targets_and_points_at_coverage_json(self):
@@ -210,6 +264,38 @@ budget: {max_increments: 1}
         ))
         self.assertEqual(cfg.endpoints["whitelist"], ["POST /a"])  # NOT ['P','O','S',...]
 
+    def test_whitelist_hits_goal_kept_for_every_interface(self):
+        # When `maximize whitelist_hits` is a configured goal, it is optimized
+        # regardless of interface (NOT a delegation metric, so goals_for_interface
+        # keeps it for cli/mcp/sdk) — and goals aren't task-filtered, so it holds
+        # for every task too. Endpoints being set does NOT by itself add the goal.
+        from banter import experiments
+        goals = [("score", "maximize"), ("whitelist_hits", "maximize"),
+                 ("cli_calls", "maximize"), ("mcp_calls", "maximize")]
+        for iface in ("cli", "mcp", "sdk"):
+            kept = {m for m, _ in experiments.goals_for_interface(goals, iface)}
+            self.assertIn("whitelist_hits", kept, iface)   # always optimized
+            self.assertIn("score", kept, iface)
+        # the delegation metrics ARE interface-gated (only the matching one kept)
+        self.assertNotIn("mcp_calls", {m for m, _ in experiments.goals_for_interface(goals, "cli")})
+
+    def test_endpoints_set_without_goal_is_not_optimized(self):
+        # Endpoints configured but whitelist_hits NOT a goal → it's a tracked
+        # metric, but NOT an optimization target (no auto-add).
+        cfg = ar.load_config(self._write(
+            """
+improve: interface
+skills: none
+challenges: [aerial-cactus-identification]
+interfaces: [{platform: hopsworks, interface: cli}]
+goals: [score]
+endpoints:
+  whitelist: ['POST /a', 'GET /b']
+budget: {max_increments: 1}
+"""
+        ))
+        self.assertNotIn("whitelist_hits", {g.metric for g in cfg.goals})
+
     def test_endpoints_default_empty(self):
         cfg = ar.load_config(self._write(
             """
@@ -247,12 +333,83 @@ class ApiLogShimTests(unittest.TestCase):
             rec = json.loads(log.read_text().splitlines()[0])
             self.assertEqual(rec["method"], "POST")
             self.assertEqual(rec["path"], "/hopsworks-api/api/project/1/featurestores/9/featuregroups")
+            self.assertIn("src", rec)  # attribution tag always present
         finally:
             if old is not None:
                 sys.modules["requests"] = old
             else:
                 sys.modules.pop("requests", None)
             os.environ.pop("BANTER_API_LOG", None)
+
+    def _origin_from(self, module_name: str, roots: str) -> str:
+        """Run the shim's `_banter_origin` from a synthetic frame whose module
+        `__name__` is `module_name`, with BANTER_IFACE_SDK=`roots`. Returns the
+        attributed `src`."""
+        log = Path(tempfile.mkdtemp()) / "api.jsonl"
+        os.environ["BANTER_API_LOG"] = str(log)
+        os.environ["BANTER_IFACE_SDK"] = roots
+        old = sys.modules.get("requests")
+        fake = types.ModuleType("requests")
+        fake.Session = type("Session", (), {"send": lambda self, r, **k: None})
+        sys.modules["requests"] = fake
+        try:
+            g: dict = {}
+            exec(claude_runner._API_LOG_SHIM, g)
+            ns = {"__name__": module_name, "_origin": g["_banter_origin"]}
+            exec("def _f():\n    return _origin()\n", ns)
+            return ns["_f"]()
+        finally:
+            if old is not None:
+                sys.modules["requests"] = old
+            else:
+                sys.modules.pop("requests", None)
+            os.environ.pop("BANTER_API_LOG", None)
+            os.environ.pop("BANTER_IFACE_SDK", None)
+
+    def test_origin_attributes_mcp_cli_sdk_and_other(self):
+        roots = "hopsworks,hopsworks_common,hsfs,hsml"
+        # A `.mcp` / `.cli` subpackage of a first-party root wins over the SDK
+        # client it wraps; any other first-party frame is "sdk"; none → "other".
+        self.assertEqual(self._origin_from("hopsworks.mcp.tools.jobs", roots), "mcp")
+        self.assertEqual(self._origin_from("hopsworks.cli.main", roots), "cli")
+        self.assertEqual(self._origin_from("hsfs.feature_group", roots), "sdk")
+        self.assertEqual(self._origin_from("hopsworks_common.core.feature_group_api", roots), "sdk")
+        self.assertEqual(self._origin_from("my_glue_script", roots), "other")
+
+    def test_origin_other_when_no_roots(self):
+        # No first-party roots configured → nothing is interface-attributed.
+        self.assertEqual(self._origin_from("hopsworks.mcp.tools.jobs", ""), "other")
+
+
+class FirstPartyRootsTests(unittest.TestCase):
+    def _venv(self, dist: str, top_level: list[str], subpkgs: dict[str, list[str]]):
+        root = Path(tempfile.mkdtemp())
+        sp = root / "lib" / "python3.11" / "site-packages"
+        (sp / f"{dist}.dist-info").mkdir(parents=True)
+        (sp / f"{dist}.dist-info" / "top_level.txt").write_text("\n".join(top_level) + "\n")
+        for pkg, subs in subpkgs.items():
+            for sub in subs:
+                (sp / pkg / sub).mkdir(parents=True, exist_ok=True)
+        return root
+
+    def test_picks_dist_shipping_mcp_or_cli_subpackage(self):
+        # The interface dist is the one whose packages include an mcp/cli subtree;
+        # returns ALL of that dist's top-level packages.
+        venv = self._venv(
+            "hopsworks-0",
+            ["hopsworks", "hopsworks_common", "hsfs", "hsml"],
+            {"hopsworks": ["mcp", "cli"]},
+        )
+        self.assertEqual(
+            set(claude_runner._first_party_roots(venv)),
+            {"hopsworks", "hopsworks_common", "hsfs", "hsml"},
+        )
+
+    def test_empty_when_no_interface_dist(self):
+        # A venv with only third-party dists (no mcp/cli subpackage) → no roots,
+        # so the shim safely tags every call "other".
+        venv = self._venv("requests-2", ["requests"], {})
+        self.assertEqual(claude_runner._first_party_roots(venv), [])
 
 
 if __name__ == "__main__":

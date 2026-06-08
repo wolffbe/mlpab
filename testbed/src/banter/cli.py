@@ -38,17 +38,14 @@ KAGGLE_DIR = TESTBED_ROOT / ".kaggle"
 
 
 def _load_dotenv() -> None:
-    """Load `.env` and OVERRIDE the shell — `.env` is the source of truth.
-
-    Stale shell exports (e.g. an old `ANTHROPIC_API_KEY` from a previous
-    session) would otherwise silently win over the file the user just edited.
-    `KAGGLE_CONFIG_DIR` still uses setdefault so a user-set override is honored.
+    """Load `.env`, OVERRIDING the shell — else a stale export (e.g. an old
+    `ANTHROPIC_API_KEY`) would win over the file the user just edited.
+    `KAGGLE_CONFIG_DIR` uses setdefault so a user override is honored.
     """
     os.environ.setdefault("KAGGLE_CONFIG_DIR", str(KAGGLE_DIR))
-    # Suppress pip's `A new release of pip is available` banner everywhere.
-    # We're intentionally NOT upgrading pip in every venv; this just hides
-    # the notice from `make install`, per-run venv creation, interface
-    # `install:` steps, and any other subprocess pip call.
+    # Hide pip's `A new release of pip is available` banner from all subprocess
+    # pip calls (make install, per-run venvs, interface `install:` steps). We
+    # intentionally do NOT upgrade pip in every venv.
     os.environ.setdefault("PIP_DISABLE_PIP_VERSION_CHECK", "1")
     os.environ.setdefault("PIP_NO_PYTHON_VERSION_WARNING", "1")
     if not DOTENV_PATH.exists():
@@ -254,17 +251,14 @@ def prepare_version(
 ) -> None:
     """Auto-populate an autoresearch version's interface copy + build it.
 
-    INTERFACE_DIR is the target — typically `<run>/v<N>/interface`. The
-    parent dir's name (e.g. `v3`) determines N: when N>0 the copy comes from
-    the PREVIOUS version's `v<N-1>/interface`; when N=0 (or there's no
-    previous), it comes from the committed `platforms/<platform>/<interface>/` — copied
-    in, NEVER edited in place. The interface is BUILT in the copy so it's
-    immediately runnable.
+    INTERFACE_DIR is the target — typically `<run>/v<N>/interface`. Its parent
+    name (`v3`) sets N: N>0 copies the PREVIOUS version's `v<N-1>/interface`;
+    N=0 (or no previous) copies the committed `platforms/<platform>/<interface>/`
+    — copied in, NEVER edited in place — then BUILT so it's immediately runnable.
 
-    The researcher invokes this once per new version instead of writing
-    `cp -r` and running install steps — the copy + build is deterministic; no
-    AI is involved in file moves or installation, and the committed roster of
-    source files is never modified.
+    The researcher calls this per new version instead of hand-rolling `cp -r` +
+    install: the copy+build is deterministic, no AI touches file moves or the
+    committed source roster.
     """
     target = Path(interface_dir).resolve()
     if target.exists():
@@ -299,9 +293,8 @@ def prepare_version(
     for w in list(target.glob("*.whl")):
         w.unlink()
 
-    # Build the interface IN the copy so the folder is in a runnable state (the
-    # researcher then just edits source for v>0; `banter run --interface-dir`
-    # force-rebuilds before each run so edits take effect).
+    # Build IN the copy so it's runnable; for v>0 the researcher just edits
+    # source and `banter run --interface-dir` force-rebuilds before each run.
     interfaces.set_interface_home(platform, interface, target)
     try:
         interfaces.build(platform, interface)
@@ -358,7 +351,9 @@ def annotate_version(
 ) -> None:
     """Fill the per-version annotation columns on every row of (config, version)
     in the global results/autoresearch/experiments.csv — the researcher uses this
-    to record each version's hypothesis, change, verdict, and next steps."""
+    to record each version's hypothesis, change, verdict, and next steps. Also
+    (re)writes that version's CHANGELOG.md section from the same fields + metrics,
+    so the narrative is never missing."""
     from banter import experiments as experiments_mod
 
     config_rel = os.path.relpath(Path(config).resolve(), TESTBED_ROOT)
@@ -372,7 +367,8 @@ def annotate_version(
         {k: v for k, v in updates.items() if v is not None}, interface=interface,
     )
     click.echo(f"annotated {n} row(s) (config={config_rel}, version={version}"
-               + (f", interface={interface}" if interface else "") + ")")
+               + (f", interface={interface}" if interface else "") + ")"
+               + ("  + wrote CHANGELOG.md section" if n else ""))
 
 
 @main.command("clean")
