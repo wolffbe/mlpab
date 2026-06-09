@@ -137,6 +137,13 @@ class EnforceHookTests(unittest.TestCase):
     def test_unknown_binary_blocked(self):
         self.assertIsNotNone(self._enforce("mcp", "Bash", "./some_custom_tool --go"))
 
+    def test_sleep_blocked_in_every_mode(self):
+        # `sleep` only stalls / burns compute budget; it does no interface work,
+        # so it is off the allowlist and denied (incl. inside compound commands).
+        for iface in ("cli", "mcp", "sdk"):
+            self.assertIsNotNone(self._enforce(iface, "Bash", "sleep 30"), iface)
+            self.assertIsNotNone(self._enforce(iface, "Bash", "sleep 5 && ls"), iface)
+
     def test_bash_c_node_blocked(self):
         # `bash -c "node …"` — the wrapper is unwrapped and the real exec gated.
         self.assertIsNotNone(self._enforce("cli", "Bash", 'bash -c "node -e \\"x\\""'))

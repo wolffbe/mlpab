@@ -169,7 +169,7 @@ _BASIC_SHELL = {
     "cp", "mv", "mkdir", "rmdir", "rm", "ln", "touch", "chmod",
     "grep", "egrep", "fgrep", "sed", "awk", "cut", "sort", "uniq", "tr",
     "diff", "cmp", "comm", "tee", "fold", "column", "rev", "paste", "join",
-    "xxd", "od", "hexdump", "split", "expand", "unexpand", "sleep", "date",
+    "xxd", "od", "hexdump", "split", "expand", "unexpand", "date",
     "gzip", "gunzip", "zcat", "bzip2", "bunzip2", "xz", "unxz", "tar",
     "unzip", "zip", "shasum", "md5sum", "sha256sum", "cksum",
 }
