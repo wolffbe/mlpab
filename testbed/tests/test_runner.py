@@ -2,7 +2,28 @@
 import unittest
 from unittest import mock
 
-from banter import runner
+from banter import mlebench_wrapper, runner
+
+
+class NormalizeScoreTests(unittest.TestCase):
+    def test_higher_better_passes_through(self):
+        # AUC / accuracy: already higher-is-better.
+        self.assertEqual(mlebench_wrapper.normalize_score(0.93, False), 0.93)
+        self.assertEqual(mlebench_wrapper.normalize_score(0.93, 0), 0.93)
+
+    def test_lower_better_is_sign_flipped(self):
+        # RMSE / RMSLE: smaller error must map to a LARGER normalized value.
+        self.assertEqual(mlebench_wrapper.normalize_score(0.05, True), -0.05)
+        self.assertEqual(mlebench_wrapper.normalize_score(3.0, 1), -3.0)
+        # A better (smaller) error normalizes higher than a worse (larger) one.
+        self.assertGreater(
+            mlebench_wrapper.normalize_score(0.04, True),
+            mlebench_wrapper.normalize_score(0.05, True),
+        )
+
+    def test_none_passes_through(self):
+        self.assertIsNone(mlebench_wrapper.normalize_score(None, True))
+        self.assertIsNone(mlebench_wrapper.normalize_score(None, False))
 
 
 class DetectEnvironmentTests(unittest.TestCase):

@@ -206,12 +206,22 @@ def _probe_skill_invocation(
         except subprocess.TimeoutExpired:
             return _ProbeResult(False, f"invoking /{skill_name} timed out.")
         out = f"{proc.stdout or ''}\n{proc.stderr or ''}"
+        low = out.lower()
+        # An unrecognized slash command short-circuits with this exact banner
+        # ("Unknown command: /name", exit 0) and never consumes turns — the
+        # definitive "not a skill" signal, independent of return code.
+        if "unknown command" in low:
+            return _ProbeResult(False, f"/{skill_name} was not recognized as a skill. Got: {out.strip()[:300]!r}")
+        # A substantial skill (interactive / multi-step — e.g. one that calls
+        # AskUserQuestion or hands off to other skills) loads, starts working,
+        # then hits the probe's 3-turn ceiling and exits non-zero with
+        # "Reached max turns". That PROVES the skill was recognized and invoked,
+        # which is all this accessibility probe needs to confirm.
+        if "reached max turns" in low:
+            return _ProbeResult(True)
         if proc.returncode != 0:
             tail = (proc.stderr or proc.stdout or "").strip().splitlines()[-3:]
             return _ProbeResult(False, f"`claude -p /{skill_name}` exited {proc.returncode}: {' / '.join(tail)}")
-        low = out.lower()
-        if any(p in low for p in ("unknown command", "no such", "not found", "isn't a", "unrecognized")):
-            return _ProbeResult(False, f"/{skill_name} was not recognized as a skill. Got: {out.strip()[:300]!r}")
         return _ProbeResult(True)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

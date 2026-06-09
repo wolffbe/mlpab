@@ -567,7 +567,11 @@ def run(spec: RunSpec) -> results.Row:
         _b = lambda x: int(bool(x))  # noqa: E731
         grading_fields = dict(
             medal=grading.get("medal"),
-            score=grading.get("score"),
+            # Normalized to higher-is-better so `score: maximize` is correct even
+            # across challenges with opposite native directions (raw score kept in
+            # grading.json). See mlebench_wrapper.normalize_score.
+            score=mlebench_wrapper.normalize_score(
+                grading.get("score"), grading.get("is_lower_better")),
             valid_submission=_b(grading.get("valid_submission")),
             above_median=_b(grading.get("above_median")),
             any_medal=_b(grading.get("any_medal")),
@@ -637,7 +641,14 @@ def run(spec: RunSpec) -> results.Row:
             row.error = str(grading.get("error")
                             or "no valid submission produced (engineer crashed, "
                                "timed out, or wrote no submission.csv)")[:1000]
-            row.score = 0.0
+            # Dead-run floor. Higher-better competitions floor to 0.0 (their
+            # natural worst — it drags the version's score mean down). For a
+            # lower-better competition the score is sign-flipped to higher=better,
+            # where 0.0 would read as the BEST possible result and silently invert
+            # the ranking — so drop to None instead (excluded from the score mean;
+            # the crash is still penalized via valid_submission=0 and the zeroed
+            # whitelist_hits/llm_calls/… below), never rewarded.
+            row.score = None if grading.get("is_lower_better") else 0.0
             for _f in ("eng_wall_time_s", "eng_input_tokens", "eng_output_tokens",
                        "eng_total_tokens", "eng_cost_usd", "total_wall_time_s",
                        "total_tokens", "total_cost", "llm_calls", "cli_calls",

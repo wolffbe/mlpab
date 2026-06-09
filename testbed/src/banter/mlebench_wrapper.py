@@ -140,6 +140,26 @@ def _parse_report(stderr_text: str) -> dict[str, Any] | None:
         return None
 
 
+def normalize_score(score: float | None, is_lower_better: Any) -> float | None:
+    """Orient a raw competition score so that HIGHER is always better.
+
+    The optimization layer (the `score` goal, the composite, the score-0 dead-run
+    floor) all assume higher score = better. But competitions are graded on their
+    native metric with NO sign flip: AUC/accuracy are higher-better while
+    RMSE/RMSLE are lower-better. Mixing both under a single `score: maximize` goal
+    (as the bivariate/multivariate treatments do across mixed challenges) would
+    reward worse models on the lower-better ones.
+
+    So we sign-flip lower-better scores here: a smaller error becomes a larger
+    (less negative) value, making `maximize` correct for every challenge. The RAW
+    score is still preserved in the per-challenge `grading.json`. `None`
+    (ungraded) passes through unchanged.
+    """
+    if score is None:
+        return None
+    return -score if is_lower_better else score
+
+
 def grade(competition_id: str, submission_path: Path, data_dir: Path) -> dict[str, Any]:
     """Grade a submission and return the parsed JSON report.
 

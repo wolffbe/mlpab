@@ -143,7 +143,6 @@ class AutoresearchConfig:
     research_question: int | None = None
     treatment: int | None = None
     optimization_variable: str | None = None   # univariate | bivariate | multivariate
-    time: int | None = None                     # compute hours per challenge
     language: str | None = None
     # Absolute path of the config file this was loaded from. The experiment
     # table keys off this (the config IS the treatment's identity).
@@ -315,7 +314,6 @@ def load_config(path: Path) -> AutoresearchConfig:
         ),
         treatment=(int(data["treatment"]) if data.get("treatment") is not None else None),
         optimization_variable=data.get("optimization_variable"),
-        time=(int(data["time"]) if data.get("time") is not None else None),
         language=data.get("language"),
         config_path=str(path),
     )
@@ -394,10 +392,26 @@ def build_researcher_prompt(
     banter_bin: Path,
 ) -> str:
     # Bullets, NOT numbered — order isn't a priority ranking; goals are
-    # optimized JOINTLY (see the prompt's joint-optimization note).
-    goals_lines = "\n".join(
-        f"  - {g.direction.upper()} `{g.metric}`" for g in config.goals
-    )
+    # optimized JOINTLY (see the prompt's joint-optimization note). A treatment
+    # with NO declared goals is a CONTROL: the researcher freely chooses what to
+    # optimize, so we swap in a free-choice directive and drop the joint-goals
+    # note (which assumes a fixed goal set + the composite).
+    if config.goals:
+        goals_lines = "\n".join(
+            f"  - {g.direction.upper()} `{g.metric}`" for g in config.goals
+        )
+        joint_goals_note = _fragment(testbed_root, "goals_joint.md")
+    else:
+        goals_lines = (
+            "_This treatment declares NO fixed optimization target._ You MAY CHOOSE "
+            "what to optimize — e.g. the interface's remote capability / endpoint "
+            "coverage, competition `score`, or fewer engineer turns (`llm_calls`) / "
+            "tokens. Pick objectives you can justify from the metric columns in "
+            "`experiments.csv`, DECLARE them in your CHANGELOG / report, and pursue "
+            "them consistently across versions (the `normalized_composite` tool needs "
+            "a goal set, so reason over the raw metric columns instead)."
+        )
+        joint_goals_note = ""
     # Endpoint-coverage targets: tell the researcher WHAT `whitelist_hits`
     # measures (target REST endpoints) and that a miss is a capability the
     # interface must expose. Empty when no `endpoints:` configured.
@@ -478,7 +492,12 @@ def build_researcher_prompt(
     )
     time_cap = (
         "unlimited" if config.budget.max_seconds == float("inf")
-        else f"{config.budget.max_seconds:.0f} s of compute"
+        else (
+            f"{config.budget.max_seconds:.0f} s "
+            f"(≈ {config.budget.max_seconds / 3600:.1f} h) of compute — the TOTAL "
+            f"for this whole session, SHARED across every version and challenge "
+            f"(not per-version, not per-challenge)"
+        )
     )
     # COMPUTE-time budget is GRACEFUL: `banter budget-check` compares
     # (now - start - rate_limit_waits) against max_seconds. Rate-limit waits
@@ -551,6 +570,7 @@ def build_researcher_prompt(
         changelog_path=changelog_path,
         hierarchy_note=hierarchy_note,
         goals_lines=goals_lines,
+        joint_goals_note=joint_goals_note,
         endpoints_block=endpoints_block,
         # `max_versions` in the prompt = chain total. `start_version` /
         # `last_version` are the range to run THIS session.

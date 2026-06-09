@@ -85,7 +85,6 @@ DESIGN_FIELDS = [
     "skills",
     "optimization_variable",
     "goals",
-    "time",
     "budget",
 ]
 
@@ -329,7 +328,6 @@ def _design_cells(cfg: "Any", config_rel: str) -> dict:
         "skills": _skills_label(cfg.improve or [], cfg.skills),
         "optimization_variable": cfg.optimization_variable or "",
         "goals": _goals_str(goals),
-        "time": cfg.time if cfg.time is not None else "",
         "budget": _budget_arr(cfg.budget) if cfg.budget else "",
     }
 
@@ -521,8 +519,12 @@ def append_run(results_root: Path, cfg: "Any", result_row: dict) -> Path:
         [(g.metric, g.direction) for g in cfg.goals], row["interface"])
     row["goals"] = _goals_str(leaf_goals)
     # optimization_variable derived from leaf goal count:
-    # 1 → univariate, 2 → bivariate, 3 → multivariate.
-    row["optimization_variable"] = _optvar_for_count(len(leaf_goals))
+    # 1 → univariate, 2 → bivariate, 3 → multivariate. A leaf with 0 goals isn't
+    # a count we label (returns "") — fall back to the config's declared variable
+    # (e.g. "control") so no-objective treatments stay identifiable in the table.
+    row["optimization_variable"] = (
+        _optvar_for_count(len(leaf_goals)) or (cfg.optimization_variable or "")
+    )
     row["version"] = result_row.get("version", "")
     row["task"] = result_row.get("task", "")
     row["challenge"] = result_row.get("challenge", "")

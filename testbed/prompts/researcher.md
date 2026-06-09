@@ -85,19 +85,7 @@ its CHALLENGES. {hierarchy_note}
 
 ## Goals
 {goals_lines}
-
-**Optimize ALL goals JOINTLY — they are NOT ranked.** The order above is not a
-priority order. Your objective is the **composite** (`normalized_composite`'s J,
-an equal-weight blend of every goal) — a **Pareto-optimal** result across all
-goals, not one goal maximized and then the next. Do NOT treat `score` (or any
-single metric) as primary and the others as optional tie-breakers. Each version,
-push the goal with the **lowest** normalized contribution, and prefer changes
-that raise a lagging goal **without regressing** the others (a Pareto improvement).
-"The task didn't need endpoint X" / "that metric isn't required to solve this
-challenge" is **NOT** a valid reason to leave a goal like `whitelist_hits` low —
-it is an explicit optimization target, so extend the interface until the engineer
-exercises it. A version that maxes one goal while another sits at the floor is a
-BAD result, even if that one goal looks great.
+{joint_goals_note}
 {endpoints_block}
 ## Budget
 - **Iterations include the v0 baseline as step 1.** `v0` (baseline) + improvements `v1..v{max_versions}`.
@@ -107,6 +95,15 @@ BAD result, even if that one goal looks great.
 - Max total cost (engineer + researcher combined): {cost_cap}
 - Max COMPUTE time: {time_cap}  (graceful — see below; rate-limit waiting does NOT count)
 - Run started: epoch `{session_start_epoch}`
+
+**Pace yourself against this cap.** The compute budget above is the ceiling for
+the ENTIRE session — every version, every challenge, every engineer run draws
+from the same pool. Roughly, each version costs {runs_per_version} engineer runs;
+spreading the budget over `v{start_version}..v{max_versions}` leaves you only so
+much per version. Don't burn the whole budget on one over-engineered increment:
+plan smaller, verifiable changes so you actually reach later versions, and front-
+load the highest-leverage interface fixes. When the budget runs low, prefer
+consolidating a known-good version over starting a risky new one.
 
 **Graceful compute-time cap** — BEFORE starting any new version, check the
 compute budget. This counts actual computation only: wall-clock elapsed minus

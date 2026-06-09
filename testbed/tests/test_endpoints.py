@@ -200,6 +200,37 @@ class ResearcherPromptEndpointsTests(unittest.TestCase):
         self.assertNotIn("{endpoints_block}", prompt)
 
 
+class ControlTreatmentPromptTests(unittest.TestCase):
+    """A control treatment (no declared goals) must tell the researcher it may
+    freely choose objectives, and must NOT print the joint-goals/composite note
+    (which assumes a fixed goal set)."""
+
+    def _build(self, goals):
+        from dataclasses import replace
+        from banter import autoresearch as ar
+        root = Path(__file__).resolve().parents[1]
+        cfg = ar.load_config(root / "platforms/hopsworks/autoresearch/hopsworks-test-ar.yaml")
+        cfg = replace(cfg, goals=goals)
+        return ar.build_researcher_prompt(
+            cfg, root, Path(tempfile.mkdtemp()), "testrun", root / ".venv/bin/banter")
+
+    def test_empty_goals_gives_free_choice_directive(self):
+        prompt = self._build([])
+        self.assertIn("MAY CHOOSE", prompt)
+        self.assertNotIn("Optimize ALL goals JOINTLY", prompt)
+        self.assertNotIn("{joint_goals_note}", prompt)
+
+    def test_declared_goals_keep_joint_note(self):
+        prompt = self._build([ar_goal() for ar_goal in [_whitelist_goal]])
+        self.assertIn("Optimize ALL goals JOINTLY", prompt)
+        self.assertNotIn("MAY CHOOSE", prompt)
+
+
+def _whitelist_goal():
+    from banter.autoresearch import Goal
+    return Goal(metric="whitelist_hits", direction="maximize")
+
+
 class EndpointSchemaTests(unittest.TestCase):
     def test_metrics_registered(self):
         for m in ("whitelist_hits", "blacklist_hits"):

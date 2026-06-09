@@ -147,6 +147,19 @@ class AppendRunTests(unittest.TestCase):
         # budget is a JSON array of specified budgets (iterations default 11 + max_seconds).
         self.assertEqual(json.loads(v1["budget"]), ["iterations:11", f"max_seconds:{1 * 4 * 3600}"])
 
+    def test_control_treatment_keeps_its_label_with_zero_goals(self):
+        # A control (no goals) leaf can't be labelled from goal count (→ ""); the
+        # config's declared `optimization_variable` ("control") must survive so the
+        # no-objective rows stay identifiable in the table.
+        cfg = _make_cfg(
+            self.root, "platforms/hopsworks/autoresearch/rq1/t01-cli-control.yaml", [])
+        cfg.optimization_variable = "control"
+        experiments.append_run(self.results_root, cfg, _run_row("v0", "tabular", "a", score=0.5))
+        r = self._rows()[0]
+        self.assertEqual(r["optimization_variable"], "control")
+        import json
+        self.assertEqual(json.loads(r["goals"]), [])
+
     def test_started_at_and_eng_columns_written(self):
         row = _run_row("v0", "tabular", "a", score=0.5)
         row["started_at"] = "2026-06-02T12:00:00+00:00"
