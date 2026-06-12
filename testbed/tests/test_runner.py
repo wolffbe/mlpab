@@ -1,30 +1,88 @@
 """Tests for runner helpers: dynamic environment detection + prompt rendering."""
+import os
 import unittest
 from unittest import mock
 
-from banter import mlebench_wrapper, runner
+from banter import evals_provider, runner
 
 
-class NormalizeScoreTests(unittest.TestCase):
-    def test_higher_better_passes_through(self):
-        # AUC / accuracy: already higher-is-better.
-        self.assertEqual(mlebench_wrapper.normalize_score(0.93, False), 0.93)
-        self.assertEqual(mlebench_wrapper.normalize_score(0.93, 0), 0.93)
+class SeedForTests(unittest.TestCase):
+    def test_deterministic_and_distinct_per_attempt(self):
+        a = evals_provider.seed_for("rq1", "feature", "training_data", 1)
+        self.assertEqual(a, evals_provider.seed_for("rq1", "feature", "training_data", 1))
+        self.assertNotEqual(a, evals_provider.seed_for("rq1", "feature", "training_data", 2))
+        # Non-negative 31-bit int (usable as a numpy/random seed).
+        self.assertGreaterEqual(a, 0)
+        self.assertLess(a, 2 ** 31)
 
-    def test_lower_better_is_sign_flipped(self):
-        # RMSE / RMSLE: smaller error must map to a LARGER normalized value.
-        self.assertEqual(mlebench_wrapper.normalize_score(0.05, True), -0.05)
-        self.assertEqual(mlebench_wrapper.normalize_score(3.0, 1), -3.0)
-        # A better (smaller) error normalizes higher than a worse (larger) one.
-        self.assertGreater(
-            mlebench_wrapper.normalize_score(0.04, True),
-            mlebench_wrapper.normalize_score(0.05, True),
+    def test_unimplemented_family_fails_fast(self):
+        with self.assertRaises(ValueError):
+            evals_provider._family("not-a-real-eval")
+
+
+class PlatformEnvTests(unittest.TestCase):
+    """_platform_env: the KEY=VALUE handoff file a platform setup step writes
+    (via $BANTER_PLATFORM_ENV) so values it derives — e.g. the SageMaker
+    execution-role ARN it just created — reach the agent's env."""
+
+    def setUp(self):
+        import tempfile
+        from pathlib import Path
+
+        self.run_dir = Path(tempfile.mkdtemp())
+
+    def test_missing_file_is_empty(self):
+        self.assertEqual(runner._platform_env(self.run_dir), {})
+
+    def test_parses_and_consumes_file(self):
+        path = self.run_dir / "platform.env"
+        path.write_text(
+            "# from setup.py\n"
+            "SAGEMAKER_ROLE_ARN=arn:aws:iam::123:role/banter-sagemaker-execution-role\n"
+            "\n"
+            "malformed line without equals\n"
+            "SPACED = padded value \n"
         )
+        env = runner._platform_env(self.run_dir)
+        self.assertEqual(env, {
+            "SAGEMAKER_ROLE_ARN": "arn:aws:iam::123:role/banter-sagemaker-execution-role",
+            "SPACED": "padded value",
+        })
+        # Consumed: deleted so it never lingers in the agent's workdir.
+        self.assertFalse(path.exists())
 
-    def test_none_passes_through(self):
-        self.assertIsNone(mlebench_wrapper.normalize_score(None, True))
-        self.assertIsNone(mlebench_wrapper.normalize_score(None, False))
+    def test_declared_keys_win_on_merge(self):
+        (self.run_dir / "platform.env").write_text("SAGEMAKER_ROLE_ARN=derived\nEXTRA=kept\n")
+        keys = {"SAGEMAKER_ROLE_ARN": "from-dotenv"}
+        merged = {**runner._platform_env(self.run_dir), **keys}
+        self.assertEqual(merged, {"SAGEMAKER_ROLE_ARN": "from-dotenv", "EXTRA": "kept"})
 
+
+class RunAuxTests(unittest.TestCase):
+    """Platform setup/teardown subprocesses must not be instrumented: their REST
+    traffic is plumbing, not agent work, so the api-log env vars are stripped
+    before the step runs (the per-run venv's shim logs whenever BANTER_API_LOG
+    is set, and these steps inherit os.environ wholesale)."""
+
+    def test_strips_api_log_instrumentation_env(self):
+        import tempfile
+        from pathlib import Path
+
+        run_dir = Path(tempfile.mkdtemp())
+        out = run_dir / "env.txt"
+        env = {
+            "PATH": os.environ.get("PATH", ""),
+            "BANTER_API_LOG": str(run_dir / "api_calls.jsonl"),
+            "BANTER_IFACE_SDK": "hopsworks",
+            "HOPSWORKS_API_KEY": "kept",
+        }
+        runner._run_aux([f'env > "{out}"'], run_dir, env)
+        text = out.read_text()
+        self.assertNotIn("BANTER_API_LOG", text)
+        self.assertNotIn("BANTER_IFACE_SDK", text)
+        self.assertIn("HOPSWORKS_API_KEY=kept", text)
+        # The caller's env dict is not mutated.
+        self.assertIn("BANTER_API_LOG", env)
 
 class DetectEnvironmentTests(unittest.TestCase):
     def test_includes_cores_and_start_method(self):
@@ -61,14 +119,14 @@ class DetectEnvironmentTests(unittest.TestCase):
 
 class BuildPromptTests(unittest.TestCase):
     def test_fills_all_placeholders(self):
-        prompt = runner._build_prompt("my-challenge", "INTERFACE_FRAGMENT")
-        self.assertIn("my-challenge", prompt)
+        prompt = runner._build_prompt("TASK BODY TEXT", "INTERFACE_FRAGMENT")
+        self.assertIn("TASK BODY TEXT", prompt)
         self.assertIn("INTERFACE_FRAGMENT", prompt)
         # The {environment} placeholder is resolved (detected bullets present).
         self.assertIn("CPU cores", prompt)
         # No unfilled placeholders leaked through.
         self.assertNotIn("{environment}", prompt)
-        self.assertNotIn("{challenge_id}", prompt)
+        self.assertNotIn("{task_body}", prompt)
         self.assertNotIn("{fragment}", prompt)
 
     def test_interface_under_test_section(self):

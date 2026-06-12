@@ -1,0 +1,429 @@
+"""One-shot treatment runner.
+
+A "treatment" is one config: a platform × model × skills arm run over the eval
+tasks. Runs every (task × interface × skills) combo `repeats` times,
+prints a summary, and writes detailed results.
+
+Layout (under the caller-supplied `runs_root`):
+    results/<config>/                                # the config yaml's stem
+        <model>/<platform>/<interface>/<version>/<skills|no-skills>/
+            <category>/<task>/<n>/   # one attempt; repeats accumulate as n+1
+    results/results.csv     # the ONE CSV: one row per execution, all
+                            # configs, appended after EVERY run
+    results/results.ipynb   # GLOBAL: raw list + averages + charts,
+                            # regenerated after EVERY run
+
+Per-leaf results.csv files (next to the attempt folders) are deprecated — any
+legacy ones found are merged into the global CSV at run start, deduped by
+run_dir. Re-running a config never overwrites: each rerun appends the next
+/<n> attempt folder and gets the next repeat number n in the global CSV.
+
+Config format (YAML):
+
+    model: claude-sonnet-4-6            # agent model
+    auth: api-key                       # agent auth
+
+    # Option A — explicit run list
+    runs:
+      - task: training_data
+        category: feature
+        platform: none
+        interface: none
+        skills: none
+
+    # Option B — Cartesian matrix: `tasks:` maps <category>: [<task>, …]
+    # tasks: {feature: [training_data]}
+    # interfaces: [{platform: hopsworks, interface: cli}]
+    # skills: [none]
+
+    max_seconds: 3600  # OPTIONAL per-agent-run wall-clock cap in SECONDS
+                       # (legacy: `max_min`, `timeout_s`). Absent/null → NO cap.
+"""
+from __future__ import annotations
+
+import os
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+from banter import claude_runner, interfaces, preflight as preflight_mod, results, runner, skills
+
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class RunEntry:
+    task: str                       # FTI sub-task (an evals family)
+    platform: str
+    interface: str
+    skills: str = "none"
+    category: str = "no_task"       # FTI category (a folder in the run path)
+
+
+@dataclass
+class TreatmentConfig:
+    runs: list[RunEntry]
+    model: str = runner.DEFAULT_MODEL
+    auth: str = "api-key"
+    # Per-agent-run wall-clock cap, in seconds. None = NO cap (the default):
+    # runs go to completion; only Ctrl-C or the agent finishing ends them.
+    max_seconds: float | None = None
+    # How many times to run EVERY combo (config key `n:` or `repeats:`). Each
+    # repeat lands in its own …/<task>/<n> attempt folder and gets its own
+    # results.csv row (n = 1..repeats).
+    repeats: int = 1
+
+
+def _parse_runs(data: dict[str, Any]) -> list[RunEntry]:
+    """Return the run list from the config dict.
+
+    Supports an explicit `runs:` list and a Cartesian matrix via `interfaces`,
+    `skills`, and a `tasks:` mapping (`<category>: [<task>, …]`) so runs are
+    grouped by FTI category.
+    """
+    if "runs" in data:
+        entries = []
+        for r in data["runs"]:
+            if r.get("config"):
+                platform, interface = interfaces.platform_interface_from_config(r["config"])
+            else:
+                platform, interface = r["platform"], r.get("interface", "none")
+            entries.append(
+                RunEntry(
+                    task=r["task"],
+                    platform=platform,
+                    interface=interface,
+                    skills=r.get("skills", "none"),
+                    category=r.get("category", "no_task"),
+                )
+            )
+        return entries
+
+    # Cartesian matrix fallback. Each platform entry references its config
+    # (`config:`) or gives platform+interface.
+    #
+    # `skills` entries mirror `interfaces` entries: reference the platform's
+    # skills manifest by config path —
+    #     skills:
+    #       - none
+    #       - {config: configs/platforms/hopsworks/skills.yaml}            # single bundle
+    #       - {config: configs/platforms/hopsworks/skills.yaml, bundle: official} # explicit
+    # The OWNING platform is inferred from the path (its folder), so a bundle
+    # applies only to that platform's runs; every other platform runs the combo
+    # with skills=none (duplicate combos are deduped). Plain-string entries
+    # (bare bundle names) apply to all platforms unchanged.
+    # The `tasks:` mapping key is the FTI category; its values are tasks.
+    task_category = [(t, str(cat)) for cat, ts in (data.get("tasks") or {}).items() for t in ts]
+    iface_entries = data.get("interfaces") or []
+    skills_list = data.get("skills") or ["none"]
+    entries = []
+    for tk, category in task_category:
+        for iface in iface_entries:
+            if not isinstance(iface, dict):
+                raise ValueError(
+                    f"treatment `interfaces` entries must be mappings, got {iface!r}"
+                )
+            if iface.get("config"):
+                platform, interface = interfaces.platform_interface_from_config(iface["config"])
+            else:
+                platform, interface = iface["platform"], iface.get("interface", "none")
+            for sk in skills_list:
+                sk_platform = None   # None → bundle applies to every platform
+                if isinstance(sk, str):
+                    sk_name = sk
+                elif isinstance(sk, dict) and sk.get("config"):
+                    sk_platform, sk_name = _skills_from_config(sk)
+                elif isinstance(sk, dict):
+                    sk_name = sk.get("name", "none")
+                else:
+                    raise ValueError(f"treatment `skills` entry must be str or mapping, got {sk!r}")
+                if sk_platform is not None and sk_platform != platform:
+                    # Foreign-platform bundle: this combo runs without skills
+                    # (deduped against an explicit `none` entry below).
+                    sk_name = "none"
+                entries.append(
+                    RunEntry(
+                        task=tk,
+                        platform=platform,
+                        interface=interface,
+                        skills=sk_name,
+                        category=category,
+                    )
+                )
+    # Dedup: a foreign-platform bundle degrades to skills=none and would
+    # duplicate the explicit `none` combo for that interface × task.
+    seen: set[tuple] = set()
+    unique: list[RunEntry] = []
+    for e in entries:
+        key = (e.task, e.platform, e.interface, e.skills, e.category)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(e)
+    return unique
+
+
+def _skills_from_config(sk: dict[str, Any]) -> tuple[str, str]:
+    """Resolve a `{config: configs/platforms/<p>/skills.yaml}` skills entry to
+    (owning_platform, bundle_name). The platform is the config's folder name
+    (mirroring `platform_interface_from_config`); the bundle is `bundle:` when
+    given, else the platform's single bundle. Resolution goes through
+    `skills.bundle_names` (testbed-root-anchored manifest + default dir), not
+    the raw config path — which would be CWD-relative and silently empty when
+    banter runs from outside the testbed root."""
+    platform = Path(sk["config"]).parent.name
+    bundle = sk.get("bundle")
+    if not bundle:
+        names = skills.bundle_names(platform)
+        if len(names) == 1:
+            bundle = names[0]
+        else:
+            raise ValueError(
+                f"skills config {sk['config']!r} declares {len(names)} bundles "
+                f"({', '.join(names) or 'none'}); pick one with `bundle:`."
+            )
+    return platform, bundle
+
+
+def load_config(path: Path) -> TreatmentConfig:
+    with open(path) as f:
+        data = yaml.safe_load(f)
+    # `max_seconds` preferred; legacy `max_min` (× 60) and `timeout_s` accepted.
+    # Absent (or explicit null) → NO per-run wall-clock cap ("no budget key =
+    # unlimited").
+    if data.get("max_seconds") is not None:
+        max_seconds = float(data["max_seconds"])
+    elif data.get("max_min") is not None:
+        max_seconds = float(data["max_min"]) * 60.0
+    elif data.get("timeout_s") is not None:
+        max_seconds = float(data["timeout_s"])
+    else:
+        max_seconds = None
+    return TreatmentConfig(
+        runs=_parse_runs(data),
+        # `model` is a research knob set in the config. Auth, however, is a
+        # machine/setup concern: it defaults to BANTER_AUTH (what `make setup`
+        # chose) unless the config explicitly overrides it.
+        model=data.get("model", runner.DEFAULT_MODEL),
+        auth=data.get("auth", os.environ.get("BANTER_AUTH", "api-key")),
+        max_seconds=max_seconds,
+        repeats=max(1, int(data.get("n", data.get("repeats", 1)) or 1)),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Runner
+# ---------------------------------------------------------------------------
+
+
+def run_treatments(
+    config: TreatmentConfig,
+    runs_root: Path,
+    config_name: str | None = None,
+    assume_yes: bool = False,   # kept for CLI compat; runs ACCUMULATE, never prompt
+) -> None:
+    total = len(config.runs) * config.repeats
+    if total == 0:
+        print("[banter] No runs configured.", file=sys.stderr)
+        return
+
+    # Fail fast, once, over the union of requirements before doing any work.
+    reqs = [
+        preflight_mod.Requirement(
+            platform=e.platform,
+            interface=e.interface,
+            skills=e.skills,
+        )
+        for e in config.runs
+    ]
+    # Fail fast on unimplemented eval families BEFORE building anything.
+    from banter import evals_provider
+    for tk in sorted({e.task for e in config.runs}):
+        evals_provider._family(tk)  # raises ValueError with the implemented list
+    # `building()` marks this session's ENTIRE setup phase for PARALLEL
+    # sessions (the per-platform configs): a platform with nothing to
+    # build must still not open its agent while a sibling session is
+    # mid-setup — every run below gates on `agent_slot()`. The barrier is
+    # two-directional: `building()` itself first waits for any ALREADY-OPEN
+    # agent run (a sibling started earlier), so staggered session starts
+    # never build under a sibling's open, timed run.
+    with preflight_mod.building():
+        try:
+            # Build + test the platforms once at session start (login is checked per
+            # run by the runner, in each run's own venv). NOTE: treatment runs
+            # put the agent directly against the built interface dir ($INTERFACE_DIR
+            # = bin_dir; preflight=False per run, so nothing rebuilds per run). The
+            # built artifact MUST persist here for the agent's runtime_install —
+            # so we do NOT cleanup_build.
+            preflight_mod.preflight(
+                reqs, auth=config.auth, model=config.model, check_login=False,
+            )
+        except preflight_mod.PreflightError as e:
+            print(f"\n[banter] preflight failed:\n{e}", file=sys.stderr)
+            raise
+
+    parent = runs_root
+    parent.mkdir(parents=True, exist_ok=True)
+    # The config FILENAME stem names the results folder; else auto-increment.
+    run_id = config_name or results.next_session_id(parent)
+    # results/<config-name>/. Each entry nests under
+    # <model>/<platform>/<interface>/<version>/<skills|no-skills>/<category>/<task>/<n>
+    # — mirroring the results.csv identity columns. Re-running the same config
+    # ACCUMULATES: each repeat lands in the next /<n> attempt folder (and gets
+    # n+1 in results.csv) instead of overwriting.
+    run_path = parent / run_id
+    if run_path.exists():
+        print(f"[banter] {run_path} exists — accumulating repeat attempts (n+1).", flush=True)
+    run_path.mkdir(parents=True, exist_ok=True)
+
+    # OAuth token side-channel: write the Keychain JWT to `<run>/.claude-oauth`
+    # (mode 0600, gitignored, removed with the run) and point
+    # BANTER_TOKEN_CACHE at it. claude_runner.resolve_oauth_token() reads
+    # the cache when the agent's redirected HOME has no on-disk creds, so the
+    # token never has to be committed or left at the repo root.
+    token = claude_runner.oauth_token_from_keychain()
+    if token:
+        cache_path = claude_runner.write_token_cache(token, run_path.resolve())
+        os.environ[claude_runner.TOKEN_CACHE_ENV] = str(cache_path)
+
+    # The GLOBAL results.csv at the results root is the ONLY csv: the runner
+    # appends each row straight into it after every run (per-leaf results.csv
+    # files are deprecated). Refreshing it here folds any legacy leaf rows
+    # (sessions run before the deprecation, or a crashed session's leftovers)
+    # into the global table — and pre-creates it (header only) on first use.
+    global_csv = parent / "results.csv"
+    try:
+        results.roll_up_results(parent, global_csv)
+    except Exception as e:
+        print(f"[banter] legacy leaf-CSV merge skipped: {e}", flush=True)
+    global_nb = parent / "results.ipynb"
+    if not global_nb.exists():
+        from nbformat.v4 import new_notebook, new_markdown_cell
+        import nbformat as _nbf
+        nb = new_notebook()
+        nb.cells = [new_markdown_cell(
+            "# Results — global analysis\n\n"
+            "_(No results yet — this notebook regenerates at end of every "
+            "treatment run.)_\n"
+        )]
+        with global_nb.open("w") as f:
+            _nbf.write(nb, f)
+
+    print(f"[banter] run={run_id}  runs={total}  dir={run_path}")
+
+    completed: list[results.Row] = []
+    failed: list[str] = []
+
+    expanded = [e for e in config.runs for _ in range(config.repeats)]
+    for idx, entry in enumerate(expanded, 1):
+        print(
+            f"\n[treatment {idx}/{total}] {entry.task} | "
+            f"{entry.platform}/{entry.interface} | skills={entry.skills}"
+        )
+        # Nest by model/platform/interface/version/skills — the results.csv identity
+        # columns — so no two combos share a <category>/<task> dir. The version
+        # segment is the manifest's pinned version/ref; the local baseline has
+        # no interface (and no manifest), so it reads "none"; skills "none"
+        # reads as the literal "no-skills".
+        if entry.platform == "none" and entry.interface == "none":
+            version_seg = "none"
+        else:
+            version_seg = interfaces.interface_ref(
+                interfaces.load_manifest(entry.platform, entry.interface))
+        skills_seg = entry.skills if entry.skills and entry.skills != "none" else "no-skills"
+        leaf_root = (run_path / config.model / entry.platform
+                     / entry.interface / version_seg / skills_seg)
+        # Repeat counter: next free /<n> attempt folder under this task.
+        task_dir = leaf_root / entry.category / entry.task
+        existing = [int(d.name) for d in task_dir.iterdir()
+                    if d.is_dir() and d.name.isdigit()] if task_dir.is_dir() else []
+        attempt = max(existing, default=0) + 1
+        try:
+            spec = runner.RunSpec(
+                task=entry.task,
+                platform=entry.platform,
+                interface=entry.interface,
+                skills=entry.skills,
+                model=config.model,
+                auth=config.auth,
+                timeout_s=int(config.max_seconds) if config.max_seconds is not None else None,
+                runs_root=leaf_root,
+                run_id=run_id,        # tagged into the `config` column of the master CSV
+                category=entry.category,
+                attempt=attempt,
+                preflight=False,  # union already verified upfront
+                results_csv=global_csv,  # the ONE results CSV, appended per run
+            )
+            # Never START an agent (claude) run while a parallel session is
+            # still in its setup phase (building, preparing data) — blocks
+            # until the barrier is clear. The slot is then HELD
+            # for the run's duration, so a sibling session started AFTER this
+            # agent opened waits in its `building()` instead of building
+            # under the open run (the staggered-start race).
+            with preflight_mod.agent_slot() as waited:
+                if waited > 1:
+                    print(f"[banter] build barrier cleared after {waited:.0f}s", flush=True)
+                row = runner.run(spec)
+            completed.append(row)
+            print(
+                f"[banter] asserts={row.asserts_passed}/{row.asserts_total}  "
+                f"tokens={row.total_tokens}  "
+                f"wall={row.wall_time_s:.1f}s  cost=${row.cost_usd:.4f}"
+            )
+            # The runner appended the row to the global results.csv; refresh
+            # the global results.ipynb to match, so both stay current after
+            # EVERY run instead of only at end of the session.
+            _refresh_notebook(parent)
+        except Exception as exc:
+            label = f"{entry.task}/{entry.platform}/{entry.interface}"
+            print(f"[banter] FAILED {label}: {exc}", file=sys.stderr)
+            failed.append(f"{label}: {exc}")
+
+    print(f"[banter] results: {global_csv}", flush=True)
+    _print_summary(completed, failed, global_csv)
+
+
+def _refresh_notebook(parent: Path) -> None:
+    """Regenerate the GLOBAL results.ipynb at the results root from the
+    global results.csv: per config → per model → one bar chart per
+    TRACKED_METRICS metric, one bar per (platform, interface, version,
+    skills), averaged across categories, tasks, and repeats. Replaces the
+    placeholder created at run start. Failures never abort the session."""
+    try:
+        from banter import notebook as notebook_mod
+        nb_path = notebook_mod.build_results_notebook(parent)
+        if nb_path is not None:
+            print(f"[banter] refreshed analysis notebook: {nb_path}", flush=True)
+    except Exception as e:
+        print(f"[banter] notebook refresh skipped: {e}", flush=True)
+
+
+def _print_summary(rows: list[results.Row], failed: list[str], rollup_csv: Path) -> None:
+    w = 110
+    print("\n" + "=" * w)
+    print("RESULTS SUMMARY")
+    print("=" * w)
+    if rows:
+        print(
+            f"{'task':<35} {'platform/interface':<20} {'skills':<18} "
+            f"{'asserts':<8} {'tokens':<8} {'wall_s':<7} cost"
+        )
+        print("-" * w)
+        for r in rows:
+            print(
+                f"{r.task:<35} {r.platform}/{r.interface:<18} {r.skills:<18} "
+                f"{f'{r.asserts_passed}/{r.asserts_total}':<8} "
+                f"{r.total_tokens:<8} {r.wall_time_s:<7.1f} ${r.cost_usd:.4f}"
+            )
+    if failed:
+        print(f"\nFailed ({len(failed)}):")
+        for f in failed:
+            print(f"  {f}")
+    print(f"\nResults CSV: {rollup_csv}")
+    print("=" * w)

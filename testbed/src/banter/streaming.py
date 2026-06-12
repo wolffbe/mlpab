@@ -1,19 +1,19 @@
 """Live terminal display + saved logs of a `claude -p` stream-json transcript.
 
-Engineer (`claude_runner.run`) and researcher (`autoresearch`) both emit
-stream-json on stdout; `run_with_retry`'s `on_line` callback forwards each line
-here so activity shows live instead of the run looking frozen. Per run:
+The agent (`claude_runner.run`) emits stream-json on stdout; `run_with_retry`'s
+`on_line` callback forwards each line here so activity shows live instead of
+the run looking frozen. Per run:
   * `transcript.jsonl` — raw stream-json; transient (mined for usage + commands,
                          then discarded at teardown).
-  * `engineer.log`     — one-line-per-event human-readable view mirrored to file;
-                         the KEPT artifact the researcher reads.
+  * `agent.log`        — one-line-per-event human-readable view mirrored to file;
+                         the KEPT artifact.
 
 Terminal streaming is on by default; `BANTER_QUIET=1`/`--quiet` silences the
-terminal but still writes `engineer.log`.
+terminal but still writes `agent.log`.
 
-Nesting (autoresearch): the researcher captures each `banter run` subprocess's
-stdout; printing engineer lines there would bloat its context, so under
-`BANTER_NESTED=1` the engineer writes only `engineer.log` and the parent tails
+Nesting: an outer controller may capture each `banter run` subprocess's
+stdout; printing agent lines there would bloat its context, so under
+`BANTER_NESTED=1` the agent writes only `agent.log` and the parent tails
 those files (`FileTailer`) to show them live.
 """
 from __future__ import annotations
@@ -33,7 +33,7 @@ def quiet() -> bool:
 
 
 def nested() -> bool:
-    """True when running under autoresearch (engineer stdout is captured)."""
+    """True when running nested (agent stdout captured by an outer controller)."""
     return os.environ.get("BANTER_NESTED", "").strip().lower() not in ("", "0", "false", "no")
 
 
@@ -125,8 +125,8 @@ def emit(line: str, log_path: Path | None = None) -> None:
 def make_printer(label: str) -> Callable[[str], None]:
     """An `on_line` callback that renders each event to stdout (fd 1).
 
-    Does NOT decide visibility or write a file: during an engineer run `tee_to`
-    captures fd 1/2 into `engineer.log` and handles terminal echo (passthrough),
+    Does NOT decide visibility or write a file: during an agent run `tee_to`
+    captures fd 1/2 into `agent.log` and handles terminal echo (passthrough),
     so this just emits the formatted line.
     """
 
@@ -153,9 +153,9 @@ def tee_to(log_path: Path, passthrough: bool = True) -> Iterator[None]:
     """Mirror everything written to fd 1 and fd 2 into `log_path` for the block.
 
     FD-level (not just `sys.stdout`), so it captures ALL terminal output — Python
-    prints AND subprocess output (pip, streamed engineer lines, tracebacks).
-    `passthrough` also echoes to the real terminal; set False under autoresearch
-    nesting (researcher captures the engineer's stdout) to avoid bloating its
+    prints AND subprocess output (pip, streamed agent lines, tracebacks).
+    `passthrough` also echoes to the real terminal; set False under nesting
+    (an outer controller captures the agent's stdout) to avoid bloating its
     context. fds are always restored, even on exception.
     """
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -203,7 +203,7 @@ def tee_to(log_path: Path, passthrough: bool = True) -> Iterator[None]:
 class FileTailer(threading.Thread):
     """Background thread that prints lines appended to `root/<glob>` files.
 
-    Used by autoresearch to surface nested engineer `engineer.log` files live.
+    Used by an outer controller to surface nested `agent.log` files live.
     Daemon; call `stop()` then `join()` to drain. Truncated/recreated files (a
     combo re-run) reset to offset 0.
     """

@@ -1,30 +1,23 @@
-"""Orchestrates a single (challenge, platform, interface, skills) engineer run.
+"""Orchestrates a single (task, platform, interface, skills) agent run.
 
 Layout under the caller-supplied `runs_root`:
-    <runs_root>/<task>/<challenge>/      # one engineer run; venv torn down at end
-    <runs_root>/results.csv              # one detailed row per challenge
+    <runs_root>/<category>/<task>/      # one agent run; venv torn down at end
 
-Callers place runs via `runs_root`:
-    benchmark      results/benchmark/<run>/
-    autoresearch   results/autoresearch/<run>/v<N>/       (per-version)
-
-Each challenge run folder contains:
+Each task run folder contains:
     prompt.txt            # exact task prompt handed to claude -p
-    venv/                 # per-run engineer venv (deleted at teardown)
-    data/                 # symlink to prepared MLE-bench data
-    submission/           # where the engineer writes submission.csv
-    engineer.log          # live formatted view (tee captures fd 1/2 of the run)
+    venv/                 # per-run agent venv (deleted at teardown)
+    data/                 # staged inputs of the generated eval instance
+    submission/           # local deliverables (platform `none` baseline only)
+    agent.log          # live formatted view (tee captures fd 1/2 of the run)
     commands.jsonl        # one line per tool call (cli/mcp/sdk/python/bash/skill/...)
-    grading.json          # MLE-bench grader output
-    endpoint_coverage.json# REST coverage vs the run's whitelist/blacklist  [when configured]
+    grading.json          # assertion-suite report (evals_provider.grade)
     .claude/settings.json # PreToolUse hook for claude -p
     .claude/skills/       # copied skill bundle (deleted at teardown)   [skills != none]
     .mcp.json             # MCP servers                                  [interface == mcp]
 
-When `spec.interface_dir` is set (autoresearch's per-increment copy), the run's
-platform home points at that copy via `interfaces.set_interface_home`; the stale
-wheel is dropped and `interfaces.preflight` force-rebuilds the researcher's edits
-before use. Login (`auth_command`) is verified per run.
+The generated instance (incl. the private answer key) lives in a SIBLING
+`.<task>.private/` dir — outside the agent's sandbox boundary.
+Login (`auth_command`) is verified per run.
 """
 from __future__ import annotations
 
@@ -34,14 +27,15 @@ import re
 import shutil
 import subprocess
 import sys
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
 from banter import (
     claude_runner,
+    codex_runner,
+    evals_provider,
     interfaces,
-    mlebench_wrapper,
     preflight as preflight_mod,
     results,
     skills as skills_mod,
@@ -52,58 +46,42 @@ from banter import (
 DEFAULT_MODEL = "claude-sonnet-4-6"
 AUTH_MODES = ("api-key", "login")
 
-# Testbed repo root — mle-bench data cache lives in the repo so it travels with
-# the testbed and doesn't depend on the user's $HOME.
+# Testbed repo root.
 TESTBED_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_DATA_ROOT = TESTBED_ROOT / "cache" / "mle-bench"
-# The managed researcher venv. `banter` itself runs outside any venv; the
-# researcher operates here, and each engineer run gets its own venv nested on it
-# (sharing its libraries).
-RESEARCHER_VENV = TESTBED_ROOT / ".venv"
+# The managed base venv (testbed/.venv). `banter` itself runs outside any venv;
+# each agent run gets its own venv nested on this one (sharing its libraries).
+BASE_VENV = TESTBED_ROOT / ".venv"
 
 
 @dataclass
 class RunSpec:
-    challenge_id: str
+    task: str                       # FTI sub-task (an evals_provider family)
     platform: str                   # e.g. "hopsworks", "none"
     interface: str                  # interface: cli/mcp/sdk/none
-    skills: str = "none"            # bundle name under testbed/skills/ or "none"
-    docs: str = "none"              # docs bundle under platforms/<platform>/docs/ or "none"
-    task: str = "no_task"           # ML task / challenge-group this challenge belongs to
+    skills: str = "none"            # platform skill bundle name or "none"
+    category: str = "no_task"       # FTI category (stage) this task belongs to
     model: str = DEFAULT_MODEL
     auth: str = "api-key"
-    timeout_s: int = 60 * 60
+    timeout_s: int | None = 60 * 60   # None → NO per-run wall-clock cap
     runs_root: Path = Path("results")
-    data_root: Path = DEFAULT_DATA_ROOT
-    interface_version: int | None = None  # None/0 → base manifest; >0 → session version
-    skills_version: int | None = None     # None → latest version
-    # Session-local platform versions dir (an autoresearch session dir).
-    # Required to resolve interface_version > 0.
-    version_root: Path | None = None
-    # Per-increment platform copy (autoresearch): engineer builds + uses THIS
-    # platform home instead of the committed one. Built fresh here (copy ships
-    # source, no binary). None → committed platforms/<platform>/<interface>/.
-    interface_dir: Path | None = None
-    # Autoresearch context (None for benchmark). `run_id` → `run` column.
-    # `prev_run`/`prev_version` are continuation hints from the autoresearch
-    # config, surfaced as columns so results.csv can be queried for "all runs
-    # continuing from run X version v2".
+    # Session tag: the treatment config's name, stored as the `run` column.
     run_id: str | None = None
-    version: str | None = None       # "v<N>" or just N (int as string)
-    prev_run: str | None = None
-    prev_version: str | None = None  # "v<N>" or just N
-    # Treatment config path (experiment runs only). When set with experiment
-    # metadata, the row is appended to the global results/experiments.csv instead
-    # of a per-run results.csv.
-    experiment_config: str | None = None
+    # Repeat-attempt number: run_dir gains a trailing /<attempt> segment so
+    # repeats of one config nest side by side (…/<task>/1, /2, …). Also
+    # feeds the instance seed, so every repeat gets a FRESH eval instance.
+    attempt: int | None = None
+    # The single global results CSV the row is appended to
+    # (results/results.csv). None → derived from `runs_root` via the
+    # nearest `results/` ancestor.
+    results_csv: Path | None = None
     # Run the upfront preflight (platform install/login + skill access probe).
     # Batch runners set False after one shared preflight over the union.
     preflight: bool = True
 
 
 def _results_root_from(runs_root: Path) -> Path:
-    """Nearest `results/` ancestor of `runs_root` (…/results/autoresearch/<run>/
-    v<N>). Falls back to `runs_root` if none found."""
+    """Nearest `results/` ancestor of `runs_root` (…/results/<config>/…).
+    Falls back to `runs_root` if none found."""
     runs_root = Path(runs_root)
     for p in (runs_root, *runs_root.parents):
         if p.name == "results":
@@ -112,14 +90,14 @@ def _results_root_from(runs_root: Path) -> Path:
 
 
 def _make_venv(target: Path) -> Path:
-    """Create the engineer's per-run venv FULLY MATERIALIZED inside the challenge.
+    """Create the agent's per-run venv FULLY MATERIALIZED inside the run dir.
 
-    The researcher venv's (testbed/.venv) site-packages are copied entirely INSIDE
-    the engineer's challenge dir — no `.pth` indirection to an outside path — so
-    the engineer's sandbox is truly bounded to its challenge folder.
+    The base venv's (testbed/.venv) site-packages are copied entirely INSIDE
+    the agent's run dir — no `.pth` indirection to an outside path — so
+    the agent's sandbox is truly bounded to its run folder.
 
     On APFS (macOS default) `cp -Rc` does copy-on-write clones, so the 2-3 GB
-    shared site-packages costs near-zero disk until the engineer modifies a page
+    shared site-packages costs near-zero disk until the agent modifies a page
     (pip install of the interface). Falls back to a recursive copy where APFS
     clones aren't available (Linux, non-APFS volumes).
     """
@@ -127,20 +105,20 @@ def _make_venv(target: Path) -> Path:
     if py.exists():
         return py
 
-    researcher_py = RESEARCHER_VENV / "bin" / "python"
-    base_py = researcher_py if researcher_py.exists() else Path(sys.executable)
+    base_venv_py = BASE_VENV / "bin" / "python"
+    base_py = base_venv_py if base_venv_py.exists() else Path(sys.executable)
     subprocess.run(
         [str(base_py), "-m", "venv", "--system-site-packages", str(target)],
         check=True,
     )
-    # Materialize the researcher venv's site-packages into the engineer venv: its
-    # sandbox confines reads to the challenge dir, so any outside `.pth` reference
+    # Materialize the base venv's site-packages into the agent venv: its
+    # sandbox confines reads to the run dir, so any outside `.pth` reference
     # would resolve to a path Seatbelt denies.
-    if researcher_py.exists():
+    if base_venv_py.exists():
         eng_sp = next((target / "lib").glob("python*/site-packages"), None)
-        res_sp = next((RESEARCHER_VENV / "lib").glob("python*/site-packages"), None)
-        if eng_sp and res_sp:
-            _clone_tree(res_sp, eng_sp)
+        base_sp = next((BASE_VENV / "lib").glob("python*/site-packages"), None)
+        if eng_sp and base_sp:
+            _clone_tree(base_sp, eng_sp)
     return py
 
 
@@ -163,19 +141,59 @@ def _clone_tree(src: Path, dst: Path) -> None:
 
 def _run_aux(steps: list[str], run_dir: Path, env: dict[str, str], timeout: int = 60) -> None:
     """Best-effort platform housekeeping (serve/teardown). Failures ignored and
-    output discarded — not part of the engineer's work.
+    output discarded — not part of the agent's work.
+
+    Setup/teardown scripts run with the per-run venv python, whose site-packages
+    carry the request-logging shim — so the api-log env vars are stripped here.
+    Their REST traffic (project create/delete, …) is platform plumbing and must
+    never become api_calls.jsonl entries scored as endpoint coverage. The
+    agent's wall_time_s never sees these phases either (it is timed around the
+    claude subprocess only).
     """
+    aux_env = {k: v for k, v in env.items()
+               if k not in ("BANTER_API_LOG", "BANTER_IFACE_SDK")}
     for cmd in steps:
         try:
             subprocess.run(
-                cmd, shell=True, cwd=str(run_dir), env=env,
+                cmd, shell=True, cwd=str(run_dir), env=aux_env,
                 timeout=timeout, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             )
         except Exception:
             pass
 
 
-TASK_PROMPT_PATH = TESTBED_ROOT / "prompts" / "engineer.md"
+def _platform_env(run_dir: Path) -> dict[str, str]:
+    """Env the platform setup step exported for the AGENT, then consume the file.
+
+    Setup scripts run as throwaway subprocesses (`serve:` via `_run_aux`), so they
+    cannot literally export env vars into the agent's process. Instead they may
+    append KEY=VALUE lines to $BANTER_PLATFORM_ENV (<run_dir>/platform.env) for
+    values only the platform side can know (e.g. the SageMaker execution-role ARN
+    setup.py just created). The file is deleted after parsing so it never lingers
+    in the agent's workdir; malformed lines are skipped (best-effort, like the
+    step that wrote them). Keys declared in the manifest (resolved from .env) take
+    precedence over these — see the merge at the call site.
+    """
+    path = run_dir / "platform.env"
+    out: dict[str, str] = {}
+    try:
+        for line in path.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            if k.strip():
+                # Same dotenv dialect as cli._load_dotenv: surrounding quotes
+                # are syntax, not value — KEY="x" must mean the same thing in
+                # platform.env as it does in .env.
+                out[k.strip()] = v.strip().strip('"').strip("'")
+    except OSError:
+        return {}
+    path.unlink(missing_ok=True)
+    return out
+
+
+TASK_PROMPT_PATH = TESTBED_ROOT / "prompts" / "agent.md"
 
 
 def _total_ram_gb() -> float | None:
@@ -190,10 +208,10 @@ def _total_ram_gb() -> float | None:
 
 
 def detect_environment() -> str:
-    """Detect the engineer's hardware/OS and render it as prompt bullet lines.
+    """Detect the agent's hardware/OS and render it as prompt bullet lines.
 
-    Probed on the host — the same machine the per-run venv (and thus the engineer)
-    runs on — so the facts apply to the engineer. Avoids importing torch (not yet
+    Probed on the host — the same machine the per-run venv (and thus the agent)
+    runs on — so the facts apply to the agent. Avoids importing torch (not yet
     installed at prompt-build time): accelerator availability is inferred from
     OS/arch and `nvidia-smi` presence. The `spawn`-deadlock warning is emitted only
     where the multiprocessing default is `spawn` (macOS/Windows), as the unguarded
@@ -234,13 +252,13 @@ def detect_environment() -> str:
     return "\n".join(lines)
 
 
-# The "platform is under test" rule (engineer default), baked into engineer.md
+# The "platform is under test" rule (agent default), baked into agent.md
 # between these markers. Applies only when a platform is present; for none/none
-# (engineer builds its own model freely) the whole section is stripped.
+# (agent builds its own model freely) the whole section is stripped.
 _UNDER_TEST_RE = re.compile(
     r"<!--UNDER_TEST_START-->\n(.*?)\n<!--UNDER_TEST_END-->", re.DOTALL
 )
-# Inverse: content kept ONLY when NO interface is under test (none/none, engineer
+# Inverse: content kept ONLY when NO interface is under test (none/none, agent
 # trains its own model locally). Stripped when an interface is under test
 # (everything must run remotely on the platform).
 _LOCAL_ONLY_RE = re.compile(
@@ -249,7 +267,7 @@ _LOCAL_ONLY_RE = re.compile(
 
 
 def _build_prompt(
-    challenge_id: str,
+    task_body: str,
     fragment: str,
     interface_under_test: bool = True,
 ) -> str:
@@ -261,10 +279,10 @@ def _build_prompt(
         template = _UNDER_TEST_RE.sub("", template)
         template = _LOCAL_ONLY_RE.sub(lambda m: m.group(1), template)
     template = re.sub(r"\n{3,}", "\n\n", template)
-    # The engineer never receives platform docs (any mode), so the prompt
-    # advertises none — its only guide is the interface's own self-description.
+    # The agent never receives platform docs — its only guide is the
+    # interface's own self-description.
     return template.format(
-        challenge_id=challenge_id,
+        task_body=task_body.strip(),
         fragment=fragment,
         environment=detect_environment(),
     ).strip()
@@ -276,215 +294,163 @@ def run(spec: RunSpec) -> results.Row:
 
     started = datetime.now(timezone.utc)
 
-    # Per-version platform copy (autoresearch): point this platform's home at the
-    # copy so config/build/$INTERFACE_DIR/install all resolve there. Any wheel in
-    # the copy may be stale (researcher may have edited source between
-    # `prepare-version` and this run); drop it and let preflight rebuild + test.
-    if spec.interface_dir is not None:
-        idir = Path(spec.interface_dir)
-        interfaces.set_interface_home(spec.platform, spec.interface, idir)
-        # ENFORCE: an improvement version (vN, N>0) must actually change the
-        # interface SOURCE vs the previous version. Prompt is frozen and
-        # config.yaml excluded, so a prompt-only / no-op edit is refused here —
-        # before the engineer runs — rather than silently re-measuring v(N-1).
-        # Baselines / non-autoresearch runs are unaffected. Fingerprint computed
-        # ONCE and reused for both the change-check and the rebuild cache (hashing
-        # the tree — a full upstream checkout for Hopsworks — isn't free).
-        fp = interfaces.source_fingerprint(idir)
-        try:
-            interfaces.assert_source_changed(idir, spec.version, fp=fp)
-        except ValueError as e:
-            raise preflight_mod.PreflightError(str(e))
-        # Rebuild only when source changed since the last build in this copy
-        # (cache keyed on the fingerprint). Repeated challenges within a version —
-        # or an unchanged interface — reuse the existing wheel instead of paying a
-        # full wheel build every run.
-        marker = idir / ".banter-src-hash"
-        wheels = list(idir.glob("*.whl"))
-        if not (wheels and marker.exists() and marker.read_text().strip() == fp):
-            for w in wheels:
-                try:
-                    w.unlink()
-                except OSError:
-                    pass
-            st = interfaces.preflight(
-                spec.platform, spec.interface, check_login=False, timeout_s=spec.timeout_s
-            )
-            if not st.ok:
-                raise preflight_mod.PreflightError(st.message)
-            marker.write_text(fp)
-
-        # Laundering audit: flag engineer-facing interface tools the researcher
-        # added/changed that run python LOCALLY (remote-only contract: tools must
-        # delegate to the cluster). Diff vN against v0 so unchanged upstream
-        # subprocess use isn't flagged. Surfaced as a warning + a per-version
-        # `interface_audit.json` artifact — visibility, not a hard block; the
-        # researcher/owner judges. Skipped for v0 (it IS the baseline).
-        _vtail = str(spec.version or "").rsplit("_", 1)[-1].lstrip("v")
-        ver = int(_vtail) if _vtail.isdigit() else 0
-        if ver > 0:
-            try:
-                # Repo-backed interfaces put source under `interface/src`;
-                # local / in-place ones have it directly under `interface/`.
-                cur_src = (idir / "src") if (idir / "src").exists() else idir
-                v0_iface = idir.parent.parent / "v0" / "interface"
-                base_src = (v0_iface / "src") if (v0_iface / "src").exists() else v0_iface
-                flagged = results.audit_interface_local_exec(
-                    cur_src, base_src if base_src.exists() else None
-                )
-                if flagged:
-                    (idir / "interface_audit.json").write_text(json.dumps(flagged, indent=2))
-                    print("[banter] WARNING: interface tool(s) execute LOCAL python "
-                          "— possible laundering of local compute as interface usage:",
-                          file=sys.stderr)
-                    for f in flagged:
-                        print(f"  - {f['file']}: {', '.join(f['patterns'])}", file=sys.stderr)
-            except Exception:
-                pass  # audit is best-effort; never block a run on it
-
     # Fail fast: platform must be installed, login must work, and any chosen skill
-    # bundle must be accessible to the engineer. Batch runners
-    # (benchmark/autoresearch) preflight the union once and pass preflight=False
+    # bundle must be accessible to the agent. Batch runners
+    # (treatments) preflight the union once and pass preflight=False
     # here to avoid re-probing per run.
     if spec.preflight:
         preflight_mod.check_run(
             platform=spec.platform,
             interface=spec.interface,
-            interface_version=spec.interface_version,
-            version_root=spec.version_root,
             skills=spec.skills,
-            skills_version=spec.skills_version,
             auth=spec.auth,
             model=spec.model,
         )
 
-    # Fail fast: validate the platform version is known before doing work (raises
-    # on unknown). The resolved version/hash for the row come from
+    # Fail fast: validate the platform/interface is known before doing work
+    # (raises on unknown). The resolved ref/hash for the row come from
     # `interfaces.setup` below, not here.
-    interfaces.variant_for(
-        spec.platform, spec.interface, spec.interface_version, spec.version_root
-    )
+    interfaces.variant_for(spec.platform, spec.interface)
     # Fail fast on unverified skill bundles — confirm the bundle is well-formed
     # before spending time on venv/data/prep.
-    if spec.skills == "none":
-        skills_version, skills_hash = 0, ""
-    else:
-        skills_version, skills_hash, _ = skills_mod.verify_installed(
-            spec.platform, spec.skills, spec.skills_version, spec.version_root
-        )
-    # Per-challenge output lives directly under runs_root:
-    #   benchmark      results/benchmark/<run>/<task>/<challenge>/
-    #   autoresearch   results/autoresearch/<run>/<increment>/<task>/<challenge>/
+    if spec.skills != "none":
+        skills_mod.verify_installed(spec.platform, spec.skills)
+    # Per-task output lives directly under runs_root:
+    #   results/<config>/<model>/…/<category>/<task>/<n>/
+    # The attempt folder holds exactly TWO dirs:
+    #   task/      the agent's ENTIRE world — cwd + sandbox boundary: data,
+    #              prompt, venv, submission, logs, .claude (everything below
+    #              uses `run_dir` = this folder)
+    #   solution/  the answer key + grading.json — a SIBLING outside the
+    #              boundary, so the agent cannot see it
     # Platform/interface/skills/version are results.csv columns, not encoded in
     # the path (one platform per run, per the per-interface configs).
-    run_dir = spec.runs_root / spec.task / spec.challenge_id
+    attempt_dir = spec.runs_root / spec.category / spec.task
+    if spec.attempt is not None:
+        attempt_dir = attempt_dir / str(spec.attempt)
     # Re-runs overwrite the previous output.
-    if run_dir.exists():
-        shutil.rmtree(run_dir)
+    if attempt_dir.exists():
+        shutil.rmtree(attempt_dir)
+    run_dir = attempt_dir / "task"
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    # Capture the ENTIRE terminal output of this run — venv build, mle-bench data
-    # prep, pip installs, engineer's streamed activity, grading — into engineer.log
-    # (FD-level tee). Echo to the real terminal unless quiet or nested
-    # (autoresearch, where the researcher captures this subprocess's stdout and the
-    # FileTailer surfaces engineer.log live instead).
+    # Capture the ENTIRE terminal output of this run — venv build, instance
+    # generation, pip installs, agent's streamed activity, grading — into
+    # agent.log (FD-level tee). Echo to the real terminal unless quiet or
+    # nested.
     passthrough = not streaming.nested() and not streaming.quiet()
-    with streaming.tee_to(run_dir / "engineer.log", passthrough=passthrough):
+    with streaming.tee_to(run_dir / "agent.log", passthrough=passthrough):
         # The per-run venv clones the base .venv. Ensure the base holds no copy of
         # the interface package before cloning, so this run installs the interface
         # wheel fresh + complete (console scripts, extras).
-        interfaces.ensure_base_clean(
-            spec.platform, spec.interface, spec.interface_version, spec.version_root,
-        )
+        interfaces.ensure_base_clean(spec.platform, spec.interface)
         venv_python = _make_venv(run_dir / "venv")
         (run_dir / "submission").mkdir(exist_ok=True)
 
-        # mle-bench data prep must succeed before spinning up Claude — without
-        # data/ the engineer has nothing to score against. Don't swallow.
-        mlebench_wrapper.prepare(spec.challenge_id, run_dir, spec.data_root)
+        # Generate a FRESH eval instance (validity gates run inside the
+        # generator) and stage its data/ — must succeed before spinning up
+        # Claude. The seed is deterministic per (session, category, task,
+        # attempt): reproducible rows, fresh instance every repeat.
+        seed = evals_provider.seed_for(
+            spec.run_id or "", spec.category, spec.task, spec.attempt or 1)
+        task_body = evals_provider.prepare(spec.task, run_dir, seed)
 
         interface_setup = interfaces.setup(
             spec.platform, spec.interface, run_dir, venv_python,
-            spec.interface_version, spec.version_root,
         )
-        skills_setup = skills_mod.apply(
-            spec.platform, spec.skills, run_dir, spec.skills_version, spec.version_root
-        )
+        skills_setup = skills_mod.apply(spec.platform, spec.skills, run_dir)
         if skills_setup.installed:
             print(
-                f"[banter] skills v{skills_setup.version} ({skills_setup.hash}): "
+                f"[banter] skills ({skills_setup.hash}): "
                 f"{','.join(skills_setup.installed)}",
                 file=sys.stderr,
             )
-        # Docs: the ENGINEER never receives platform docs, in ANY mode. Its sole
-        # guide is the interface's own self-description (names, `--help`,
-        # docstrings, errors) — the interface's quality is what we measure, and
-        # engineer-side docs would confound that. In autoresearch the session
-        # bootstrap clones the bundle into `<run>/docs/` FOR THE RESEARCHER only;
-        # nothing materializes docs into the engineer's challenge dir.
+        # The agent never receives platform docs. Its sole guide is the
+        # interface's own self-description (names, `--help`, docstrings,
+        # errors) — the interface's quality is what we measure, and agent-side
+        # docs would confound that.
 
         # Start fresh: stop servers a previous (possibly crashed) run left running
         # and clear leaked state (incl. platform-side artifacts the agent created —
         # see the interface `teardown:` step), then start the servers THIS run
         # needs (e.g. the MCP HTTP server claude connects to at launch).
         # `BANTER_PLATFORM_DIR` points teardown/serve steps at the COMMITTED
-        # platforms/<platform>/ dir (e.g. a teardown.py cleanup script), NOT the
-        # per-version interface copy — so cleanup logic is fixed infrastructure,
-        # immune to interface edits.
+        # configs/platforms/<platform>/ dir (e.g. a teardown.py cleanup script)
+        # — cleanup logic is fixed infrastructure, immune to run-dir state.
         base_keys_env = {
             **os.environ,
             **interface_setup.keys,
-            "BANTER_PLATFORM_DIR": str(interfaces.PLATFORMS_DIR / spec.platform),
+            "BANTER_PLATFORM_DIR": str(interfaces.CONFIGS_DIR / spec.platform),
         }
         _run_aux(interface_setup.teardown, run_dir, base_keys_env)
         if interface_setup.serve:
             serve_env = dict(base_keys_env)
             serve_env["PATH"] = f"{run_dir / 'venv' / 'bin'}{os.pathsep}{serve_env.get('PATH', '')}"
             serve_env["VIRTUAL_ENV"] = str(run_dir / "venv")
-            _run_aux(interface_setup.serve, run_dir, serve_env)
+            serve_env["BANTER_PLATFORM_ENV"] = str(run_dir / "platform.env")
+            # Generous timeout: hopsworks setup.py retries project creation for
+            # up to ~3 min while the backend finishes deleting the previous
+            # run's namespace (teardown is async server-side).
+            _run_aux(interface_setup.serve, run_dir, serve_env, timeout=300)
+        # Env the setup step exported for the agent (e.g. a role ARN it just
+        # created) — declared keys (.env) win on conflict, so an explicit .env
+        # value always overrides what setup derived.
+        agent_keys = {**_platform_env(run_dir), **interface_setup.keys}
 
-        # Log in + verify auth for THIS challenge in its own venv. Build/test ran
-        # once at session preflight; login is re-checked every run (catches expired
-        # creds mid-session; each run authenticates in its own venv).
+        # Log in + verify auth for THIS run in its own venv. Build/test ran
+        # once at treatment preflight; login is re-checked every run (catches
+        # expired creds mid-session; each run authenticates in its own venv).
         login = interfaces.login_status(
-            spec.platform, spec.interface, venv_python=venv_python, keys=interface_setup.keys,
+            spec.platform, spec.interface, venv_python=venv_python, keys=agent_keys,
         )
         if not login.ok:
             raise preflight_mod.PreflightError(login.message)
 
-        prompt = _build_prompt(spec.challenge_id, interface_setup.prompt_fragment,
+        prompt = _build_prompt(task_body, interface_setup.prompt_fragment,
                                interface_under_test=interface_setup.interface != "none")
         (run_dir / "prompt.txt").write_text(prompt)
 
-        # Autoresearch (`spec.version` set): confine the engineer's sandbox to the
-        # whole version dir (`<run>/v<N>`) — runs_root IS the version dir.
-        # Benchmark: None, so the engineer is confined to its own challenge dir.
-        version_dir = spec.runs_root if spec.version else None
-        cr = claude_runner.run(
+        # The agent is confined to its own run dir (the generated
+        # instance's private answer key lives in a sibling dir it cannot read).
+        # Engine dispatch: OpenAI models (`gpt-*` / `*codex*`) run on the Codex
+        # CLI, everything else on Claude Code. Same signature + result shape;
+        # codex runs skip the PreToolUse enforcement hook (no codex equivalent)
+        # but keep full post-hoc accounting via the normalized transcript.
+        engine = codex_runner if codex_runner.is_codex_model(spec.model) else claude_runner
+        cr = engine.run(
             prompt=prompt,
             run_dir=run_dir,
             auth=spec.auth,
             model=spec.model,
             cli_binary=interface_setup.cli_binary,
+            cli_subcommand=interface_setup.cli_subcommand,
             sdk_module=interface_setup.sdk_module,
             mcp_servers=interface_setup.mcp_servers,
             command_log=run_dir / "commands.jsonl",
             timeout_s=spec.timeout_s,
-            extra_env=interface_setup.keys,
-            version_dir=version_dir,
+            extra_env=agent_keys,
             allowed_domains=interface_setup.allowed_domains,
             interface=interface_setup.interface,
+            instance_allowlist=interface_setup.instance_allowlist,
+            sandbox_excluded_commands=interface_setup.sandbox_excluded_commands,
+            platform=spec.platform,
         )
 
         if cr.exit_code != 0:
             print(f"[banter] claude exit={cr.exit_code}", file=sys.stderr)
 
-        submission = run_dir / "submission" / "submission.csv"
+        # Grade by replaying the instance's assertion suite against the
+        # platform's read paths (or the local deliverable for platform `none`).
+        # Runs BEFORE venv teardown: the grader uses the run venv's python,
+        # whose platform client was installed from the committed pinned wheel.
         try:
-            grading = mlebench_wrapper.grade(spec.challenge_id, submission, spec.data_root)
+            grading = evals_provider.grade(
+                spec.task, run_dir, spec.platform, venv_python)
         except Exception as e:
-            grading = {"medal": None, "score": None, "error": str(e)}
-        (run_dir / "grading.json").write_text(json.dumps(grading, indent=2))
+            grading = {"success": False, "asserts_passed": 0, "asserts_total": 0,
+                       "asserts": [], "error": str(e)}
+        # grading.json lives grader-side, next to the answer key.
+        (attempt_dir / "solution" / "grading.json").write_text(json.dumps(grading, indent=2))
 
         usage = results.parse_transcript_usage(cr.transcript_path)
         # Counting classifies by the ACTIVE interface only: a `hops`/`import
@@ -493,12 +459,17 @@ def run(spec: RunSpec) -> results.Row:
         # feed the cross-interface enforcement HOOK, but counting must not relabel
         # an off-interface call as on-interface.)
         count_cli = interface_setup.cli_binary if interface_setup.interface == "cli" else None
+        count_cli_sub = interface_setup.cli_subcommand if interface_setup.interface == "cli" else None
         count_sdk = interface_setup.sdk_module if interface_setup.interface == "sdk" else None
         counts = results.aggregate_commands(
             cr.transcript_path,
             cli_binary=count_cli,
             sdk_module=count_sdk,
             run_dir=run_dir,
+            cli_subcommand=count_cli_sub,
+            # The hook's own log (pre-rebuild): its `denied: true` records are
+            # the structured source for denied_calls.
+            commands_log=run_dir / "commands.jsonl",
         )
         # Rebuild commands.jsonl from the transcript so it's always populated even
         # if the PreToolUse hook silently fails.
@@ -508,18 +479,18 @@ def run(spec: RunSpec) -> results.Row:
             cli_binary=count_cli,
             sdk_module=count_sdk,
             run_dir=run_dir,
+            cli_subcommand=count_cli_sub,
         )
         # Surface the interface CLIENT's runtime logs + crashes into a per-run
         # <platform>_client.logs (cli/mcp/sdk). For mcp this rescues the stdio
         # server's stderr/connection status — a startup crash there otherwise only
-        # reaches the engineer as "No such tool available", reading like an empty
-        # interface. The engineer's HOME (where Claude buries the MCP logs) is the
-        # version dir in autoresearch, else the challenge dir.
+        # reaches the agent as "No such tool available", reading like an empty
+        # interface. The agent's HOME (where Claude buries the MCP logs) is the
+        # run dir.
         if interface_setup.interface in ("cli", "mcp", "sdk"):
-            boundary = (version_dir or run_dir)
             client_log = results.collect_client_logs(
                 run_dir=run_dir,
-                boundary=boundary,
+                boundary=run_dir,
                 interface=interface_setup.interface,
                 platform=spec.platform,
                 mcp_servers=interface_setup.mcp_servers,
@@ -532,18 +503,9 @@ def run(spec: RunSpec) -> results.Row:
                     f"(markers: {', '.join(client_log['markers'])})",
                     file=sys.stderr,
                 )
-        # Load the experiment config ONCE (reused below for the row append). Its
-        # endpoints policy drives REST-endpoint coverage scoring of the per-run API
-        # log (written by the venv shim).
-        exp_cfg = None
-        if spec.experiment_config:
-            try:
-                from banter import autoresearch as ar_mod
-                exp_cfg = ar_mod.load_config(Path(spec.experiment_config))
-            except Exception:
-                exp_cfg = None
-        _endpoints = exp_cfg.endpoints if exp_cfg is not None else {"whitelist": [], "blacklist": []}
-        _wl, _bl = _endpoints.get("whitelist"), _endpoints.get("blacklist")
+        # REST-endpoint coverage: no per-config endpoint policy anymore — the
+        # whitelist/blacklist mechanism stays available but unconfigured.
+        _wl, _bl = None, None
         # Attribute whitelist coverage to the interface under test: only calls made
         # THROUGH cli/mcp/sdk count — not hand-rolled `requests`, not server-side
         # Job calls (which never reach the venv shim). A none/none baseline has no
@@ -554,152 +516,131 @@ def run(spec: RunSpec) -> results.Row:
             "whitelist_hits": endpoint_cov["whitelist_hits"],
             "blacklist_hits": endpoint_cov["blacklist_hits"],
         }
-        # Per-run coverage breakdown the researcher reads (covered/missed target
-        # endpoints) to see WHICH lifecycle steps the engineer reached — a missed
+        # Per-run coverage breakdown (covered/missed target endpoints) showing
+        # WHICH lifecycle steps the agent reached — a missed
         # endpoint is a capability the interface must expose. Embeds the
         # `whitelist`/`blacklist` patterns it was scored against, so it stays
         # self-contained once the raw api_calls.jsonl is discarded below. Only when
         # configured.
         if _wl or _bl:
             (run_dir / "endpoint_coverage.json").write_text(json.dumps(endpoint_cov, indent=2))
-        # mle-bench grading report → Row fields. Booleans stored 0/1 so they
-        # average into rates at rollup; thresholds kept as-is (may be None).
-        _b = lambda x: int(bool(x))  # noqa: E731
-        grading_fields = dict(
-            medal=grading.get("medal"),
-            # Normalized to higher-is-better so `score: maximize` is correct even
-            # across challenges with opposite native directions (raw score kept in
-            # grading.json). See mlebench_wrapper.normalize_score.
-            score=mlebench_wrapper.normalize_score(
-                grading.get("score"), grading.get("is_lower_better")),
-            valid_submission=_b(grading.get("valid_submission")),
-            above_median=_b(grading.get("above_median")),
-            any_medal=_b(grading.get("any_medal")),
-            gold_medal=_b(grading.get("gold_medal")),
-            silver_medal=_b(grading.get("silver_medal")),
-            bronze_medal=_b(grading.get("bronze_medal")),
-            gold_threshold=grading.get("gold_threshold"),
-            silver_threshold=grading.get("silver_threshold"),
-            bronze_threshold=grading.get("bronze_threshold"),
-            median_threshold=grading.get("median_threshold"),
-            is_lower_better=_b(grading.get("is_lower_better")),
+        # Assertion-suite report → Row fields: the passed/total tallies
+        # (all green = task solved). `deliverable_exists` = the deliverable
+        # exists on the platform (first assert passed), separating "wrong" from
+        # "absent". The full report (asserts, diagnostic) lives in grading.json.
+        _asserts = grading.get("asserts") or []
+        deliverable_exists = bool(_asserts) and bool(_asserts[0].get("passed"))
+        slim_grading = {
+            "asserts_passed": grading.get("asserts_passed", 0),
+            "asserts_total": grading.get("asserts_total", 0),
+        }
+        if grading.get("asserts_total"):
+            print(f"[banter] graded: {grading.get('asserts_passed', 0)}/"
+                  f"{grading['asserts_total']} asserts"
+                  + (f" — {grading['diagnostic']}" if grading.get("diagnostic") else ""),
+                  flush=True)
+        # Map the agent's `claude -p` usage into the Row's metric columns.
+        # Wall metrics count COMPUTE time only: rate-limit back-off sleeps are
+        # excluded (waiting != computing) and recorded separately in
+        # `rate_limit_wait_s`.
+        rl_wait = round(cr.rate_limit_wait_s, 2)
+        wall = round(cr.wall_time_s - cr.rate_limit_wait_s, 2)
+        if rl_wait:
+            print(f"[banter] rate-limit waits excluded from wall time: "
+                  f"{rl_wait:.0f}s", flush=True)
+        # Exact execution split of wall: platform = seconds inside interface
+        # (cli/mcp/sdk) tool calls — remote execution against the platform;
+        # local = the rest (local tools + LLM generation). Clamped so the
+        # wall = platform + local identity survives rounding.
+        platform_time = min(
+            results.platform_tool_time(
+                cr.tool_spans,
+                cli_binary=count_cli,
+                sdk_module=count_sdk,
+                run_dir=run_dir,
+                cli_subcommand=count_cli_sub,
+            ),
+            wall,
         )
-        # `version` is stored as `v<N>` (e.g. "v2"). Accept "v2" or bare "2" on
-        # input — normalise to the prefixed form.
-        def _to_v(v: str | None) -> str:
-            if not v:
-                return ""
-            tail = str(v).rsplit("_", 1)[-1]
-            if tail.startswith("v") and tail[1:].isdigit():
-                return tail
-            if tail.isdigit():
-                return f"v{tail}"
-            return ""
-        slim_grading = {k: grading_fields.get(k) for k in ("valid_submission", "score", "medal")}
-        # Map engineer's `claude -p` usage into eng_* columns. Researcher values
-        # stay 0 here; autoresearch end-of-session backfills them and computes the
-        # `total_*` aggregates.
-        eng_wall = round(cr.wall_time_s, 2)
-        eng_usage = {
-            "eng_input_tokens": usage.get("input_tokens", 0),
-            "eng_output_tokens": usage.get("output_tokens", 0),
-            "eng_total_tokens": usage.get("total_tokens", 0),
-            "eng_cost_usd": usage.get("cost_usd", 0.0),
+        local_time = round(wall - platform_time, 2)
+        usage_cols = {
+            "input_tokens": usage.get("input_tokens", 0),
+            "output_tokens": usage.get("output_tokens", 0),
+            "total_tokens": usage.get("total_tokens", 0),
+            "cost_usd": usage.get("cost_usd", 0.0),
         }
         row = results.Row(
             started_at=started.isoformat(),
             run=spec.run_id or "",
-            version=_to_v(spec.version),
+            version="",   # raw Row field; the CSV `version` column carries interface_ref
             platform=spec.platform,
             interface=spec.interface,
             skills=spec.skills,
-            prev_run=spec.prev_run or "",
-            prev_version=_to_v(spec.prev_version),
+            category=spec.category,
             task=spec.task,
-            challenge=spec.challenge_id,
-            eng_wall_time_s=eng_wall,
-            **eng_usage,
-            total_wall_time_s=eng_wall,
-            total_tokens=eng_usage["eng_total_tokens"],
-            total_cost=eng_usage["eng_cost_usd"],
+            interface_ref=interface_setup.ref,
+            model=spec.model,
+            wall_time_s=wall,
+            rate_limit_wait_s=rl_wait,
+            platform_time_s=platform_time,
+            local_time_s=local_time,
+            **usage_cols,
             llm_calls=usage.get("llm_calls", 0),
-            run_dir=str(run_dir),
+            run_dir=str(attempt_dir),
             **counts,
             **endpoint_counts,
             **slim_grading,
         )
 
-        # A DEAD run produced NO valid submission (engineer crashed / timed out
-        # before writing any submission.csv). Record as a comparable score-0 row
-        # with ALL numeric metrics zeroed and an `error` reason set, so the
-        # researcher sees the failure (and why) without misleading partial counts
-        # (the old SDK-v1 row had sdk_calls=11 / llm_calls=1 from a crash). NOTE: a
-        # graceful "give up" still ships a floor submission (copy of
-        # sample_submission), grading low but non-zero and NOT zeroed — that low
-        # score is itself the signal.
-        if not row.valid_submission:
+        # Annotate failures. A missing deliverable keeps its metrics — a clean
+        # give-up with a capability report is meaningful data (tokens,
+        # friction, denied calls). Metrics are zeroed ONLY when the agent
+        # process itself died (crash/timeout), where partial counts would
+        # mislead.
+        if not deliverable_exists:
             row.error = str(grading.get("error")
-                            or "no valid submission produced (engineer crashed, "
-                               "timed out, or wrote no submission.csv)")[:1000]
-            # Dead-run floor. Higher-better competitions floor to 0.0 (their
-            # natural worst — it drags the version's score mean down). For a
-            # lower-better competition the score is sign-flipped to higher=better,
-            # where 0.0 would read as the BEST possible result and silently invert
-            # the ranking — so drop to None instead (excluded from the score mean;
-            # the crash is still penalized via valid_submission=0 and the zeroed
-            # whitelist_hits/llm_calls/… below), never rewarded.
-            row.score = None if grading.get("is_lower_better") else 0.0
-            for _f in ("eng_wall_time_s", "eng_input_tokens", "eng_output_tokens",
-                       "eng_total_tokens", "eng_cost_usd", "total_wall_time_s",
-                       "total_tokens", "total_cost", "llm_calls", "cli_calls",
-                       "mcp_calls", "sdk_calls", "python_calls", "bash_calls",
-                       "skill_calls", "other_tool_calls",
-                       "whitelist_hits", "blacklist_hits"):
-                setattr(row, _f, 0)
-            print(
-                f"[banter] DEAD run (no valid submission) for {run_dir} — recording "
-                f"a zeroed score-0 row with error; artifacts kept on disk.",
-                file=sys.stderr,
-            )
+                            or grading.get("diagnostic")
+                            or "deliverable not found on the platform")[:1000]
+            if cr.exit_code != 0:
+                for _f in ("wall_time_s", "rate_limit_wait_s",
+                           "platform_time_s", "local_time_s",
+                           "input_tokens", "output_tokens",
+                           "total_tokens", "cost_usd", "llm_calls", "cli_calls",
+                           "mcp_calls", "sdk_calls", "python_calls", "bash_calls",
+                           "skill_calls", "read_calls", "write_calls", "edit_calls",
+                           "glob_calls", "grep_calls", "todo_calls",
+                           "failed_commands", "denied_calls",
+                           "whitelist_hits", "blacklist_hits"):
+                    setattr(row, _f, 0)
+                print(
+                    f"[banter] DEAD run (agent exited {cr.exit_code}, no "
+                    f"deliverable) for {run_dir} — recording a zeroed "
+                    f"row with error; artifacts kept on disk.",
+                    file=sys.stderr,
+                )
 
-        # Autoresearch writes ONE exploded row straight into the global
-        # results/autoresearch/experiments.csv (no per-run results.csv); benchmark
-        # keeps its per-session results.csv. `exp_cfg` loaded once above (for
-        # endpoint scoring) is reused here.
-        if exp_cfg is not None:
-            from banter import experiments as experiments_mod
-            results_root = _results_root_from(spec.runs_root)
-            experiments_mod.append_run(results_root, exp_cfg, asdict(row))
-        else:
-            # One results.csv per session, in that session's run dir. For
-            # autoresearch `runs_root` is `<run>/v<N>`, so the CSV lives one level
-            # up at `<run>/results.csv`; benchmark keeps it at runs_root.
-            master_csv_dir = spec.runs_root.parent if spec.version else spec.runs_root
-            results.append(
-                master_csv_dir / "results.csv",
-                row,
-                # Benchmark uses the slimmer column set; autoresearch the full FIELDS.
-                fields=None if spec.version else results.BENCHMARK_FIELDS,
-            )
-
-        # Notebook regeneration happens once at end-of-autoresearch (which has the
-        # goals in-process); the runner just appends rows to the CSV.
+        # ONE global CSV for all configs, appended right here
+        # after every run so the table is always fresh. `append` numbers the
+        # row's repeat counter `n` against the rows already in the global table.
+        global_csv = spec.results_csv or (
+            _results_root_from(spec.runs_root) / "results.csv")
+        results.append(global_csv, row, fields=results.RESULTS_FIELDS)
 
         # Teardown: run done — stop the platform's background servers, then remove
-        # its standalone venv (platform package + everything the engineer
+        # its standalone venv (platform package + everything the agent
         # pip-installed) and the copied skill bundle, so nothing persists into
-        # other runs. Results/artifacts (engineer.log, submission, grading,
+        # other runs. Results/artifacts (agent.log, submission, grading,
         # commands.jsonl, endpoint_coverage.json) stay.
         _run_aux(interface_setup.teardown, run_dir, {
             **os.environ,
             **interface_setup.keys,
-            "BANTER_PLATFORM_DIR": str(interfaces.PLATFORMS_DIR / spec.platform),
+            "BANTER_PLATFORM_DIR": str(interfaces.CONFIGS_DIR / spec.platform),
         })
         shutil.rmtree(run_dir / "venv", ignore_errors=True)
         shutil.rmtree(run_dir / ".claude" / "skills", ignore_errors=True)
-        # Transient processing inputs, not kept per version: the raw stream-json
+        # Transient processing inputs, not kept per run: the raw stream-json
         # transcript (already mined for usage + commands above) and the API log
-        # (already folded into endpoint_coverage.json). Drop both so each version
+        # (already folded into endpoint_coverage.json). Drop both so each run
         # dir keeps only distilled artifacts.
         (run_dir / "transcript.jsonl").unlink(missing_ok=True)
         (run_dir / "api_calls.jsonl").unlink(missing_ok=True)

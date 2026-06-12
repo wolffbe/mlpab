@@ -41,9 +41,9 @@ class QuietTests(unittest.TestCase):
     def test_make_printer_always_callable(self):
         # Never None — stream.log must be written even when quiet/nested.
         os.environ["BANTER_QUIET"] = "1"
-        self.assertTrue(callable(streaming.make_printer("engineer")))
+        self.assertTrue(callable(streaming.make_printer("agent")))
         os.environ.pop("BANTER_QUIET", None)
-        self.assertTrue(callable(streaming.make_printer("engineer")))
+        self.assertTrue(callable(streaming.make_printer("agent")))
 
 
 class NestedTests(unittest.TestCase):
@@ -92,27 +92,27 @@ class FileTailerTests(unittest.TestCase):
         run = root / "inc0_combo" / "task" / "chal"
         run.mkdir(parents=True)
         log = run / "stream.log"
-        log.write_text("[engineer] a\n[engineer:bash] ls\n")
+        log.write_text("[agent] a\n[agent:bash] ls\n")
         tailer = streaming.FileTailer(root, "**/stream.log")
 
         buf = io.StringIO()
         with redirect_stdout(buf):
             tailer.poll_once()
-        self.assertEqual(buf.getvalue(), "[engineer] a\n[engineer:bash] ls\n")
+        self.assertEqual(buf.getvalue(), "[agent] a\n[agent:bash] ls\n")
 
         # Append; only the new line is printed on the next poll.
         with log.open("a") as f:
-            f.write("[engineer] b\n")
+            f.write("[agent] b\n")
         buf = io.StringIO()
         with redirect_stdout(buf):
             tailer.poll_once()
-        self.assertEqual(buf.getvalue(), "[engineer] b\n")
+        self.assertEqual(buf.getvalue(), "[agent] b\n")
 
     def test_excludes_paths(self):
         root = Path(tempfile.mkdtemp())
-        researcher_log = root / "stream.log"
-        researcher_log.write_text("[researcher] x\n")
-        tailer = streaming.FileTailer(root, "**/stream.log", exclude=(researcher_log,))
+        controller_log = root / "stream.log"
+        controller_log.write_text("[controller] x\n")
+        tailer = streaming.FileTailer(root, "**/stream.log", exclude=(controller_log,))
         buf = io.StringIO()
         with redirect_stdout(buf):
             tailer.poll_once()
@@ -121,24 +121,24 @@ class FileTailerTests(unittest.TestCase):
     def test_truncated_file_re_read(self):
         root = Path(tempfile.mkdtemp())
         log = root / "stream.log"
-        log.write_text("[engineer] a longer original line\n")
+        log.write_text("[agent] a longer original line\n")
         tailer = streaming.FileTailer(root, "**/stream.log")
         with redirect_stdout(io.StringIO()):
             tailer.poll_once()
         # Recreate smaller (combo re-run) → re-read from the start.
-        log.write_text("[engineer] new\n")
+        log.write_text("[agent] new\n")
         buf = io.StringIO()
         with redirect_stdout(buf):
             tailer.poll_once()
-        self.assertEqual(buf.getvalue(), "[engineer] new\n")
+        self.assertEqual(buf.getvalue(), "[agent] new\n")
 
 
 class AssistantLinesTests(unittest.TestCase):
     def test_text_block_one_line_per_source_line(self):
         ev = _assistant({"type": "text", "text": "hello\n\nworld"})
         self.assertEqual(
-            streaming.assistant_lines(ev, "engineer"),
-            ["[engineer] hello", "[engineer] world"],
+            streaming.assistant_lines(ev, "agent"),
+            ["[agent] hello", "[agent] world"],
         )
 
     def test_bash_shows_full_command_one_line_per_source_line(self):
@@ -148,15 +148,15 @@ class AssistantLinesTests(unittest.TestCase):
         cmd = "echo first\nsecond\nthird"
         ev = _assistant({"type": "tool_use", "name": "Bash", "input": {"command": cmd}})
         self.assertEqual(
-            streaming.assistant_lines(ev, "engineer"),
-            ["[engineer:bash] echo first", "[engineer:bash] second", "[engineer:bash] third"],
+            streaming.assistant_lines(ev, "agent"),
+            ["[agent:bash] echo first", "[agent:bash] second", "[agent:bash] third"],
         )
 
     def test_bash_does_not_truncate_long_lines(self):
         long = "x" * 500
         ev = _assistant({"type": "tool_use", "name": "Bash", "input": {"command": long}})
-        (line,) = streaming.assistant_lines(ev, "engineer")
-        self.assertEqual(line, f"[engineer:bash] {long}")
+        (line,) = streaming.assistant_lines(ev, "agent")
+        self.assertEqual(line, f"[agent:bash] {long}")
 
     def test_file_tools_show_path(self):
         for name in ("Read", "Write", "Edit"):
@@ -229,7 +229,7 @@ class PrinterTests(unittest.TestCase):
         os.environ.pop("BANTER_QUIET", None)
 
     def _capture(self, raw_line):
-        printer = streaming.make_printer("engineer")
+        printer = streaming.make_printer("agent")
         buf = io.StringIO()
         with redirect_stdout(buf):
             printer(raw_line)
@@ -237,12 +237,12 @@ class PrinterTests(unittest.TestCase):
 
     def test_prints_assistant_tool_use(self):
         line = json.dumps(_assistant({"type": "tool_use", "name": "Bash", "input": {"command": "ls"}}))
-        self.assertEqual(self._capture(line), "[engineer:bash] ls\n")
+        self.assertEqual(self._capture(line), "[agent:bash] ls\n")
 
     def test_result_line(self):
         line = json.dumps({"type": "result", "num_turns": 7, "total_cost_usd": 0.1234, "subtype": "success"})
         out = self._capture(line)
-        self.assertIn("[engineer] done: 7 turns", out)
+        self.assertIn("[agent] done: 7 turns", out)
         self.assertIn("$0.1234", out)
         self.assertIn("stop=success", out)
 

@@ -15,17 +15,19 @@ class InterfaceTestBase(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
         self.root = Path(self._tmp.name)
-        self.ifaces = self.root / "platforms"
-        # Redirect the single unified tree at the temp dir.
-        self._orig = interfaces.PLATFORMS_DIR
-        interfaces.PLATFORMS_DIR = self.ifaces
+        # Redirect BOTH trees at the temp dir: flat config manifests + build homes.
+        self.configs = self.root / "configs" / "platforms"
+        self.builds = self.root / "build"
+        self._orig = (interfaces.CONFIGS_DIR, interfaces.BUILD_DIR)
+        interfaces.CONFIGS_DIR = self.configs
+        interfaces.BUILD_DIR = self.builds
 
     def tearDown(self) -> None:
-        interfaces.PLATFORMS_DIR = self._orig
+        interfaces.CONFIGS_DIR, interfaces.BUILD_DIR = self._orig
         self._tmp.cleanup()
 
     def write_manifest(self, platform: str, interface: str, text: str) -> Path:
-        p = self.ifaces / platform / interface / "config.yaml"
+        p = self.configs / platform / f"{interface}.yaml"
         _write(p, text)
         return p
 
@@ -52,21 +54,33 @@ class AccountingFieldsTests(InterfaceTestBase):
             "svc", "cli",
             "binary: svc_cli-0.1.0-py3-none-any.whl\ncli_command: svc\nprompt: hi\n",
         )
-        cfg = interfaces._resolved_config("svc", "cli", 0, None)
+        cfg = interfaces._resolved_config("svc", "cli")
         self.assertEqual(cfg["cli_command"], "svc")
         self.assertEqual(cfg["binary"], "svc_cli-0.1.0-py3-none-any.whl")
 
     def test_resolved_config_defaults_none_when_absent(self):
         self.write_manifest("svc", "cli", "binary: hops\nprompt: hi\n")
-        cfg = interfaces._resolved_config("svc", "cli", 0, None)
+        cfg = interfaces._resolved_config("svc", "cli")
         self.assertIsNone(cfg["cli_command"])   # falls back to binary in setup()
         self.assertIsNone(cfg["sdk_module"])
         self.assertEqual(cfg["teardown"], [])   # default: nothing to tear down
 
     def test_resolved_config_surfaces_teardown(self):
         self.write_manifest("svc", "cli", "teardown:\n  - 'echo bye'\nprompt: hi\n")
-        cfg = interfaces._resolved_config("svc", "cli", 0, None)
+        cfg = interfaces._resolved_config("svc", "cli")
         self.assertEqual(cfg["teardown"], ["echo bye"])
+
+    def test_norm_subcommands_string_list_and_none(self):
+        # Manifest `cli_subcommand` accepts one service or a list; both normalize
+        # to the comma-joined TESTBED_CLI_SUBCOMMAND wire format.
+        self.assertEqual(interfaces._norm_subcommands("sagemaker"), "sagemaker")
+        self.assertEqual(
+            interfaces._norm_subcommands(["sagemaker", "sagemaker-runtime", "s3"]),
+            "sagemaker,sagemaker-runtime,s3",
+        )
+        self.assertIsNone(interfaces._norm_subcommands(None))
+        self.assertIsNone(interfaces._norm_subcommands([]))
+        self.assertIsNone(interfaces._norm_subcommands("  "))
 
 
 class BaseCleanTests(InterfaceTestBase):
@@ -108,7 +122,7 @@ class BaseCleanTests(InterfaceTestBase):
             return mock.Mock(returncode=0)
 
         with mock.patch.object(interfaces.subprocess, "run", side_effect=fake_run):
-            interfaces.ensure_base_clean("svc", "sdk", 0, None)
+            interfaces.ensure_base_clean("svc", "sdk")
 
         # A `pip show svc_pkg` probe followed by a `pip uninstall -y svc_pkg`.
         self.assertTrue(any("show" in c and "svc_pkg" in c for c in calls))
@@ -126,140 +140,54 @@ class BaseCleanTests(InterfaceTestBase):
             return mock.Mock(returncode=1)  # `pip show` → not present
 
         with mock.patch.object(interfaces.subprocess, "run", side_effect=fake_run):
-            interfaces.ensure_base_clean("svc", "sdk", 0, None)
+            interfaces.ensure_base_clean("svc", "sdk")
 
         self.assertFalse(any("uninstall" in c for c in calls))
 
 
-class VersionResolutionTests(InterfaceTestBase):
-    def test_base_version_is_zero(self):
+class ResolutionTests(InterfaceTestBase):
+    def test_variant_for_returns_hash(self):
         self.write_manifest("svc", "sdk", "prompt: base prompt\n")
-        version, _hash = interfaces.variant_for("svc", "sdk")
-        self.assertEqual(version, 0)
+        h = interfaces.variant_for("svc", "sdk")
+        self.assertTrue(h)
+        self.assertEqual(len(h), 8)
 
-    def test_version_gt_zero_requires_version_root(self):
-        self.write_manifest("svc", "sdk", "prompt: base\n")
+    def test_variant_for_unknown_interface_raises(self):
         with self.assertRaises(ValueError):
-            interfaces.variant_for("svc", "sdk", version=1)
+            interfaces.variant_for("svc", "bogus")
 
-    def test_prompt_frozen_against_version_override(self):
-        """The prompt is FROZEN: a version.yaml `prompt:` is ignored — the
-        engineer always sees the committed base prompt."""
+    def test_variant_for_missing_config_raises(self):
+        with self.assertRaises(ValueError):
+            interfaces.variant_for("ghost", "sdk")
+
+    def test_prompt_comes_from_manifest(self):
         self.write_manifest("svc", "sdk", "prompt: base prompt\n")
-        vroot = self.root / "session"
-        vp = interfaces.version_dir(vroot, "svc", "sdk", 1) / "version.yaml"
-        _write(vp, "prompt: improved prompt\n")
-        version, _ = interfaces.variant_for("svc", "sdk", version=1, version_root=vroot)
-        self.assertEqual(version, 1)
-        frag = interfaces._prompt_for("svc", "sdk", 1, vroot)
-        self.assertEqual(frag, "base prompt")  # override ignored
+        self.assertEqual(interfaces._prompt_for("svc", "sdk"), "base prompt")
 
-    def test_prompt_frozen_against_interface_home_copy(self):
-        """The autoresearch flow points the interface home at a per-version copy
-        (set_interface_home) whose config.yaml prompt the researcher may edit.
-        That edit must be ignored — the prompt comes from the committed base."""
-        self.write_manifest("svc", "sdk", "prompt: base prompt\n")
-        copy = self.root / "run" / "v1" / "interface"
-        _write(copy / "config.yaml", "prompt: hacked prompt\n")
-        try:
-            interfaces.set_interface_home("svc", "sdk", copy)
-            frag = interfaces._prompt_for("svc", "sdk", 0, None)
-            self.assertEqual(frag, "base prompt")
-        finally:
-            interfaces._INTERFACE_HOME.pop(("svc", "sdk"), None)
-
-    def test_prompt_frozen_when_committed_is_empty(self):
-        """An intentionally EMPTY committed prompt still freezes to empty — the
-        home-redirected copy's prompt must not leak in via the falsy fallthrough."""
+    def test_empty_prompt_stays_empty(self):
+        # An intentionally EMPTY `prompt:` must not fall through to the
+        # auto-generated default.
         self.write_manifest("svc", "sdk", 'prompt: ""\n')
-        copy = self.root / "run" / "v1" / "interface"
-        _write(copy / "config.yaml", "prompt: hacked\n")
-        try:
-            interfaces.set_interface_home("svc", "sdk", copy)
-            self.assertEqual(interfaces._prompt_for("svc", "sdk", 0, None), "")
-        finally:
-            interfaces._INTERFACE_HOME.pop(("svc", "sdk"), None)
+        self.assertEqual(interfaces._prompt_for("svc", "sdk"), "")
+
+    def test_missing_prompt_auto_generates(self):
+        self.write_manifest("svc", "sdk", "binary: tool\n")
+        self.assertIn("SDK", interfaces._prompt_for("svc", "sdk"))
+
+    def test_sandbox_keys_resolved_from_manifest(self):
+        self.write_manifest(
+            "svc", "sdk",
+            "prompt: base\n"
+            "allowed_domains: [api.svc.com]\n"
+            "instance_allowlist: [ml.m5.large]\n",
+        )
+        cfg = interfaces._resolved_config("svc", "sdk")
+        self.assertEqual(cfg["allowed_domains"], ["api.svc.com"])
+        self.assertEqual(cfg["instance_allowlist"], ["ml.m5.large"])
+        self.assertEqual(cfg["sandbox_excluded_commands"], [])
 
     def test_none_interface(self):
-        self.assertEqual(interfaces.variant_for("none", "none"), (0, ""))
-
-
-class SourceFingerprintTests(InterfaceTestBase):
-    def _make_iface(self, base: Path, src_body: str) -> Path:
-        _write(base / "config.yaml", "prompt: hi\n")
-        _write(base / "src" / "python" / "pkg" / "mod.py", src_body)
-        return base
-
-    def test_fingerprint_ignores_config_and_artifacts(self):
-        a = self._make_iface(self.root / "a", "x = 1\n")
-        b = self._make_iface(self.root / "b", "x = 1\n")
-        # b differs only in config.yaml (the prompt) + a built wheel + pycache.
-        _write(b / "config.yaml", "prompt: TOTALLY DIFFERENT\n")
-        _write(b / "thing-0-py3-none-any.whl", "binarygarbage")
-        _write(b / "src" / "python" / "pkg" / "__pycache__" / "mod.cpython-312.pyc", "z")
-        self.assertEqual(
-            interfaces.source_fingerprint(a), interfaces.source_fingerprint(b)
-        )
-
-    def test_fingerprint_detects_source_change(self):
-        a = self._make_iface(self.root / "a", "x = 1\n")
-        b = self._make_iface(self.root / "b", "x = 2\n")  # real source edit
-        self.assertNotEqual(
-            interfaces.source_fingerprint(a), interfaces.source_fingerprint(b)
-        )
-
-    def test_fingerprint_detects_non_prompt_config_change(self):
-        """A real config.yaml edit (NOT the prompt) is a source change — the
-        researcher is allowed to change install/plumbing, so it must count."""
-        a = self._make_iface(self.root / "a", "x = 1\n")
-        b = self._make_iface(self.root / "b", "x = 1\n")
-        _write(a / "config.yaml", "prompt: hi\nbinary: tool-0.whl\n")
-        _write(b / "config.yaml", "prompt: hi\nbinary: tool-9.whl\n")  # plumbing differs
-        self.assertNotEqual(
-            interfaces.source_fingerprint(a), interfaces.source_fingerprint(b)
-        )
-
-    def test_fingerprint_ignores_prompt_only_config_change(self):
-        """Only the prompt differs in config.yaml → identical fingerprint."""
-        a = self._make_iface(self.root / "a", "x = 1\n")
-        b = self._make_iface(self.root / "b", "x = 1\n")
-        _write(a / "config.yaml", "prompt: one\nbinary: tool.whl\n")
-        _write(b / "config.yaml", "prompt: two\nbinary: tool.whl\n")
-        self.assertEqual(
-            interfaces.source_fingerprint(a), interfaces.source_fingerprint(b)
-        )
-
-    def test_assert_source_changed_blocks_prompt_only_version(self):
-        run = self.root / "run"
-        v0 = run / "v0" / "interface"
-        v1 = run / "v1" / "interface"
-        self._make_iface(v0, "x = 1\n")
-        self._make_iface(v1, "x = 1\n")            # identical source
-        _write(v1 / "config.yaml", "prompt: reworded\n")  # only the prompt moved
-        with self.assertRaises(ValueError):
-            interfaces.assert_source_changed(v1, "v1")
-
-    def test_assert_source_changed_allows_real_edit(self):
-        run = self.root / "run"
-        v0 = run / "v0" / "interface"
-        v1 = run / "v1" / "interface"
-        self._make_iface(v0, "x = 1\n")
-        self._make_iface(v1, "x = 2\n")            # real source change
-        interfaces.assert_source_changed(v1, "v1")  # must not raise
-
-    def test_assert_source_changed_skips_baseline_and_unlabeled(self):
-        run = self.root / "run"
-        v0 = run / "v0" / "interface"
-        self._make_iface(v0, "x = 1\n")
-        interfaces.assert_source_changed(v0, "v0")   # baseline — no constraint
-        interfaces.assert_source_changed(v0, None)   # non-autoresearch — no constraint
-
-    def test_assert_source_changed_skips_when_no_prev(self):
-        # v1 with no sibling v0 on disk (e.g. a prev_run continuation) — allowed.
-        run = self.root / "run"
-        v1 = run / "v1" / "interface"
-        self._make_iface(v1, "x = 1\n")
-        interfaces.assert_source_changed(v1, "v1")   # must not raise
+        self.assertEqual(interfaces.variant_for("none", "none"), "")
 
 
 class PreflightTests(InterfaceTestBase):

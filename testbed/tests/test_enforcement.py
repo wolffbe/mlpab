@@ -1,5 +1,5 @@
 """Tests for the remote-only / single-interface enforcement added to the
-PreToolUse hook, the engineer-prompt mode gating, and the auth-error retry
+PreToolUse hook, the agent-prompt mode gating, and the auth-error retry
 detection in claude_runner."""
 import importlib.util
 import os
@@ -19,6 +19,7 @@ _spec.loader.exec_module(hook)
 _MARKERS = {
     "TESTBED_SDK_MODULE": "hopsworks",
     "TESTBED_CLI_BINARY": "hops",
+    "TESTBED_PLATFORM": "hopsworks",
     "TESTBED_COMPUTE_DENY": "torch,tensorflow,sklearn,xgboost",
 }
 
@@ -26,13 +27,30 @@ _MARKERS = {
 class EnforceHookTests(unittest.TestCase):
     def _enforce(self, interface, tool, command=None, **input_extra):
         env = dict(_MARKERS, TESTBED_INTERFACE=interface)
-        for k in ("TESTBED_INTERFACE", *_MARKERS):
+        # Also clear TESTBED_CLI_SUBCOMMAND so a subcommand-entrypoint test can't
+        # leak into the default (single-token) cases.
+        for k in ("TESTBED_INTERFACE", "TESTBED_CLI_SUBCOMMAND", *_MARKERS):
             os.environ.pop(k, None)
         os.environ.update(env)
         tool_input = dict(input_extra)
         if command is not None:
             tool_input["command"] = command
         return hook.enforce(tool, tool_input)
+
+    def _enforce_entrypoint(self, command, cli_binary="aws", cli_subcommand="sagemaker"):
+        """Enforce in CLI mode with a SUBCOMMAND ENTRYPOINT (e.g. `aws sagemaker`):
+        only `<cli_binary> <cli_subcommand> …` is on-interface."""
+        for k in ("TESTBED_INTERFACE", "TESTBED_CLI_SUBCOMMAND", *_MARKERS):
+            os.environ.pop(k, None)
+        os.environ.update({
+            "TESTBED_INTERFACE": "cli",
+            "TESTBED_CLI_BINARY": cli_binary,
+            "TESTBED_CLI_SUBCOMMAND": cli_subcommand,
+            "TESTBED_SDK_MODULE": "sagemaker",
+            "TESTBED_PLATFORM": "sagemaker",
+            "TESTBED_COMPUTE_DENY": "torch,tensorflow,sklearn,xgboost",
+        })
+        return hook.enforce("Bash", {"command": command})
 
     # --- compute libraries: blocked locally in every mode ---
     def test_local_torch_blocked_in_cli(self):
@@ -87,7 +105,7 @@ class EnforceHookTests(unittest.TestCase):
         self.assertIsNotNone(self._enforce("mcp", "Bash", "hops project create x"))
 
     def test_mcp_native_sdk_blocked(self):
-        # The engineer must NOT drive the SDK natively (locally) in MCP mode —
+        # The agent must NOT drive the SDK natively (locally) in MCP mode —
         # only the MCP tools may touch the platform. (Shipping SDK code to a
         # remote Job is server-side and uncounted; using it locally is the escape.)
         self.assertIsNotNone(
@@ -118,7 +136,7 @@ class EnforceHookTests(unittest.TestCase):
     # --- fail-closed allowlist: only the interface + basic shell; everything
     #     else (node/ruby/curl/stray binaries) denied by default in EVERY mode ---
     def test_node_blocked_in_every_mode(self):
-        # The field failure: when python was blocked the engineer used `node -e`
+        # The field failure: when python was blocked the agent used `node -e`
         # to wrangle data locally. The allowlist denies it in all three modes.
         for iface in ("cli", "mcp", "sdk"):
             self.assertIsNotNone(self._enforce(iface, "Bash", 'node -e "console.log(1)"'), iface)
@@ -164,6 +182,156 @@ class EnforceHookTests(unittest.TestCase):
         self.assertIsNone(self._enforce("mcp", "Bash", "cp a b 2>&1"))
         self.assertIsNone(self._enforce("cli", "Bash", "cat data/train.csv > /tmp/out.txt"))
 
+    def test_line_continuation_keeps_one_segment(self):
+        # A multi-line `hops` command joined with backslash-newline must stay one
+        # segment — the `\<nl>` is a continuation, not a separator. Otherwise the
+        # continuation lines (`--primary-key id`) become bogus segments whose
+        # first token is treated as a stray off-interface binary and denied.
+        cmd = 'hops fg create --name trips \\\n  --primary-key id \\\n  --description "trip data"'
+        self.assertEqual(len(hook._segments(cmd)), 1)
+        self.assertIsNone(self._enforce("cli", "Bash", cmd))
+
+    def test_line_continuation_real_separator_still_splits(self):
+        # Folding `\<nl>` must not swallow a genuine separator on the next line:
+        # a backgrounded interpreter after the continuation is still denied.
+        cmd = 'hops fg create --name t \\\n  --primary-key id\nnode evil.js'
+        self.assertIsNotNone(self._enforce("cli", "Bash", cmd))
+
+    def test_escaped_char_not_treated_as_separator(self):
+        # An escaped `;` is a literal char in the argument, not a command
+        # separator — the single `hops` segment stays allowed in CLI mode.
+        self.assertIsNone(self._enforce("cli", "Bash", "hops fg create --filter a\\;b"))
+
+    # --- subcommand entrypoint (`aws sagemaker`): only that service is on-interface ---
+    def test_entrypoint_subcommand_allowed(self):
+        self.assertIsNone(self._enforce_entrypoint("aws sagemaker list-models"))
+        # flags after the service are fine (still starts `aws sagemaker`)
+        self.assertIsNone(self._enforce_entrypoint("aws sagemaker list-endpoints --max-results 5"))
+
+    def test_entrypoint_other_service_denied(self):
+        # Same binary, different service → off-interface escape.
+        self.assertIsNotNone(self._enforce_entrypoint("aws s3 ls"))
+        self.assertIsNotNone(self._enforce_entrypoint("aws ec2 describe-instances"))
+
+    def test_entrypoint_bare_binary_denied(self):
+        # `aws` with no service is not the `aws sagemaker` entrypoint.
+        self.assertIsNotNone(self._enforce_entrypoint("aws configure list"))
+
+    def test_entrypoint_subcommand_in_pipeline_allowed(self):
+        # On-interface even piped into a basic shell util for inspection.
+        self.assertIsNone(
+            self._enforce_entrypoint("aws sagemaker list-models --output json | head -50")
+        )
+
+    def test_entrypoint_other_service_after_separator_denied(self):
+        # `aws sagemaker …; aws s3 …` — the second segment is off-interface.
+        self.assertIsNotNone(
+            self._enforce_entrypoint("aws sagemaker list-models; aws s3 cp x y")
+        )
+
+    def test_entrypoint_allowlist_multiple_services(self):
+        # `cli_subcommand` is an allowlist (comma-joined in the env): sagemaker
+        # needs its S3 data plane and the runtime for endpoint invocation.
+        subs = "sagemaker,sagemaker-runtime,s3"
+        self.assertIsNone(self._enforce_entrypoint(
+            "aws s3 cp data/train s3://bkt/train --recursive", cli_subcommand=subs))
+        self.assertIsNone(self._enforce_entrypoint(
+            "aws sagemaker-runtime invoke-endpoint --endpoint-name e out.json",
+            cli_subcommand=subs))
+        self.assertIsNone(self._enforce_entrypoint(
+            "aws sagemaker list-training-jobs", cli_subcommand=subs))
+
+    def test_entrypoint_allowlist_other_services_still_denied(self):
+        subs = "sagemaker,sagemaker-runtime,s3"
+        # s3api is a DIFFERENT service token than s3 — not on the allowlist.
+        for cmd in ("aws ec2 describe-instances", "aws iam create-role --role-name x",
+                    "aws s3api create-bucket --bucket x", "aws configure list"):
+            msg = self._enforce_entrypoint(cmd, cli_subcommand=subs)
+            self.assertIsNotNone(msg, cmd)
+        # The denial names the full allowlist so the agent knows its options.
+        self.assertIn("sagemaker-runtime", msg)
+
+    def test_entrypoint_global_options_before_service_allowed(self):
+        # The AWS CLI accepts global options BEFORE the service; the service
+        # token after them is still the entrypoint, not the option.
+        self.assertIsNone(self._enforce_entrypoint(
+            "aws --region us-east-1 sagemaker list-models"))
+        self.assertIsNone(self._enforce_entrypoint(
+            "aws --output json --region us-east-1 sagemaker list-training-jobs"))
+        self.assertIsNone(self._enforce_entrypoint(
+            "aws --region=us-east-1 sagemaker list-models"))   # --opt=value form
+        self.assertIsNone(self._enforce_entrypoint(
+            "aws --debug sagemaker list-models"))              # valueless flag
+        self.assertIsNone(self._enforce_entrypoint(
+            "aws --no-cli-pager sagemaker list-models"))       # --no-* flag
+
+    def test_entrypoint_global_options_other_service_still_denied(self):
+        # Skipping options must not skip PAST an off-interface service.
+        self.assertIsNotNone(self._enforce_entrypoint(
+            "aws --region us-east-1 ec2 describe-instances"))
+        self.assertIsNotNone(self._enforce_entrypoint(
+            "aws --debug s3api create-bucket --bucket x"))
+
+    def test_entrypoint_option_value_matching_service_not_entrypoint(self):
+        # Fail closed: an option VALUE that happens to equal an allowed service
+        # must not legitimize the real (off-interface) service after it.
+        self.assertIsNotNone(self._enforce_entrypoint(
+            "aws --profile sagemaker ec2 describe-instances"))
+
+    def test_denials_logged_structurally(self):
+        # A denied call must land in TESTBED_COMMAND_LOG with `denied: true` +
+        # the reason — results.denied_calls counts these records instead of
+        # substring-scanning transcripts.
+        import io
+        import json
+        from unittest import mock
+        log = Path(tempfile.mkdtemp()) / "commands.jsonl"
+        for k in ("TESTBED_INTERFACE", "TESTBED_CLI_SUBCOMMAND", *_MARKERS):
+            os.environ.pop(k, None)
+        os.environ.update(dict(_MARKERS, TESTBED_INTERFACE="cli",
+                               TESTBED_COMMAND_LOG=str(log)))
+        try:
+            payload = {"tool_name": "Bash",
+                       "tool_input": {"command": 'python -c "import torch"'}}
+            with mock.patch("sys.stdin", io.StringIO(json.dumps(payload))):
+                rc = hook.main()
+            self.assertEqual(rc, 2)
+            allowed = {"tool_name": "Bash", "tool_input": {"command": "hops fg list"}}
+            with mock.patch("sys.stdin", io.StringIO(json.dumps(allowed))):
+                rc = hook.main()
+            self.assertEqual(rc, 0)
+            recs = [json.loads(l) for l in log.read_text().splitlines() if l.strip()]
+            self.assertEqual(len(recs), 2)
+            self.assertTrue(recs[0].get("denied"))
+            self.assertIn("DENIED:", recs[0]["reason"])
+            self.assertNotIn("denied", recs[1])
+        finally:
+            os.environ.pop("TESTBED_COMMAND_LOG", None)
+
+    # --- denial messages name the ACTIVE platform/interface, never a hardcoded one ---
+    def test_denial_message_names_active_interface(self):
+        # Regression: messages used to hardcode Hopsworks ("Use only the `hops`
+        # CLI") regardless of platform — a sagemaker agent denied `aws s3`
+        # was told to use `hops`. Must derive from TESTBED_* env instead.
+        msg = self._enforce_entrypoint("aws s3 ls")
+        self.assertIn("aws sagemaker", msg)
+        self.assertNotIn("hops", msg)
+        msg = self._enforce_entrypoint('python -c "import torch"')
+        self.assertIn("sagemaker", msg)
+        self.assertNotIn("Hopsworks", msg)
+
+    def test_denial_message_falls_back_without_platform_env(self):
+        # No TESTBED_PLATFORM (e.g. an old run dir's settings) → generic wording,
+        # still no hardcoded platform.
+        env = {k: v for k, v in _MARKERS.items() if k != "TESTBED_PLATFORM"}
+        for k in ("TESTBED_INTERFACE", "TESTBED_CLI_SUBCOMMAND", *_MARKERS):
+            os.environ.pop(k, None)
+        os.environ.update(dict(env, TESTBED_INTERFACE="mcp"))
+        msg = hook.enforce("Bash", {"command": "hops project use x"})
+        self.assertIn("the platform's MCP tools", msg)
+        msg = hook.enforce("Bash", {"command": 'python -c "print(1)"'})
+        self.assertIn("the remote platform", msg)
+
     def test_mcp_floor_submission_allowed(self):
         self.assertIsNone(
             self._enforce("mcp", "Bash", "mkdir -p submission && cp data/sample_submission.csv submission/submission.csv")
@@ -199,7 +367,7 @@ class EnforceHookTests(unittest.TestCase):
         )
 
     # --- installs stay LOCKED in CLI/MCP: banter installs the interface + deps
-    #     before the run, so the engineer never needs pip there. ---
+    #     before the run, so the agent never needs pip there. ---
     def test_pip_blocked_in_cli_and_mcp(self):
         for iface in ("cli", "mcp"):
             self.assertIsNotNone(self._enforce(iface, "Bash", "pip install pandas"), iface)
@@ -248,8 +416,86 @@ class EnforceHookTests(unittest.TestCase):
         self.assertIsNone(self._enforce("none", "Bash", 'python -c "import torch; train()"'))
 
 
+class InstanceTypeGuardTests(unittest.TestCase):
+    """Free-tier guard: with TESTBED_INSTANCE_ALLOW set, any `ml.<family>.<size>`
+    token outside the allowlist is denied — in Bash commands, executed python
+    payloads, MCP tool args, and Write/Edit content."""
+
+    FREE_TIER = "ml.t3.medium,ml.m4.xlarge,ml.m5.xlarge"
+
+    def _check(self, tool, tool_input, allow=FREE_TIER):
+        os.environ.pop("TESTBED_INSTANCE_ALLOW", None)
+        if allow is not None:
+            os.environ["TESTBED_INSTANCE_ALLOW"] = allow
+        try:
+            return hook.enforce_instance_types(tool, tool_input)
+        finally:
+            os.environ.pop("TESTBED_INSTANCE_ALLOW", None)
+
+    def test_no_allowlist_no_enforcement(self):
+        self.assertIsNone(self._check(
+            "Bash", {"command": "aws sagemaker create-training-job --resource-config "
+                                "InstanceType=ml.p3.2xlarge,InstanceCount=1"},
+            allow=None))
+
+    def test_cli_free_tier_instance_allowed(self):
+        self.assertIsNone(self._check(
+            "Bash", {"command": "aws sagemaker create-training-job --resource-config "
+                                "InstanceType=ml.m5.xlarge,InstanceCount=1,VolumeSizeInGB=10"}))
+
+    def test_cli_gpu_instance_denied(self):
+        reason = self._check(
+            "Bash", {"command": "aws sagemaker create-training-job --resource-config "
+                                "InstanceType=ml.p3.2xlarge,InstanceCount=1"})
+        self.assertIsNotNone(reason)
+        self.assertIn("ml.p3.2xlarge", reason)
+
+    def test_cli_big_cpu_instance_denied(self):
+        self.assertIsNotNone(self._check(
+            "Bash", {"command": "aws sagemaker create-endpoint-config --production-variants "
+                                "VariantName=v1,InstanceType=ml.m5.24xlarge,InitialInstanceCount=1"}))
+
+    def test_mcp_args_denied(self):
+        self.assertIsNotNone(self._check(
+            "mcp__sagemaker__create_training_job",
+            {"resource_config": {"InstanceType": "ml.g5.xlarge", "InstanceCount": 1}}))
+
+    def test_mcp_args_free_tier_allowed(self):
+        self.assertIsNone(self._check(
+            "mcp__sagemaker__create_training_job",
+            {"resource_config": {"InstanceType": "ml.m4.xlarge", "InstanceCount": 1}}))
+
+    def test_write_job_spec_denied(self):
+        # A job spec written to disk first (`--cli-input-json file://job.json`)
+        # is caught at Write time.
+        self.assertIsNotNone(self._check(
+            "Write", {"file_path": "/x/job.json",
+                      "content": '{"ResourceConfig": {"InstanceType": "ml.trn1.32xlarge"}}'}))
+
+    def test_executed_script_payload_denied(self):
+        with tempfile.TemporaryDirectory() as td:
+            script = Path(td) / "train.py"
+            script.write_text("est = Estimator(instance_type='ml.c5.18xlarge')\n")
+            cwd = os.getcwd()
+            os.chdir(td)
+            try:
+                self.assertIsNotNone(self._check("Bash", {"command": "python train.py"}))
+            finally:
+                os.chdir(cwd)
+
+    def test_serverless_no_instance_type_allowed(self):
+        self.assertIsNone(self._check(
+            "Bash", {"command": "aws sagemaker create-endpoint-config --production-variants "
+                                "VariantName=v1,ServerlessConfig={MemorySizeInMB=2048,MaxConcurrency=1}"}))
+
+    def test_plain_text_not_misflagged(self):
+        # `html.parser` etc. must not match the ml.<family>.<size> pattern.
+        self.assertIsNone(self._check(
+            "Bash", {"command": 'grep "html.parser" data/description.md'}))
+
+
 class BanterRunForegroundTests(unittest.TestCase):
-    """`banter run` (the researcher's engineer-eval command) must be foreground —
+    """A nested `banter run` must be foreground —
     never piped (SIGPIPE-kills it mid-build) or backgrounded."""
 
     def _misuse(self, command):
@@ -259,7 +505,7 @@ class BanterRunForegroundTests(unittest.TestCase):
     def test_pipe_to_head_blocked(self):
         # This is the exact failure from the field: `… 2>&1 | head -300`.
         self.assertIsNotNone(
-            self._misuse("banter run --task t --challenge c --platform hopsworks 2>&1 | head -300")
+            self._misuse("banter run --category t --task c --platform hopsworks 2>&1 | head -300")
         )
 
     def test_pipe_to_tail_blocked(self):
@@ -271,7 +517,7 @@ class BanterRunForegroundTests(unittest.TestCase):
         )
 
     def test_background_ampersand_blocked(self):
-        self.assertIsNotNone(self._misuse("banter run --task t --challenge c &"))
+        self.assertIsNotNone(self._misuse("banter run --category t --task c &"))
 
     def test_background_then_poll_blocked(self):
         self.assertIsNotNone(self._misuse("banter run --task t & sleep 30"))
@@ -279,24 +525,24 @@ class BanterRunForegroundTests(unittest.TestCase):
     def test_pipe_after_cd_guard_blocked(self):
         # The cd-guard prefix is fine; the trailing pipe on `banter run` is not.
         self.assertIsNotNone(
-            self._misuse('cd /run && banter run --task t --challenge c | head -100')
+            self._misuse('cd /run && banter run --category t --task c | head -100')
         )
 
     # --- allowed: foreground, redirects, other subcommands ---
     def test_plain_foreground_allowed(self):
-        self.assertIsNone(self._misuse("banter run --task t --challenge c --platform hopsworks"))
+        self.assertIsNone(self._misuse("banter run --category t --task c --platform hopsworks"))
 
     def test_redirect_to_file_allowed(self):
-        # The sanctioned way to cap output: redirect, then read engineer.log.
+        # The sanctioned way to cap output: redirect, then read agent.log.
         self.assertIsNone(self._misuse("banter run --task t > run.log 2>&1"))
 
     def test_redirect_to_devnull_allowed(self):
-        self.assertIsNone(self._misuse("banter run --task t --challenge c > /dev/null 2>&1"))
+        self.assertIsNone(self._misuse("banter run --category t --task c > /dev/null 2>&1"))
 
     def test_redirect_then_chained_tail_allowed(self):
-        # `&&` chains a SEPARATE tail of engineer.log — not a pipe of banter run.
+        # `&&` chains a SEPARATE tail of agent.log — not a pipe of banter run.
         self.assertIsNone(
-            self._misuse("banter run --task t > run.log 2>&1 && tail -60 v1/t/c/engineer.log")
+            self._misuse("banter run --task t > run.log 2>&1 && tail -60 v1/t/c/agent.log")
         )
 
     def test_budget_check_piped_not_blocked(self):
@@ -308,7 +554,7 @@ class BanterRunForegroundTests(unittest.TestCase):
 
     def test_2to1_redirect_alone_not_flagged_as_background(self):
         # `2>&1` without a pipe/`&` must NOT be misread as backgrounding.
-        self.assertIsNone(self._misuse("banter run --task t --challenge c 2>&1"))
+        self.assertIsNone(self._misuse("banter run --category t --task c 2>&1"))
 
 
 class PromptModeGatingTests(unittest.TestCase):
@@ -324,8 +570,9 @@ class PromptModeGatingTests(unittest.TestCase):
 
     def test_baseline_is_local_training(self):
         text = runner._build_prompt("comp", "FRAG", interface_under_test=False)
-        self.assertIn("Build and train a model", text)
-        self.assertNotIn("Everything runs on Hopsworks", text)
+        self.assertIn("you are the LOCAL BASELINE", text)
+        self.assertNotIn("nothing runs locally", text.lower())
+        self.assertNotIn("The interface is what's being measured", text)
         self.assertNotIn("UNDER_TEST", text)
         self.assertNotIn("LOCAL_ONLY", text)
 
@@ -355,83 +602,44 @@ class AuthRetryDetectionTests(unittest.TestCase):
         self.assertFalse(claude_runner._last_result_is_rate_limited(tr))
 
 
-class LaunderingAuditTests(unittest.TestCase):
-    def _src(self, files: dict):
-        root = Path(tempfile.mkdtemp())
-        for rel, text in files.items():
-            p = root / rel
-            p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_text(text)
-        return root
+class RateLimitWaitAccountingTests(unittest.TestCase):
+    """`run_with_retry` returns the back-off sleep total as a third value so
+    callers can report compute time (wall − wait) — results rows must not be
+    penalized for time spent waiting on rate limits."""
 
-    def test_flags_mcp_tool_running_local_python(self):
-        from banter import results
-        src = self._src({
-            "python/hopsworks/mcp/tools/train.py": "import subprocess\nsubprocess.run(['python','t.py'])\n",
-        })
-        flagged = results.audit_interface_local_exec(src)
-        self.assertEqual(len(flagged), 1)
-        self.assertEqual(flagged[0]["file"], "python/hopsworks/mcp/tools/train.py")
-        self.assertIn("subprocess", flagged[0]["patterns"])
-
-    def test_clean_tool_not_flagged(self):
-        from banter import results
-        src = self._src({
-            "python/hopsworks/mcp/tools/jobs.py": "def run_job(c):\n    return client.post('/jobs')\n",
-        })
-        self.assertEqual(results.audit_interface_local_exec(src), [])
-
-    def test_non_entrypoint_subprocess_ignored(self):
-        from banter import results
-        # subprocess in a non-tool/command file is not the laundering vector.
-        src = self._src({
-            "python/hopsworks/core/util.py": "import subprocess\nsubprocess.run(['x'])\n",
-        })
-        self.assertEqual(results.audit_interface_local_exec(src), [])
-
-    def test_unchanged_upstream_not_flagged_against_baseline(self):
-        from banter import results
-        body = "import subprocess\nsubprocess.run(['x'])\n"
-        base = self._src({"python/hopsworks/cli/commands/job.py": body})
-        cur = self._src({"python/hopsworks/cli/commands/job.py": body})
-        # Identical to baseline → researcher didn't introduce it → not flagged.
-        self.assertEqual(results.audit_interface_local_exec(cur, base), [])
-
-    def test_researcher_added_exec_flagged_against_baseline(self):
-        from banter import results
-        base = self._src({"python/hopsworks/cli/commands/job.py": "def run(): pass\n"})
-        cur = self._src({"python/hopsworks/cli/commands/job.py": "import subprocess\ndef run(): subprocess.run(['x'])\n"})
-        flagged = results.audit_interface_local_exec(cur, base)
-        self.assertEqual(len(flagged), 1)
-
-    def test_sdk_source_laundering_flagged_with_baseline(self):
-        from banter import results
-        # An SDK-interface file (not under mcp/tools or cli/commands): only
-        # scanned when a baseline is present, and only if the researcher ADDED
-        # the local-exec pattern.
-        rel = "python/hopsworks/core/engine.py"
-        base = self._src({rel: "def train(): return remote_job()\n"})
-        cur = self._src({rel: "import subprocess\ndef train(): subprocess.run(['python','t.py'])\n"})
-        self.assertEqual(len(results.audit_interface_local_exec(cur, base)), 1)
-        # Without a baseline, a non-entrypoint file is NOT scanned (avoids
-        # flagging legitimate upstream subprocess use).
-        self.assertEqual(results.audit_interface_local_exec(cur), [])
-
-    def test_preexisting_subprocess_unchanged_pattern_not_flagged(self):
-        from banter import results
-        # Researcher edits a file that ALREADY used subprocess, without adding a
-        # new local-exec pattern → not flagged (the pattern isn't researcher-new).
-        rel = "python/hopsworks/cli/commands/job.py"
-        base = self._src({rel: "import subprocess\ndef run(): subprocess.run(['x'])\n"})
-        cur = self._src({rel: "import subprocess\ndef run(): subprocess.run(['x'])  # tweaked comment\n"})
-        self.assertEqual(results.audit_interface_local_exec(cur, base), [])
+    def test_backoff_wait_returned_separately_from_wall(self):
+        import json
+        from unittest import mock
+        d = Path(tempfile.mkdtemp())
+        marker = d / "ran_once"
+        rl = json.dumps({"type": "result", "is_error": True,
+                         "api_error_status": "429", "result": "rate_limit"})
+        ok = json.dumps({"type": "result", "is_error": False, "result": "ok"})
+        # First attempt: rate-limited result + non-zero exit → one back-off
+        # sleep (base 2s, mocked). Second attempt: success.
+        script = (f"if [ -e {marker} ]; then echo '{ok}'; "
+                  f"else touch {marker}; echo '{rl}'; exit 1; fi")
+        with mock.patch("time.sleep") as slept:
+            exit_code, wall, wait = claude_runner.run_with_retry(
+                cmd=["sh", "-c", script],
+                cwd=d,
+                env={},
+                transcript_path=d / "transcript.jsonl",
+                stderr_path=d / "stderr.log",
+            )
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(wait, claude_runner.RATE_LIMIT_BASE_BACKOFF_S)
+        slept.assert_called_once_with(claude_runner.RATE_LIMIT_BASE_BACKOFF_S)
+        # Wall stays the true elapsed time; the wait is reported alongside, not
+        # silently folded in or subtracted here (callers decide).
+        self.assertGreaterEqual(wall, 0.0)
 
 
 class DeadRowSchemaTests(unittest.TestCase):
     def test_error_column_present_and_last_is_run_dir(self):
         from banter import results
-        self.assertIn("error", results.FIELDS)
-        self.assertEqual(results.FIELDS[-1], "run_dir")  # invariant preserved
+        self.assertIn("error", results.RESULTS_FIELDS)
+        self.assertEqual(results.RESULTS_FIELDS[-1], "run_dir")  # invariant preserved
 
     def test_dead_row_round_trips_with_error_and_zeros(self):
         from banter import results
@@ -440,15 +648,14 @@ class DeadRowSchemaTests(unittest.TestCase):
         row = results.Row(
             started_at="2026-06-04T00:00:00+00:00", run="9", version="v1",
             platform="hopsworks", interface="sdk", skills="none",
-            prev_run="", prev_version="", task="t", challenge="c",
-            valid_submission=0, score=0.0, sdk_calls=0,
+            category="t", task="c", sdk_calls=0,
             error="no valid submission produced", run_dir=str(out.parent),
         )
         results.append(out, row)
         got = list(csv.DictReader(out.open()))[0]
         self.assertEqual(got["error"], "no valid submission produced")
-        self.assertEqual(got["valid_submission"], "0")
-        self.assertEqual(float(got["score"]), 0.0)
+        self.assertEqual(got["asserts_passed"], "0")  # Row default
+        self.assertEqual(got["asserts_total"], "0")
 
 
 if __name__ == "__main__":

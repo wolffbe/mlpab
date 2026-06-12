@@ -1,4 +1,4 @@
-.PHONY: help install setup test uninstall venv check-git ml-libs openmp link unlink
+.PHONY: help install setup test uninstall venv check-git ml-libs link unlink
 
 # Pin to a Python that orjson/PyO3 supports. PyO3 0.23 caps at 3.13; pip-built
 # orjson on 3.14 fails. Override with `make install PYTHON=python3.13`.
@@ -20,58 +20,67 @@ LOCALBIN := $(HOME)/.local/bin
 export PIP_DISABLE_PIP_VERSION_CHECK := 1
 export PIP_NO_PYTHON_VERSION_WARNING := 1
 
-# Heavy ML libraries guaranteed available to every engineer run live in
+# Heavy ML libraries guaranteed available to every agent run live in
 # requirements.txt (repo root); they're installed into the base .venv so each
-# per-run engineer venv inherits them (shared via --system-site-packages) and
+# per-run agent venv inherits them (shared via --system-site-packages) and
 # they survive the per-run venv teardown. Edit requirements.txt to change the set.
 
 help:
-	@echo "banter — MLE-bench testbed driver"
+	@echo "banter — ML-platform benchmarking testbed"
 	@echo ""
 	@echo "Targets:"
-	@echo "  make install   — create venv, install banter + mle-bench, link banter onto PATH, then run setup"
-	@echo "  make setup     — auth for engineer + researcher (Kaggle, Claude)"
+	@echo "  make install   — create venv, install banter + evals, link banter onto PATH, then run setup"
+	@echo "  make setup     — auth for the agent (Claude)"
 	@echo "  make test      — run the unit tests"
 	@echo "  make test-integration — run live-claude integration tests (real API calls)"
 	@echo "  make uninstall — remove the venv + build artifacts (install state)"
 	@echo ""
-	@echo "Run a config:  banter run platforms/<project>/<benchmark|autoresearch>/<name>.yaml"
-	@echo "Clear results: banter clean"
+	@echo "Run a treatment session in tmux (detached from any terminal/Claude):"
+	@echo "  banter start configs/treatments/hopsworks/hopsworks-haiku-4-5-no-skills.yaml"
+	@echo "  banter status          — list running treatment sessions"
+	@echo "  banter attach <yaml>   — watch it live (detach: Ctrl-b d)"
+	@echo "  banter stop   <yaml>   — kill it (the session also dies on its own when the run finishes)"
+	@echo ""
+	@echo "Run a config inline: banter run configs/treatments/<platform>/<name>.yaml"
+	@echo "Clear results:       banter clean"
 
 check-git:
 	@command -v git >/dev/null 2>&1 || { echo "ERROR: git is not installed. Install git and retry."; exit 1; }
 	@echo ">> git OK ($(shell git --version))"
 
-install: check-git $(VENV)/.installed link setup
+
+install: check-git $(VENV)/.installed link codex setup
 
 $(VENV)/.installed: pyproject.toml requirements.txt
 	@echo ">> using interpreter: $(PYTHON)"
 	$(PYTHON) -m venv $(VENV)
 	$(PIP) install --upgrade pip
 	$(PIP) install -e .
-	$(PIP) install git+https://github.com/openai/mle-bench.git
-	$(MAKE) openmp
 	$(PIP) install -r requirements.txt
 	touch $(VENV)/.installed
 
 # Confinement is per-run via .claude/settings.json (sandbox + denies) plus a
 # HOME redirect on the env. See `claude_runner._write_settings` for details.
 
-# OpenMP runtime (libomp) — xgboost/lightgbm wheels need it (and it isn't
-# pip-installable on macOS; they import-fail without it). Installed BEFORE
-# requirements.txt. Best-effort: Homebrew on macOS; Linux ships libgomp with the
-# toolchain so this is a no-op there.
-openmp:
-	@if command -v brew >/dev/null 2>&1; then \
-		echo ">> ensuring libomp (OpenMP) via Homebrew"; brew list libomp >/dev/null 2>&1 || brew install libomp; \
+# OpenAI Codex CLI — the second agent engine (banter dispatches `gpt-*` /
+# `*codex*` agent models to it; see codex_runner.py). Best-effort: npm first
+# (official channel), Homebrew fallback. Auth comes from OPENAI_API_KEY in .env
+# or a one-time `codex login` on the host.
+codex:
+	@if command -v codex >/dev/null 2>&1; then \
+		echo ">> codex OK ($$(codex --version 2>/dev/null))"; \
+	elif command -v npm >/dev/null 2>&1; then \
+		echo ">> installing @openai/codex via npm"; npm install -g @openai/codex; \
+	elif command -v brew >/dev/null 2>&1; then \
+		echo ">> installing codex via Homebrew"; brew install codex; \
 	else \
-		echo ">> brew not found; assuming OpenMP (libgomp) is provided by the system"; \
+		echo ">> WARNING: neither npm nor brew found; install codex manually (npm i -g @openai/codex) to use codex agent models"; \
 	fi
 
-# Install/refresh just the shared ML libs (requirements.txt) into the existing
+# Install/refresh just the shared libs (requirements.txt) into the existing
 # base .venv without rebuilding it — e.g. after editing requirements.txt, or to
 # add them to a venv that predates this target.
-ml-libs: venv openmp
+ml-libs: venv
 	$(PIP) install -r requirements.txt
 
 venv: $(VENV)/.installed

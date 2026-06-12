@@ -1,12 +1,26 @@
-"""Tests for the results hierarchy: session ids, combo rollups, autoresearch."""
+"""Tests for the results table: session ids, legacy rollups, the row schema."""
 import csv
 import json
+import multiprocessing
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
 from banter import results
+
+
+def _append_bench_row(csv_path: str, i: int) -> None:
+    """Module-level worker for the concurrent-append test (spawn-picklable)."""
+    row = results.Row(
+        started_at=f"2026-06-10T00:00:{i:02d}+00:00",
+        run="", version="", platform="hopsworks", interface="cli", skills="none",
+        category="img", task="c1",
+        asserts_passed=3, asserts_total=4,
+        wall_time_s=1.0, total_tokens=10, cost_usd=0.1,
+        run_dir=f"/tmp/run-{i}",
+    )
+    results.append(Path(csv_path), row, fields=results.RESULTS_FIELDS)
 
 
 class ConfirmOverwriteTests(unittest.TestCase):
@@ -56,77 +70,279 @@ class NextSessionIdTests(unittest.TestCase):
     def test_counts_leading_int_of_combo_folders(self):
         d = Path(tempfile.mkdtemp())
         (d / "0").mkdir()                                   # pure-int session dir
-        (d / "1_mlkit_cli_no_skills_no_session_v0").mkdir()  # combo folder
-        (d / "1_mlkit_sdk_no_skills_no_session_v0").mkdir()  # same session 1
+        (d / "1_hopsworks_cli_no_skills").mkdir()            # combo folder
+        (d / "1_hopsworks_sdk_no_skills").mkdir()            # same session 1
         (d / "notes").mkdir()
         (d / "results.csv").write_text("hdr\n")             # file, ignored
         self.assertEqual(results.next_session_id(d), "2")
 
 
-def _write_runs(combo_dir: Path, *, task, score, tokens):
-    """Drop a minimal benchmark-style CSV (BENCHMARK_FIELDS) for rollup tests."""
-    combo_dir.mkdir(parents=True)
-    fields = results.BENCHMARK_FIELDS
-    with open(combo_dir / "results.csv", "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=fields)
-        w.writeheader()
-        for ch in ("a", "b"):
-            row = {k: "" for k in fields}
-            # Benchmark uses plain (unprefixed) metric names.
-            row.update(
-                task=task, challenge=ch, platform="hopsworks", interface="cli", skills="none",
-                score=score, total_tokens=tokens, wall_time_s=100, cost_usd=0.5,
-            )
-            w.writerow(row)
+class RollUpResultsTests(unittest.TestCase):
+    """LEGACY merge into the single global results CSV: per-leaf results.csv
+    files are deprecated (the runner appends straight to the global table);
+    roll_up folds leftover leaf rows in, deduped by run_dir, one row PER
+    EXECUTION (no averaging), flat metric names."""
 
+    def _write_mixed_run(self, run_dir: Path):
+        """One config-run CSV holding TWO interface combos (like rq1)."""
+        run_dir.mkdir(parents=True)
+        fields = results.RESULTS_FIELDS
+        with open(run_dir / "results.csv", "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=fields)
+            w.writeheader()
+            for iface, passed, calls in (("cli", 3, 4), ("sdk", 4, 9)):
+                for task in ("a", "b"):
+                    row = {k: "" for k in fields}
+                    row.update(
+                        task=task, platform="hopsworks",
+                        interface=iface, skills="none", n=1,
+                        asserts_passed=passed, asserts_total=4,
+                        wall_time_s=100, total_tokens=5000, cost_usd=0.5,
+                        interface_calls=calls, python_calls=1,
+                    )
+                    w.writerow(row)
 
-class RollUpCombosTests(unittest.TestCase):
-    def test_one_row_per_combo(self):
-        parent = Path(tempfile.mkdtemp()) / "benchmark"
-        _write_runs(parent / "0_hopsworks_cli_no_skills_no_session_v0", task="image_classification", score=0.6, tokens=9000)
-        _write_runs(parent / "0_hopsworks_sdk_no_skills_no_session_v0", task="image_classification", score=0.7, tokens=7000)
-        rows = results.roll_up_combos(parent)
-        self.assertEqual(len(rows), 2)
-        with open(parent / "results.csv") as f:
+    def test_one_row_per_execution_no_averaging(self):
+        root = Path(tempfile.mkdtemp())
+        parent = root / "runs"
+        self._write_mixed_run(parent / "rq1")
+        out = root / "out" / "results.csv"
+        rows = results.roll_up_results(parent, out)
+        self.assertEqual(len(rows), 4)  # 2 interfaces × 2 tasks — every execution
+        with open(out) as f:
             csv_rows = list(csv.DictReader(f))
-        self.assertEqual({r["combo"] for r in csv_rows},
-                         {"0_hopsworks_cli_no_skills_no_session_v0", "0_hopsworks_sdk_no_skills_no_session_v0"})
-        self.assertEqual({r["platform"] for r in csv_rows}, {"hopsworks"})
-        self.assertEqual(csv_rows[0]["n_runs"], "2")
-        self.assertIn("dir", csv_rows[0])
+        self.assertEqual(len(csv_rows), 4)
+        # Per-execution identity survives: task + interface per row.
+        self.assertEqual({r["task"] for r in csv_rows}, {"a", "b"})
+        cli_rows = [r for r in csv_rows if r["interface"] == "cli"]
+        self.assertEqual(len(cli_rows), 2)
+        self.assertEqual(cli_rows[0]["asserts_passed"], "3")
+        self.assertEqual(cli_rows[0]["asserts_total"], "4")
+        self.assertEqual(cli_rows[0]["interface_calls"], "4")
+        # The whole point: same flat columns as the per-run CSVs — no eng_/res_,
+        # no avg_, no run/prev_run/whitelist columns.
+        header = list(csv_rows[0].keys())
+        self.assertEqual(header, results.RESULTS_FIELDS)
+        self.assertFalse(any(c.startswith(("eng_", "res_", "avg_")) for c in header))
+
+    def test_reads_nested_leaf_csvs(self):
+        # Leaf CSVs live deep under <config>/<model>/<platform>/<interface>/
+        # <version>/<skills>/ — there is no per-config rollup CSV anymore.
+        root = Path(tempfile.mkdtemp())
+        parent = root / "runs"
+        leaf = parent / "rq1" / "opus" / "hopsworks" / "cli" / "v1" / "no-skills"
+        self._write_mixed_run(leaf)
+        out = root / "out" / "results.csv"
+        rows = results.roll_up_results(parent, out)
+        self.assertEqual(len(rows), 4)
+        self.assertEqual({r["task"] for r in rows}, {"a", "b"})
+
+    def test_repeats_across_runs_numbered(self):
+        # The SAME config executed in two run folders → n=1 then n=2.
+        root = Path(tempfile.mkdtemp())
+        parent = root / "runs"
+        self._write_mixed_run(parent / "rq1")
+        self._write_mixed_run(parent / "rq1-repeat")
+        out = root / "out" / "results.csv"
+        rows = results.roll_up_results(parent, out)
+        self.assertEqual(len(rows), 8)
+        cli_a = [r for r in rows if r["interface"] == "cli" and r["task"] == "a"]
+        self.assertEqual([r["n"] for r in cli_a], [1, 2])
+
+    def test_empty_parent_writes_header_only(self):
+        root = Path(tempfile.mkdtemp())
+        out = root / "out" / "results.csv"
+        rows = results.roll_up_results(root / "nope", out)
+        self.assertEqual(rows, [])
+        self.assertTrue(out.exists())
+        with open(out) as f:
+            self.assertEqual(f.readline().strip().split(","), results.RESULTS_FIELDS)
+
+    def _write_csv(self, path: Path, rows: list[dict]):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=results.RESULTS_FIELDS)
+            w.writeheader()
+            for r in rows:
+                w.writerow({k: r.get(k, "") for k in results.RESULTS_FIELDS})
+
+    def test_merge_keeps_global_rows_and_dedupes_leaves_by_run_dir(self):
+        # The global CSV is maintained per-run by the runner; the merge must
+        # KEEP its rows (incl. ones in no leaf) and only add leaf rows whose
+        # run_dir is missing from the global table.
+        root = Path(tempfile.mkdtemp())
+        parent = root / "runs"
+        base = dict(task="a", platform="hopsworks",
+                    interface="cli", skills="none", asserts_passed=4,
+                    asserts_total=4)
+        out = parent / "results.csv"
+        self._write_csv(out, [
+            {**base, "run_dir": "/runs/a/1", "n": 1},   # also in leaf
+            {**base, "run_dir": "/runs/a/2", "n": 2},   # global-only
+        ])
+        self._write_csv(parent / "rq1" / "results.csv", [
+            {**base, "run_dir": "/runs/a/1", "n": 1},   # dup → skipped
+            {**base, "run_dir": "/runs/a/0", "n": 1},   # legacy → added
+        ])
+        rows = results.roll_up_results(parent, out)
+        self.assertEqual([r["run_dir"] for r in rows],
+                         ["/runs/a/1", "/runs/a/2", "/runs/a/0"])
+        # `n` re-numbered across the merged whole, same identity counts up.
+        self.assertEqual([r["n"] for r in rows], [1, 2, 3])
+        with open(out) as f:
+            self.assertEqual(len(list(csv.DictReader(f))), 3)
+
+    def test_merge_is_idempotent(self):
+        # Re-running the merge (every session start) must not duplicate rows.
+        root = Path(tempfile.mkdtemp())
+        parent = root / "runs"
+        base = dict(task="a", platform="hopsworks",
+                    interface="cli", skills="none", asserts_passed=4,
+                    asserts_total=4)
+        self._write_csv(parent / "rq1" / "results.csv",
+                        [{**base, "run_dir": "/runs/a/1", "n": 1}])
+        out = parent / "results.csv"
+        results.roll_up_results(parent, out)
+        rows = results.roll_up_results(parent, out)
+        self.assertEqual(len(rows), 1)
+
+    def test_same_run_in_leaf_and_config_rollup_merged_once(self):
+        # The OLD runner wrote each execution to BOTH a per-leaf CSV and a
+        # per-config rollup; rglob sees both copies, so the merge must dedup
+        # rows it added THIS pass, not just against the pre-existing global.
+        root = Path(tempfile.mkdtemp())
+        parent = root / "runs"
+        base = dict(task="a", platform="hopsworks",
+                    interface="cli", skills="none", asserts_passed=4,
+                    asserts_total=4)
+        row = {**base, "run_dir": "/runs/a/1", "n": 1}
+        self._write_csv(parent / "rq1" / "results.csv", [row])           # old rollup
+        self._write_csv(parent / "rq1" / "hopsworks" / "cli" / "no-skills"
+                        / "results.csv", [row])                          # old leaf
+        out = parent / "results.csv"
+        rows = results.roll_up_results(parent, out)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["n"], 1)
+
+    def test_old_combo_schema_global_rows_dropped(self):
+        # A pre-migration global CSV in the old combo-summary schema (no
+        # run_dir COLUMN, avg_* data) is not execution rows: drop it instead
+        # of renumbering garbage into the table.
+        root = Path(tempfile.mkdtemp())
+        parent = root / "runs"
+        out = parent / "results.csv"
+        out.parent.mkdir(parents=True)
+        with open(out, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=["combo", "dir", "avg_score"])
+            w.writeheader()
+            w.writerow({"combo": "hopsworks_cli", "dir": "rq1", "avg_score": 0.5})
+        base = dict(task="a", platform="hopsworks",
+                    interface="cli", skills="none", asserts_passed=4,
+                    asserts_total=4)
+        self._write_csv(parent / "rq1" / "results.csv",
+                        [{**base, "run_dir": "/runs/a/1", "n": 1}])
+        rows = results.roll_up_results(parent, out)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["run_dir"], "/runs/a/1")
+
+    def test_old_schema_leaf_rows_merge_without_new_columns(self):
+        # Legacy leaf CSVs may carry an OLD schema (extra columns, no assert
+        # columns). The merge must not KeyError; legacy rows simply leave the
+        # new assert columns blank and the unknown columns are not written.
+        root = Path(tempfile.mkdtemp())
+        parent = root / "runs"
+        leaf = parent / "rq1" / "results.csv"
+        leaf.parent.mkdir(parents=True)
+        old_fields = ["config", "model", "platform", "interface", "version",
+                      "skills", "task", "legacy_sub_task", "n", "started_at",
+                      "legacy_valid", "legacy_score", "wall_time_s",
+                      "run_dir"]
+        with open(leaf, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=old_fields)
+            w.writeheader()
+            w.writerow({"platform": "hopsworks", "interface": "cli",
+                        "skills": "none", "task": "feature",
+                        "legacy_sub_task": "drift", "n": 1, "legacy_valid": 1,
+                        "legacy_score": 0.5, "wall_time_s": 10,
+                        "run_dir": "/runs/legacy/1"})
+        out = parent / "results.csv"
+        rows = results.roll_up_results(parent, out)
+        self.assertEqual(len(rows), 1)
+        with open(out) as f:
+            written = list(csv.DictReader(f))
+        self.assertEqual(list(written[0].keys()), results.RESULTS_FIELDS)
+        self.assertEqual(written[0]["task"], "feature")  # kept verbatim
+        self.assertEqual(written[0]["asserts_passed"], "")  # blank, no migration
+        self.assertEqual(written[0]["asserts_total"], "")
+
+
+class AppendRepeatNumberTests(unittest.TestCase):
+    def _row(self, run_dir, asserts_passed=2):
+        return results.Row(
+            started_at="2026-06-10T00:00:00+00:00",
+            run="rq1", version="",
+            platform="hopsworks", interface="cli", skills="none",
+            category="t", task="a",
+            asserts_passed=asserts_passed, asserts_total=4,
+            run_dir=run_dir,
+        )
+
+    def test_replacing_non_latest_run_keeps_its_n(self):
+        # Re-running attempt 1 while attempts 2 and 3 still hold rows must keep
+        # n=1 for the replacement — recounting kept rows would mint a duplicate
+        # n=3 and lose n=1.
+        out = Path(tempfile.mkdtemp()) / "results.csv"
+        for i in (1, 2, 3):
+            results.append(out, self._row(f"/runs/a/{i}"),
+                           fields=results.RESULTS_FIELDS)
+        results.append(out, self._row("/runs/a/1", asserts_passed=4),
+                       fields=results.RESULTS_FIELDS)
+        with open(out) as f:
+            rows = list(csv.DictReader(f))
+        self.assertEqual(sorted(int(r["n"]) for r in rows), [1, 2, 3])
+        replaced = next(r for r in rows if r["run_dir"] == "/runs/a/1")
+        self.assertEqual(replaced["n"], "1")
+        self.assertEqual(replaced["asserts_passed"], "4")
 
 
 class RowSchemaTests(unittest.TestCase):
-    """Master CSV schema — single file at `results/autoresearch/results.csv`
-    accumulating one row per (session, increment, task, challenge)."""
+    """Results CSV schema — single file at `results/results.csv` accumulating
+    one row per execution."""
 
     def test_fields_order_matches_documented_layout(self):
-        # `started_at` is first (every row records when the engineer started),
-        # then identity, then work cols, then metrics.
-        self.assertEqual(results.FIELDS[0], "started_at")
-        self.assertEqual(results.FIELDS[1:6], ["run", "version", "platform", "interface", "skills"])
-        self.assertEqual(results.FIELDS[6:8], ["prev_run", "prev_version"])
-        # `incr` is gone — `increment` is now itself a plain integer.
-        self.assertNotIn("incr", results.FIELDS)
-        self.assertEqual(results.FIELDS[-1], "run_dir")
-        for dropped in ("above_median", "any_medal", "gold_medal", "silver_medal",
-                        "bronze_medal", "gold_threshold", "silver_threshold",
-                        "bronze_threshold", "median_threshold", "is_lower_better",
-                        "model", "auth"):
-            self.assertNotIn(dropped, results.FIELDS, f"{dropped!r} should be gone")
+        # Identity first (mirroring the run-folder hierarchy), then work cols,
+        # then metrics; `run_dir` last.
+        self.assertEqual(
+            results.RESULTS_FIELDS[:8],
+            ["config", "model", "platform", "interface", "version", "skills",
+             "category", "task"],
+        )
+        self.assertEqual(results.RESULTS_FIELDS[8:10], ["n", "started_at"])
+        # Assertion-suite grading columns sit where the old grading triple was.
+        self.assertEqual(results.RESULTS_FIELDS[10:12],
+                         ["asserts_passed", "asserts_total"])
+        self.assertEqual(results.RESULTS_FIELDS[-1], "run_dir")
+        # The legacy schema (and its annotation columns) is gone entirely.
+        self.assertFalse(hasattr(results, "FIELDS"))
+        for dropped in ("hypothesis", "change", "verdict", "verdict_reason",
+                        "keep", "observations", "proposed_changes"):
+            self.assertNotIn(dropped, results.RESULTS_FIELDS,
+                             f"{dropped!r} should be gone")
+            self.assertFalse(hasattr(results.Row, dropped))
 
     def test_append_round_trip(self):
+        # Default `append` writes the RESULTS_FIELDS view: `run` surfaces as
+        # the `config` column, `interface_ref` as `version`, and the
+        # sub-task Row.task as the `task` column.
         out = Path(tempfile.mkdtemp()) / "results.csv"
         row = results.Row(
             started_at="2026-05-28T00:00:00+00:00",
-            run="7", version="v2",
-            platform="mlkit", interface="cli", skills="none",
-            prev_run="3", prev_version="4",
-            task="image_classification", challenge="aerial",
-            valid_submission=1, score=0.99, medal="gold",
-            eng_wall_time_s=12.3, eng_total_tokens=100, eng_cost_usd=0.4,
-            res_wall_time_s=5.0, res_total_tokens=200, res_cost_usd=0.6,
-            total_wall_time_s=17.3, total_tokens=300, total_cost=1.0,
+            run="rq1", version="",
+            platform="hopsworks", interface="cli", skills="none",
+            category="image_classification", task="aerial",
+            interface_ref="v2", model="claude-sonnet-4-6",
+            asserts_passed=3, asserts_total=4,
+            wall_time_s=12.3, total_tokens=100, cost_usd=0.4,
             run_dir=str(out.parent / "a"),
         )
         results.append(out, row)
@@ -134,55 +350,97 @@ class RowSchemaTests(unittest.TestCase):
             written = list(csv.DictReader(f))
         self.assertEqual(len(written), 1)
         w = written[0]
-        self.assertEqual(w["run"], "7")
+        self.assertEqual(list(w.keys()), results.RESULTS_FIELDS)
+        self.assertEqual(w["config"], "rq1")
         self.assertEqual(w["version"], "v2")
-        self.assertEqual(w["prev_run"], "3")
-        self.assertEqual(w["prev_version"], "4")
-        self.assertEqual(w["challenge"], "aerial")
+        self.assertEqual(w["model"], "claude-sonnet-4-6")
+        # `task` carries the meaningful task id: the sub-task
+        # (Row.task), not the parent FTI category (Row.category).
+        self.assertEqual(w["task"], "aerial")
         self.assertEqual(w["interface"], "cli")
-        self.assertAlmostEqual(float(w["score"]), 0.99)
-        self.assertEqual(w["medal"], "gold")
-        self.assertAlmostEqual(float(w["eng_cost_usd"]), 0.4)
-        self.assertAlmostEqual(float(w["res_cost_usd"]), 0.6)
-        self.assertAlmostEqual(float(w["total_cost"]), 1.0)
+        self.assertEqual(w["n"], "1")
+        self.assertEqual(w["asserts_passed"], "3")
+        self.assertEqual(w["asserts_total"], "4")
+        self.assertAlmostEqual(float(w["cost_usd"]), 0.4)
+        self.assertAlmostEqual(float(w["wall_time_s"]), 12.3)
+        self.assertEqual(w["total_tokens"], "100")
 
-    def test_benchmark_schema_uses_plain_metric_names(self):
-        # Benchmark has no researcher, so the eng_*/res_*/total_* prefixes
-        # collapse to plain names. Continuation hints survive (a benchmark
-        # can be derived from an autoresearch session).
-        for dropped in ("run", "version",
-                        "eng_wall_time_s", "eng_cost_usd", "eng_total_tokens",
-                        "res_wall_time_s", "res_cost_usd", "res_total_tokens",
-                        "total_wall_time_s", "total_cost",
-                        "hypothesis", "verdict", "keep"):
-            self.assertNotIn(dropped, results.BENCHMARK_FIELDS,
-                             f"BENCHMARK_FIELDS should drop {dropped!r}")
-        for kept in ("started_at", "prev_run", "prev_version", "task", "challenge",
-                     "wall_time_s", "input_tokens", "output_tokens", "total_tokens", "cost_usd",
-                     "score", "medal", "cli_calls", "run_dir"):
-            self.assertIn(kept, results.BENCHMARK_FIELDS,
-                          f"BENCHMARK_FIELDS should keep {kept!r}")
+    def test_results_schema_uses_plain_metric_names(self):
+        # The results CSV uses plain metric names. The cli/mcp/sdk triple
+        # collapses into `interface_calls` (off-interface remainder folds into
+        # bash_calls); endpoint columns drop (no endpoint policy configured).
+        for dropped in ("run",
+                        "cli_calls", "mcp_calls", "sdk_calls",
+                        "whitelist_hits", "blacklist_hits"):
+            self.assertNotIn(dropped, results.RESULTS_FIELDS,
+                             f"RESULTS_FIELDS should drop {dropped!r}")
+        for kept in ("started_at", "version", "n", "task",
+                     "wall_time_s", "rate_limit_wait_s",
+                     "input_tokens", "output_tokens", "total_tokens", "cost_usd",
+                     "asserts_passed", "asserts_total",
+                     "interface_calls", "python_calls", "bash_calls",
+                     "run_dir"):
+            self.assertIn(kept, results.RESULTS_FIELDS,
+                          f"RESULTS_FIELDS should keep {kept!r}")
 
-    def test_benchmark_view_renames_eng_to_plain(self):
-        # The Row dataclass holds `eng_*`; the benchmark CSV view renames
-        # those columns to plain names.
+    def test_results_view_interface_calls_and_bash_fold(self):
+        # cli row: interface_calls = its cli_calls; off-interface mcp attempts
+        # fold into bash_calls (cli/mcp that is NOT the interface = bash).
+        raw = dict(interface="cli", cli_calls=7, mcp_calls=2, sdk_calls=0,
+                   bash_calls=5, python_calls=3)
+        view = results._results_view(raw)
+        self.assertEqual(view["interface_calls"], "7")
+        self.assertEqual(view["bash_calls"], "7")   # 5 bash + 2 off-interface mcp
+        self.assertEqual(view["python_calls"], 3)
+        # sdk row: interface_calls = sdk_calls.
+        view = results._results_view(dict(interface="sdk", cli_calls=0, mcp_calls=0,
+                                            sdk_calls=9, bash_calls=1, python_calls=2))
+        self.assertEqual(view["interface_calls"], "9")
+        self.assertEqual(view["bash_calls"], "1")
+
+    def test_results_view_uses_plain_names(self):
+        # Row metric fields and the results CSV columns share plain names.
         row = results.Row(
             started_at="2026-05-28T00:00:00+00:00",
             run="", version="", platform="i", interface="t", skills="none",
-            prev_run="", prev_version="",
-            task="img", challenge="c1",
-            valid_submission=1, score=0.5, medal=None,
-            eng_wall_time_s=10.0, eng_total_tokens=100, eng_cost_usd=0.5,
+            category="img", task="c1",
+            asserts_passed=2, asserts_total=4,
+            wall_time_s=10.0, total_tokens=100, cost_usd=0.5,
             run_dir="/tmp/x",
         )
         out = Path(tempfile.mkdtemp()) / "results.csv"
-        results.append(out, row, fields=results.BENCHMARK_FIELDS)
+        results.append(out, row, fields=results.RESULTS_FIELDS)
         with open(out) as f:
             written = list(csv.DictReader(f))[0]
         self.assertEqual(written["wall_time_s"], "10.0")
         self.assertEqual(written["total_tokens"], "100")
         self.assertAlmostEqual(float(written["cost_usd"]), 0.5)
-        self.assertNotIn("eng_wall_time_s", written)
+
+
+class ConcurrentAppendTests(unittest.TestCase):
+    def test_parallel_processes_lose_no_rows(self):
+        # `append` rewrites the whole global CSV (run_dir dedup + n renumber).
+        # Parallel treatment sessions (the per-platform rq1 configs) append to
+        # the SAME file — without the flock guard, concurrent read-modify-writes
+        # drop each other's rows. Every row must survive and the shared-identity
+        # repeat counter must come out as a clean 1..N sequence.
+        out = Path(tempfile.mkdtemp()) / "results.csv"
+        n_procs = 8
+        ctx = multiprocessing.get_context("spawn")
+        procs = [ctx.Process(target=_append_bench_row, args=(str(out), i))
+                 for i in range(n_procs)]
+        for p in procs:
+            p.start()
+        for p in procs:
+            p.join(60)
+            self.assertEqual(p.exitcode, 0)
+        with open(out) as f:
+            rows = list(csv.DictReader(f))
+        self.assertEqual(len(rows), n_procs)
+        self.assertEqual({r["run_dir"] for r in rows},
+                         {f"/tmp/run-{i}" for i in range(n_procs)})
+        self.assertEqual(sorted(int(r["n"]) for r in rows),
+                         list(range(1, n_procs + 1)))
 
 
 class CommandClassificationTests(unittest.TestCase):
@@ -194,13 +452,56 @@ class CommandClassificationTests(unittest.TestCase):
 
     def test_skill_tool_counted_as_skill_calls(self):
         tr = self._transcript(
-            {"type": "tool_use", "name": "Skill", "input": {"skill": "mlkit-tip"}},
+            {"type": "tool_use", "name": "Skill", "input": {"skill": "hops-tip"}},
             {"type": "tool_use", "name": "Bash", "input": {"command": "ls"}},
         )
         counts = results.aggregate_commands(tr)
         self.assertEqual(counts["skill_calls"], 1)
         self.assertEqual(counts["bash_calls"], 1)
-        self.assertEqual(counts["other_tool_calls"], 0)
+
+    def test_workspace_tools_bucketed_explicitly(self):
+        # Read/Write/Edit/Glob/Grep/TodoWrite get their own columns; tools
+        # outside the map (denied ones like WebFetch) are not bucketed at all.
+        tr = self._transcript(
+            {"type": "tool_use", "name": "Read", "input": {"file_path": "data/train.csv"}},
+            {"type": "tool_use", "name": "Read", "input": {"file_path": "data/test.csv"}},
+            {"type": "tool_use", "name": "Write", "input": {"file_path": "train.py"}},
+            {"type": "tool_use", "name": "Edit", "input": {"file_path": "train.py"}},
+            {"type": "tool_use", "name": "NotebookEdit", "input": {"notebook_path": "x.ipynb"}},
+            {"type": "tool_use", "name": "Glob", "input": {"pattern": "*.csv"}},
+            {"type": "tool_use", "name": "Grep", "input": {"pattern": "label"}},
+            {"type": "tool_use", "name": "TodoWrite", "input": {}},
+            {"type": "tool_use", "name": "WebFetch", "input": {"url": "http://x"}},
+        )
+        counts = results.aggregate_commands(tr)
+        self.assertEqual(counts["read_calls"], 2)
+        self.assertEqual(counts["write_calls"], 1)
+        self.assertEqual(counts["edit_calls"], 2)   # Edit + NotebookEdit
+        self.assertEqual(counts["glob_calls"], 1)
+        self.assertEqual(counts["grep_calls"], 1)
+        self.assertEqual(counts["todo_calls"], 1)
+        self.assertNotIn("other_tool_calls", counts)
+
+    def test_failed_and_denied_counted_from_tool_results(self):
+        # Errored tool results split into hook rejections (DENIED:) vs real
+        # execution failures; successful results count nowhere.
+        tr = self._transcript(
+            {"type": "tool_use", "name": "Bash", "input": {"command": "hops fg create"}},
+        )
+        import json
+        with open(tr, "a") as f:
+            for content, is_err in (
+                ("DENIED: local python is off-interface in 'cli' mode.", True),
+                ("Traceback (most recent call last): boom", True),
+                ("error: unknown flag --primary-key", True),
+                ("ok", False),
+            ):
+                f.write(json.dumps({"type": "user", "message": {"content": [
+                    {"type": "tool_result", "is_error": is_err, "content": content}
+                ]}}) + "\n")
+        counts = results.aggregate_commands(tr)
+        self.assertEqual(counts["denied_calls"], 1)
+        self.assertEqual(counts["failed_commands"], 2)
 
     def test_python_buried_in_multi_segment_bash_counts_as_python(self):
         # `BASE=/x; python train.py` — first token is the env assignment,
@@ -256,76 +557,133 @@ class CommandClassificationTests(unittest.TestCase):
         # is the primary intent we're optimising for).
         tr = self._transcript(
             {"type": "tool_use", "name": "Bash",
-             "input": {"command": "mlkit fit data && python eval.py"}},
+             "input": {"command": "hops fit data && python eval.py"}},
         )
-        counts = results.aggregate_commands(tr, cli_binary="mlkit")
+        counts = results.aggregate_commands(tr, cli_binary="hops")
         self.assertEqual(counts["cli_calls"], 1)
         self.assertEqual(counts["python_calls"], 0)
 
+    def test_cli_subcommand_allowlist_counts_all_services(self):
+        # `cli_subcommand` is a comma-joined allowlist: every allowed service of
+        # the binary counts as an interface call; others fall through to bash.
+        tr = self._transcript(
+            {"type": "tool_use", "name": "Bash",
+             "input": {"command": "aws sagemaker list-training-jobs"}},
+            {"type": "tool_use", "name": "Bash",
+             "input": {"command": "aws s3 cp data s3://bkt/data --recursive"}},
+            {"type": "tool_use", "name": "Bash",
+             "input": {"command": "aws sagemaker-runtime invoke-endpoint --endpoint-name e o.json"}},
+            {"type": "tool_use", "name": "Bash",
+             "input": {"command": "aws ec2 describe-instances"}},
+        )
+        counts = results.aggregate_commands(
+            tr, cli_binary="aws", cli_subcommand="sagemaker,sagemaker-runtime,s3",
+        )
+        self.assertEqual(counts["cli_calls"], 3)
+        self.assertEqual(counts["bash_calls"], 1)
 
-class RollingAverageTests(unittest.TestCase):
-    def _row(self, rd, *, cli=0, wall=0.0):
-        return results.Row(
-            started_at="t", run="", version="", platform="mlkit", interface="cli",
-            skills="none", prev_run="", prev_version="", task="no_task",
-            challenge="c", run_dir=rd, cli_calls=cli, eng_wall_time_s=wall,
-            total_wall_time_s=wall)
+    def test_cli_subcommand_requires_exec_position(self):
+        # An echoed/printed `aws sagemaker …` is not an interface call — the
+        # service match must sit in an EXEC-position segment, mirroring the
+        # no-subcommand branch.
+        tr = self._transcript(
+            {"type": "tool_use", "name": "Bash",
+             "input": {"command": "echo aws sagemaker create-training-job"}},
+        )
+        counts = results.aggregate_commands(
+            tr, cli_binary="aws", cli_subcommand="sagemaker,s3")
+        self.assertEqual(counts["cli_calls"], 0)
+        self.assertEqual(counts["bash_calls"], 1)
 
-    def _ar_row(self, rd, *, cli=0, wall=0.0):
-        # Autoresearch row (rolling averages are autoresearch-only).
-        r = self._row(rd, cli=cli, wall=wall)
-        r.run, r.version = "1", "v0"
-        return r
+    def test_cli_subcommand_skips_global_options(self):
+        # Same rule as the enforcement hook: global options before the service
+        # don't hide the entrypoint (`aws --region x sagemaker …` is cli), and
+        # an option value equal to an allowed service legitimizes nothing.
+        tr = self._transcript(
+            {"type": "tool_use", "name": "Bash",
+             "input": {"command": "aws --region us-east-1 sagemaker list-models"}},
+            {"type": "tool_use", "name": "Bash",
+             "input": {"command": "aws --profile sagemaker ec2 describe-instances"}},
+        )
+        counts = results.aggregate_commands(
+            tr, cli_binary="aws", cli_subcommand="sagemaker,s3")
+        self.assertEqual(counts["cli_calls"], 1)
+        self.assertEqual(counts["bash_calls"], 1)
 
-    def test_count_rolling_avg_is_cumulative(self):
-        # cli_calls_avg = cumulative running mean of cli_calls across rows.
-        d = Path(tempfile.mkdtemp())
-        csvp = d / "results.csv"
-        results.append(csvp, self._ar_row("r1", cli=2))  # fields=None → autoresearch
-        results.append(csvp, self._ar_row("r2", cli=4))
-        results.append(csvp, self._ar_row("r3", cli=0))
-        with csvp.open() as f:
-            rows = list(csv.DictReader(f))
-        # zeros count as real samples (a run with no cli calls is still a run).
-        self.assertEqual([r["cli_calls_avg"] for r in rows],
-                         ["2.0000", "3.0000", "2.0000"])  # 2, (2+4)/2, (2+4+0)/3
+    def test_denied_marker_is_line_anchored(self):
+        # Echoed remote errors containing `…DENIED:` mid-token (PERMISSION_DENIED:)
+        # are FAILURES, not hook denials; the hook marker sits at line start
+        # (optionally bulleted by Claude Code's blocked-by-hook formatting).
+        import json
+        tr = self._transcript(
+            {"type": "tool_use", "name": "Bash", "input": {"command": "ls"}},
+        )
+        with open(tr, "a") as f:
+            for content in (
+                "grpc error: PERMISSION_DENIED: caller lacks permission",
+                "PreToolUse:Bash blocked by hook:\n- DENIED: local python is off-interface",
+            ):
+                f.write(json.dumps({"type": "user", "message": {"content": [
+                    {"type": "tool_result", "is_error": True, "content": content}
+                ]}}) + "\n")
+        counts = results.aggregate_commands(tr)
+        self.assertEqual(counts["denied_calls"], 1)
+        self.assertEqual(counts["failed_commands"], 1)
 
-    def test_wall_rolling_avg_and_recompute_on_replace(self):
-        d = Path(tempfile.mkdtemp())
-        csvp = d / "results.csv"
-        results.append(csvp, self._ar_row("r1", wall=10.0))
-        results.append(csvp, self._ar_row("r2", wall=20.0))
-        with csvp.open() as f:
-            rows = list(csv.DictReader(f))
-        self.assertEqual([r["eng_wall_time_avg_s"] for r in rows], ["10.0000", "15.0000"])
-        # Re-run r1 → moves to end, rolling recomputed over the new order.
-        results.append(csvp, self._ar_row("r1", wall=40.0))
-        with csvp.open() as f:
-            rows = list(csv.DictReader(f))
-        self.assertEqual([r["run_dir"] for r in rows], ["r2", "r1"])
-        self.assertEqual([r["eng_wall_time_avg_s"] for r in rows], ["20.0000", "30.0000"])
+    def test_denied_counted_from_structured_commands_log(self):
+        # When the hook's commands.jsonl is available, its `denied: true`
+        # records are the source of truth: echoed DENIED text in tool results
+        # cannot inflate denied_calls, and the remaining errors are failures.
+        import json
+        tr = self._transcript(
+            {"type": "tool_use", "name": "Bash", "input": {"command": "ls"}},
+        )
+        with open(tr, "a") as f:
+            for content in (
+                "DENIED: local python is off-interface in 'cli' mode.",  # real
+                "DENIED: looks like a denial but the hook never logged it",  # echo
+                "Traceback (most recent call last): boom",
+            ):
+                f.write(json.dumps({"type": "user", "message": {"content": [
+                    {"type": "tool_result", "is_error": True, "content": content}
+                ]}}) + "\n")
+        log = tr.parent / "commands.jsonl"
+        log.write_text(
+            json.dumps({"tool_name": "Bash", "category": "bash",
+                        "tool_input": {"command": "ls"}}) + "\n"
+            + json.dumps({"tool_name": "Bash", "category": "python", "denied": True,
+                          "reason": "DENIED: local python is off-interface",
+                          "tool_input": {"command": "python x.py"}}) + "\n"
+        )
+        counts = results.aggregate_commands(tr, commands_log=log)
+        self.assertEqual(counts["denied_calls"], 1)
+        self.assertEqual(counts["failed_commands"], 2)
 
-    def test_autoresearch_schema_uses_eng_and_total_avg(self):
-        # Full FIELDS schema: engineer + total wall time each get a rolling avg.
-        d = Path(tempfile.mkdtemp())
-        csvp = d / "results.csv"
-        results.append(csvp, self._ar_row("r1", cli=3, wall=5.0))
-        with csvp.open() as f:
-            rows = list(csv.DictReader(f))
-        self.assertEqual(rows[0]["eng_wall_time_avg_s"], "5.0000")
-        self.assertEqual(rows[0]["total_wall_time_avg_s"], "5.0000")
-        self.assertEqual(rows[0]["cli_calls_avg"], "3.0000")
+    def test_write_commands_log_preserves_denial_records(self):
+        # The rebuild from the transcript must not erase the hook's structured
+        # denial records — they are the denied_calls source of truth.
+        import json
+        tr = self._transcript(
+            {"type": "tool_use", "name": "Bash", "input": {"command": "ls"}},
+        )
+        log = tr.parent / "commands.jsonl"
+        log.write_text(
+            json.dumps({"tool_name": "Bash", "category": "python", "denied": True,
+                        "reason": "DENIED: local python is off-interface",
+                        "tool_input": {"command": "python x.py"}}) + "\n"
+        )
+        results.write_commands_log(tr, log)
+        recs = [json.loads(l) for l in log.read_text().splitlines() if l.strip()]
+        self.assertEqual(len(recs), 2)  # rebuilt `ls` + preserved denial
+        self.assertEqual(sum(1 for r in recs if r.get("denied")), 1)
 
-    def test_benchmark_schema_has_no_rolling_avg_columns(self):
-        # Rolling averages are autoresearch-only; benchmark has nothing to
-        # accumulate across (one session of independent challenges).
-        self.assertFalse([c for c in results.BENCHMARK_FIELDS if c.endswith(("_avg", "_avg_s"))])
-        d = Path(tempfile.mkdtemp())
-        csvp = d / "results.csv"
-        results.append(csvp, self._row("r1", cli=2), fields=results.BENCHMARK_FIELDS)
-        with csvp.open() as f:
-            header = next(csv.reader(f))
-        self.assertFalse([c for c in header if c.endswith(("_avg", "_avg_s"))])
+
+class NoRollingAverageTests(unittest.TestCase):
+    def test_no_avg_columns_anywhere(self):
+        # Rolling `_avg` columns were removed from the results CSV; the schema
+        # doesn't carry them and the recompute machinery is gone.
+        self.assertFalse([c for c in results.RESULTS_FIELDS if c.endswith(("_avg", "_avg_s"))])
+        self.assertFalse(hasattr(results, "recompute_rolling_averages"))
 
 
 class CollectClientLogsTests(unittest.TestCase):
@@ -346,7 +704,7 @@ class CollectClientLogsTests(unittest.TestCase):
     def test_mcp_startup_crash_is_surfaced(self):
         import json
         run_dir = self._run_dir()
-        boundary = run_dir  # benchmark-style: HOME == challenge dir
+        boundary = run_dir  # HOME == run dir
         self._mcp_log(
             boundary, run_dir, "hopsworks",
             json.dumps("Server stderr: Traceback (most recent call last):\n  RuntimeError: Login failed"),
@@ -380,7 +738,7 @@ class CollectClientLogsTests(unittest.TestCase):
         )
         self.assertTrue(res["crashed"])
         text = Path(res["path"]).read_text()
-        self.assertIn("client errors (engineer transcript)", text)
+        self.assertIn("client errors (agent transcript)", text)
         self.assertIn("RestAPIError: boom", text)
 
     def test_clean_run_writes_file_without_crash(self):
@@ -407,6 +765,74 @@ class CollectClientLogsTests(unittest.TestCase):
         )
         self.assertFalse(res["crashed"])
         self.assertFalse(Path(res["path"]).exists())
+
+
+class ToolTimerTests(unittest.TestCase):
+    """Arrival-time spans (stream-json events carry no timestamps) and the
+    platform/local split of wall time."""
+
+    def _timer(self, ticks):
+        from banter import claude_runner
+        it = iter(ticks)
+        return claude_runner.ToolTimer(clock=lambda: next(it))
+
+    @staticmethod
+    def _use(tid, name, **inp):
+        return json.dumps({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": tid, "name": name, "input": inp}]}})
+
+    @staticmethod
+    def _result(tid):
+        return json.dumps({"type": "user", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": tid}]}})
+
+    def test_spans_measure_tool_use_to_tool_result(self):
+        t = self._timer([0.0, 5.0, 6.0, 8.5])
+        t.observe(self._use("a", "Bash", command="hops fg list"))   # t=0
+        t.observe(self._result("a"))                                 # t=5
+        t.observe(self._use("b", "Read", file_path="x.csv"))         # t=6
+        t.observe(self._result("b"))                                 # t=8.5
+        spans = t.finalize()
+        self.assertEqual([s["seconds"] for s in spans], [5.0, 2.5])
+        self.assertEqual(spans[0]["tool_name"], "Bash")
+
+    def test_result_event_closes_open_spans_before_backoff_sleep(self):
+        # A `result` event ends one attempt; the rate-limit sleep that follows
+        # must not inflate a span left open by a kill/error.
+        t = self._timer([0.0, 3.0])
+        t.observe(self._use("a", "Bash", command="sleep 999"))       # t=0
+        t.observe(json.dumps({"type": "result"}))                    # t=3
+        spans = t.finalize()
+        self.assertEqual(len(spans), 1)
+        self.assertEqual(spans[0]["seconds"], 3.0)
+
+    def test_finalize_closes_span_open_at_process_death(self):
+        t = self._timer([0.0, 7.0])
+        t.observe(self._use("a", "Bash", command="aws sagemaker wait"))
+        spans = t.finalize()                                          # t=7
+        self.assertEqual(spans[0]["seconds"], 7.0)
+
+    def test_platform_tool_time_counts_only_the_interface_under_test(self):
+        spans = [
+            {"tool_name": "Bash", "tool_input": {"command": "hops fg list"}, "seconds": 5.0},
+            {"tool_name": "Bash", "tool_input": {"command": "ls data/"}, "seconds": 2.0},
+            {"tool_name": "Read", "tool_input": {"file_path": "x.csv"}, "seconds": 1.0},
+        ]
+        self.assertEqual(results.platform_tool_time(spans, cli_binary="hops"), 5.0)
+        # Same spans with NO active cli interface (e.g. the local baseline):
+        # nothing is platform time.
+        self.assertEqual(results.platform_tool_time(spans), 0.0)
+
+    def test_platform_tool_time_sdk_python(self):
+        spans = [
+            {"tool_name": "Bash",
+             "tool_input": {"command": "python -c 'import hopsworks; hopsworks.login()'"},
+             "seconds": 4.0},
+            {"tool_name": "Bash",
+             "tool_input": {"command": "python -c 'print(1)'"}, "seconds": 3.0},
+        ]
+        self.assertEqual(
+            results.platform_tool_time(spans, sdk_module="hopsworks"), 4.0)
 
 
 if __name__ == "__main__":

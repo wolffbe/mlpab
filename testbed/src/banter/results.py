@@ -1,126 +1,136 @@
 """results.csv writer.
 
-One row per (challenge, platform, interface, skills, auth) run. Token/cost
+One row per (task, platform, interface, skills, auth) run. Token/cost
 columns come from the stream-json transcript's `result` event (Claude Code's
 `total_cost_usd` + aggregated `usage`); command counts from walking each
-`tool_use` block in the same transcript; medal/score from the MLE-bench grader.
+`tool_use` block in the same transcript; asserts_passed/asserts_total from the
+assertion-suite grading report.
 """
 from __future__ import annotations
 
+import contextlib
 import csv
+import fcntl
 import json
+import os
 import re
 import shlex
 import shutil
 import sys
+import tempfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
+
+# One parser for "which service follows the CLI binary": the same rule the
+# enforcement hook applies, so counted interface_calls match what the hook
+# actually allowed.
+from banter.hooks.log_tool_call import _cli_arg_after as _hook_cli_arg_after
+
+
+@contextlib.contextmanager
+def _locked_csv(csv_path: Path):
+    """Serialize cross-process read-modify-writes of a shared CSV.
+
+    `append` and `roll_up_results` both READ the whole table and REWRITE
+    it (run_dir dedup + `n` renumbering), so two treatment processes running in
+    parallel (e.g. the per-platform rq1 configs) would silently drop each
+    other's rows without this. flock on a sidecar `<name>.lock` (the CSV itself
+    is replaced atomically, so its fd can't serve as the lock anchor).
+    """
+    lock_path = csv_path.with_name(csv_path.name + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "w") as lf:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lf, fcntl.LOCK_UN)
+
+
+def _write_csv_atomic(csv_path: Path, fieldnames: list[str], rows: list[dict[str, Any]]) -> None:
+    """Replace `csv_path` in one rename, so lock-less readers (the analysis
+    notebook, a parallel process's pre-lock peek) never see a torn file."""
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(csv_path.parent), prefix=f".{csv_path.name}.", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=fieldnames)
+            w.writeheader()
+            for row in rows:
+                w.writerow({k: row.get(k, "") for k in fieldnames})
+        os.replace(tmp_name, csv_path)
+    except BaseException:
+        Path(tmp_name).unlink(missing_ok=True)
+        raise
 
 
 _PYTHON_PREFIXES = ("python", "python3", "uv run python", "uv run", "pip", "pip3")
 _PY_INTERPRETER_BASENAMES = ("python", "python3", "pip", "pip3")
 
 
-# One-row-per-session summary schemas, at the top of each runner's results tree:
-# results/<benchmark|autoresearch>/results.csv. One metric per numeric per-run
-# FIELDS column, so rollups reflect ALL per-run metrics. `platform_invocations`
-# is the derived remote-platform delegation total (cli + mcp + sdk calls).
-AGG_METRICS = [
-    "score",
-    "eng_wall_time_s", "eng_input_tokens", "eng_output_tokens", "eng_total_tokens", "eng_cost_usd",
-    "res_wall_time_s", "res_input_tokens", "res_output_tokens", "res_total_tokens", "res_cost_usd",
-    "total_wall_time_s", "total_tokens", "total_cost",
-    "llm_calls", "cli_calls", "mcp_calls", "sdk_calls", "python_calls",
-    "bash_calls", "other_tool_calls", "skill_calls",
-    "whitelist_hits", "blacklist_hits",
-    "platform_invocations",
-    # Only grading bool kept in FIELDS; its average is the valid-submission rate.
-    "valid_submission",
-]
-
-# Per-category tool-call counts tracked on every (engineer) run, with their
-# improvement direction. Each gets a cumulative rolling-average column `<cat>_avg`
-# (mean of the count across results.csv rows up to and including the row),
-# recomputed on every append/replace (see `recompute_rolling_averages`).
-# Directions are cosmetic chart-title labels: more interface use
-# (cli/mcp/sdk/skill) is "good", self-written code (python/bash) is "bad".
-CALL_COUNT_DIRECTIONS: dict[str, str] = {
-    "llm_calls": "minimize",
-    "cli_calls": "maximize",
-    "mcp_calls": "maximize",
-    "sdk_calls": "maximize",
-    "python_calls": "minimize",
-    "bash_calls": "minimize",
-    "skill_calls": "maximize",
-    "other_tool_calls": "minimize",
+# Per-category tool-call count columns tracked on every (agent) run.
+CALL_COUNT_COLUMNS: tuple[str, ...] = (
+    "llm_calls",
+    "cli_calls",
+    "mcp_calls",
+    "sdk_calls",
+    "python_calls",
+    "bash_calls",
+    "skill_calls",
+    # Explicit workspace-tool buckets (no catch-all "other").
+    "read_calls",
+    "write_calls",
+    "edit_calls",
+    "glob_calls",
+    "grep_calls",
+    "todo_calls",
+    # Outcome friction: tool results that ERRORED. `denied_calls` = hook
+    # rejections (the `DENIED:` enforcement messages — attempts to leave the
+    # interface); `failed_commands` = every OTHER errored tool result (real
+    # execution failures: bad CLI args, SDK exceptions, non-zero exits).
+    "failed_commands",
+    "denied_calls",
     # REST-endpoint coverage (from `endpoint_hits`, NOT aggregate_commands):
-    # distinct whitelisted endpoints hit (more = better), forbidden calls (fewer).
-    "whitelist_hits": "maximize",
-    "blacklist_hits": "minimize",
-}
-CALL_COUNT_COLS = tuple(CALL_COUNT_DIRECTIONS)
-
-# Metrics ALWAYS tracked + charted in every autoresearch run, with improvement
-# direction. Config `goals` only picks WHICH the researcher optimizes for; charts
-# cover the full set regardless. Order = chart order. One chart per metric; wall
-# time + every call category also carry a rolling cumulative average drawn as a
-# dotted overlay on the same chart (see `rolling_avg_col`), not a separate diagram.
-TRACKED_METRICS: list[tuple[str, str]] = [
-    ("score", "maximize"),
-    ("total_tokens", "minimize"),
-    ("eng_wall_time_s", "minimize"),
-    # `observe` (neutral, not an optimization target): eng + researcher wall time
-    # is partly controller overhead, so charted for visibility only.
-    ("total_wall_time_s", "observe"),
-    ("total_cost", "minimize"),
-    *((c, d) for c, d in CALL_COUNT_DIRECTIONS.items()),
-]
-
-# Benchmark CSV: same canonical list, plain metric names (no `eng_`/`total_`
-# prefix since there's no researcher) and a different wall-time name.
-BENCHMARK_TRACKED_METRICS: list[tuple[str, str]] = [
-    ("score", "maximize"),
-    ("total_tokens", "minimize"),
-    ("wall_time_s", "minimize"),
-    ("cost_usd", "minimize"),
-    *((c, d) for c, d in CALL_COUNT_DIRECTIONS.items()),
-]
-
-
-# Metric column → its rolling-average column. Rolling averages are
-# AUTORESEARCH-only (a cumulative average accumulating across versions); benchmark
-# is independent (task, challenge) rows with nothing to accumulate, so no `*_avg`
-# columns. This map plus `CALL_COUNT_COLS` is the single source of raw→avg pairs,
-# used for chart overlays (`rolling_avg_col`) and the recompute (`_rolling_pairs`).
-_ROLLING_AVG_OF = {
-    "score": "score_avg",
-    "total_tokens": "total_tokens_avg",
-    "total_cost": "total_cost_avg",
-    "eng_wall_time_s": "eng_wall_time_avg_s",
-    "total_wall_time_s": "total_wall_time_avg_s",
-}
-
-
-def rolling_avg_col(metric: str) -> str | None:
-    """The dotted rolling-average column to overlay on `metric`'s chart, or None
-    when the metric has no rolling average."""
-    if metric in _ROLLING_AVG_OF:
-        return _ROLLING_AVG_OF[metric]
-    if metric in CALL_COUNT_COLS:
-        return f"{metric}_avg"
-    return None
-
-# Per-run rollup (benchmark): one row per <run> folder averaging its per-challenge
-# rows. Written to results/benchmark/results.csv.
-COMBO_SUMMARY_FIELDS = (
-    ["combo", "platform", "interface", "skills", "n_runs"]
-    + [f"avg_{m}" for m in AGG_METRICS]
-    + ["dir"]   # the run folder
+    # distinct whitelisted endpoints hit, and forbidden calls.
+    "whitelist_hits",
+    "blacklist_hits",
 )
-# Autoresearch has no global rollup CSV: each session writes its own
-# <run>/results.csv (one row per (run, version, task, challenge), columns =
-# FIELDS below) and the researcher reports the best increment in report.md.
+
+# Metrics ALWAYS tracked + charted on every run.
+# Order = chart order. One chart per metric.
+TRACKED_METRICS: list[str] = [
+    "asserts_passed",
+    "asserts_total",
+    "total_tokens",
+    "wall_time_s",
+    "cost_usd",
+    *CALL_COUNT_COLUMNS,
+]
+
+# Results CSV: the cli/mcp/sdk triple collapsed into `interface_calls`, and no
+# endpoint columns (no per-config endpoint policy is configured).
+RESULTS_TRACKED_METRICS: list[str] = [
+    "asserts_passed",
+    "asserts_total",
+    "total_tokens",
+    "wall_time_s",
+    "cost_usd",
+    "llm_calls",
+    "interface_calls",
+    "python_calls",
+    "bash_calls",
+    "skill_calls",
+    "read_calls",
+    "write_calls",
+    "edit_calls",
+    "glob_calls",
+    "grep_calls",
+    "todo_calls",
+    "failed_commands",
+    "denied_calls",
+]
 
 
 def _avg(values: list[float]) -> str:
@@ -145,111 +155,89 @@ def _num_col(runs: list[dict[str, str]], key: str) -> list[float]:
     return out
 
 
-def _platform_col(runs: list[dict[str, str]]) -> list[float]:
-    """Per-run remote-platform invocations = cli + mcp + sdk calls."""
-    out: list[float] = []
-    for r in runs:
-        total, seen = 0.0, False
-        for k in ("cli_calls", "mcp_calls", "sdk_calls"):
-            try:
-                total += float(r.get(k, ""))
-                seen = True
-            except (TypeError, ValueError):
-                pass
-        if seen:
-            out.append(total)
-    return out
-
-
-def _agg_runs(runs: list[dict[str, str]]) -> dict[str, Any]:
-    out: dict[str, Any] = {"n_runs": len(runs)}
-    for m in AGG_METRICS:
-        col = _platform_col(runs) if m == "platform_invocations" else _num_col(runs, m)
-        out[f"avg_{m}"] = _avg(col)
-    return out
-
-
-def roll_up_combos(parent: Path) -> list[dict[str, Any]]:
-    """Average each `<combo>/results.csv` run folder under `parent` into one row
-    and (over)write `parent/results.csv` (COMBO_SUMMARY_FIELDS). Returns the rows.
-
-    A "combo" folder is any immediate subdir holding a detailed per-challenge
-    results.csv (e.g. `0_no_interface_no_type_no_skills_no_session_v0/`).
-    """
-    rows: list[dict[str, Any]] = []
-    if not parent.exists():
-        return rows
-    for d in sorted(p for p in parent.iterdir() if p.is_dir()):
-        runs = _read_runs(d / "results.csv")
-        if not runs:
-            continue
-        first = runs[0]
-        rows.append({
-            "combo": d.name,
-            "platform": first.get("platform", ""),
-            "interface": first.get("interface", ""),
-            "skills": first.get("skills", ""),
-            **_agg_runs(runs),
-            "dir": str(d),
-        })
-    with open(parent / "results.csv", "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=COMBO_SUMMARY_FIELDS)
-        w.writeheader()
-        for row in rows:
-            w.writerow({k: row.get(k, "") for k in COMBO_SUMMARY_FIELDS})
-    return rows
-
-
-# The runner appends each challenge row directly to `<run>/results.csv` (one CSV
-# per session, tagged with `session` + `increment`); the notebook computes its own
-# per-increment means from those raw rows.
-
-
-# Benchmark CSV has no researcher (no eng/res split) and no increments, so it uses
-# plain column names (`wall_time_s`, `total_tokens`, …) instead of the
-# autoresearch `eng_*`/`res_*`/`total_*` triple. Maps autoresearch Row fields →
-# benchmark column names, in benchmark-CSV order; `BENCHMARK_FIELDS` is the
-# .keys() view.
-_BENCHMARK_VIEW = {
-    "started_at": "started_at",
+# The results CSV uses plain column names (`wall_time_s`, `total_tokens`, …).
+# Maps Row fields → results column names, in results-CSV order;
+# `RESULTS_FIELDS` is the .keys() view.
+# Column order mirrors the run-folder hierarchy:
+#   <config>/<model>/<platform>/<interface>/<version>/<skills>/<category>/<task>/<n>
+# (run-dir paths use BOTH Row.category — the FTI stage — and Row.task — the
+# sub-task; only the latter surfaces in the CSV, as the `task` column.)
+_RESULTS_VIEW = {
+    # The treatment config name (results/<config>/ — the yaml stem).
+    "config": "run",
+    "model": "model",
     "platform": "platform",
     "interface": "interface",
+    # The interface build under test: pinned ref/version (git SHA / ==X.Y.Z pin /
+    # package version).
+    "version": "interface_ref",
     "skills": "skills",
-    "prev_run": "prev_run",
-    "prev_version": "prev_version",
+    # The meaningful task id — the FTI sub-task (Row.task, e.g.
+    # training_data/skew/drift). Row.category (the parent FTI stage) stays an
+    # internal field only.
+    "category": "category",   # FTI stage: feature / training / inference / ops
     "task": "task",
-    "challenge": "challenge",
-    "valid_submission": "valid_submission",
-    "score": "score",
-    "medal": "medal",
-    # Engineer metrics: drop the `eng_` prefix. Benchmark has NO `*_avg` rolling
-    # columns — one run of independent (task, challenge) rows, nothing to accumulate.
-    "wall_time_s": "eng_wall_time_s",
-    "input_tokens": "eng_input_tokens",
-    "output_tokens": "eng_output_tokens",
-    "total_tokens": "eng_total_tokens",
-    "cost_usd": "eng_cost_usd",
+    # Repeat counter (derived; src None): 1 for the first execution of a given
+    # (platform, interface, skills, category, task) config, 2 for its second
+    # run, … Numbered against the global results.csv at append time;
+    # roll_up_results re-numbers only when merging legacy leaf CSVs.
+    "n": None,
+    "started_at": "started_at",
+    # Assertion-suite grading (full breakdown in the per-run grading.json).
+    "asserts_passed": "asserts_passed",
+    "asserts_total": "asserts_total",
+    # Agent metrics. `wall_time_s` is COMPUTE time; rate-limit back-off
+    # sleeps land in `rate_limit_wait_s` instead.
+    "wall_time_s": "wall_time_s",
+    "rate_limit_wait_s": "rate_limit_wait_s",
+    # Exact two-way split of `wall_time_s` (wall = platform + local):
+    #   platform_time_s — seconds inside tool calls THROUGH the interface
+    #     under test (cli/mcp/sdk): remote execution against the platform.
+    #   local_time_s — everything else client-side (wall − platform): local
+    #     tool execution + LLM generation. See `platform_tool_time`.
+    "platform_time_s": "platform_time_s",
+    "local_time_s": "local_time_s",
+    "input_tokens": "input_tokens",
+    "output_tokens": "output_tokens",
+    "total_tokens": "total_tokens",
+    "cost_usd": "cost_usd",
     "llm_calls": "llm_calls",
-    "cli_calls": "cli_calls",
-    "mcp_calls": "mcp_calls",
-    "sdk_calls": "sdk_calls",
+    # The cli/mcp/sdk triple collapses into ONE column (src None = derived in
+    # `_results_view`):
+    #   interface_calls — calls through the interface UNDER TEST (cli row →
+    #     cli_calls, mcp row → mcp_calls, sdk row → sdk_calls).
+    #   bash_calls — plain shell PLUS any off-interface cli/mcp attempts (e.g.
+    #     mcp tool calls during a cli run): not the interface, so not
+    #     interface_calls. python stays separate (python_calls = local python
+    #     that isn't the SDK under test).
+    # No whitelist/blacklist either — no endpoint policy is configured for
+    # treatment runs.
+    "interface_calls": None,
     "python_calls": "python_calls",
-    "bash_calls": "bash_calls",
+    "bash_calls": None,
+    "read_calls": "read_calls",
+    "write_calls": "write_calls",
+    "edit_calls": "edit_calls",
+    "glob_calls": "glob_calls",
+    "grep_calls": "grep_calls",
+    "todo_calls": "todo_calls",
     "skill_calls": "skill_calls",
-    "other_tool_calls": "other_tool_calls",
-    "whitelist_hits": "whitelist_hits",
-    "blacklist_hits": "blacklist_hits",
+    "failed_commands": "failed_commands",
+    "denied_calls": "denied_calls",
     "error": "error",
     "run_dir": "run_dir",
 }
+
+# Row field holding the interface's own call count, per interface kind.
+_INTERFACE_CALL_SRC = {"cli": "cli_calls", "mcp": "mcp_calls", "sdk": "sdk_calls"}
 
 
 def next_session_id(parent: Path) -> str:
     """Next incrementing integer session id (as a string) under `parent`.
 
-    Counts the leading integer of each child dir name — both pure-integer session
-    dirs (autoresearch: `0`, `1`) and `<id>_<combo>` run folders (benchmark:
-    `0_no_interface_..._v0`). Returns max+1, or "0" when there are none.
+    Counts the leading integer of each child dir name — both pure-integer
+    session dirs (`0`, `1`) and `<id>_<combo>` run folders. Returns max+1,
+    or "0" when there are none.
     """
     nums: list[int] = []
     if parent.exists():
@@ -289,148 +277,139 @@ def confirm_overwrite(path: Path, assume_yes: bool = False) -> bool:
     return True
 
 
-FIELDS = [
-    # Engineer's `claude -p` start (UTC ISO-8601). One per row.
-    "started_at",
-    # Run / version identity (autoresearch). `version` is `v<N>` (e.g. `v2`) —
-    # same string that names the increment's filesystem dir.
-    "run",
-    "version",
-    "platform",
-    "interface",       # interface: cli/mcp/sdk/none
-    "skills",
-    "prev_run",        # carried from autoresearch config; "" if not a continuation
-    "prev_version",    # e.g. "v2" — last version of `prev_run` we continue from
-    # The work this row covers.
-    "task",
-    "challenge",
-    # Grading (slim — full breakdown in the per-challenge `grading.json`).
-    "valid_submission",
-    "score",
-    "medal",
-    # Engineer-side wall/tokens/cost: per-challenge values from the engineer's
-    # `claude -p`.
-    "eng_wall_time_s",
-    "eng_input_tokens",
-    "eng_output_tokens",
-    "eng_total_tokens",
-    "eng_cost_usd",
-    # Researcher-side contribution attributed to this row. The researcher's
-    # `claude -p` runs ONCE per autoresearch session; at end-of-session
-    # `autoresearch.run_autoresearch` parses its transcript and distributes the
-    # totals equally across all rows. Empty/0 for benchmark rows (no researcher).
-    "res_wall_time_s",
-    "res_input_tokens",
-    "res_output_tokens",
-    "res_total_tokens",
-    "res_cost_usd",
-    # Combined totals = eng_* + res_*. Pre-computed so the CSV is self-contained.
-    # Config budgets (`max_cost_usd`, `max_seconds`) check against these, not the
-    # engineer alone.
-    "total_wall_time_s",
-    "total_tokens",
-    "total_cost",
-    # Rolling cumulative averages across rows (filled by `append`; the dotted
-    # "average across all runs" line per chart). `total_*` are recomputed after
-    # the researcher backfill in autoresearch.
-    "score_avg",
-    "total_tokens_avg",
-    "total_cost_avg",
-    "eng_wall_time_avg_s",
-    "total_wall_time_avg_s",
-    # Tool-call accounting parsed from the engineer's transcript.
-    "llm_calls",
-    "cli_calls",
-    "mcp_calls",
-    "sdk_calls",
-    "python_calls",
-    "bash_calls",
-    "skill_calls",
-    "other_tool_calls",
-    # REST-endpoint coverage (from the venv API-log shim; see `endpoint_hits`).
-    "whitelist_hits",
-    "blacklist_hits",
-    # Per-category rolling cumulative averages of the counts above (mean across
-    # rows up to and including the row). Recomputed by `append` on every write so
-    # they stay correct as rows are added/replaced.
-    "llm_calls_avg",
-    "cli_calls_avg",
-    "mcp_calls_avg",
-    "sdk_calls_avg",
-    "python_calls_avg",
-    "bash_calls_avg",
-    "skill_calls_avg",
-    "other_tool_calls_avg",
-    "whitelist_hits_avg",
-    "blacklist_hits_avg",
-    # Per-increment annotations the researcher fills in after evaluating the
-    # increment (via `banter annotate-increment`). Every challenge row in the same
-    # (session, increment) carries the same annotation — denormalised so a single
-    # CSV is the full record.
-    "hypothesis",         # one-line rationale for the change
-    "change",             # what was modified vs. the previous increment
-    "verdict",            # positive | negative | neutral
-    "verdict_reason",
-    "keep",               # 0/1 — did the researcher keep this change?
-    "observations",       # qualitative findings from the engineer transcripts
-    "proposed_changes",   # what to try next
-    # Failure reason for a DEAD run (no valid submission): recorded with all
-    # numeric metrics zeroed and this string set, so the researcher sees a
-    # comparable score-0 row + why it crashed (vs a graceful give-up, which floors
-    # a real submission with a low but non-zero score).
-    "error",
-    # Pointer to the engineer's per-challenge artifacts dir (engineer.log, submission, grading.json, …).
-    "run_dir",
-]
+# Results CSV columns, in order. Sourced from `_RESULTS_VIEW.keys()`.
+RESULTS_FIELDS = list(_RESULTS_VIEW.keys())
 
-# Benchmark CSV columns, in order. Sourced from `_BENCHMARK_VIEW.keys()`.
-BENCHMARK_FIELDS = list(_BENCHMARK_VIEW.keys())
+# Results summary. One row PER EXECUTION (no
+# averaging), appended by the runner after every run (already flat
+# `_RESULTS_VIEW` names, incl. the per-row `interface_calls`). The single
+# global table at results/results.csv is the ONLY results CSV
+# (per-leaf results.csv files are deprecated); which run a row came from is
+# recoverable from `run_dir`.
+RESULTS_SUMMARY_FIELDS = list(RESULTS_FIELDS)
 
 
-def _benchmark_view(row_dict: dict[str, Any]) -> dict[str, Any]:
-    """Project an autoresearch Row dict into the benchmark column set.
+def _bench_identity(row: dict[str, Any]) -> tuple:
+    """The config identity that `n` counts repeats of."""
+    return tuple(str(row.get(k, "")) for k in
+                 ("config", "model", "platform", "interface", "version",
+                  "skills", "task", "category"))
 
-    Renames `eng_*` → plain names, drops non-benchmark columns
-    (session/increment/res_*/total_*/annotations).
+
+def roll_up_results(parent: Path, out_csv: Path) -> list[dict[str, Any]]:
+    """Merge LEGACY per-leaf results.csv rows into the single global table at
+    `out_csv` (results/results.csv) — one row per execution, NO
+    averaging, no eng_/res_ split.
+
+    Per-leaf CSVs are deprecated: the runner appends every new row straight
+    into the global CSV. This merge exists for migration only — it folds in
+    leaf rows under `parent`'s config dirs
+    (results/<config>/**/results.csv, flat RESULTS_FIELDS columns)
+    that never made it into the global table (sessions run before the
+    deprecation, or a crashed session's leftovers). Rows already present in
+    `out_csv` are kept as-is and deduped against leaf rows by `run_dir`.
+    `n` is RE-numbered across the merged whole: the i-th execution of the same
+    config (platform/interface/skills/category/task) gets n=i. Writes
+    `out_csv` (header only when there is nothing) and returns the rows."""
+    with _locked_csv(out_csv):
+        # A pre-migration global CSV in the old combo-summary schema (avg_*
+        # columns, no run_dir COLUMN) is not execution rows — drop those
+        # rather than renumbering garbage into the table. Rows whose run_dir
+        # column exists but is empty are kept (legacy executions without the
+        # pointer).
+        merged: list[dict[str, Any]] = [r for r in _read_runs(out_csv) if "run_dir" in r]
+        have = {r["run_dir"] for r in merged if r.get("run_dir")}
+        if parent.exists():
+            for d in sorted(p for p in parent.iterdir() if p.is_dir()):
+                for leaf_csv in sorted(d.rglob("results.csv")):
+                    if leaf_csv.resolve() == out_csv.resolve():
+                        continue  # the global table itself, already read above
+                    for r in _read_runs(leaf_csv):
+                        # The old code wrote each execution to BOTH a per-leaf
+                        # CSV and a per-config rollup; rglob sees both copies,
+                        # so dedup must track rows added THIS merge too. An
+                        # empty run_dir can't be deduped — kept verbatim.
+                        rd = r.get("run_dir")
+                        if rd:
+                            if rd in have:
+                                continue  # already in the global table
+                            have.add(rd)
+                        merged.append(r)
+        seen: dict[tuple, int] = {}
+        for r in merged:
+            ident = _bench_identity(r)
+            seen[ident] = seen.get(ident, 0) + 1
+            r["n"] = seen[ident]
+        _write_csv_atomic(out_csv, RESULTS_SUMMARY_FIELDS, merged)
+    return merged
+
+
+def _num(v: Any) -> float:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _results_view(row_dict: dict[str, Any]) -> dict[str, Any]:
+    """Project a Row dict into the results column set.
+
+    Drops columns outside the results table (the raw cli/mcp/sdk triple,
+    endpoint hits). Derived columns:
+      interface_calls — the call count of the row's OWN interface
+        (cli→cli_calls, mcp→mcp_calls, sdk→sdk_calls; none → 0).
+      bash_calls — plain bash PLUS the OFF-interface remainder of the
+        cli/mcp/sdk triple (an mcp attempt during a cli run is not the
+        interface — it's noise, bucketed with bash).
     """
-    return {dest: row_dict.get(src, "") for dest, src in _BENCHMARK_VIEW.items()}
+    out = {dest: row_dict.get(src, "") for dest, src in _RESULTS_VIEW.items() if src}
+    own_src = _INTERFACE_CALL_SRC.get(str(row_dict.get("interface", "")))
+    triple = {k: _num(row_dict.get(k)) for k in ("cli_calls", "mcp_calls", "sdk_calls")}
+    own = triple.pop(own_src) if own_src else 0.0
+    out["interface_calls"] = f"{own:g}"
+    out["bash_calls"] = f"{_num(row_dict.get('bash_calls')) + sum(triple.values()):g}"
+    return {dest: out.get(dest, "") for dest in RESULTS_FIELDS}  # restore order
 
 
 @dataclass
 class Row:
-    # UTC ISO-8601 recorded when the engineer's `claude -p` started.
+    # UTC ISO-8601 recorded when the agent's `claude -p` started.
     started_at: str
-    # Identity. Field order MATCHES `FIELDS` so csv.DictWriter emits columns in
-    # the documented order.
-    run: str                # autoresearch run id (empty for benchmark rows)
-    version: str            # `v<N>` (e.g. "v2"); "" for benchmark rows
-    platform: str           # platform NAME, e.g. "mlkit" or "none"
+    # Identity.
+    run: str                # the treatment config name (the `config` column
+                            # of the results CSV)
+    version: str            # raw Row field, always ""; the CSV `version`
+                            # column is sourced from `interface_ref`
+    platform: str           # platform NAME, e.g. "hopsworks" or "none"
     interface: str          # interface: cli/mcp/sdk/none
     skills: str             # skill bundle name or "none"
-    prev_run: str           # autoresearch config continuation hint; "" if none
-    prev_version: str       # e.g. "v2"; "" if none
-    task: str               # ML task / challenge group this challenge belongs to
-    challenge: str          # MLE-bench competition id
-    # Slim grading (full breakdown in the per-challenge `grading.json`).
-    valid_submission: int = 0
-    score: float | None = None
-    medal: str | None = None
-    # Engineer-side wall + tokens + cost.
-    eng_wall_time_s: float = 0.0
-    eng_input_tokens: int = 0
-    eng_output_tokens: int = 0
-    eng_total_tokens: int = 0
-    eng_cost_usd: float = 0.0
-    # Researcher attribution (set at end-of-session by autoresearch).
-    res_wall_time_s: float = 0.0
-    res_input_tokens: int = 0
-    res_output_tokens: int = 0
-    res_total_tokens: int = 0
-    res_cost_usd: float = 0.0
-    # Combined totals (eng + res); also written at end-of-session.
-    total_wall_time_s: float = 0.0
+    category: str           # FTI stage (feature/inference/ops) this task belongs to
+    task: str               # FTI sub-task (an evals_provider family)
+    # Interface build identity (pinned ref / version pin) — surfaced as the
+    # results `version` column.
+    interface_ref: str = ""
+    # Agent model — the results `model` column.
+    model: str = ""
+    # Slim grading: assertion-suite tallies (full breakdown in the
+    # per-run `grading.json`).
+    asserts_passed: int = 0
+    asserts_total: int = 0
+    # Wall + tokens + cost from the agent's `claude -p`. Wall time is COMPUTE
+    # time — rate-limit back-off sleeps are excluded and recorded in
+    # `rate_limit_wait_s`.
+    wall_time_s: float = 0.0
+    rate_limit_wait_s: float = 0.0
+    # Exact split of wall_time_s (wall = platform + local): seconds inside
+    # interface (cli/mcp/sdk) tool calls = remote/platform execution; the
+    # rest of wall = local (local tool execution + LLM generation). Spans are
+    # stamped live at stream arrival (`claude_runner.ToolTimer`) — the
+    # transcript events carry no timestamps.
+    platform_time_s: float = 0.0
+    local_time_s: float = 0.0
+    input_tokens: int = 0
+    output_tokens: int = 0
     total_tokens: int = 0
-    total_cost: float = 0.0
+    cost_usd: float = 0.0
     llm_calls: int = 0
     cli_calls: int = 0
     mcp_calls: int = 0
@@ -438,36 +417,17 @@ class Row:
     python_calls: int = 0
     bash_calls: int = 0
     skill_calls: int = 0
-    other_tool_calls: int = 0
+    read_calls: int = 0
+    write_calls: int = 0
+    edit_calls: int = 0
+    glob_calls: int = 0
+    grep_calls: int = 0
+    todo_calls: int = 0
+    failed_commands: int = 0
+    denied_calls: int = 0
     # REST-endpoint coverage (from the venv API-log shim; see `endpoint_hits`).
     whitelist_hits: int = 0
     blacklist_hits: int = 0
-    # Rolling cumulative averages across results.csv rows (mean of the raw column
-    # up to and including each row). All filled by `append` at write time, so
-    # left None on a fresh Row.
-    score_avg: float | None = None
-    total_tokens_avg: float | None = None
-    total_cost_avg: float | None = None
-    eng_wall_time_avg_s: float | None = None
-    total_wall_time_avg_s: float | None = None
-    llm_calls_avg: float | None = None
-    cli_calls_avg: float | None = None
-    mcp_calls_avg: float | None = None
-    sdk_calls_avg: float | None = None
-    python_calls_avg: float | None = None
-    bash_calls_avg: float | None = None
-    skill_calls_avg: float | None = None
-    other_tool_calls_avg: float | None = None
-    whitelist_hits_avg: float | None = None
-    blacklist_hits_avg: float | None = None
-    # Per-increment annotations (researcher fills in via `banter annotate-increment`).
-    hypothesis: str = ""
-    change: str = ""
-    verdict: str = ""          # "positive" | "negative" | "neutral"
-    verdict_reason: str = ""
-    keep: int = 0              # 0 / 1
-    observations: str = ""
-    proposed_changes: str = ""
     # Failure reason for a dead run (no valid submission); "" for normal runs.
     error: str = ""
     run_dir: str = ""
@@ -571,24 +531,26 @@ def _is_env_var_assignment(tok: str) -> bool:
     return all(c.isalnum() or c == "_" for c in head)
 
 
-def _executable_tokens(tokens: list[str], depth: int = 0) -> list[str]:
-    """Yield the executable token of each command SEGMENT in `tokens`.
+def _exec_segments(tokens: list[str], depth: int = 0) -> list[list[str]]:
+    """Token lists of each command SEGMENT in `tokens`, starting at the
+    segment's executable token (so `seg[0]` is what runs).
 
     Tracks segment boundaries (`;`, `&&`, `||`, `|`, `&`, etc.), skips env-var
     assignment prefixes (`FOO=bar python script.py` → python is the executable),
     and for a `bash`/`sh`/`zsh -c "<script>"` segment recursively scans the quoted
     inner script (so `bash -c "python train.py"` is classified as a python call).
     """
-    out: list[str] = []
-    expect_exec = True
+    out: list[list[str]] = []
+    cur: list[str] | None = None
     i = 0
     while i < len(tokens):
         tok = tokens[i]
         if tok in _SEGMENT_SEPARATORS:
-            expect_exec = True
+            cur = None
             i += 1
             continue
-        if not expect_exec:
+        if cur is not None:
+            cur.append(tok)
             i += 1
             continue
         if _is_env_var_assignment(tok):
@@ -601,14 +563,29 @@ def _executable_tokens(tokens: list[str], depth: int = 0) -> list[str]:
                 inner_tokens = shlex.split(inner)
             except ValueError:
                 inner_tokens = inner.split()
-            out.extend(_executable_tokens(inner_tokens, depth + 1))
+            out.extend(_exec_segments(inner_tokens, depth + 1))
             i += 3
-            expect_exec = False
+            cur = []  # consume the rest of this segment as already handled
             continue
-        out.append(tok)
-        expect_exec = False
+        cur = [tok]
+        out.append(cur)
         i += 1
-    return out
+    return [seg for seg in out if seg]
+
+
+def _executable_tokens(tokens: list[str], depth: int = 0) -> list[str]:
+    """The executable token of each command segment (see `_exec_segments`)."""
+    return [seg[0] for seg in _exec_segments(tokens, depth)]
+
+
+_TOOL_BUCKETS = {
+    "Read": "read",
+    "Write": "write",
+    "Edit": "edit", "MultiEdit": "edit", "NotebookEdit": "edit",
+    "Glob": "glob",
+    "Grep": "grep",
+    "TodoWrite": "todo",
+}
 
 
 def _classify_tool_use(
@@ -617,21 +594,24 @@ def _classify_tool_use(
     cli_binary: str | None = None,
     sdk_module: str | None = None,
     run_dir: Path | None = None,
+    cli_subcommand: str | None = None,
 ) -> str:
     if tool_name == "Skill":
         return "skill"
     if tool_name.startswith("mcp__"):
         return "mcp"
     if tool_name != "Bash":
-        return "other"
+        # Explicit workspace-tool buckets — no catch-all "other". Tools outside
+        # this map (denied ones like WebFetch/Task) are not bucketed.
+        return _TOOL_BUCKETS.get(tool_name, "")
     command = (tool_input.get("command") or "").strip()
     if not command:
         return "bash"
-    # Engineers often write multi-line bash where the python call isn't the first
+    # Agents often write multi-line bash where the python call isn't the first
     # token (env-var assignments, or cd/setup lines before it). `shlex.split`
     # strips newlines, so split by line first; within a line, segment by
     # `;`/`&&`/`||`/`|`.
-    exec_tokens: list[str] = []
+    exec_segs: list[list[str]] = []
     tokens: list[str] = []
     for line in command.splitlines():
         line = line.strip()
@@ -642,7 +622,8 @@ def _classify_tool_use(
         except ValueError:
             line_tokens = line.split()
         tokens.extend(line_tokens)
-        exec_tokens.extend(_executable_tokens(line_tokens))
+        exec_segs.extend(_exec_segments(line_tokens))
+    exec_tokens = [seg[0] for seg in exec_segs]
     if not tokens:
         return "bash"
     if not exec_tokens:
@@ -651,89 +632,29 @@ def _classify_tool_use(
     # bash (pure shell utilities).
     def _is_cli(tok: str) -> bool:
         return bool(cli_binary) and (tok == cli_binary or tok.endswith(f"/{cli_binary}"))
-    if any(_is_cli(t) for t in exec_tokens):
+    def _cli_present() -> bool:
+        if not cli_binary:
+            return False
+        # `cli_subcommand` is a comma-joined entrypoint allowlist (e.g.
+        # `sagemaker,sagemaker-runtime,s3`); empty → any use of the binary counts.
+        subs = [s for s in (p.strip() for p in (cli_subcommand or "").split(",")) if s]
+        if not subs:
+            return any(_is_cli(t) for t in exec_tokens)
+        # Subcommand entrypoint: the allowed service must follow the binary in
+        # an EXEC-position segment (`echo aws sagemaker …` doesn't count),
+        # skipping global options (`aws --region us-east-1 sagemaker …`) via
+        # the hook's shared parser — one rule for enforcement and counting.
+        return any(
+            _is_cli(seg[0]) and _hook_cli_arg_after(seg, cli_binary) in subs
+            for seg in exec_segs
+        )
+    if _cli_present():
         return "cli"
     if any(_is_python_first(t) for t in exec_tokens):
         if sdk_module and _command_uses_sdk(tokens, command, sdk_module, run_dir):
             return "sdk"
         return "python"
     return "bash"
-
-
-# Patterns meaning an interface tool runs python/compute LOCALLY instead of
-# delegating to the remote platform. A researcher could "win" an interface by
-# adding such a tool — laundering local compute as mcp/cli usage. Flagged in the
-# engineer-facing entry-point files (MCP tools, CLI commands).
-_LOCAL_EXEC_PATTERNS = [
-    ("subprocess", re.compile(r"\bsubprocess\b")),
-    ("os.system", re.compile(r"\bos\.system\s*\(")),
-    ("os.popen", re.compile(r"\bos\.popen\s*\(")),
-    ("Popen", re.compile(r"\bPopen\s*\(")),
-    ("exec(", re.compile(r"(?<![A-Za-z_.])exec\s*\(")),
-    ("runpy", re.compile(r"\brunpy\b")),
-    ("sys.executable", re.compile(r"\bsys\.executable\b")),
-]
-
-
-def audit_interface_local_exec(
-    interface_src: Path | str | None,
-    baseline_src: Path | str | None = None,
-) -> list[dict[str, Any]]:
-    """Flag engineer-facing interface tools that execute python/compute LOCALLY.
-
-    Scans MCP-tool (`**/mcp/tools/*.py`) and CLI-command (`**/cli/commands/*.py`)
-    source under `interface_src` for local-execution patterns (subprocess, exec,
-    runpy, …). When `baseline_src` (the v0 interface source) is given, flag only
-    files the researcher CHANGED or added — an unchanged upstream file using
-    subprocess isn't laundering and is skipped.
-
-    Returns `[{"file": <relpath>, "patterns": [...]}, ...]` (empty = clean).
-    Enforces the remote-only contract: interface tools must delegate to the
-    cluster, never run the work locally.
-    """
-    flagged: list[dict[str, Any]] = []
-    if not interface_src:
-        return flagged
-    src = Path(interface_src)
-    if not src.exists():
-        return flagged
-    base = Path(baseline_src) if baseline_src else None
-    for path in sorted(src.rglob("*.py")):
-        rel = path.relative_to(src).as_posix()
-        tagged = f"/{rel}"
-        if "/build/" in tagged or "/tests/" in tagged or "/test/" in tagged:
-            continue  # built copies + test fixtures aren't engineer-facing
-        is_entrypoint = "/mcp/tools/" in tagged or "/cli/commands/" in tagged
-        # WITH a v0 baseline, scan ALL researcher-changed source (covers
-        # SDK-interface laundering too) and flag only ADDED patterns — low false
-        # positives. WITHOUT a baseline, scan only the narrow MCP/CLI entry points
-        # (scanning all source would flag legit upstream subprocess).
-        if base is None and not is_entrypoint:
-            continue
-        try:
-            text = path.read_text(errors="ignore")
-        except OSError:
-            continue
-        hits = [name for name, rx in _LOCAL_EXEC_PATTERNS if rx.search(text)]
-        if not hits:
-            continue
-        if base is not None:
-            counterpart = base / rel
-            base_text = ""
-            try:
-                if counterpart.exists():
-                    base_text = counterpart.read_text(errors="ignore")
-            except OSError:
-                base_text = ""
-            if base_text == text:
-                continue  # unchanged file — not researcher-introduced
-            # Flag only patterns the researcher ADDED (absent from baseline).
-            hits = [name for name, rx in _LOCAL_EXEC_PATTERNS
-                    if rx.search(text) and not rx.search(base_text)]
-            if not hits:
-                continue
-        flagged.append({"file": rel, "patterns": hits})
-    return flagged
 
 
 def _parse_endpoint_patterns(patterns: list[str] | None) -> list[tuple[str, str, "re.Pattern[str]"]]:
@@ -797,8 +718,8 @@ def endpoint_coverage(
 ) -> dict[str, Any]:
     """Full REST endpoint-coverage breakdown from the per-run API log (written by
     the venv shim). Drives BOTH the `whitelist_hits`/`blacklist_hits` metrics AND
-    the per-run `endpoint_coverage.json` the researcher reads to see WHICH
-    lifecycle steps the engineer reached.
+    the per-run `endpoint_coverage.json` report showing WHICH lifecycle steps
+    the agent reached.
 
     `interface` ATTRIBUTES whitelist coverage: when set (cli/mcp/sdk), a target
     endpoint counts as covered only if hit THROUGH that interface (the shim's
@@ -857,11 +778,40 @@ def endpoint_hits(
     return {"whitelist_hits": c["whitelist_hits"], "blacklist_hits": c["blacklist_hits"]}
 
 
+# Hook denial marker in errored tool results — FALLBACK only (used when no
+# hook-written commands.jsonl is available). Line-anchored (optional "- "
+# bullet from Claude Code's blocked-by-hook formatting) so echoed remote
+# errors like `PERMISSION_DENIED: …` mid-line don't count as hook denials.
+_DENIED_MARKER_RE = re.compile(r"(?m)^(?:- )?DENIED:")
+
+
+def _denied_from_commands_log(commands_log: Path | None) -> int | None:
+    """Count of structured denial records in the hook-written commands.jsonl,
+    or None when the log is absent/empty (fall back to the transcript scan)."""
+    if commands_log is None or not commands_log.exists():
+        return None
+    denied = 0
+    seen_any = False
+    for line in commands_log.read_text().splitlines():
+        if not line.strip():
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        seen_any = True
+        if rec.get("denied"):
+            denied += 1
+    return denied if seen_any else None
+
+
 def aggregate_commands(
     transcript_path: Path,
     cli_binary: str | None = None,
     sdk_module: str | None = None,
     run_dir: Path | None = None,
+    cli_subcommand: str | None = None,
+    commands_log: Path | None = None,
 ) -> dict[str, int]:
     """Count tool calls by category from the stream-json transcript.
 
@@ -870,6 +820,11 @@ def aggregate_commands(
     `sdk_module` (typically the platform name when interface=sdk) promotes python
     invocations that import or `-m`-run that module to sdk_calls; a run script file
     is also peeked (relative to `run_dir`) for SDK use.
+
+    `commands_log` (the hook-written commands.jsonl) is the preferred source for
+    `denied_calls`: the hook logs every denial structurally, so the count can't
+    be skewed by remote error text echoed into tool results. Without it, errored
+    tool results are split by the line-anchored `DENIED:` marker.
     """
     counts = {
         "cli_calls": 0,
@@ -878,7 +833,14 @@ def aggregate_commands(
         "python_calls": 0,
         "bash_calls": 0,
         "skill_calls": 0,
-        "other_tool_calls": 0,
+        "read_calls": 0,
+        "write_calls": 0,
+        "edit_calls": 0,
+        "glob_calls": 0,
+        "grep_calls": 0,
+        "todo_calls": 0,
+        "failed_commands": 0,
+        "denied_calls": 0,
     }
     bucket = {
         "cli": "cli_calls",
@@ -887,12 +849,19 @@ def aggregate_commands(
         "python": "python_calls",
         "bash": "bash_calls",
         "skill": "skill_calls",
-        "other": "other_tool_calls",
+        "read": "read_calls",
+        "write": "write_calls",
+        "edit": "edit_calls",
+        "glob": "glob_calls",
+        "grep": "grep_calls",
+        "todo": "todo_calls",
     }
     if not transcript_path.exists():
         return counts
     if run_dir is None:
         run_dir = transcript_path.parent
+    denied_from_log = _denied_from_commands_log(commands_log)
+    total_errors = 0
     for line in transcript_path.read_text().splitlines():
         if not line.strip():
             continue
@@ -900,7 +869,24 @@ def aggregate_commands(
             event = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if event.get("type") != "assistant":
+        etype = event.get("type")
+        if etype == "user":
+            # Outcome friction: errored tool results. A hook rejection carries
+            # the enforcement `DENIED:` marker → denied_calls; every other
+            # error (non-zero exit, exception, bad args) → failed_commands.
+            for block in (event.get("message") or {}).get("content") or []:
+                if not isinstance(block, dict) or block.get("type") != "tool_result":
+                    continue
+                if not block.get("is_error"):
+                    continue
+                total_errors += 1
+                text = _flatten_text(block.get("content"))
+                if _DENIED_MARKER_RE.search(text):
+                    counts["denied_calls"] += 1
+                else:
+                    counts["failed_commands"] += 1
+            continue
+        if etype != "assistant":
             continue
         for block in (event.get("message") or {}).get("content") or []:
             if not isinstance(block, dict) or block.get("type") != "tool_use":
@@ -911,9 +897,54 @@ def aggregate_commands(
                 cli_binary=cli_binary,
                 sdk_module=sdk_module,
                 run_dir=run_dir,
+                cli_subcommand=cli_subcommand,
             )
-            counts[bucket.get(category, "other_tool_calls")] += 1
+            col = bucket.get(category)
+            if col:
+                counts[col] += 1
+    if denied_from_log is not None:
+        # Structured hook records win: every denial (exit 2) produces exactly
+        # one errored tool_result, so the remaining errors are real failures.
+        counts["denied_calls"] = denied_from_log
+        counts["failed_commands"] = max(0, total_errors - denied_from_log)
     return counts
+
+
+# Tool-call categories that execute against the PLATFORM (remote): the
+# interface under test. Everything else a tool call does is local execution.
+_REMOTE_CATEGORIES = ("cli", "mcp", "sdk")
+
+
+def platform_tool_time(
+    spans: list[dict[str, Any]],
+    cli_binary: str | None = None,
+    sdk_module: str | None = None,
+    run_dir: Path | None = None,
+    cli_subcommand: str | None = None,
+) -> float:
+    """Seconds spent inside tool calls THROUGH the interface under test.
+
+    `spans` are `claude_runner.ToolTimer` records ({tool_name, tool_input,
+    seconds}). Each span is classified with the SAME `_classify_tool_use` that
+    drives the call counters, under the same active-interface kwargs — so a
+    `hops …` Bash call is platform time only when cli is the interface under
+    test, exactly as it is `cli_calls` only then. The caller derives
+    `local_time_s = wall_time_s − platform_time_s` (local tool execution +
+    LLM generation), so wall always splits exactly into platform + local.
+    """
+    platform = 0.0
+    for span in spans:
+        category = _classify_tool_use(
+            span.get("tool_name", ""),
+            span.get("tool_input") or {},
+            cli_binary=cli_binary,
+            sdk_module=sdk_module,
+            run_dir=run_dir,
+            cli_subcommand=cli_subcommand,
+        )
+        if category in _REMOTE_CATEGORIES:
+            platform += span.get("seconds") or 0.0
+    return round(platform, 2)
 
 
 def write_commands_log(
@@ -922,6 +953,7 @@ def write_commands_log(
     cli_binary: str | None = None,
     sdk_module: str | None = None,
     run_dir: Path | None = None,
+    cli_subcommand: str | None = None,
 ) -> None:
     """Render one JSONL line per tool call from the stream-json transcript.
 
@@ -957,6 +989,7 @@ def write_commands_log(
                 cli_binary=cli_binary,
                 sdk_module=sdk_module,
                 run_dir=run_dir,
+                cli_subcommand=cli_subcommand,
             )
             record = {
                 "timestamp": timestamp,
@@ -966,11 +999,24 @@ def write_commands_log(
                 "tool_input": tool_input,
             }
             lines.append(json.dumps(record, default=str))
+    # The transcript only shows tool calls; denials live solely in the hook's
+    # own records (`denied: true`). Carry them over so the rebuild doesn't
+    # erase the structured denial count `aggregate_commands` relies on.
+    if commands_log.exists():
+        for line in commands_log.read_text().splitlines():
+            if not line.strip():
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if rec.get("denied"):
+                lines.append(json.dumps(rec, default=str))
     commands_log.write_text("\n".join(lines) + ("\n" if lines else ""))
 
 
 # Substrings marking a client-side failure worth flagging at the top of the
-# collected log (the engineer otherwise only sees "No such tool available").
+# collected log (the agent otherwise only sees "No such tool available").
 _CRASH_MARKERS = (
     "Traceback (most recent call last)",
     "Connection failed",
@@ -1005,7 +1051,7 @@ def _mcp_server_log(caches_dir: Path, run_dir: Path, server: str) -> list[str]:
     tool registers. Both are surfaced.
     """
     out: list[str] = []
-    # Cache dir is keyed on the engineer's cwd (the challenge dir); fall back to a
+    # Cache dir is keyed on the agent's cwd (the run dir); fall back to a
     # glob so a layout change doesn't silently drop the logs.
     candidates = [caches_dir / _slug_for(run_dir) / f"mcp-logs-{server}"]
     candidates += [
@@ -1040,7 +1086,7 @@ def _mcp_server_log(caches_dir: Path, run_dir: Path, server: str) -> list[str]:
 
 
 def _transcript_crashes(transcript_path: Path) -> list[str]:
-    """Errored / traceback-bearing tool results from the engineer transcript.
+    """Errored / traceback-bearing tool results from the agent transcript.
 
     Covers the cli (`hops …` subprocess) and sdk (`import hopsworks`) paths, where
     a client crash surfaces as a Python traceback or an errored tool result rather
@@ -1083,7 +1129,7 @@ def collect_client_logs(
     effectively invisible: Claude launches the stdio server and buries its stderr +
     connection status under
     `<HOME>/Library/Caches/claude-cli-nodejs/<cwd-slug>/mcp-logs-<server>/*.jsonl`.
-    A server that crashes at startup leaves the engineer with only "No such tool
+    A server that crashes at startup leaves the agent with only "No such tool
     available", reading like an empty interface rather than a crash. This
     aggregates, per run:
 
@@ -1116,7 +1162,7 @@ def collect_client_logs(
     crashes = _transcript_crashes(transcript_path) if transcript_path else []
     if crashes:
         sections.append(
-            "===== client errors (engineer transcript) =====\n"
+            "===== client errors (agent transcript) =====\n"
             + "\n---\n".join(crashes)
         )
         body_for_scan.extend(crashes)
@@ -1140,60 +1186,39 @@ def append(results_csv: Path, row: Row, fields: list[str] | None = None) -> None
     combo re-run) is replaced rather than appended, so each combo has at most one
     row at any time.
 
-    `fields` narrows the column set. `None` (default) writes the full autoresearch
-    schema. Pass `BENCHMARK_FIELDS` for benchmark: columns are renamed and trimmed
-    via `_benchmark_view`.
+    `fields` narrows the column set; `None` (default) writes `RESULTS_FIELDS`.
+    For `RESULTS_FIELDS` the Row is renamed and trimmed via `_results_view`.
     """
-    cols = fields if fields is not None else FIELDS
-    # Detect benchmark by column-list equality (callers import BENCHMARK_FIELDS, so
-    # either `is` or `==` works; `==` is robust across module re-imports).
-    use_benchmark_view = cols == BENCHMARK_FIELDS
+    cols = fields if fields is not None else RESULTS_FIELDS
+    # Detect the results view by column-list equality (callers import
+    # RESULTS_FIELDS, so either `is` or `==` works; `==` is robust across
+    # module re-imports).
+    use_results_view = cols == RESULTS_FIELDS
     results_csv.parent.mkdir(parents=True, exist_ok=True)
     raw = asdict(row)
-    new_row = _benchmark_view(raw) if use_benchmark_view else raw
-    kept: list[dict[str, Any]] = []
-    if results_csv.exists():
-        with results_csv.open() as f:
-            reader = csv.DictReader(f)
-            for r in reader:
-                if r.get("run_dir") == new_row.get("run_dir"):
-                    continue  # replaced by new_row below
-                kept.append(r)
-    # Rolling averages: recompute the cumulative running mean of each tracked raw
-    # column in file order (kept first, new/replacement row last) so `*_avg` stays
-    # correct after append OR replace. Blank raw values don't contribute.
-    ordered = kept + [new_row]
-    recompute_rolling_averages(ordered, cols)
-    with results_csv.open("w", newline="") as fw:
-        writer = csv.DictWriter(fw, fieldnames=cols)
-        writer.writeheader()
-        for r in ordered:
-            writer.writerow({k: r.get(k, "") for k in cols})
+    new_row = _results_view(raw) if use_results_view else raw
+    with _locked_csv(results_csv):
+        kept: list[dict[str, Any]] = []
+        replaced: dict[str, Any] | None = None
+        if results_csv.exists():
+            with results_csv.open() as f:
+                reader = csv.DictReader(f)
+                for r in reader:
+                    if r.get("run_dir") == new_row.get("run_dir"):
+                        replaced = r  # replaced by new_row below
+                        continue
+                    kept.append(r)
+        if use_results_view:
+            # `n` = repeat counter: 1 + how many KEPT rows already ran this exact
+            # config (same platform/interface/skills/category/task). A re-run of
+            # the same run_dir replaces its row and KEEPS its number — counting
+            # kept rows instead would collide with a later repeat's n whenever
+            # the replaced row wasn't the latest one.
+            ident = _bench_identity(new_row)
+            old_n = (replaced or {}).get("n") if replaced is not None and _bench_identity(replaced) == ident else None
+            if old_n and str(old_n).isdigit():
+                new_row["n"] = int(old_n)
+            else:
+                new_row["n"] = 1 + sum(1 for r in kept if _bench_identity(r) == ident)
+        _write_csv_atomic(results_csv, cols, kept + [new_row])
 
-
-def _rolling_pairs(cols: list[str]) -> list[tuple[str, str]]:
-    """(raw_col, avg_col) pairs to recompute, filtered to those present in `cols`.
-    Derived from the single `_ROLLING_AVG_OF` map plus the per-category call counts
-    — so benchmark (no `*_avg` columns) yields an empty list and the recompute is a
-    no-op there."""
-    pairs = list(_ROLLING_AVG_OF.items()) + [(c, f"{c}_avg") for c in CALL_COUNT_COLS]
-    return [(r, a) for r, a in pairs if r in cols and a in cols]
-
-
-def recompute_rolling_averages(ordered: list[dict[str, Any]], cols: list[str]) -> None:
-    """In-place fill each rolling `*_avg` column with the cumulative running mean
-    of its raw column across `ordered` (file order). Skips pairs whose columns
-    aren't in the active schema; blank/None raw values are excluded (a blank row
-    carries the mean-so-far forward)."""
-    for raw_col, avg_col in _rolling_pairs(cols):
-        running_sum = 0.0
-        running_n = 0
-        for r in ordered:
-            try:
-                x = float(r.get(raw_col))  # type: ignore[arg-type]
-            except (TypeError, ValueError):
-                x = None  # blank/None → no sample this row
-            if x is not None:
-                running_sum += x
-                running_n += 1
-            r[avg_col] = f"{running_sum / running_n:.4f}" if running_n else ""

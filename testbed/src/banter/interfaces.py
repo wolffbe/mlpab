@@ -1,31 +1,22 @@
-"""Resolve a chosen (platform, interface, version) for an engineer run.
+"""Resolve a chosen (platform, interface) for an agent run.
 
 Two locations:
 
-    platforms/<platform>/<interface>/config.yaml — CONFIG: where the interface
-        lives, how to build/run it, its credential keys, and the base (v0) prompt.
-    platforms/<platform>/<interface>/ — BINARY: the built artifact only (e.g.
-        platforms/hopsworks/cli/hops). SDK interfaces build nothing (pip-install
-        per run) so have no folder here; `none` has none either.
+    configs/platforms/<platform>/<interface>.yaml — CONFIG: where the interface
+        lives, how to build/run it, its credential keys, and the agent-facing
+        prompt.
+    build/<platform>/<interface>/ — BUILD HOME: source checkout + built artifact
+        (e.g. build/hopsworks/cli/hops). SDK interfaces build nothing (pip-install
+        per run); `none` has neither.
 
-The config manifest carries NO versions; its `prompt:` is v0 (the base). Improved
-versions live INSIDE an autoresearch session:
-
-    <version_root>/platforms/<platform>/<interface>/v<n>/version.yaml
-
-(`<version_root>` is the session dir.) A version.yaml overrides the base manifest
-(optionally `binary`, `runtime_install`, `mcp_servers`) and may ship its own binary
-copy, else the base binary is reused. `prompt:` is the ONE non-overridable field —
-frozen to the committed base across versions (the researcher improves interface
-SOURCE, not the prompt). v0 always = base manifest, needs no folder.
-
-`banter run` selects a version via `--interface-version <n>` + `--version-root <dir>`
-(the session dir). Without a version-root only v0 (base) is available.
+`banter run` resolves the committed manifest, builds the artifact at preflight
+when missing, and installs the interface fresh into each run's own venv.
 """
 from __future__ import annotations
 
 import hashlib
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -40,15 +31,15 @@ import yaml
 INTERFACES = ("cli", "mcp", "sdk", "none")
 _TESTBED_ROOT = Path(__file__).resolve().parents[2]
 
-# Single unified tree. Per interface, config + checked-out source + built binary
-# live together — that IS the base (v0) version:
-#     platforms/<platform>/<interface>/config.yaml (build/run/keys/prompt)
-#     platforms/<platform>/<interface>/...          (source + built artifact)
-# A platform also holds its skills + research configs:
-#     platforms/<platform>/skills/<bundle>/<version>/<skill>/SKILL.md
-#     platforms/<platform>/autoresearch/*.yaml
-#     platforms/<platform>/benchmark/*.yaml
-PLATFORMS_DIR = _TESTBED_ROOT / "platforms"
+# Two-way split:
+#     configs/platforms/<platform>/ — the platform's CONFIG FOLDER: flat
+#         interface manifests (cli.yaml / mcp.yaml / sdk.yaml), skills.yaml
+#         (pointer manifest) + skills trees, and platform infra
+#         (setup.py / teardown.py — $BANTER_PLATFORM_DIR points here).
+#     build/<platform>/<interface>/ — gitignored BUILD HOME ($INTERFACE_DIR):
+#         source checkouts + built wheels/binaries; recreated on demand.
+CONFIGS_DIR = _TESTBED_ROOT / "configs" / "platforms"
+BUILD_DIR = _TESTBED_ROOT / "build"
 
 
 @dataclass
@@ -56,18 +47,48 @@ class InterfaceSetup:
     platform: str
     interface: str
     prompt_fragment: str
-    version: int
     hash: str
+    # Human identity of the interface build under test (the `version` column in
+    # the results CSV): the manifest's pinned `ref:` (git SHA, shortened) /
+    # `==X.Y.Z` pip pin / `VER=` pin / rendered package.version; "unknown" when
+    # nothing is pinned.
+    ref: str = ""
     cli_binary: str | None = None
+    cli_subcommand: str | None = None
     sdk_module: str | None = None
     mcp_servers: dict[str, Any] = field(default_factory=dict)
     keys: dict[str, str] = field(default_factory=dict)
     serve: list[str] = field(default_factory=list)      # per-run server-start steps
     teardown: list[str] = field(default_factory=list)   # run start+end cleanup steps
     # Outbound hosts THIS interface needs reachable, beyond the testbed baseline
-    # (claude API + loopback). Drives the engineer sandbox `allowedDomains`. e.g.
+    # (claude API + loopback). Drives the agent sandbox `allowedDomains`. e.g.
     # `["api.openai.com", "*.openai.com"]` for a cloud SDK; empty for local-only.
     allowed_domains: list[str] = field(default_factory=list)
+    # Command patterns that must run OUTSIDE the agent sandbox (drives the
+    # sandbox `excludedCommands`). Needed for Go binaries on macOS: Seatbelt
+    # blocks trustd, so their TLS verification fails with `x509: OSStatus
+    # -26276` (the Claude Code docs name `gh`/`gcloud`/`terraform`; same for
+    # `databricks`). Excluded commands lose the domain allowlist, so list only
+    # binaries that pin their own host; the PreToolUse hook still applies.
+    sandbox_excluded_commands: list[str] = field(default_factory=list)
+    # Cost control: the ONLY `ml.<family>.<size>` instance types the agent may
+    # request (e.g. the AWS Free Tier set for sagemaker). Surfaced to the hook as
+    # TESTBED_INSTANCE_ALLOW, which denies any other instance-type token in a
+    # tool call. Empty → no restriction (platforms without instance types).
+    instance_allowlist: list[str] = field(default_factory=list)
+
+
+def _norm_subcommands(value: Any) -> str | None:
+    """Manifest `cli_subcommand` accepts one service or a list (e.g.
+    `[sagemaker, sagemaker-runtime, s3]`). Normalize to a comma-joined string —
+    the wire format of TESTBED_CLI_SUBCOMMAND, which the hook and the command
+    counter split back into an allowlist."""
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)):
+        joined = ",".join(s for v in value if (s := str(v).strip()))
+        return joined or None
+    return str(value).strip() or None
 
 
 @dataclass
@@ -97,51 +118,54 @@ class InterfaceStatus:
 # ---------------------------------------------------------------------------
 
 
-# Per-(platform,interface) override of an interface's home dir. Autoresearch sets
-# this (via set_interface_home / `banter run --interface-dir`) so the engineer
-# builds + uses the increment's OWN copy
-# (results/autoresearch/<run>/<inc>/interface/) instead of the committed
-# platforms/<platform>/<interface>/. Safe as process-global: each `banter run`
-# process handles exactly one interface.
-_INTERFACE_HOME: dict[tuple[str, str], Path] = {}
-
-
-def set_interface_home(platform: str, interface: str, home: Path) -> None:
-    """Point this interface's home at `home` (the per-increment copy) for this
-    process — config.yaml, $INTERFACE_DIR, build, install all resolve there."""
-    _INTERFACE_HOME[(platform, interface)] = Path(home)
-
-
 def manifest_path(platform: str, interface: str) -> Path:
-    return bin_dir(platform, interface) / "config.yaml"
+    """The committed flat manifest: configs/platforms/<p>/<interface>.yaml."""
+    return CONFIGS_DIR / platform / f"{interface}.yaml"
 
 
 def platform_interface_from_config(config_path: str | Path) -> tuple[str, str]:
     """Infer (platform, interface) from an interface config path like
-    `platforms/<platform>/<interface>/config.yaml`."""
+    `configs/platforms/<platform>/<interface>.yaml`."""
     p = Path(config_path)
-    interface = p.parent.name
-    platform = p.parent.parent.name
+    interface = p.stem
+    platform = p.parent.name
     if interface not in INTERFACES:
         raise ValueError(
             f"Unknown interface {interface!r} from {config_path!r}. "
-            "Expected a path like platforms/<platform>/<interface>/config.yaml"
+            "Expected a path like configs/platforms/<platform>/<interface>.yaml"
         )
     return platform, interface
 
 
 def bin_dir(platform: str, interface: str) -> Path:
-    """The interface's home: config.yaml + checked-out code + built binary.
-
-    Honors a per-(platform,interface) override from `set_interface_home`
-    (autoresearch's per-increment copy); else committed platforms/<platform>/<interface>/.
-    """
-    return _INTERFACE_HOME.get((platform, interface), PLATFORMS_DIR / platform / interface)
+    """The interface's BUILD HOME: checked-out code + built binary
+    ($INTERFACE_DIR), at the gitignored build/<platform>/<interface>/."""
+    return BUILD_DIR / platform / interface
 
 
-def version_dir(version_root: Path, platform: str, interface: str, version: int) -> Path:
-    """Session-local directory for an improved interface version."""
-    return Path(version_root) / "platforms" / platform / interface / f"v{version}"
+_PIN_RE = re.compile(r"==([0-9][\w.\-]*)")
+_VER_VAR_RE = re.compile(r"\bVER=([0-9][\w.]*)")
+
+
+def interface_ref(manifest: dict[str, Any]) -> str:
+    """See InterfaceSetup.ref — the version/ref identity of an interface build."""
+    # An explicit `version:` in the manifest wins over any derivation.
+    if manifest.get("version"):
+        return str(manifest["version"])
+    ref = manifest.get("ref")
+    if ref:
+        s = str(ref)
+        return s[:12] if re.fullmatch(r"[0-9a-f]{40}", s) else s
+    steps = " ".join(
+        list(manifest.get("runtime_install") or []) + list(manifest.get("install") or [])
+    )
+    m = _PIN_RE.search(steps) or _VER_VAR_RE.search(steps)
+    if m:
+        return m.group(1)
+    pkg = manifest.get("package") or {}
+    if pkg.get("version"):
+        return str(pkg["version"])
+    return "unknown"
 
 
 def load_manifest(platform: str, interface: str) -> dict[str, Any]:
@@ -151,30 +175,10 @@ def load_manifest(platform: str, interface: str) -> dict[str, Any]:
     return yaml.safe_load(p.read_text()) or {}
 
 
-# ---------------------------------------------------------------------------
-# Version override (session-local)
-# ---------------------------------------------------------------------------
-
-
-def _load_version_override(
-    version_root: Path | None, platform: str, interface: str, version: int
-) -> dict[str, Any]:
-    """Read a session-local version.yaml, or {} for base (v0) / when absent."""
-    if not version or version_root is None:
-        return {}
-    vp = version_dir(version_root, platform, interface, version) / "version.yaml"
-    if not vp.exists():
-        return {}
-    return yaml.safe_load(vp.read_text()) or {}
-
-
-def _resolved_config(
-    platform: str, interface: str, version: int, version_root: Path | None
-) -> dict[str, Any]:
-    """Merge base manifest defaults with a session-local version override."""
+def _resolved_config(platform: str, interface: str) -> dict[str, Any]:
+    """The manifest's run-relevant fields, with defaults normalized."""
     manifest = load_manifest(platform, interface)
-    override = _load_version_override(version_root, platform, interface, version)
-    merged: dict[str, Any] = {
+    return {
         "binary": manifest.get("binary"),
         "runtime_install": manifest.get("runtime_install") or [],
         "mcp_servers": manifest.get("mcp_servers") or {},
@@ -183,37 +187,25 @@ def _resolved_config(
         # importable SDK module (for sdk_calls). Default to `binary` / `platform`
         # below, so existing configs are unchanged.
         "cli_command": manifest.get("cli_command"),
+        # Optional subcommand entrypoint(s) — one service or a list (e.g.
+        # `[sagemaker, sagemaker-runtime, s3]` with `cli_command: aws`): scopes
+        # the CLI interface to `<cli_command> <one of these> …`.
+        "cli_subcommand": manifest.get("cli_subcommand"),
         "sdk_module": manifest.get("sdk_module"),
-        # Per-run shell steps in the run venv to START the engineer's servers (e.g.
+        # Per-run shell steps in the run venv to START the agent's servers (e.g.
         # the MCP HTTP server claude connects to at launch), after stale-server
         # cleanup. `teardown` stops them at run start + end.
         "serve": manifest.get("serve") or [],
         "teardown": manifest.get("teardown") or [],
+        # Sandbox/cost controls:
+        #   allowed_domains: outbound hosts for the agent sandbox.
+        #   instance_allowlist: the only ml.* instance types the agent may
+        #     request (e.g. the AWS Free Tier set for sagemaker).
+        #   sandbox_excluded_commands: commands run OUTSIDE the sandbox.
+        "allowed_domains": manifest.get("allowed_domains") or [],
+        "instance_allowlist": manifest.get("instance_allowlist") or [],
+        "sandbox_excluded_commands": manifest.get("sandbox_excluded_commands") or [],
     }
-    # `prompt` is deliberately NOT overridable: frozen to the committed base (see
-    # `_prompt_for`/`_committed_prompt`) since the researcher improves interface
-    # SOURCE, never the prompt. A `prompt:` in a version.yaml override (or an
-    # autoresearch interface-dir copy) is ignored.
-    for key in ("binary", "runtime_install", "mcp_servers",
-                "cli_command", "sdk_module", "serve", "teardown"):
-        if key in override:
-            merged[key] = override[key]
-    return merged
-
-
-def _interface_dir_for(
-    platform: str, interface: str, version: int, version_root: Path | None, binary: str | None
-) -> Path:
-    """The dir to expose as $INTERFACE_DIR — where the binary to use lives.
-
-    A session version shipping its own binary copy uses its own folder; else the
-    base binary dir is reused.
-    """
-    if binary and version and version_root is not None:
-        vd = version_dir(version_root, platform, interface, version)
-        if (vd / binary).exists():
-            return vd
-    return bin_dir(platform, interface)
 
 
 # ---------------------------------------------------------------------------
@@ -236,156 +228,25 @@ def _auto_prompt(platform: str, interface: str, binary: str | None) -> str:
     return ""
 
 
-def _committed_prompt(platform: str, interface: str) -> str | None:
-    """The engineer-facing prompt AS COMMITTED at platforms/<p>/<i>/config.yaml.
-
-    Read straight from the committed tree — NOT via bin_dir/load_manifest, which
-    honor `set_interface_home` and would pick up an autoresearch interface-dir copy
-    whose `prompt:` the researcher may have edited. The prompt is FROZEN across
-    versions (the researcher improves interface SOURCE, never the prompt), so edits
-    to `prompt:` in a version copy or version.yaml override are ignored.
-    """
-    p = PLATFORMS_DIR / platform / interface / "config.yaml"
-    if not p.exists():
-        return None
-    m = yaml.safe_load(p.read_text()) or {}
-    return m.get("prompt")
-
-
-def _prompt_for(platform: str, interface: str, version: int, version_root: Path | None) -> str:
-    # FROZEN: always the committed base prompt, regardless of version / home
-    # redirect — this makes a prompt-only "improvement" a no-op. `is not None`
-    # (not truthiness): an intentionally EMPTY committed prompt must also freeze to
-    # empty, else the home-redirected copy's edited prompt leaks back in.
-    committed = _committed_prompt(platform, interface)
-    if committed is not None:
-        return committed.strip()
-    # No committed prompt key (legacy / dynamically-homed interface): fall back to
-    # the resolved config, then an auto-generated default.
-    cfg = _resolved_config(platform, interface, version, version_root)
+def _prompt_for(platform: str, interface: str) -> str:
+    """The agent-facing prompt: the manifest's `prompt:` (kept verbatim, even
+    when intentionally empty), else an auto-generated default."""
+    cfg = _resolved_config(platform, interface)
     text = cfg.get("prompt")
-    if text:
+    if text is not None:
         return text.strip()
     return _auto_prompt(platform, interface, cfg.get("binary"))
 
 
-def prompt_hash_for(
-    platform: str, interface: str, version: int | None = None, version_root: Path | None = None
-) -> str:
+def prompt_hash_for(platform: str, interface: str) -> str:
     if platform == "none" and interface == "none":
         return ""
     if not load_manifest(platform, interface):
         return ""
-    chosen = version or 0
-    text = _prompt_for(platform, interface, chosen, version_root)
+    text = _prompt_for(platform, interface)
     if not text:
         return ""
     return hashlib.sha256(text.encode()).hexdigest()[:8]
-
-
-# ---------------------------------------------------------------------------
-# Source fingerprint — "did the interface SOURCE actually change?"
-# ---------------------------------------------------------------------------
-
-# Build output + plumbing, not interface SOURCE: excluded from the fingerprint so
-# prompt/config tweaks and rebuilt wheels don't count as a "real" change.
-_FINGERPRINT_EXCLUDE_DIRS = {
-    "__pycache__", ".git", "build", "dist", ".claude", ".github", "Library",
-}
-_FINGERPRINT_EXCLUDE_SUFFIXES = (".whl", ".pyc", ".pyo", ".egg-link")
-# `pyproject.toml` is build-generated; `.banter-src-hash` is our own cache key.
-# `config.yaml` is NOT excluded — it's hashed with only the (frozen) `prompt:`
-# removed, so a prompt-only edit is a no-op but a real config edit (install steps,
-# binary, runtime_install, teardown, …) counts as a change.
-_FINGERPRINT_EXCLUDE_NAMES = {"pyproject.toml", ".banter-src-hash"}
-
-
-def _config_fingerprint_bytes(config_path: Path) -> bytes:
-    """Bytes for the root `config.yaml` MINUS the frozen `prompt:` field.
-
-    Lets `source_fingerprint` treat a prompt-only edit as no change while still
-    detecting real plumbing edits (install steps, binary, runtime_install,
-    teardown, …) — a valid researcher lever. Falls back to raw bytes if the YAML
-    can't be parsed.
-    """
-    try:
-        data = yaml.safe_load(config_path.read_text())
-        if isinstance(data, dict):
-            data.pop("prompt", None)
-            return yaml.safe_dump(data, sort_keys=True).encode()
-    except Exception:
-        pass
-    return config_path.read_bytes()
-
-
-def source_fingerprint(interface_dir: Path) -> str:
-    """A stable hash of an interface's SOURCE tree.
-
-    Excludes build artifacts (wheels, `build/`, `*.egg-info`, `__pycache__`), the
-    generated `pyproject.toml`, and Claude/VCS plumbing. The root `config.yaml` is
-    hashed with its frozen `prompt:` stripped, so two copies with the same
-    fingerprint have identical source AND build plumbing — only the prompt or
-    rebuilt binaries differ.
-    """
-    interface_dir = Path(interface_dir)
-    h = hashlib.sha256()
-    for f in sorted(p for p in interface_dir.rglob("*") if p.is_file()):
-        rel = f.relative_to(interface_dir)
-        if set(rel.parts) & _FINGERPRINT_EXCLUDE_DIRS:
-            continue
-        if any(part.endswith(".egg-info") for part in rel.parts):
-            continue
-        if f.name in _FINGERPRINT_EXCLUDE_NAMES or f.suffix in _FINGERPRINT_EXCLUDE_SUFFIXES:
-            continue
-        # Root config.yaml: hash everything except the frozen prompt. A nested
-        # config.yaml deeper in the tree is hashed normally (it's source).
-        payload = (
-            _config_fingerprint_bytes(f) if str(rel) == "config.yaml" else f.read_bytes()
-        )
-        h.update(str(rel).encode())
-        h.update(b"\0")
-        h.update(payload)
-        h.update(b"\0")
-    return h.hexdigest()
-
-
-def assert_source_changed(
-    interface_dir: Path, version_label: str | None, fp: str | None = None
-) -> None:
-    """Refuse an autoresearch IMPROVEMENT version that didn't change the source.
-
-    For `v<N>` (N>0) with a sibling `v<N-1>/interface` present, raise `ValueError`
-    if the source is byte-identical to the previous version. Since the prompt is
-    frozen and `config.yaml` excluded from the fingerprint, a version that only
-    re-worded the prompt (or changed nothing) is caught here — before the engineer
-    runs — instead of silently re-measuring `v<N-1>`.
-
-    Baselines (`v0`), non-autoresearch runs (no version label), and the first
-    version after a continuation (no sibling on disk) are unconstrained. `fp` may
-    carry this dir's already-computed fingerprint (the caller often needs it too)
-    to avoid hashing the tree twice.
-    """
-    if not version_label:
-        return
-    label = str(version_label).lstrip("v")
-    if not label.isdigit():
-        return
-    n = int(label)
-    if n <= 0:
-        return
-    interface_dir = Path(interface_dir)
-    prev = interface_dir.parent.parent / f"v{n - 1}" / "interface"
-    if not prev.is_dir():
-        return
-    cur = fp if fp is not None else source_fingerprint(interface_dir)
-    if cur == source_fingerprint(prev):
-        raise ValueError(
-            f"interface source for {version_label} is identical to v{n - 1} "
-            f"(only config.yaml/prompt or build artifacts differ). The engineer "
-            f"prompt is FROZEN — to make {version_label} count, improve the "
-            f"interface SOURCE under {interface_dir} (e.g. src/python/...) and "
-            f"re-run. A prompt-only change is not a valid version."
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -419,7 +280,7 @@ def keys_for(platform: str, interface: str) -> dict[str, str]:
 
 
 def _resolved_keys(platform: str, interface: str, env: dict[str, str] | None = None) -> dict[str, str]:
-    """Key values to inject into the engineer env: manifest value, else env."""
+    """Key values to inject into the agent env: manifest value, else env."""
     base = env if env is not None else os.environ
     out: dict[str, str] = {}
     for k, v in keys_for(platform, interface).items():
@@ -432,64 +293,39 @@ def _resolved_keys(platform: str, interface: str, env: dict[str, str] | None = N
 # ---------------------------------------------------------------------------
 
 
-def _compute_hash(platform: str, interface: str, version: int, version_root: Path | None) -> str:
-    """sha256 over manifest bytes + version override bytes + binary bytes + version."""
+def _compute_hash(platform: str, interface: str) -> str:
+    """sha256 over manifest bytes + binary bytes."""
     h = hashlib.sha256()
     mp = manifest_path(platform, interface)
     if mp.exists():
         h.update(mp.read_bytes())
         h.update(b"\0")
-    if version and version_root is not None:
-        vp = version_dir(version_root, platform, interface, version) / "version.yaml"
-        if vp.exists():
-            h.update(vp.read_bytes())
-            h.update(b"\0")
-    cfg = _resolved_config(platform, interface, version, version_root)
-    binary = cfg.get("binary")
+    binary = load_manifest(platform, interface).get("binary")
     if binary:
-        bpath = _interface_dir_for(platform, interface, version, version_root, binary) / binary
+        bpath = bin_dir(platform, interface) / binary
         if bpath.is_file():
             h.update(bpath.read_bytes())
             h.update(b"\0")
-    h.update(f"|v={version}".encode())
     return h.hexdigest()[:8]
 
 
-def _check_known(platform: str, interface: str, version: int | None, version_root: Path | None) -> int:
-    """Validate interface/version and return the chosen version int. Raises ValueError."""
+def _check_known(platform: str, interface: str) -> None:
+    """Validate the interface exists. Raises ValueError."""
     if interface not in INTERFACES:
         raise ValueError(f"Unknown interface {interface!r}; expected one of {INTERFACES}")
-    manifest = load_manifest(platform, interface)
-    if not manifest:
+    if not load_manifest(platform, interface):
         raise ValueError(
             f"No config for {platform!r}/{interface!r} at {manifest_path(platform, interface)}. "
-            f"Create it (platforms/{platform}/{interface}/config.yaml) — preflight builds the binary."
+            f"Create it (configs/platforms/{platform}/{interface}.yaml) — preflight builds the binary."
         )
-    chosen = version or 0
-    if chosen and version_root is None:
-        raise ValueError(
-            f"Interface {platform!r}/{interface!r} v{chosen} requires --version-root "
-            f"(versions live inside an autoresearch session)."
-        )
-    if chosen and not (version_dir(version_root, platform, interface, chosen) / "version.yaml").exists():
-        raise ValueError(
-            f"Interface {platform!r}/{interface!r} has no version {chosen} under "
-            f"{version_dir(version_root, platform, interface, chosen)}."
-        )
-    return chosen
 
 
-def variant_for(
-    platform: str,
-    interface: str,
-    version: int | None = None,
-    version_root: Path | None = None,
-) -> tuple[int, str]:
-    """Return (version, hash). version None → 0 (base manifest)."""
+def variant_for(platform: str, interface: str) -> str:
+    """Validate the interface and return its content hash ("" for none/none)."""
     if platform == "none" and interface == "none":
-        return 0, ""
-    chosen = _check_known(platform, interface, version, version_root)
-    return chosen, _compute_hash(platform, interface, chosen, version_root)
+        return ""
+    _check_known(platform, interface)
+    return _compute_hash(platform, interface)
 
 
 def setup(
@@ -497,35 +333,33 @@ def setup(
     interface: str,
     run_dir: Path,
     venv_python: Path,
-    version: int | None = None,
-    version_root: Path | None = None,
 ) -> InterfaceSetup:
     if interface not in INTERFACES:
         raise ValueError(f"Unknown interface {interface!r}; expected one of {INTERFACES}")
 
     if platform == "none" and interface == "none":
-        return InterfaceSetup(platform="none", interface="none", prompt_fragment="", version=0, hash="")
+        return InterfaceSetup(platform="none", interface="none", prompt_fragment="", hash="")
 
-    chosen = _check_known(platform, interface, version, version_root)
-    cfg = _resolved_config(platform, interface, chosen, version_root)
+    _check_known(platform, interface)
+    cfg = _resolved_config(platform, interface)
     binary = cfg.get("binary")
     runtime_install = cfg.get("runtime_install") or []
     mcp_servers = cfg.get("mcp_servers") or {}
-    prompt_fragment = _prompt_for(platform, interface, chosen, version_root)
-    # The "use the interface as-is" rule is the engineer prompt's default (baked
-    # into engineer.md, stripped only for none/none) — not appended here. This
+    prompt_fragment = _prompt_for(platform, interface)
+    # The "use the interface as-is" rule is the agent prompt's default (baked
+    # into agent.md, stripped only for none/none) — not appended here. This
     # fragment carries just the interface's own `prompt:` prose.
-    hash_ = _compute_hash(platform, interface, chosen, version_root)
-    interface_dir = _interface_dir_for(platform, interface, chosen, version_root, binary)
+    hash_ = _compute_hash(platform, interface)
+    interface_dir = bin_dir(platform, interface)
 
     # Guard: if runtime steps reference $INTERFACE_DIR (pre-built binary), it must
     # exist. Preflight builds it before here; this is a backstop.
     if binary and runtime_install and any("$INTERFACE_DIR" in s for s in runtime_install):
         if not (interface_dir / binary).exists():
             raise RuntimeError(
-                f"Interface {platform!r}/{interface!r} v{chosen} binary '{binary}' not found at "
+                f"Interface {platform!r}/{interface!r} binary '{binary}' not found at "
                 f"{interface_dir / binary}. Preflight should have built it; "
-                f"check platforms/{platform}/{interface}/config.yaml install steps."
+                f"check configs/platforms/{platform}/{interface}.yaml install steps."
             )
 
     if runtime_install:
@@ -534,11 +368,11 @@ def setup(
     return InterfaceSetup(
         platform=platform,
         interface=interface,
+        ref=interface_ref(load_manifest(platform, interface)),
         prompt_fragment=prompt_fragment,
-        version=chosen,
         hash=hash_,
         # Resolve BOTH the CLI command and SDK module for EVERY interface (not just
-        # the active one), so the engineer hook + command counter can detect and
+        # the active one), so the agent hook + command counter can detect and
         # block CROSS-INTERFACE escapes — e.g. `import hopsworks` while the CLI is
         # under test, or a `hops` call while the SDK is. `interface` decides which is
         # "on-interface".
@@ -547,18 +381,21 @@ def setup(
         #   sdk_module: the importable module (`sdk_module`, else the platform name
         #     — true when package == platform name).
         cli_binary=cfg.get("cli_command") or (binary if interface == "cli" else None),
+        cli_subcommand=_norm_subcommands(cfg.get("cli_subcommand")),
         sdk_module=cfg.get("sdk_module") or platform,
         mcp_servers=mcp_servers,
         keys=_resolved_keys(platform, interface),
         serve=cfg.get("serve") or [],
         teardown=cfg.get("teardown") or [],
         allowed_domains=list(cfg.get("allowed_domains") or []),
+        instance_allowlist=list(cfg.get("instance_allowlist") or []),
+        sandbox_excluded_commands=list(cfg.get("sandbox_excluded_commands") or []),
     )
 
 
 def _make_check_venv(target: Path) -> Path:
     """Create an empty venv that shares the base .venv's libraries but holds no
-    interface packages — for ephemeral preflight checks (mirrors how each engineer
+    interface packages — for ephemeral preflight checks (mirrors how each agent
     run's venv is built). Returns the venv's python.
     """
     base_py = _TESTBED_ROOT / ".venv" / "bin" / "python"
@@ -592,14 +429,9 @@ def _interface_dist_name(cfg: dict, platform: str, binary: str | None) -> str | 
     return cfg.get("sdk_module") or platform
 
 
-def ensure_base_clean(
-    platform: str,
-    interface: str,
-    version: int | None = None,
-    version_root: Path | None = None,
-) -> None:
-    """Keep the base researcher .venv free of the interface package, so every
-    per-run (and preflight check) venv installs the wheel FRESH and complete.
+def ensure_base_clean(platform: str, interface: str) -> None:
+    """Keep the base .venv free of the interface package, so every per-run (and
+    preflight check) venv installs the wheel FRESH and complete.
 
     The base .venv holds only the SHARED libraries each run inherits
     (requirements.txt) — never an interface package. If one leaks in (e.g. a manual
@@ -613,8 +445,8 @@ def ensure_base_clean(
     if not base_py.exists():
         return
     try:
-        chosen = _check_known(platform, interface, version, version_root)
-        cfg = _resolved_config(platform, interface, chosen, version_root)
+        _check_known(platform, interface)
+        cfg = _resolved_config(platform, interface)
     except Exception:
         return
     dist = _interface_dist_name(cfg, platform, cfg.get("binary"))
@@ -641,8 +473,6 @@ def ensure_base_clean(
 def preflight(
     platform: str,
     interface: str,
-    version: int | None = None,
-    version_root: Path | None = None,
     *,
     check_login: bool = True,
     auto_build: bool = True,
@@ -650,14 +480,13 @@ def preflight(
     cleanup_build: bool = False,
     env: dict[str, str] | None = None,
 ) -> InterfaceStatus:
-    """Build + verify an interface. `cleanup_build=True` (session preflight,
-    `banter test`) afterwards deletes any build artifacts this created from the
-    committed source folder, keeping it source-only — real installs happen per
-    version (autoresearch `vX`) or per benchmark run. Default False leaves the
-    artifact in place (benchmark runs the engineer against it directly)."""
+    """Build + verify an interface. `cleanup_build=True` (`banter test`)
+    afterwards deletes any build artifacts this created from the committed
+    source folder, keeping it source-only. Default False leaves the artifact in
+    place (treatment runs put the agent against it directly)."""
     try:
         return _preflight_impl(
-            platform, interface, version, version_root,
+            platform, interface,
             check_login=check_login, auto_build=auto_build, timeout_s=timeout_s, env=env,
         )
     finally:
@@ -685,10 +514,10 @@ def _force_rmtree(path: Path) -> None:
 
 
 def _clean_build_artifacts(platform: str, interface: str) -> None:
-    """Remove build artifacts from the committed source folder so it stays
-    source-only (config + source). A wheel, build|dist|src dir, egg-info, or the
-    configured `binary` in a source folder is always a build artifact."""
-    base = PLATFORMS_DIR / platform / interface
+    """Remove build artifacts from the interface's build home (build/<p>/<i>) —
+    used by `banter test` to leave no state behind. A wheel, build|dist|src dir,
+    egg-info, or the configured `binary` is always a build artifact."""
+    base = BUILD_DIR / platform / interface
     if not base.is_dir():
         return
     for d in ("build", "dist", "src"):
@@ -702,7 +531,7 @@ def _clean_build_artifacts(platform: str, interface: str) -> None:
     if binary and not binary.endswith((".py", ".toml", ".md", ".yaml", ".yml")):
         (base / binary).unlink(missing_ok=True)
     # With build metadata in config.yaml (`package:`), pyproject.toml is
-    # build-generated — remove it so the committed folder stays source-only.
+    # build-generated — remove it so the build folder stays source-only.
     if manifest.get("package"):
         (base / "pyproject.toml").unlink(missing_ok=True)
 
@@ -710,8 +539,6 @@ def _clean_build_artifacts(platform: str, interface: str) -> None:
 def _preflight_impl(
     platform: str,
     interface: str,
-    version: int | None = None,
-    version_root: Path | None = None,
     *,
     check_login: bool = True,
     auto_build: bool = True,
@@ -730,8 +557,8 @@ def _preflight_impl(
         declared key is set.
       * Test — `test_command` exits 0.
     """
-    config_fix = f"check platforms/{platform}/{interface}/config.yaml (build/install steps)"
-    setup_fix = "make setup  (or: banter setup " + f"platforms/{platform}/{interface}/config.yaml)"
+    config_fix = f"check configs/platforms/{platform}/{interface}.yaml (build/install steps)"
+    setup_fix = "make setup  (or: banter setup " + f"configs/platforms/{platform}/{interface}.yaml)"
 
     if platform == "none" and interface == "none":
         return InterfaceStatus(platform, interface, ok=True, installed=True, authenticated=True)
@@ -741,34 +568,31 @@ def _preflight_impl(
             reason=f"unknown interface {interface!r}",
         )
 
-    # 1) installed? Build the base binary on demand if it's missing.
+    # 1) installed? Build the binary on demand if it's missing.
     try:
-        chosen = _check_known(platform, interface, version, version_root)
+        _check_known(platform, interface)
     except ValueError as e:
         return InterfaceStatus(
             platform, interface, ok=False, installed=False, authenticated=False,
             reason=str(e), fix_command=config_fix,
         )
-    cfg = _resolved_config(platform, interface, chosen, version_root)
+    cfg = _resolved_config(platform, interface)
     binary = cfg.get("binary")
     # The base .venv must never hold the interface package — it would shadow the
     # fresh per-run wheel install (check + run venvs both derive from base). Strip
     # it here so the checks below mirror a real run.
-    ensure_base_clean(platform, interface, chosen, version_root)
+    ensure_base_clean(platform, interface)
     runtime_install = cfg.get("runtime_install") or []
     uses_prebuilt = bool(
         binary and runtime_install and any("$INTERFACE_DIR" in s for s in runtime_install)
     )
-    bpath = (
-        _interface_dir_for(platform, interface, chosen, version_root, binary) / binary
-        if uses_prebuilt else None
-    )
+    bpath = bin_dir(platform, interface) / binary if uses_prebuilt else None
 
     # (Re)build only when the artifact is missing. The config's `install:` steps
     # only BUILD the artifact into the interface dir — they don't install it into
     # the base .venv, so base stays free of interface packages and runs don't
     # overlap. The interface installs fresh into a throwaway venv for the checks
-    # below, and into each engineer's per-run venv at run time.
+    # below, and into each agent's per-run venv at run time.
     artifact_missing = bpath is not None and not bpath.exists()
     if artifact_missing and auto_build and load_manifest(platform, interface).get("install"):
         try:
@@ -785,10 +609,10 @@ def _preflight_impl(
         )
 
     # Verify in an EPHEMERAL venv that shares base libs but installs ONLY this
-    # interface (its runtime_install) — exactly what an engineer run gets — then is
-    # torn down (keeps base free of interface packages). Session preflight runs only
-    # build + `test_command`; LOGIN is verified per challenge
-    # (interfaces.login_status). check_login=True (single-challenge form) also checks
+    # interface (its runtime_install) — exactly what an agent run gets — then is
+    # torn down (keeps base free of interface packages). Treatment preflight runs
+    # only build + `test_command`; LOGIN is verified per run
+    # (interfaces.login_status). check_login=True (single-task form) also checks
     # login here.
     keys = keys_for(platform, interface)
     base_env = dict(env) if env is not None else dict(os.environ)
@@ -829,7 +653,7 @@ def _preflight_impl(
             try:
                 _run_install(
                     runtime_install, cwd=tmp, venv_python=check_python,
-                    interface_dir=_interface_dir_for(platform, interface, chosen, version_root, binary),
+                    interface_dir=bin_dir(platform, interface),
                 )
             except Exception as e:
                 return InterfaceStatus(
@@ -913,14 +737,14 @@ def login_status(
     keys: dict[str, str] | None = None,
     timeout_s: int = 30,
 ) -> InterfaceStatus:
-    """Per-challenge login check: run the interface's `auth_command` in the given
-    (per-run) venv. Build + test happen once at session preflight; login is
-    re-verified for EVERY challenge here (so expired creds are caught mid-session
+    """Per-run login check: run the interface's `auth_command` in the given
+    (per-run) venv. Build + test happen once at treatment preflight; login is
+    re-verified for EVERY run here (so expired creds are caught mid-session
     and each run authenticates in its own venv).
     """
     if platform == "none" and interface == "none":
         return InterfaceStatus(platform, interface, ok=True, installed=True, authenticated=True)
-    setup_fix = "make setup  (or: banter setup " + f"platforms/{platform}/{interface}/config.yaml)"
+    setup_fix = "make setup  (or: banter setup " + f"configs/platforms/{platform}/{interface}.yaml)"
     declared = keys_for(platform, interface)
     env = dict(os.environ)
     missing = []
@@ -997,7 +821,7 @@ def _render_pyproject(pkg: dict) -> str:
 def build(platform: str, interface: str) -> Path:
     """Check out the interface's repo into its folder and build it (no AI).
 
-    Code is checked out INTO platforms/<platform>/<interface>/ — both the checkout
+    Code is checked out INTO build/<platform>/<interface>/ — both the checkout
     and the build/artifact location ($INTERFACE_DIR). A `repo:` pointing at a local
     path (e.g. a `fake_repos/...` fake repo) is copied in; a URL is git-cloned. Then
     the config's `install:` steps run there. Idempotent. Returns the interface dir.
@@ -1012,13 +836,12 @@ def build(platform: str, interface: str) -> Path:
     repo = manifest.get("repo")
     ref = manifest.get("ref", "main")
     install_steps = manifest.get("install") or []
-    iface_dir = bin_dir(platform, interface)   # config.yaml + (committed) source + artifact
+    iface_dir = bin_dir(platform, interface)   # source checkout + built artifact
     iface_dir.mkdir(parents=True, exist_ok=True)
     venv_bin = _TESTBED_ROOT / ".venv" / "bin"
 
-    # Where install steps run. No `repo:` → source committed in place (e.g. mlkit).
-    # A remote `repo:` is cloned into a `src/` subdir so it doesn't clobber
-    # config.yaml; a local path is copied in place.
+    # Where install steps run. No `repo:` → source already in place. A remote
+    # `repo:` is cloned into a `src/` subdir; a local path is copied in place.
     src_cwd = iface_dir
     if repo:
         local = _TESTBED_ROOT / repo
@@ -1028,9 +851,8 @@ def build(platform: str, interface: str) -> Path:
             src = iface_dir / "src"
             # Pin source to `ref` — a FIXED COMMIT SHA (preferred, reproducible) or
             # a branch/tag. Once checked out we NEVER `git pull`: the tree stays at
-            # the pinned commit, so (1) the experiment isn't confounded by upstream
-            # drift mid-session, and (2) a researcher's edits to a per-version copy
-            # aren't clobbered/merged with origin. To refresh the base, delete src/.
+            # the pinned commit, so the benchmark isn't confounded by upstream
+            # drift between runs. To refresh, delete src/.
             if not (src / ".git").exists():
                 src.mkdir(parents=True, exist_ok=True)
                 subprocess.run(["git", "-C", str(src), "init", "-q"], check=True)
@@ -1049,8 +871,8 @@ def build(platform: str, interface: str) -> Path:
             src_cwd = src
         # Always strip a cloned/copied repo's own agent instructions (.claude/,
         # CLAUDE.md, .mcp.json) — e.g. hopsworks-api ships a .claude/ — so they're
-        # never auto-loaded as directives by the engineer/researcher working in or
-        # near the interface source.
+        # never auto-loaded as directives by the agent working in or near the
+        # interface source.
         from banter import docs as _docs
         _docs.strip_agent_plumbing(src_cwd)
 
@@ -1069,7 +891,7 @@ def build(platform: str, interface: str) -> Path:
         env["TESTBED_ROOT"] = str(_TESTBED_ROOT)
         # Disable the pip download cache — interface installs are tiny wheels and
         # the cache write path (<testbed>/cache/pip) is unreachable for the
-        # researcher/engineer (deny patterns), triggering a pip warning otherwise.
+        # agent (deny patterns), triggering a pip warning otherwise.
         env["PIP_NO_CACHE_DIR"] = "1"
         for step in install_steps:
             subprocess.run(step, shell=True, env=env, cwd=str(src_cwd), check=True)
@@ -1089,7 +911,7 @@ def _run_install(
     if interface_dir is not None:
         env["INTERFACE_DIR"] = str(interface_dir)
     # Disable pip's download cache: the shared cache path isn't writable to the
-    # engineer (deny patterns), and runtime_install steps are tiny.
+    # agent (deny patterns), and runtime_install steps are tiny.
     env["PIP_NO_CACHE_DIR"] = "1"
     for step in steps:
         subprocess.run(step, shell=True, cwd=cwd, env=env, check=True)

@@ -1,6 +1,6 @@
-"""Live-claude integration test for engineer confinement.
+"""Live-claude integration test for agent confinement.
 
-Spawns a real `claude -p` with the engineer's settings, asks it to attempt
+Spawns a real `claude -p` with the agent's settings, asks it to attempt
 each escape vector, and asserts `permission_denials` carries every attempt.
 Only covers Bash + tool-name denies — Read/Write/Edit are skipped by
 bypassPermissions (see `claude_runner.deny_patterns_for` for the why).
@@ -92,20 +92,20 @@ class FunctionalEscapeBlockingTests(unittest.TestCase):
 
 @unittest.skipUnless(_claude_available() and _keychain_token_available(),
                      "needs `claude` on PATH and a usable Keychain OAuth token")
-class EngineerCanDoItsThingTests(unittest.TestCase):
-    """End-to-end: the engineer's boundary is its challenge dir AND every
+class AgentCanDoItsThingTests(unittest.TestCase):
+    """End-to-end: the agent's boundary is its run dir AND every
     capability it needs (python imports, data reads, submission writes) is
     actually reachable inside that boundary.
 
-    Materializes a tiny synthetic challenge dir with a venv + data + hook,
-    spawns a real engineer-style `claude -p`, and verifies it can do all
+    Materializes a tiny synthetic run dir with a venv + data + hook,
+    spawns a real agent-style `claude -p`, and verifies it can do all
     three. Catches regressions where tightening the sandbox would break
-    the engineer's normal workflow.
+    the agent's normal workflow.
     """
 
     def setUp(self):
         # Put the boundary under the testbed's results/ so it sits where
-        # production engineers actually run from.
+        # production agents actually run from.
         self.run_dir = (claude_runner.TESTBED_ROOT
                         / "results" / "_eng_can_do_its_thing")
         if self.run_dir.exists():
@@ -114,11 +114,11 @@ class EngineerCanDoItsThingTests(unittest.TestCase):
         self.run_dir.mkdir(parents=True)
 
         # Materialize a minimal venv inside the boundary (instant via APFS
-        # clone of the base researcher venv).
+        # clone of the base venv).
         from banter import runner as runner_mod
         runner_mod._make_venv(self.run_dir / "venv")
 
-        # Pretend-data: a small CSV the engineer is supposed to read.
+        # Pretend-data: a small CSV the agent is supposed to read.
         (self.run_dir / "data").mkdir()
         (self.run_dir / "data" / "train.csv").write_text("id,y\n0,1\n1,0\n")
 
@@ -129,8 +129,8 @@ class EngineerCanDoItsThingTests(unittest.TestCase):
         import shutil as _s
         _s.rmtree(self.run_dir, ignore_errors=True)
 
-    def test_engineer_can_write_inside_boundary(self):
-        # Minimal positive test: ask the engineer to write a single file
+    def test_agent_can_write_inside_boundary(self):
+        # Minimal positive test: ask the agent to write a single file
         # inside its cwd via Bash. If the sandbox is shaped right, the file
         # exists on disk afterward; we don't depend on what the model says.
         prompt = (
@@ -156,7 +156,7 @@ class EngineerCanDoItsThingTests(unittest.TestCase):
         target = self.run_dir / "submission.txt"
         self.assertTrue(
             target.exists(),
-            f"engineer's write didn't land on disk.\n"
+            f"agent's write didn't land on disk.\n"
             f"  cwd: {self.run_dir}\n"
             f"  stdout tail: {proc.stdout[-1000:]}\n"
             f"  stderr tail: {proc.stderr[-300:]}",

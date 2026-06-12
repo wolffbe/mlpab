@@ -1,0 +1,111 @@
+# Databricks MCP interface — the `unitycatalog-mcp` server from databrickslabs/mcp
+# (Unity Catalog server: exposes UC functions in a schema + Genie spaces as MCP
+# tools over stdio). Repo: https://github.com/databrickslabs/mcp
+#
+# Built LOCALLY from source (no PyPI): preflight clones the repo, builds the wheel
+# into $INTERFACE_DIR (the gitignored build home, build/databricks/mcp/), and
+# EXPORTS THE FROZEN uv.lock to a pip requirements file. The lock is load-bearing
+# — the project's own deps are unpinned (`>=`) and plain pip resolves an
+# INCOMPATIBLE set (databricks-openai vs databricks-vectorsearch:
+# `VectorSearchIndex` import fails). So each run installs the LOCKED deps first,
+# then the wheel with `--no-deps`.
+#
+# Set keys: edit the global testbed/.env (see `keys:` below).
+
+# --- Where it lives / how to build it (run automatically at preflight) ---
+# The interface version/ref under test — written to the results `version`
+# column. Keep in sync with the pin below (ref: / ==X.Y.Z / VER=).
+version: "1da491c10f97"
+
+repo: https://github.com/databrickslabs/mcp
+# Pinned to a FIXED COMMIT for reproducibility (the interface source never drifts
+# between runs; the checkout is never re-pulled). To advance, update this
+# SHA + delete the built src/ so the lock + wheel are regenerated.
+ref: 1da491c10f97169b384de7f3a6d557a02b94b5fa
+install:
+  # 1) Build the wheel from the repo root into $INTERFACE_DIR, then RENAME it to one
+  #    fixed, valid wheel filename (upstream version floats, e.g. 0.1.dev1+g<sha> —
+  #    `mv` leaves exactly one wheel; pip reads the real version from the wheel's
+  #    own metadata, so the fixed `-0-` name is cosmetic).
+  - pip install build
+  - python -m build --wheel --outdir "$INTERFACE_DIR" .
+  - sh -c 'mv "$(ls -t "$INTERFACE_DIR"/databricks_labs_mcp-*.whl | head -1)" "$INTERFACE_DIR/databricks_labs_mcp-0-py3-none-any.whl"'
+  # 2) Export the committed uv.lock to a pinned pip requirements file (single source
+  #    of truth = this ref's lock). Requires `uv` at build time (preflight only).
+  - uv export --frozen --no-dev --no-emit-project --no-hashes -o "$INTERFACE_DIR/requirements.lock"
+
+# Deterministic, OFFLINE "does it run?" check (no live workspace): the server
+# console script installs and its module graph imports cleanly (this is exactly
+# what the version mismatch broke, so it's a meaningful check).
+test_command: unitycatalog-mcp --help
+
+# Real connectivity check: the MCP server authenticates with DATABRICKS_HOST /
+# DATABRICKS_TOKEN at runtime via databricks-sdk (a locked dep, installed in the
+# run venv), so validate those same credentials at preflight with a current-user
+# call. Exits non-zero on a bad/missing token; `banter test --no-login` skips it.
+auth_command: python -c "from databricks.sdk import WorkspaceClient; WorkspaceClient().current_user.me()"
+
+# --- How to run it (per agent run) — install the LOCKED deps, then the wheel
+#     with --no-deps (deps already satisfied by the lock; this avoids pip
+#     re-resolving to an incompatible set). ---
+binary: databricks_labs_mcp-0-py3-none-any.whl
+runtime_install:
+  - 'pip install -r "$INTERFACE_DIR/requirements.lock"'
+  - 'pip install --no-deps "$INTERFACE_DIR/databricks_labs_mcp-0-py3-none-any.whl"'
+
+# --- MCP server: Claude Code launches it over stdio per run. It inherits the run
+#     environment (DATABRICKS_HOST / DATABRICKS_TOKEN injected from the keys below),
+#     so `env: {}` like the other MCP interfaces. The `-s` schema is REQUIRED (the
+#     server needs a Unity Catalog schema or a Genie space); `workspace.default` is
+#     a sensible default that exists in a fresh workspace — change it to expose a
+#     different schema's UC functions, or add `-g <genie_space_ids>`. ---
+mcp_servers:
+  databricks:
+    command: unitycatalog-mcp
+    args: ["-s", "workspace.default"]
+    env: {}
+
+# Outbound hosts the agent + MCP server need reachable at run time (drives the
+# sandbox allowedDomains). The workspace host comes from DATABRICKS_HOST.
+allowed_domains:
+  - "*.cloud.databricks.com"   # AWS
+  - "*.azuredatabricks.net"    # Azure
+  - "*.gcp.databricks.com"     # GCP
+  - "*.databricks.com"
+
+# --- Platform setup — run automatically by banter at the START of every run,
+#     right AFTER the teardown sweep below. Databricks has no project container
+#     to pre-create; instead this ensures the Unity Catalog schema
+#     `workspace.default` exists — the schema THIS server binds with
+#     `-s workspace.default` above, so the MCP interface never starts against a
+#     missing schema. The logic is the committed
+#     configs/platforms/databricks/setup.py — $BANTER_PLATFORM_DIR points there
+#     (fixed infra); pure-stdlib REST, so it runs in any run venv. ---
+serve:
+  - './venv/bin/python "$BANTER_PLATFORM_DIR/setup.py"'
+
+# --- Platform teardown — run automatically by banter at the START and END of
+#     every run. Databricks has no project whose deletion cascades, so this
+#     sweeps the workspace PER RESOURCE TYPE in cost order — serving/vector
+#     endpoints, active runs, clusters, warehouses, DLT pipelines, jobs, MLflow
+#     experiments + models, Unity Catalog objects, workspace home + DBFS
+#     /FileStore — deleting only what the token's user created where the API
+#     reports a creator. The `workspace` catalog and `default` schemas are kept
+#     (the binding above relies on them). The cleanup logic is the committed
+#     configs/platforms/databricks/teardown.py — $BANTER_PLATFORM_DIR points
+#     there (fixed infra); pure-stdlib REST, so it runs in any run venv. ---
+teardown:
+  - './venv/bin/python "$BANTER_PLATFORM_DIR/teardown.py"'
+
+# --- Credentials — names only; values resolve from the GLOBAL testbed/.env at
+#     run time (never stored here), injected into the agent's env AND inherited
+#     by the MCP server. ---
+keys:
+  - DATABRICKS_HOST    # workspace URL, e.g. https://dbc-xxxx.cloud.databricks.com
+  - DATABRICKS_TOKEN   # secret — personal access token
+
+# --- Agent-facing prompt ---
+prompt: |
+  The Databricks MCP server is available as tools prefixed `mcp__databricks__`. It
+  is authenticated via DATABRICKS_HOST and DATABRICKS_TOKEN from the environment. List your available tools
+  to see what they can do.

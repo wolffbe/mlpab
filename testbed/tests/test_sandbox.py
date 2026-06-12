@@ -1,7 +1,7 @@
 """Unit tests for the confinement design.
 
 Covers: settings.json shape (sandbox + denies), OAuth token Keychain helper,
-engineer env construction (HOME redirect + auth fallback). Live-claude
+agent env construction (HOME redirect + auth fallback). Live-claude
 integration lives in tests/integration/live_sandbox.py.
 """
 import json
@@ -66,7 +66,7 @@ class WriteSettingsTests(unittest.TestCase):
         return json.loads((self.run_dir / ".claude" / "settings.json").read_text())
 
     def test_sandbox_network_gated_filesystem_open(self):
-        # Engineer's sandbox: network is gated (allowlist of claude API +
+        # Agent's sandbox: network is gated (allowlist of claude API +
         # loopback + per-interface domains), filesystem is explicitly opted
         # OUT of restriction (`allowRead: ["/"]` + `allowWrite: ["/"]`).
         # Enabling the sandbox at all engages default fs restrictions,
@@ -83,7 +83,7 @@ class WriteSettingsTests(unittest.TestCase):
         self.assertTrue(net["allowLocalBinding"])
         for h in ("127.0.0.1", "api.anthropic.com"):
             self.assertIn(h, net["allowedDomains"])
-        for blocked in ("pypi.org", "huggingface.co", "kaggle.com", "github.com"):
+        for blocked in ("pypi.org", "huggingface.co", "example.com", "github.com"):
             self.assertNotIn(blocked, net["allowedDomains"])
 
     def test_sandbox_merges_interface_allowed_domains(self):
@@ -96,6 +96,21 @@ class WriteSettingsTests(unittest.TestCase):
         self.assertIn("*.openai.com", net["allowedDomains"])
         # Baseline still present.
         self.assertIn("api.anthropic.com", net["allowedDomains"])
+
+    def test_sandbox_excluded_commands_passed_through(self):
+        # Go binaries (databricks CLI) can't verify TLS inside Seatbelt
+        # (trustd unreachable → OSStatus -26276); the manifest's
+        # `sandbox_excluded_commands` must land in sandbox.excludedCommands
+        # so they run outside the sandbox.
+        claude_runner._write_settings(self.run_dir, self.command_log,
+                                      sandbox_excluded_commands=["databricks", "databricks *"])
+        sb = self._load()["sandbox"]
+        self.assertEqual(sb["excludedCommands"], ["databricks", "databricks *"])
+
+    def test_sandbox_excluded_commands_default_empty(self):
+        # No manifest key → nothing runs outside the sandbox.
+        claude_runner._write_settings(self.run_dir, self.command_log)
+        self.assertEqual(self._load()["sandbox"]["excludedCommands"], [])
 
     def test_hook_script_copied_into_boundary(self):
         # The PreToolUse hook command should reference an in-boundary script,
@@ -112,24 +127,13 @@ class WriteSettingsTests(unittest.TestCase):
 
     def test_home_dir_is_real_user_home_not_redirected(self):
         # Regression: HOME_DIR must come from /etc/passwd (pwd module), NOT
-        # $HOME — because autoresearch redirects $HOME into the run dir
-        # before banter run imports claude_runner. A redirected HOME_DIR
-        # would emit denyRead rooted at <run>/, which then blocks parent-
-        # dir lookups for writes inside the engineer's own cwd.
+        # $HOME — the runner redirects $HOME into the run dir before
+        # claude_runner is imported in nested invocations. A redirected
+        # HOME_DIR would emit denyRead rooted at <run>/, which then blocks
+        # parent-dir lookups for writes inside the agent's own cwd.
         import pwd as _pwd
         real_home = Path(_pwd.getpwuid(os.getuid()).pw_dir).resolve()
         self.assertEqual(claude_runner.HOME_DIR, real_home)
-
-    def test_version_dir_accepted_for_backcompat(self):
-        # `version_dir` is accepted as a kwarg but has no effect on the
-        # emitted settings — the per-challenge engineer's boundary is just
-        # its cwd; version_dir was a stale autoresearch concept.
-        version_dir = self.run_dir / "v0"
-        version_dir.mkdir()
-        claude_runner._write_settings(self.run_dir, self.command_log, version_dir=version_dir)
-        # Settings still write to <run>/.claude/, not the version dir.
-        self.assertTrue((self.run_dir / ".claude" / "settings.json").exists())
-        self.assertFalse((version_dir / ".claude" / "settings.json").exists())
 
     def test_hooks_pretooluse_command_present(self):
         claude_runner._write_settings(self.run_dir, self.command_log)
@@ -138,22 +142,19 @@ class WriteSettingsTests(unittest.TestCase):
         self.assertEqual(hooks[0]["matcher"], ".*")
         self.assertIn("log_tool_call.py", hooks[0]["hooks"][0]["command"])
 
-    def test_engineer_denies_include_common_engineer_and_escape_patterns(self):
+    def test_agent_denies_include_common_agent_and_escape_patterns(self):
         claude_runner._write_settings(self.run_dir, self.command_log)
         denies = self._load()["permissions"]["deny"]
         for t in claude_runner.COMMON_DENY:
             self.assertIn(t, denies)
-        for t in claude_runner.ENGINEER_ONLY_DENY:
+        for t in claude_runner.AGENT_ONLY_DENY:
             self.assertIn(t, denies)
         for pat in claude_runner.deny_patterns_for(self.run_dir.resolve()):
             self.assertIn(pat, denies)
 
-    def test_settings_written_to_run_dir_not_version_dir(self):
-        version_dir = self.run_dir / "v0"
-        version_dir.mkdir()
-        claude_runner._write_settings(self.run_dir, self.command_log, version_dir=version_dir)
+    def test_settings_written_to_run_dir(self):
+        claude_runner._write_settings(self.run_dir, self.command_log)
         self.assertTrue((self.run_dir / ".claude" / "settings.json").exists())
-        self.assertFalse((version_dir / ".claude" / "settings.json").exists())
 
 
 # ---------------------------------------------------------------------------
@@ -222,8 +223,11 @@ class TokenCacheTests(unittest.TestCase):
                              clear=True):
             self.assertIsNone(claude_runner.read_token_cache())
 
-    def test_resolve_order_env_beats_cache_beats_keychain(self):
-        # env → cache → keychain; first hit wins.
+    def test_resolve_order_env_beats_keychain_beats_cache(self):
+        # env → keychain → cache; first hit wins. The Keychain is fresher than
+        # the session-start cache snapshot (an interactive claude refreshes it),
+        # so it must win over the cache — preferring the stale cache once froze
+        # an expired token for ~30 runs.
         cache = claude_runner.write_token_cache("CACHED", self.run_path)
         with mock.patch.dict(os.environ,
                              {"CLAUDE_CODE_OAUTH_TOKEN": "ENV",
@@ -235,6 +239,12 @@ class TokenCacheTests(unittest.TestCase):
                              clear=True), \
              mock.patch.object(claude_runner, "oauth_token_from_keychain",
                                return_value="KEYCHAIN"):
+            self.assertEqual(claude_runner.resolve_oauth_token(), "KEYCHAIN")
+        with mock.patch.dict(os.environ,
+                             {claude_runner.TOKEN_CACHE_ENV: str(cache)},
+                             clear=True), \
+             mock.patch.object(claude_runner, "oauth_token_from_keychain",
+                               return_value=None):
             self.assertEqual(claude_runner.resolve_oauth_token(), "CACHED")
         cache.unlink()
         with mock.patch.dict(os.environ,
@@ -245,7 +255,7 @@ class TokenCacheTests(unittest.TestCase):
             self.assertEqual(claude_runner.resolve_oauth_token(), "KEYCHAIN")
 
 
-class EngineerEnvConstructionTests(unittest.TestCase):
+class AgentEnvConstructionTests(unittest.TestCase):
     """Patch run_with_retry to capture the env dict claude_runner.run builds."""
 
     def setUp(self):
@@ -256,16 +266,16 @@ class EngineerEnvConstructionTests(unittest.TestCase):
     def tearDown(self):
         self._tmp.cleanup()
 
-    def _invoke(self, auth: str = "login", version_dir: Path | None = None,
+    def _invoke(self, auth: str = "login",
                 token: str | None = "sk-ant-oat01-FAKE"):
         captured = {}
 
         def fake_run_with_retry(*, cmd, cwd, env, **kw):
             captured.update(cmd=cmd, cwd=cwd, env=env)
-            return 0, 0.01
+            return 0, 0.01, 0.0
 
         # Force keychain + token cache to the mocked value so a real on-disk
-        # cache file from `banter autoresearch` doesn't leak into tests.
+        # cache file from a previous run doesn't leak into tests.
         with mock.patch("shutil.which", return_value="/usr/bin/claude"), \
              mock.patch.object(claude_runner, "run_with_retry", side_effect=fake_run_with_retry), \
              mock.patch.object(claude_runner, "oauth_token_from_keychain", return_value=token), \
@@ -275,21 +285,16 @@ class EngineerEnvConstructionTests(unittest.TestCase):
                 auth=auth, model="claude-sonnet-4-6",
                 cli_binary=None, sdk_module=None, mcp_servers={},
                 command_log=self.run_dir / "commands.jsonl",
-                version_dir=version_dir,
             )
         return captured
 
-    def test_home_redirected_to_run_dir_for_benchmark(self):
-        self.assertEqual(self._invoke(version_dir=None)["env"]["HOME"],
+    def test_home_redirected_to_run_dir(self):
+        self.assertEqual(self._invoke()["env"]["HOME"],
                          str(self.run_dir.resolve()))
 
-    def test_home_redirected_to_version_dir_for_autoresearch(self):
-        version_dir = self.run_dir / "v3"
-        version_dir.mkdir()
-        self.assertEqual(self._invoke(version_dir=version_dir)["env"]["HOME"],
-                         str(version_dir.resolve()))
-
-    def test_oauth_token_injected_when_auth_login(self):
+    def test_keychain_token_injected_when_auth_login(self):
+        # Redirected HOME → claude cannot reach the Keychain itself; the
+        # runner injects the freshest resolvable token (re-read every run).
         env = self._invoke(auth="login", token="sk-ant-oat01-TOKEN")["env"]
         self.assertEqual(env["CLAUDE_CODE_OAUTH_TOKEN"], "sk-ant-oat01-TOKEN")
         self.assertNotIn("ANTHROPIC_API_KEY", env)  # login strips it
@@ -303,6 +308,15 @@ class EngineerEnvConstructionTests(unittest.TestCase):
         self.assertIn("BASH_MAX_TIMEOUT_MS", env)
         self.assertIn("BASH_DEFAULT_TIMEOUT_MS", env)
 
+    def test_mcp_timeouts_raised(self):
+        # Slow-starting stdio MCP servers (databricks UC: ~20s of imports
+        # before tool enumeration) die under Claude Code's default 30s startup
+        # timeout → zero mcp__* tools registered. Startup gets a fixed generous
+        # window; tool calls are pinned to the run budget like Bash.
+        env = self._invoke()["env"]
+        self.assertEqual(env["MCP_TIMEOUT"], str(180 * 1000))
+        self.assertEqual(env["MCP_TOOL_TIMEOUT"], env["BASH_MAX_TIMEOUT_MS"])
+
     def test_warns_when_no_auth_available(self):
         # No API key, no Keychain token, no token cache → warn (don't raise).
         import io
@@ -315,29 +329,22 @@ class EngineerEnvConstructionTests(unittest.TestCase):
             self.assertIn("no auth available", buf.getvalue())
 
     def test_keychain_fallback_when_api_key_unset(self):
-        # api-key mode without ANTHROPIC_API_KEY must still auth via Keychain.
+        # api-key mode without ANTHROPIC_API_KEY still auths via the
+        # Keychain-resolved token.
         with mock.patch.dict(os.environ, {}, clear=True):
             env = self._invoke(auth="api-key", token="sk-ant-oat01-FALLBACK")["env"]
         self.assertEqual(env["CLAUDE_CODE_OAUTH_TOKEN"], "sk-ant-oat01-FALLBACK")
 
-    def test_inherited_env_token_preferred_over_keychain(self):
-        # If parent env already has CLAUDE_CODE_OAUTH_TOKEN, don't re-fetch
-        # from Keychain (avoids nested-subprocess ACL failures masking a
-        # working inherited token).
+    def test_inherited_env_token_used_when_no_keychain(self):
+        # No Keychain credential → an inherited CLAUDE_CODE_OAUTH_TOKEN from
+        # the parent env is re-injected via resolve_oauth_token().
         with mock.patch.dict(os.environ,
                              {"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat01-INHERITED"},
                              clear=True):
-            with mock.patch.object(claude_runner, "oauth_token_from_keychain",
-                                   return_value="sk-ant-oat01-FRESH") as ko:
-                # token kwarg is ignored — patch.object above wins for the
-                # actual keychain helper call. We just need to ensure run()
-                # doesn't crash.
-                captured = self._invoke(auth="login", token="ignored")
-                # Keychain not consulted because env had the token already.
-                ko.assert_not_called()
+            captured = self._invoke(auth="login", token=None)
         self.assertEqual(captured["env"]["CLAUDE_CODE_OAUTH_TOKEN"], "sk-ant-oat01-INHERITED")
 
-    def test_api_key_auth_keeps_api_key_and_still_injects_oauth_fallback(self):
+    def test_api_key_auth_keeps_api_key_and_injects_oauth_fallback(self):
         with mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-ant-api01-USER"}, clear=False):
             env = self._invoke(auth="api-key", token="sk-ant-oat01-FALLBACK")["env"]
         self.assertEqual(env["ANTHROPIC_API_KEY"], "sk-ant-api01-USER")
@@ -345,7 +352,7 @@ class EngineerEnvConstructionTests(unittest.TestCase):
 
     def test_bash_timeouts_pinned_to_run_budget(self):
         # Long foreground commands must stay synchronous: both Bash timeouts
-        # are pinned to the engineer's whole `claude -p` budget (default
+        # are pinned to the agent's whole `claude -p` budget (default
         # timeout_s = 3600s → 3_600_000 ms) so Claude Code never auto-moves a
         # training command to a background task mid-run.
         env = self._invoke()["env"]
@@ -358,11 +365,11 @@ class EngineerEnvConstructionTests(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class HookTaskOutputAllowanceTests(unittest.TestCase):
-    """The boundary hook denies reads outside the engineer's cwd, EXCEPT for
+    """The boundary hook denies reads outside the agent's cwd, EXCEPT for
     Claude Code's own background-task output files for THIS run — otherwise an
     auto-backgrounded command leaves the agent blind to its own output. The
     allowance is scoped by the cwd slug embedded in the task path, so a
-    sibling challenge's task output stays denied.
+    sibling run's task output stays denied.
     """
 
     def _check(self, path: str, boundary: str, cwd: str) -> str | None:
@@ -376,9 +383,9 @@ class HookTaskOutputAllowanceTests(unittest.TestCase):
         path = f"/private/tmp/claude-501/{slug}/9a78-uuid/tasks/btph5a74.output"
         self.assertIsNone(self._check(path, boundary=cwd, cwd=cwd))
 
-    def test_denies_sibling_challenge_task_output(self):
+    def test_denies_sibling_run_task_output(self):
         cwd = "/runs/v0/image_classification/aerial-cactus"
-        other = "/runs/v0/image_classification/some-other-challenge"
+        other = "/runs/v0/image_classification/some-other-task"
         other_slug = other.replace("/", "-")
         path = f"/private/tmp/claude-501/{other_slug}/uuid/tasks/x.output"
         self.assertIsNotNone(self._check(path, boundary=cwd, cwd=cwd))

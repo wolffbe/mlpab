@@ -1,6 +1,5 @@
 """Tests for REST-endpoint coverage tracking: the `endpoint_hits` matcher, the
-metric registration, the `endpoints:` config block, and the venv request-logging
-shim."""
+metric registration, and the venv request-logging shim."""
 import json
 import os
 import sys
@@ -9,7 +8,7 @@ import types
 import unittest
 from pathlib import Path
 
-from banter import autoresearch as ar, claude_runner, experiments, results
+from banter import claude_runner, results
 
 
 def _log(*rows) -> Path:
@@ -176,169 +175,29 @@ class AttributionTests(unittest.TestCase):
         self.assertEqual(results.endpoint_hits(log, [], bl, interface="mcp")["blacklist_hits"], 1)
 
 
-class ResearcherPromptEndpointsTests(unittest.TestCase):
-    def test_prompt_lists_targets_and_points_at_coverage_json(self):
-        from banter import autoresearch as ar
-        root = Path(__file__).resolve().parents[1]
-        cfg = ar.load_config(root / "platforms/hopsworks/autoresearch/hopsworks-test-ar.yaml")
-        prompt = ar.build_researcher_prompt(
-            cfg, root, Path(tempfile.mkdtemp()), "testrun", root / ".venv/bin/banter")
-        self.assertIn("Endpoint coverage targets", prompt)
-        self.assertIn("endpoint_coverage.json", prompt)          # tells it where to look
-        self.assertIn(f"max {len(cfg.endpoints['whitelist'])}", prompt)  # knows the target count
-        self.assertNotIn("{endpoints_block}", prompt)            # placeholder consumed
-
-    def test_no_endpoints_no_block(self):
-        from banter import autoresearch as ar
-        from dataclasses import replace
-        root = Path(__file__).resolve().parents[1]
-        cfg = ar.load_config(root / "platforms/hopsworks/autoresearch/hopsworks-test-ar.yaml")
-        cfg = replace(cfg, endpoints={"whitelist": [], "blacklist": []})
-        prompt = ar.build_researcher_prompt(
-            cfg, root, Path(tempfile.mkdtemp()), "testrun", root / ".venv/bin/banter")
-        self.assertNotIn("Endpoint coverage targets", prompt)
-        self.assertNotIn("{endpoints_block}", prompt)
-
-
-class ControlTreatmentPromptTests(unittest.TestCase):
-    """A control treatment (no declared goals) must tell the researcher it may
-    freely choose objectives, and must NOT print the joint-goals/composite note
-    (which assumes a fixed goal set)."""
-
-    def _build(self, goals):
-        from dataclasses import replace
-        from banter import autoresearch as ar
-        root = Path(__file__).resolve().parents[1]
-        cfg = ar.load_config(root / "platforms/hopsworks/autoresearch/hopsworks-test-ar.yaml")
-        cfg = replace(cfg, goals=goals)
-        return ar.build_researcher_prompt(
-            cfg, root, Path(tempfile.mkdtemp()), "testrun", root / ".venv/bin/banter")
-
-    def test_empty_goals_gives_free_choice_directive(self):
-        prompt = self._build([])
-        self.assertIn("MAY CHOOSE", prompt)
-        self.assertNotIn("Optimize ALL goals JOINTLY", prompt)
-        self.assertNotIn("{joint_goals_note}", prompt)
-
-    def test_declared_goals_keep_joint_note(self):
-        prompt = self._build([ar_goal() for ar_goal in [_whitelist_goal]])
-        self.assertIn("Optimize ALL goals JOINTLY", prompt)
-        self.assertNotIn("MAY CHOOSE", prompt)
-
-
-def _whitelist_goal():
-    from banter.autoresearch import Goal
-    return Goal(metric="whitelist_hits", direction="maximize")
-
-
 class EndpointSchemaTests(unittest.TestCase):
     def test_metrics_registered(self):
+        # The endpoint metrics stay tracked on the Row (and in the tracked
+        # call-count columns) but are NOT columns of the results CSV.
         for m in ("whitelist_hits", "blacklist_hits"):
-            self.assertIn(m, results.FIELDS)
-            self.assertIn(f"{m}_avg", results.FIELDS)
-            self.assertIn(m, experiments.METRICS)
-            self.assertIn(m, results.CALL_COUNT_DIRECTIONS)
-        self.assertEqual(results.CALL_COUNT_DIRECTIONS["whitelist_hits"], "maximize")
-        self.assertEqual(results.CALL_COUNT_DIRECTIONS["blacklist_hits"], "minimize")
-        self.assertEqual(results.FIELDS[-1], "run_dir")  # invariant preserved
+            self.assertIn(m, results.CALL_COUNT_COLUMNS)
+            self.assertNotIn(m, results.RESULTS_FIELDS)
+        self.assertEqual(results.RESULTS_FIELDS[-1], "run_dir")  # invariant preserved
 
-    def test_row_round_trips_endpoint_metrics(self):
+    def test_row_carries_endpoint_metrics_but_csv_drops_them(self):
         import csv
         out = Path(tempfile.mkdtemp()) / "results.csv"
         row = results.Row(
             started_at="2026-06-04T00:00:00+00:00", run="1", version="v1",
             platform="hopsworks", interface="cli", skills="none",
-            prev_run="", prev_version="", task="t", challenge="c",
+            category="t", task="c",
             whitelist_hits=5, blacklist_hits=0, run_dir=str(out.parent),
         )
+        self.assertEqual(row.whitelist_hits, 5)  # still recorded on the Row
         results.append(out, row)
         got = list(csv.DictReader(out.open()))[0]
-        self.assertEqual(got["whitelist_hits"], "5")
-        self.assertEqual(got["blacklist_hits"], "0")
-
-
-class EndpointConfigTests(unittest.TestCase):
-    def _write(self, body: str) -> Path:
-        p = Path(tempfile.mkdtemp()) / "cfg.yaml"
-        p.write_text(body)
-        return p
-
-    def test_endpoints_parsed(self):
-        cfg = ar.load_config(self._write(
-            """
-improve: interface
-skills: none
-challenges: [aerial-cactus-identification]
-interfaces: [{platform: hopsworks, interface: cli}]
-goals: [score, {metric: whitelist_hits, direction: maximize}]
-endpoints:
-  whitelist: ['POST /a', 'GET /b']
-  blacklist: ['DELETE /c']
-budget: {max_increments: 1}
-"""
-        ))
-        self.assertEqual(cfg.endpoints["whitelist"], ["POST /a", "GET /b"])
-        self.assertEqual(cfg.endpoints["blacklist"], ["DELETE /c"])
-
-    def test_scalar_whitelist_is_one_pattern_not_chars(self):
-        cfg = ar.load_config(self._write(
-            """
-improve: interface
-skills: none
-challenges: [aerial-cactus-identification]
-interfaces: [{platform: hopsworks, interface: cli}]
-goals: [score]
-endpoints:
-  whitelist: 'POST /a'
-budget: {max_increments: 1}
-"""
-        ))
-        self.assertEqual(cfg.endpoints["whitelist"], ["POST /a"])  # NOT ['P','O','S',...]
-
-    def test_whitelist_hits_goal_kept_for_every_interface(self):
-        # When `maximize whitelist_hits` is a configured goal, it is optimized
-        # regardless of interface (NOT a delegation metric, so goals_for_interface
-        # keeps it for cli/mcp/sdk) — and goals aren't task-filtered, so it holds
-        # for every task too. Endpoints being set does NOT by itself add the goal.
-        from banter import experiments
-        goals = [("score", "maximize"), ("whitelist_hits", "maximize"),
-                 ("cli_calls", "maximize"), ("mcp_calls", "maximize")]
-        for iface in ("cli", "mcp", "sdk"):
-            kept = {m for m, _ in experiments.goals_for_interface(goals, iface)}
-            self.assertIn("whitelist_hits", kept, iface)   # always optimized
-            self.assertIn("score", kept, iface)
-        # the delegation metrics ARE interface-gated (only the matching one kept)
-        self.assertNotIn("mcp_calls", {m for m, _ in experiments.goals_for_interface(goals, "cli")})
-
-    def test_endpoints_set_without_goal_is_not_optimized(self):
-        # Endpoints configured but whitelist_hits NOT a goal → it's a tracked
-        # metric, but NOT an optimization target (no auto-add).
-        cfg = ar.load_config(self._write(
-            """
-improve: interface
-skills: none
-challenges: [aerial-cactus-identification]
-interfaces: [{platform: hopsworks, interface: cli}]
-goals: [score]
-endpoints:
-  whitelist: ['POST /a', 'GET /b']
-budget: {max_increments: 1}
-"""
-        ))
-        self.assertNotIn("whitelist_hits", {g.metric for g in cfg.goals})
-
-    def test_endpoints_default_empty(self):
-        cfg = ar.load_config(self._write(
-            """
-improve: interface
-skills: none
-challenges: [aerial-cactus-identification]
-interfaces: [{platform: hopsworks, interface: cli}]
-goals: [score]
-budget: {max_increments: 1}
-"""
-        ))
-        self.assertEqual(cfg.endpoints, {"whitelist": [], "blacklist": []})
+        self.assertNotIn("whitelist_hits", got)
+        self.assertNotIn("blacklist_hits", got)
 
 
 class ApiLogShimTests(unittest.TestCase):
