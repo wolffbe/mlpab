@@ -138,7 +138,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.selftest:
         for seed in (1, 2, 3):
-            meta = generate(seed, Path(f"/tmp/banter-drift-selftest/{seed}"))
+            meta = generate(seed, Path(f"/tmp/mlpab-drift-selftest/{seed}"))
             print(f"[drift] seed={seed} gates=OK truth={meta['feature']}@{meta['onset']}")
         return 0
     if not args.out:

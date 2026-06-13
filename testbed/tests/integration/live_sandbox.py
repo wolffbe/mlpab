@@ -16,7 +16,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from banter import claude_runner
+from mlpab import claude_runner
 
 
 def _claude_available() -> bool:
@@ -115,7 +115,7 @@ class AgentCanDoItsThingTests(unittest.TestCase):
 
         # Materialize a minimal venv inside the boundary (instant via APFS
         # clone of the base venv).
-        from banter import runner as runner_mod
+        from mlpab import runner as runner_mod
         runner_mod._make_venv(self.run_dir / "venv")
 
         # Pretend-data: a small CSV the agent is supposed to read.

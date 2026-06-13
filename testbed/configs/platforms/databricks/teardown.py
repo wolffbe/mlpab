@@ -1,6 +1,6 @@
 """Databricks platform teardown — delete everything the agent created.
 
-Run automatically by `banter run` (the interface `teardown:` step) at the START
+Run automatically by `mlpab run` (the interface `teardown:` step) at the START
 and END of every challenge, so each run — and therefore each autoresearch
 version — starts and ends with a clean workspace (same contract as the
 hopsworks teardown).

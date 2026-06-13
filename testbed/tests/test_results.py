@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from banter import results
+from mlpab import results
 
 
 def _append_bench_row(csv_path: str, i: int) -> None:
@@ -318,9 +318,9 @@ class RowSchemaTests(unittest.TestCase):
              "category", "task"],
         )
         self.assertEqual(results.RESULTS_FIELDS[8:10], ["n", "started_at"])
-        # Assertion-suite grading columns sit where the old grading triple was.
-        self.assertEqual(results.RESULTS_FIELDS[10:12],
-                         ["asserts_passed", "asserts_total"])
+        # Grading outcome (valid/success) then the assertion-suite tallies.
+        self.assertEqual(results.RESULTS_FIELDS[10:14],
+                         ["valid", "success", "asserts_passed", "asserts_total"])
         self.assertEqual(results.RESULTS_FIELDS[-1], "run_dir")
         # The legacy schema (and its annotation columns) is gone entirely.
         self.assertFalse(hasattr(results, "FIELDS"))
@@ -772,7 +772,7 @@ class ToolTimerTests(unittest.TestCase):
     platform/local split of wall time."""
 
     def _timer(self, ticks):
-        from banter import claude_runner
+        from mlpab import claude_runner
         it = iter(ticks)
         return claude_runner.ToolTimer(clock=lambda: next(it))
 

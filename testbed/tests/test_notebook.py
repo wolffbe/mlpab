@@ -12,8 +12,8 @@ from pathlib import Path
 
 import nbformat
 
-from banter import notebook as notebook_mod
-from banter import results as results_mod
+from mlpab import notebook as notebook_mod
+from mlpab import results as results_mod
 
 
 def _has_exec_deps() -> bool:

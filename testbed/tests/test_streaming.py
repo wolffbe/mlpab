@@ -1,4 +1,4 @@
-"""Tests for the live stream-json terminal display (banter.streaming)."""
+"""Tests for the live stream-json terminal display (mlpab.streaming)."""
 import io
 import json
 import os
@@ -7,7 +7,7 @@ import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
 
-from banter import streaming
+from mlpab import streaming
 
 
 def _assistant(*blocks):
@@ -16,57 +16,57 @@ def _assistant(*blocks):
 
 class QuietTests(unittest.TestCase):
     def setUp(self):
-        self._saved = os.environ.get("BANTER_QUIET")
-        os.environ.pop("BANTER_QUIET", None)
+        self._saved = os.environ.get("MLPAB_QUIET")
+        os.environ.pop("MLPAB_QUIET", None)
 
     def tearDown(self):
         if self._saved is None:
-            os.environ.pop("BANTER_QUIET", None)
+            os.environ.pop("MLPAB_QUIET", None)
         else:
-            os.environ["BANTER_QUIET"] = self._saved
+            os.environ["MLPAB_QUIET"] = self._saved
 
     def test_default_is_loud(self):
         self.assertFalse(streaming.quiet())
 
     def test_truthy_values_silence(self):
         for v in ("1", "true", "yes", "TRUE"):
-            os.environ["BANTER_QUIET"] = v
+            os.environ["MLPAB_QUIET"] = v
             self.assertTrue(streaming.quiet(), v)
 
     def test_falsey_values_stay_loud(self):
         for v in ("", "0", "false", "no"):
-            os.environ["BANTER_QUIET"] = v
+            os.environ["MLPAB_QUIET"] = v
             self.assertFalse(streaming.quiet(), v)
 
     def test_make_printer_always_callable(self):
         # Never None — stream.log must be written even when quiet/nested.
-        os.environ["BANTER_QUIET"] = "1"
+        os.environ["MLPAB_QUIET"] = "1"
         self.assertTrue(callable(streaming.make_printer("agent")))
-        os.environ.pop("BANTER_QUIET", None)
+        os.environ.pop("MLPAB_QUIET", None)
         self.assertTrue(callable(streaming.make_printer("agent")))
 
 
 class NestedTests(unittest.TestCase):
     def setUp(self):
-        self._saved = os.environ.pop("BANTER_NESTED", None)
+        self._saved = os.environ.pop("MLPAB_NESTED", None)
 
     def tearDown(self):
         if self._saved is not None:
-            os.environ["BANTER_NESTED"] = self._saved
+            os.environ["MLPAB_NESTED"] = self._saved
         else:
-            os.environ.pop("BANTER_NESTED", None)
+            os.environ.pop("MLPAB_NESTED", None)
 
     def test_default_not_nested(self):
         self.assertFalse(streaming.nested())
 
     def test_set_is_nested(self):
-        os.environ["BANTER_NESTED"] = "1"
+        os.environ["MLPAB_NESTED"] = "1"
         self.assertTrue(streaming.nested())
 
 
 class EmitTests(unittest.TestCase):
     def setUp(self):
-        os.environ.pop("BANTER_QUIET", None)
+        os.environ.pop("MLPAB_QUIET", None)
 
     def test_writes_file_and_stdout(self):
         log = Path(tempfile.mkdtemp()) / "stream.log"
@@ -77,7 +77,7 @@ class EmitTests(unittest.TestCase):
         self.assertEqual(log.read_text(), "[eng] hi\n")
 
     def test_quiet_suppresses_stdout_but_still_writes_file(self):
-        os.environ["BANTER_QUIET"] = "1"
+        os.environ["MLPAB_QUIET"] = "1"
         log = Path(tempfile.mkdtemp()) / "stream.log"
         buf = io.StringIO()
         with redirect_stdout(buf):
@@ -226,7 +226,7 @@ class ToolResultLinesTests(unittest.TestCase):
 
 class PrinterTests(unittest.TestCase):
     def setUp(self):
-        os.environ.pop("BANTER_QUIET", None)
+        os.environ.pop("MLPAB_QUIET", None)
 
     def _capture(self, raw_line):
         printer = streaming.make_printer("agent")

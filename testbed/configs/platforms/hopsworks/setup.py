@@ -1,6 +1,6 @@
 """Hopsworks platform setup — create one empty project for the engineer to work in.
 
-Run automatically by `banter run` (the interface `serve:` step) at the START of
+Run automatically by `mlpab run` (the interface `serve:` step) at the START of
 every challenge, right AFTER `teardown.py` has wiped the cluster clean — so each
 run (and therefore each autoresearch version) begins with exactly ONE fresh,
 empty project and nothing leaked from an earlier run. The matching removal is
@@ -26,10 +26,10 @@ Best-effort by design: invoked via the interface `serve:` step, whose runner
 (`_run_aux`) ignores failures and discards output. Nothing here may raise out of
 `main()` — a setup hiccup must never fail an engineer run.
 
-The project name is UNIQUE PER RUN (banter<6 hex chars>): the backend deletes a
+The project name is UNIQUE PER RUN (mlpab<6 hex chars>): the backend deletes a
 project's Kubernetes namespace and Kafka topics/ACLs ASYNCHRONOUSLY, so an
 immediate same-name re-create either fails outright (HTTP 500 / errorCode
-150051 "Namespace:banter is being deleted") or — worse — comes up colliding
+150051 "Namespace:mlpab is being deleted") or — worse — comes up colliding
 with the old namesake's still-being-cleaned Kafka state, and every feature
 group insert dies server-side with KafkaError TOPIC_AUTHORIZATION_FAILED
 (observed live 2026-06-12). A fresh name sidesteps both races. Uniqueness is
@@ -46,7 +46,7 @@ import time
 
 # Unique-per-run, alphanumeric project name (see module docstring). A single
 # existing project means the agent's login selects it with no prompt.
-PROJECT_NAME = f"banter{secrets.token_hex(3)}"
+PROJECT_NAME = f"mlpab{secrets.token_hex(3)}"
 
 # How long to keep retrying the create while the backend finishes tearing down
 # the previous run's namespace. A clean create takes ~20s; namespace finalizers

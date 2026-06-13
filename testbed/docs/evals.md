@@ -106,10 +106,10 @@ different exact top-5):
 - **databricks** — native: a Vector Search endpoint + a Direct Vector Access
   index (3-part UC name) accepting upserted vectors, queried with
   query-index; SDK and CLI.
-- **sagemaker** — SageMaker itself has no vector similarity search; the
+- **aws** — SageMaker itself has no vector similarity search; the
   managed path on this interface is **Amazon S3 Vectors** (`aws s3vectors`:
   vector buckets + indexes, put-vectors/query-vectors; on the CLI allowlist,
-  needs the `s3vectors:*` grant from `banter-policy.json`; verified live in
+  needs the `s3vectors:*` grant from `mlpab-policy.json`; verified live in
   eu-north-1). The grader accepts, in order: an S3 Vectors index named
   `items<sfx>` (native ANN), the vectors stored in an (online) feature group
   with neighbors computed interface-side, or an InService endpoint

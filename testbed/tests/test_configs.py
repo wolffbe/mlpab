@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from banter import treatments as bm, interfaces
+from mlpab import treatments as bm, interfaces
 
 
 class PlatformInterfaceFromConfigTests(unittest.TestCase):

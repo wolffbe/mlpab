@@ -262,7 +262,7 @@ def generate(seed: int, out: Path) -> dict:
 
     # Gate: the EMITTED script, run from the emitted data files in a clean temp
     # dir, must reproduce the truth metrics EXACTLY.
-    with tempfile.TemporaryDirectory(prefix="banter-finetune-gate-") as td:
+    with tempfile.TemporaryDirectory(prefix="mlpab-finetune-gate-") as td:
         for f in ("base_model.npz", "finetune.txt", "eval.txt", "finetune_model.py"):
             shutil.copy(out / "data" / f, Path(td) / f)
         proc = subprocess.run([sys.executable, "finetune_model.py"], cwd=td,
@@ -335,7 +335,7 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
     if args.selftest:
         for seed in (1, 2, 3):
-            meta = generate(seed, Path(f"/tmp/banter-llm-finetuning-selftest/{seed}"))
+            meta = generate(seed, Path(f"/tmp/mlpab-llm-finetuning-selftest/{seed}"))
             print(f"[llm_finetuning] seed={seed} metrics={meta['metrics']} gates=OK "
                   "(incl. subprocess reproduction)")
         return 0

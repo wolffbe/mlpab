@@ -8,7 +8,7 @@ import types
 import unittest
 from pathlib import Path
 
-from banter import claude_runner, results
+from mlpab import claude_runner, results
 
 
 def _log(*rows) -> Path:
@@ -212,7 +212,7 @@ class ApiLogShimTests(unittest.TestCase):
         log = Path(tempfile.mkdtemp()) / "api.jsonl"
         old = sys.modules.get("requests")
         sys.modules["requests"] = fake
-        os.environ["BANTER_API_LOG"] = str(log)
+        os.environ["MLPAB_API_LOG"] = str(log)
         try:
             exec(claude_runner._API_LOG_SHIM, {})
             req = types.SimpleNamespace(
@@ -229,15 +229,15 @@ class ApiLogShimTests(unittest.TestCase):
                 sys.modules["requests"] = old
             else:
                 sys.modules.pop("requests", None)
-            os.environ.pop("BANTER_API_LOG", None)
+            os.environ.pop("MLPAB_API_LOG", None)
 
     def _origin_from(self, module_name: str, roots: str) -> str:
-        """Run the shim's `_banter_origin` from a synthetic frame whose module
-        `__name__` is `module_name`, with BANTER_IFACE_SDK=`roots`. Returns the
+        """Run the shim's `_mlpab_origin` from a synthetic frame whose module
+        `__name__` is `module_name`, with MLPAB_IFACE_SDK=`roots`. Returns the
         attributed `src`."""
         log = Path(tempfile.mkdtemp()) / "api.jsonl"
-        os.environ["BANTER_API_LOG"] = str(log)
-        os.environ["BANTER_IFACE_SDK"] = roots
+        os.environ["MLPAB_API_LOG"] = str(log)
+        os.environ["MLPAB_IFACE_SDK"] = roots
         old = sys.modules.get("requests")
         fake = types.ModuleType("requests")
         fake.Session = type("Session", (), {"send": lambda self, r, **k: None})
@@ -245,7 +245,7 @@ class ApiLogShimTests(unittest.TestCase):
         try:
             g: dict = {}
             exec(claude_runner._API_LOG_SHIM, g)
-            ns = {"__name__": module_name, "_origin": g["_banter_origin"]}
+            ns = {"__name__": module_name, "_origin": g["_mlpab_origin"]}
             exec("def _f():\n    return _origin()\n", ns)
             return ns["_f"]()
         finally:
@@ -253,8 +253,8 @@ class ApiLogShimTests(unittest.TestCase):
                 sys.modules["requests"] = old
             else:
                 sys.modules.pop("requests", None)
-            os.environ.pop("BANTER_API_LOG", None)
-            os.environ.pop("BANTER_IFACE_SDK", None)
+            os.environ.pop("MLPAB_API_LOG", None)
+            os.environ.pop("MLPAB_IFACE_SDK", None)
 
     def test_origin_attributes_mcp_cli_sdk_and_other(self):
         roots = "hopsworks,hopsworks_common,hsfs,hsml"

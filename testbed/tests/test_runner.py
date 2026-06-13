@@ -3,7 +3,7 @@ import os
 import unittest
 from unittest import mock
 
-from banter import evals_provider, runner
+from mlpab import evals_provider, runner
 
 
 class SeedForTests(unittest.TestCase):
@@ -22,7 +22,7 @@ class SeedForTests(unittest.TestCase):
 
 class PlatformEnvTests(unittest.TestCase):
     """_platform_env: the KEY=VALUE handoff file a platform setup step writes
-    (via $BANTER_PLATFORM_ENV) so values it derives — e.g. the SageMaker
+    (via $MLPAB_PLATFORM_ENV) so values it derives — e.g. the SageMaker
     execution-role ARN it just created — reach the agent's env."""
 
     def setUp(self):
@@ -38,14 +38,14 @@ class PlatformEnvTests(unittest.TestCase):
         path = self.run_dir / "platform.env"
         path.write_text(
             "# from setup.py\n"
-            "SAGEMAKER_ROLE_ARN=arn:aws:iam::123:role/banter-sagemaker-execution-role\n"
+            "SAGEMAKER_ROLE_ARN=arn:aws:iam::123:role/mlpab-sagemaker-execution-role\n"
             "\n"
             "malformed line without equals\n"
             "SPACED = padded value \n"
         )
         env = runner._platform_env(self.run_dir)
         self.assertEqual(env, {
-            "SAGEMAKER_ROLE_ARN": "arn:aws:iam::123:role/banter-sagemaker-execution-role",
+            "SAGEMAKER_ROLE_ARN": "arn:aws:iam::123:role/mlpab-sagemaker-execution-role",
             "SPACED": "padded value",
         })
         # Consumed: deleted so it never lingers in the agent's workdir.
@@ -61,7 +61,7 @@ class PlatformEnvTests(unittest.TestCase):
 class RunAuxTests(unittest.TestCase):
     """Platform setup/teardown subprocesses must not be instrumented: their REST
     traffic is plumbing, not agent work, so the api-log env vars are stripped
-    before the step runs (the per-run venv's shim logs whenever BANTER_API_LOG
+    before the step runs (the per-run venv's shim logs whenever MLPAB_API_LOG
     is set, and these steps inherit os.environ wholesale)."""
 
     def test_strips_api_log_instrumentation_env(self):
@@ -72,17 +72,17 @@ class RunAuxTests(unittest.TestCase):
         out = run_dir / "env.txt"
         env = {
             "PATH": os.environ.get("PATH", ""),
-            "BANTER_API_LOG": str(run_dir / "api_calls.jsonl"),
-            "BANTER_IFACE_SDK": "hopsworks",
+            "MLPAB_API_LOG": str(run_dir / "api_calls.jsonl"),
+            "MLPAB_IFACE_SDK": "hopsworks",
             "HOPSWORKS_API_KEY": "kept",
         }
         runner._run_aux([f'env > "{out}"'], run_dir, env)
         text = out.read_text()
-        self.assertNotIn("BANTER_API_LOG", text)
-        self.assertNotIn("BANTER_IFACE_SDK", text)
+        self.assertNotIn("MLPAB_API_LOG", text)
+        self.assertNotIn("MLPAB_IFACE_SDK", text)
         self.assertIn("HOPSWORKS_API_KEY=kept", text)
         # The caller's env dict is not mutated.
-        self.assertIn("BANTER_API_LOG", env)
+        self.assertIn("MLPAB_API_LOG", env)
 
 class DetectEnvironmentTests(unittest.TestCase):
     def test_includes_cores_and_start_method(self):

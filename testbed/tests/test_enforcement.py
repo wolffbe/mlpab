@@ -7,11 +7,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from banter import claude_runner, runner
+from mlpab import claude_runner, runner
 
 # The hook is designed to run standalone (copied into each run dir), so load it
 # straight from its file — exactly how the harness executes it.
-_HOOK_PATH = Path(__file__).resolve().parents[1] / "src" / "banter" / "hooks" / "log_tool_call.py"
+_HOOK_PATH = Path(__file__).resolve().parents[1] / "src" / "mlpab" / "hooks" / "log_tool_call.py"
 _spec = importlib.util.spec_from_file_location("log_tool_call", _HOOK_PATH)
 hook = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(hook)
@@ -47,7 +47,7 @@ class EnforceHookTests(unittest.TestCase):
             "TESTBED_CLI_BINARY": cli_binary,
             "TESTBED_CLI_SUBCOMMAND": cli_subcommand,
             "TESTBED_SDK_MODULE": "sagemaker",
-            "TESTBED_PLATFORM": "sagemaker",
+            "TESTBED_PLATFORM": "aws",
             "TESTBED_COMPUTE_DENY": "torch,tensorflow,sklearn,xgboost",
         })
         return hook.enforce("Bash", {"command": command})
@@ -366,7 +366,7 @@ class EnforceHookTests(unittest.TestCase):
             self._enforce("sdk", "Bash", 'python -c "import importlib; importlib.import_module(\'sklearn\')"')
         )
 
-    # --- installs stay LOCKED in CLI/MCP: banter installs the interface + deps
+    # --- installs stay LOCKED in CLI/MCP: mlpab installs the interface + deps
     #     before the run, so the agent never needs pip there. ---
     def test_pip_blocked_in_cli_and_mcp(self):
         for iface in ("cli", "mcp"):
@@ -494,67 +494,67 @@ class InstanceTypeGuardTests(unittest.TestCase):
             "Bash", {"command": 'grep "html.parser" data/description.md'}))
 
 
-class BanterRunForegroundTests(unittest.TestCase):
-    """A nested `banter run` must be foreground —
+class MlpabRunForegroundTests(unittest.TestCase):
+    """A nested `mlpab run` must be foreground —
     never piped (SIGPIPE-kills it mid-build) or backgrounded."""
 
     def _misuse(self, command):
-        return hook._banter_run_misuse(command)
+        return hook._mlpab_run_misuse(command)
 
     # --- blocked: piping / backgrounding ---
     def test_pipe_to_head_blocked(self):
         # This is the exact failure from the field: `… 2>&1 | head -300`.
         self.assertIsNotNone(
-            self._misuse("banter run --category t --task c --platform hopsworks 2>&1 | head -300")
+            self._misuse("mlpab run --category t --task c --platform hopsworks 2>&1 | head -300")
         )
 
     def test_pipe_to_tail_blocked(self):
-        self.assertIsNotNone(self._misuse("banter run --task t | tail -40"))
+        self.assertIsNotNone(self._misuse("mlpab run --task t | tail -40"))
 
-    def test_absolute_banter_path_pipe_blocked(self):
+    def test_absolute_mlpab_path_pipe_blocked(self):
         self.assertIsNotNone(
-            self._misuse("/Users/x/testbed/.venv/bin/banter run --task t | head -5")
+            self._misuse("/Users/x/testbed/.venv/bin/mlpab run --task t | head -5")
         )
 
     def test_background_ampersand_blocked(self):
-        self.assertIsNotNone(self._misuse("banter run --category t --task c &"))
+        self.assertIsNotNone(self._misuse("mlpab run --category t --task c &"))
 
     def test_background_then_poll_blocked(self):
-        self.assertIsNotNone(self._misuse("banter run --task t & sleep 30"))
+        self.assertIsNotNone(self._misuse("mlpab run --task t & sleep 30"))
 
     def test_pipe_after_cd_guard_blocked(self):
-        # The cd-guard prefix is fine; the trailing pipe on `banter run` is not.
+        # The cd-guard prefix is fine; the trailing pipe on `mlpab run` is not.
         self.assertIsNotNone(
-            self._misuse('cd /run && banter run --category t --task c | head -100')
+            self._misuse('cd /run && mlpab run --category t --task c | head -100')
         )
 
     # --- allowed: foreground, redirects, other subcommands ---
     def test_plain_foreground_allowed(self):
-        self.assertIsNone(self._misuse("banter run --category t --task c --platform hopsworks"))
+        self.assertIsNone(self._misuse("mlpab run --category t --task c --platform hopsworks"))
 
     def test_redirect_to_file_allowed(self):
         # The sanctioned way to cap output: redirect, then read agent.log.
-        self.assertIsNone(self._misuse("banter run --task t > run.log 2>&1"))
+        self.assertIsNone(self._misuse("mlpab run --task t > run.log 2>&1"))
 
     def test_redirect_to_devnull_allowed(self):
-        self.assertIsNone(self._misuse("banter run --category t --task c > /dev/null 2>&1"))
+        self.assertIsNone(self._misuse("mlpab run --category t --task c > /dev/null 2>&1"))
 
     def test_redirect_then_chained_tail_allowed(self):
-        # `&&` chains a SEPARATE tail of agent.log — not a pipe of banter run.
+        # `&&` chains a SEPARATE tail of agent.log — not a pipe of mlpab run.
         self.assertIsNone(
-            self._misuse("banter run --task t > run.log 2>&1 && tail -60 v1/t/c/agent.log")
+            self._misuse("mlpab run --task t > run.log 2>&1 && tail -60 v1/t/c/agent.log")
         )
 
     def test_budget_check_piped_not_blocked(self):
-        # Only `banter run` is gated; other subcommands may be piped freely.
-        self.assertIsNone(self._misuse("banter budget-check --start 1 | grep CONTINUE"))
+        # Only `mlpab run` is gated; other subcommands may be piped freely.
+        self.assertIsNone(self._misuse("mlpab budget-check --start 1 | grep CONTINUE"))
 
-    def test_non_banter_pipe_allowed(self):
+    def test_non_mlpab_pipe_allowed(self):
         self.assertIsNone(self._misuse("ls v1 | head -5"))
 
     def test_2to1_redirect_alone_not_flagged_as_background(self):
         # `2>&1` without a pipe/`&` must NOT be misread as backgrounding.
-        self.assertIsNone(self._misuse("banter run --category t --task c 2>&1"))
+        self.assertIsNone(self._misuse("mlpab run --category t --task c 2>&1"))
 
 
 class PromptModeGatingTests(unittest.TestCase):
@@ -637,12 +637,12 @@ class RateLimitWaitAccountingTests(unittest.TestCase):
 
 class DeadRowSchemaTests(unittest.TestCase):
     def test_error_column_present_and_last_is_run_dir(self):
-        from banter import results
+        from mlpab import results
         self.assertIn("error", results.RESULTS_FIELDS)
         self.assertEqual(results.RESULTS_FIELDS[-1], "run_dir")  # invariant preserved
 
     def test_dead_row_round_trips_with_error_and_zeros(self):
-        from banter import results
+        from mlpab import results
         import csv
         out = Path(tempfile.mkdtemp()) / "results.csv"
         row = results.Row(

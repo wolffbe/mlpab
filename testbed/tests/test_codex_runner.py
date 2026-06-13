@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from banter import codex_runner, results
+from mlpab import codex_runner, results
 
 
 class ModelRoutingTests(unittest.TestCase):

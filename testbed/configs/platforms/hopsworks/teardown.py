@@ -1,6 +1,6 @@
 """Hopsworks platform teardown — delete every project the agent created.
 
-Run automatically by `banter run` (the interface `teardown:` step) at the START
+Run automatically by `mlpab run` (the interface `teardown:` step) at the START
 and END of every challenge, so each run — and therefore each autoresearch
 version — starts and ends with a clean cluster. Without this, feature groups /
 feature views / models from earlier runs leak into later ones (the exact bug

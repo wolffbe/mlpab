@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from banter import interfaces, preflight
+from mlpab import interfaces, preflight
 
 
 def _write(path: Path, text: str) -> None:

@@ -67,14 +67,20 @@ def fetch_table(adapter: str, table: str, version: int, record_ids: list[str] | 
     if adapter == "databricks":
         from evals.adapters.databricks import DatabricksChecker
         return DatabricksChecker().read_rows(table)
-    if adapter == "sagemaker":
-        from evals.adapters.sagemaker import SageMakerChecker
+    if adapter == "aws":
+        from evals.adapters.aws import SageMakerChecker
         if not record_ids:
             raise LookupError("sagemaker table reads need the truth's record ids")
         df = SageMakerChecker().get_records(table, record_ids)
         if df.empty:
             raise LookupError(f"feature group {table!r}: online store returned no records")
         return df
+    if adapter == "azure":
+        from evals.adapters.azure import AzureMLChecker
+        return AzureMLChecker().read_rows(table, version)
+    if adapter == "gcp":
+        from evals.adapters.gcp import VertexChecker
+        return VertexChecker().read_rows(table, version)
     raise LookupError(f"no checker adapter for {adapter!r}")
 
 
@@ -86,9 +92,15 @@ def table_exists_info(adapter: str, table: str, version: int):
     if adapter == "databricks":
         from evals.adapters.databricks import DatabricksChecker
         return DatabricksChecker().get_feature_table(table)
-    if adapter == "sagemaker":
-        from evals.adapters.sagemaker import SageMakerChecker
+    if adapter == "aws":
+        from evals.adapters.aws import SageMakerChecker
         return SageMakerChecker().get_feature_table(table)
+    if adapter == "azure":
+        from evals.adapters.azure import AzureMLChecker
+        return AzureMLChecker().get_feature_table(table, version)
+    if adapter == "gcp":
+        from evals.adapters.gcp import VertexChecker
+        return VertexChecker().get_feature_table(table, version)
     return None
 
 
@@ -100,7 +112,8 @@ def grade_table_main(family: str, grade_fn, argv: list[str] | None = None) -> in
     ap.add_argument("--instance", type=Path, required=True)
     src = ap.add_mutually_exclusive_group(required=True)
     src.add_argument("--csv", type=Path)
-    src.add_argument("--adapter", choices=["hopsworks", "databricks", "sagemaker"])
+    src.add_argument("--adapter",
+                     choices=["hopsworks", "databricks", "aws", "azure", "gcp"])
     args = ap.parse_args(argv)
 
     truth = json.loads((args.instance / "solution" / "truth.json").read_text())
@@ -201,9 +214,15 @@ def state_checker(adapter: str):
     if adapter == "databricks":
         from evals.adapters.databricks import DatabricksChecker
         return DatabricksChecker()
-    if adapter == "sagemaker":
-        from evals.adapters.sagemaker import SageMakerChecker
+    if adapter == "aws":
+        from evals.adapters.aws import SageMakerChecker
         return SageMakerChecker()
+    if adapter == "azure":
+        from evals.adapters.azure import AzureMLChecker
+        return AzureMLChecker()
+    if adapter == "gcp":
+        from evals.adapters.gcp import VertexChecker
+        return VertexChecker()
     return None
 
 
@@ -216,7 +235,7 @@ def grade_platform_main(family: str, grade_fn, argv: list[str] | None = None) ->
     ap = argparse.ArgumentParser()
     ap.add_argument("--instance", type=Path, required=True)
     ap.add_argument("--adapter", required=True,
-                    choices=["hopsworks", "databricks", "sagemaker", "none"])
+                    choices=["hopsworks", "databricks", "aws", "azure", "gcp", "none"])
     args = ap.parse_args(argv)
     report = grade_fn(args.instance, args.adapter, Path.cwd())
     print(json.dumps(report, indent=2, default=str))

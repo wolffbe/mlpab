@@ -1,0 +1,131 @@
+# Amazon SageMaker AI MCP interface — the `awslabs.sagemaker-ai-mcp-server`
+# (AWS Labs MCP server exposing SageMaker AI operations as MCP tools over stdio).
+# Repo: https://github.com/awslabs/mcp/tree/main/src/sagemaker-ai-mcp-server
+#
+# Published PyPI package (no build-from-source), so each agent run `pip install`s
+# the pinned version into its venv; the console script `awslabs.sagemaker-ai-mcp-server`
+# (entry point ...server:main) lands on the run-venv PATH and Claude Code launches
+# it over stdio. (Upstream docs show `uvx ...@latest`; we pip-install a PINNED
+# version instead — reproducible, and no uvx needed in the agent sandbox.)
+#
+# Set keys: edit the global testbed/.env (see `keys:` below).
+
+# --- How to run it (per agent run) — install the pinned server from PyPI. ---
+# The interface version/ref under test — written to the results `version`
+# column. Keep in sync with the pin below (ref: / ==X.Y.Z / VER=).
+version: "1.0.8"
+
+runtime_install:
+  - pip install "awslabs.sagemaker-ai-mcp-server==1.0.8"
+
+# Deterministic, OFFLINE "does it run?" check (no AWS calls): the server console
+# script installs and responds to --help.
+test_command: awslabs.sagemaker-ai-mcp-server --help
+
+# Real connectivity + PERMISSIONS check (botocore ships with the server's boto3).
+# STS alone is not enough: it needs no IAM permission, so it green-lights
+# credentials that cannot call SageMaker at all. This probes that (1) the account
+# policy actually grants SageMaker (cheap read), and (2) setup.py's execution-role
+# bootstrap can work — iam:GetRole succeeds or the role merely doesn't exist yet
+# (NoSuchEntity is fine; setup.py creates it). Exits non-zero with the missing
+# grant named; `mlpab test --no-login` skips it.
+auth_command: |
+  python - <<'AUTHCHECK'
+  import os, sys
+  import botocore.session
+  session = botocore.session.get_session()
+  region = os.environ.get("AWS_REGION")
+  ident = session.create_client("sts", region_name=region).get_caller_identity()
+  try:
+      session.create_client("sagemaker", region_name=region).list_training_jobs(MaxResults=1)
+  except Exception as e:
+      sys.exit(f"{ident['Arn']} lacks SageMaker permissions — attach "
+               f"AmazonSageMakerFullAccess (or equivalent) to it: {e}")
+  # An explicit SAGEMAKER_ROLE_ARN (.env or setup.py's platform.env export)
+  # reaches the agent regardless of IAM rights — only the bootstrap path
+  # needs iam:GetRole (NoSuchEntity is fine; setup.py then creates the role).
+  if not os.environ.get("SAGEMAKER_ROLE_ARN"):
+      role = "mlpab-sagemaker-execution-role"
+      try:
+          session.create_client("iam", region_name=region).get_role(RoleName=role)
+      except Exception as e:
+          if getattr(e, "response", {}).get("Error", {}).get("Code") != "NoSuchEntity":
+              sys.exit(f"{ident['Arn']} cannot read execution role {role!r}, so setup.py's "
+                       f"role bootstrap will fail — grant iam:GetRole/CreateRole/"
+                       f"AttachRolePolicy on that role (or pre-provision it and set "
+                       f"SAGEMAKER_ROLE_ARN in .env): {e}")
+  AUTHCHECK
+
+# --- MCP server: Claude Code launches it over stdio per run. It inherits the run
+#     environment (AWS creds + AWS_REGION injected from the keys below), so
+#     `env: {}` like the other MCP interfaces. `--allow-write` enables mutating
+#     operations and `--allow-sensitive-data-access` permits reading logs/details
+#     (both off by default); keep them so the agent can do real work. ---
+mcp_servers:
+  sagemaker:
+    command: awslabs.sagemaker-ai-mcp-server
+    args: ["--allow-write", "--allow-sensitive-data-access"]
+    env: {}
+
+# Outbound hosts the agent + MCP server need reachable at run time (drives the
+# sandbox allowedDomains). SageMaker/STS/S3 all live under amazonaws.com.
+allowed_domains:
+  - "*.amazonaws.com"
+
+# --- AWS Free Tier guard — the ONLY `ml.<family>.<size>` instance types the
+#     agent may request; the PreToolUse hook DENIES any other instance-type
+#     token in a tool call (TESTBED_INSTANCE_ALLOW). SageMaker Free Tier (first
+#     2 months): training 50 h + real-time inference 125 h on ml.m4.xlarge /
+#     ml.m5.xlarge; Studio/notebooks 250 h on ml.t3.medium; Serverless Inference
+#     (no instance type) 150k seconds. ---
+instance_allowlist:
+  - ml.t3.medium
+  - ml.m4.xlarge
+  - ml.m5.xlarge
+
+# --- Platform setup — run automatically by mlpab at the START of every run,
+#     right AFTER the teardown sweep below. SageMaker has no project container to
+#     pre-create; instead this ensures the plumbing the agent is locked out of
+#     creating: the default bucket `sagemaker-<region>-<account>` (jobs write
+#     artifacts to S3, and S3 is off-interface) and the IAM execution role (jobs
+#     need a RoleArn, and IAM is off-interface), whose ARN setup.py exports into
+#     the agent's env as SAGEMAKER_ROLE_ARN via $MLPAB_PLATFORM_ENV.
+#     The logic is the committed configs/platforms/sagemaker/setup.py —
+#     $MLPAB_PLATFORM_DIR points there (fixed infra); `./venv` is the agent's
+#     run venv (boto3/botocore ship with the MCP server there). ---
+serve:
+  - './venv/bin/python "$MLPAB_PLATFORM_DIR/setup.py"'
+
+# --- Platform teardown — run automatically by mlpab at the START and END of
+#     every run. SageMaker has no project whose deletion cascades, so this sweeps
+#     the dedicated account/region PER RESOURCE TYPE in cost order: endpoints +
+#     MLflow tracking servers, stop in-flight jobs, then endpoint configs /
+#     models / feature groups / pipelines / model packages / experiments, then
+#     the default bucket's contents. The cleanup logic is the committed
+#     configs/platforms/sagemaker/teardown.py — $MLPAB_PLATFORM_DIR points there
+#     (fixed infra); `./venv` is the agent's run venv. ---
+teardown:
+  - './venv/bin/python "$MLPAB_PLATFORM_DIR/teardown.py"'
+
+# --- Credentials — names only; values resolve from the GLOBAL testbed/.env at
+#     run time (never stored here), injected into the agent's env AND inherited
+#     by the MCP server. ---
+keys:
+  - AWS_ACCESS_KEY_ID       # secret
+  - AWS_SECRET_ACCESS_KEY   # secret
+  - AWS_REGION              # e.g. us-east-1
+  # OPTIONAL override — normally LEAVE UNSET in .env: setup.py creates/finds the
+  # execution role (default name mlpab-sagemaker-execution-role) and exports its
+  # ARN into the agent env as SAGEMAKER_ROLE_ARN automatically. Set it only to
+  # force a specific pre-provisioned role (an explicit .env value wins).
+  - SAGEMAKER_ROLE_ARN
+
+# --- Agent-facing prompt ---
+prompt: |
+  The Amazon SageMaker MCP server is available as tools prefixed `mcp__sagemaker__`. It
+  is authenticated via AWS credentials and AWS_REGION from the environment. Operations that require an IAM
+  execution role (RoleArn) must use the pre-provisioned role in SAGEMAKER_ROLE_ARN from the environment.
+  List your available tools to see what they can do.
+  Stay within the AWS Free Tier: any job, endpoint, or notebook may request ONLY the instance types ml.m5.xlarge,
+  ml.m4.xlarge (jobs/endpoints) or ml.t3.medium (notebooks), with a single instance — every other instance type is
+  hard-blocked. Serverless Inference (no instance type) is also Free Tier.

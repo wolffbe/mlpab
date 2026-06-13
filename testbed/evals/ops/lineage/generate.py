@@ -158,7 +158,7 @@ def _gate_grader(inst: Path, truth_df: pd.DataFrame, table: str,
     from evals.ops.lineage.grade import grade
 
     def run(df: pd.DataFrame, answers: dict | None) -> bool:
-        with tempfile.TemporaryDirectory(prefix="banter-lineage-gate-") as td:
+        with tempfile.TemporaryDirectory(prefix="mlpab-lineage-gate-") as td:
             run_dir = Path(td)
             (run_dir / "submission").mkdir()
             df.to_csv(run_dir / "submission" / f"{table}.csv", index=False)
@@ -186,7 +186,7 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
     if args.selftest:
         for seed in (1, 2, 3):
-            meta = generate(seed, Path(f"/tmp/banter-lineage-selftest/{seed}"))
+            meta = generate(seed, Path(f"/tmp/mlpab-lineage-selftest/{seed}"))
             print(f"[lineage] seed={seed} rows={meta['row_count']} gates=OK")
         return 0
     if not args.out:

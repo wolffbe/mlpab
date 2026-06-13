@@ -84,7 +84,7 @@ class GateError(RuntimeError):
 
 
 def _load_scorer(path: Path):
-    spec = importlib.util.spec_from_file_location(f"banter_scorer_{path.stem}", path)
+    spec = importlib.util.spec_from_file_location(f"mlpab_scorer_{path.stem}", path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
@@ -140,7 +140,7 @@ def generate(seed: int, out: Path) -> dict:
     from evals.inference.llm_serving.grade import grade
 
     def run(answers: dict) -> bool:
-        with tempfile.TemporaryDirectory(prefix="banter-llm-gate-") as td:
+        with tempfile.TemporaryDirectory(prefix="mlpab-llm-gate-") as td:
             run_dir = Path(td)
             (run_dir / "submission").mkdir()
             (run_dir / "submission" / "answers.json").write_text(json.dumps(answers))
@@ -165,7 +165,7 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
     if args.selftest:
         for seed in (1, 2, 3):
-            meta = generate(seed, Path(f"/tmp/banter-llm-selftest/{seed}"))
+            meta = generate(seed, Path(f"/tmp/mlpab-llm-selftest/{seed}"))
             print(f"[llm_serving] seed={seed} payloads={len(meta['payloads'])} gates=OK")
         return 0
     if not args.out:

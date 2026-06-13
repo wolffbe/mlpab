@@ -96,7 +96,7 @@ def generate(seed: int, out: Path) -> dict:
     from evals.ops.alerting.grade import grade
 
     def run(answers: dict | None) -> bool:
-        with tempfile.TemporaryDirectory(prefix="banter-alert-gate-") as td:
+        with tempfile.TemporaryDirectory(prefix="mlpab-alert-gate-") as td:
             run_dir = Path(td)
             (run_dir / "submission").mkdir()
             if answers is not None:
@@ -122,7 +122,7 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
     if args.selftest:
         for seed in (1, 2, 3):
-            meta = generate(seed, Path(f"/tmp/banter-alerting-selftest/{seed}"))
+            meta = generate(seed, Path(f"/tmp/mlpab-alerting-selftest/{seed}"))
             print(f"[alerting] seed={seed} error_code={meta['error_code']} gates=OK")
         return 0
     if not args.out:

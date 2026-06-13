@@ -12,8 +12,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from banter import claude_runner
-from banter.hooks import log_tool_call as hook
+from mlpab import claude_runner
+from mlpab.hooks import log_tool_call as hook
 
 
 # ---------------------------------------------------------------------------
@@ -192,7 +192,7 @@ class TokenCacheTests(unittest.TestCase):
     """Per-run token cache: side-channel around Claude Code's env stripping.
 
     The cache file lives at `<run>/.claude-oauth` (mode 0600); the env var
-    `BANTER_TOKEN_CACHE` points downstream banter invocations at it.
+    `MLPAB_TOKEN_CACHE` points downstream mlpab invocations at it.
     """
 
     def setUp(self):
@@ -207,7 +207,7 @@ class TokenCacheTests(unittest.TestCase):
         # Lives at <run>/.claude-oauth, mode 0600.
         self.assertEqual(cache, self.run_path / claude_runner.TOKEN_CACHE_FILENAME)
         self.assertEqual(cache.stat().st_mode & 0o777, 0o600)
-        # Readable via BANTER_TOKEN_CACHE pointing at the file.
+        # Readable via MLPAB_TOKEN_CACHE pointing at the file.
         with mock.patch.dict(os.environ,
                              {claude_runner.TOKEN_CACHE_ENV: str(cache)},
                              clear=False):

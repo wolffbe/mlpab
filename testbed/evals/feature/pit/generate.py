@@ -320,7 +320,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.selftest:
         for seed in (1, 2, 3):
-            out = Path(f"/tmp/banter-pit-selftest/{seed}")
+            out = Path(f"/tmp/mlpab-pit-selftest/{seed}")
             meta = generate(seed, out)
             print(f"[pit] seed={seed} rows={meta['row_count']:4d} "
                   f"gates=OK variants={list(meta['variant_digests'])}")

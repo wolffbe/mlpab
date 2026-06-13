@@ -1,0 +1,75 @@
+# Google Cloud CLI interface — `gcloud` (with `gcloud ai ...` for Gemini Enterprise Agent Platform).
+# Docs: https://cloud.google.com/sdk/gcloud/reference/ai
+#
+# Distributed as a prebuilt archive (NOT pip): preflight downloads the pinned
+# Cloud SDK tarball into $INTERFACE_DIR (the gitignored build home); each run
+# copies the SDK tree into its venv (the build dir isn't readable inside the
+# sandbox) and symlinks `gcloud` onto PATH. Auth is a service-account activation.
+#
+# Set keys: edit the global testbed/.env (see `keys:` below).
+version: "503.0.0"
+
+install:
+  - >-
+    sh -c 'set -e;
+    VER=503.0.0;
+    OS=$(uname -s | tr "[:upper:]" "[:lower:]");
+    ARCH=$(uname -m);
+    case "$ARCH" in x86_64|amd64) ARCH=x86_64 ;; arm64|aarch64) ARCH=arm ;; esac;
+    curl -fsSL "https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/google-cloud-cli-${VER}-${OS}-${ARCH}.tar.gz"
+    | tar -xz -C "$INTERFACE_DIR" google-cloud-sdk'
+
+# The gcloud entrypoint inside the extracted tree (a single launcher script);
+# its bytes are folded into the interface hash.
+binary: google-cloud-sdk/bin/gcloud
+cli_command: gcloud
+cli_subcommand: [ai, auth, config, components, storage]
+
+# Copy the SDK tree INTO the run venv (sandbox-readable) and put gcloud on PATH.
+runtime_install:
+  - 'cp -R "$INTERFACE_DIR/google-cloud-sdk" ./venv/google-cloud-sdk'
+  - 'ln -sf "../google-cloud-sdk/bin/gcloud" ./venv/bin/gcloud'
+
+# OFFLINE "does it run?" check.
+test_command: gcloud version
+
+# Live auth: activate the service account from the key file, then a cheap read.
+auth_command: |
+  sh -c 'set -e;
+  gcloud auth activate-service-account --key-file="$GOOGLE_APPLICATION_CREDENTIALS" --project="$GCP_PROJECT";
+  gcloud ai models list --region="$GCP_LOCATION" --project="$GCP_PROJECT" --limit=1 >/dev/null'
+
+allowed_domains:
+  - "*.googleapis.com"
+  - "oauth2.googleapis.com"
+  - "aiplatform.googleapis.com"
+  - "bigquery.googleapis.com"
+  - "storage.googleapis.com"
+  - "dl.google.com"
+  - "*.google.com"
+
+# gcloud (like gh/terraform) cannot reach the macOS trust daemon inside the
+# Seatbelt sandbox → TLS handshakes fail; run it OUTSIDE the sandbox. It only
+# talks to Google APIs, and the PreToolUse hook still enforces the exec
+# allowlist + path denies on every call.
+sandbox_excluded_commands:
+  - "gcloud"
+  - "gcloud *"
+
+serve:
+  - './venv/bin/python "$MLPAB_PLATFORM_DIR/setup.py"'
+
+teardown:
+  - './venv/bin/python "$MLPAB_PLATFORM_DIR/teardown.py"'
+
+keys:
+  - GCP_PROJECT
+  - GCP_LOCATION
+  - GOOGLE_APPLICATION_CREDENTIALS
+  - GCP_BQ_DATASET
+
+prompt: |
+  The Google Cloud CLI is available as `gcloud`, with Gemini Enterprise Agent Platform commands under `gcloud ai ...`. It is authenticated
+  via a service account (GOOGLE_APPLICATION_CREDENTIALS) from the environment; the project (GCP_PROJECT) and region
+  (GCP_LOCATION) are pre-configured. The feature store is backed by the BigQuery dataset GCP_BQ_DATASET (query it
+  with `bq` or `gcloud`). Run `gcloud ai --help` to see what it can do.

@@ -157,7 +157,7 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
     if args.selftest:
         for seed in (1, 2, 3):
-            meta = generate(seed, Path(f"/tmp/banter-validate-selftest/{seed}"))
+            meta = generate(seed, Path(f"/tmp/mlpab-validate-selftest/{seed}"))
             print(f"[validate] seed={seed} clean_rows={meta['row_count']} "
                   f"rejected={len(meta['rejected_ids'])} gates=OK")
         return 0

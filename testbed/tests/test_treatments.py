@@ -14,7 +14,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from banter import treatments, claude_runner, preflight, results, runner
+from mlpab import treatments, claude_runner, preflight, results, runner
 
 
 class SetupBarrierWindowTests(unittest.TestCase):

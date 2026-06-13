@@ -99,7 +99,7 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
     if args.selftest:
         for seed in (1, 2, 3):
-            meta = generate(seed, Path(f"/tmp/banter-register-selftest/{seed}"))
+            meta = generate(seed, Path(f"/tmp/mlpab-register-selftest/{seed}"))
             print(f"[register] seed={seed} metrics={meta['metrics']} gates=OK")
         return 0
     if not args.out:

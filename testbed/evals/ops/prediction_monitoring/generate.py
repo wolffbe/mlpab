@@ -133,7 +133,7 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
     if args.selftest:
         for seed in (1, 2, 3):
-            meta = generate(seed, Path(f"/tmp/banter-predmon-selftest/{seed}"))
+            meta = generate(seed, Path(f"/tmp/mlpab-predmon-selftest/{seed}"))
             print(f"[prediction_monitoring] seed={seed} gates=OK truth={meta['onset']}")
         return 0
     if not args.out:

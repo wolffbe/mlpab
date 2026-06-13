@@ -1,6 +1,6 @@
 """Databricks platform setup — ensure the `workspace.default` UC schema exists.
 
-Run automatically by `banter run` (the interface `serve:` step) at the START of
+Run automatically by `mlpab run` (the interface `serve:` step) at the START of
 every challenge, right AFTER `teardown.py` has swept the workspace — same
 contract as the hopsworks setup.
 

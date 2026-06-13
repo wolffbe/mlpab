@@ -155,7 +155,7 @@ def generate(seed: int, out: Path) -> dict:
 
     # Gate: the EMITTED script, run from the emitted data files in a clean temp
     # dir, must reproduce the truth digest exactly.
-    with tempfile.TemporaryDirectory(prefix="banter-train-gate-") as td:
+    with tempfile.TemporaryDirectory(prefix="mlpab-train-gate-") as td:
         for f in ("train.csv", "score.csv", "train_model.py"):
             shutil.copy(out / "data" / f, Path(td) / f)
         proc = subprocess.run([sys.executable, "train_model.py"], cwd=td,
@@ -207,7 +207,7 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
     if args.selftest:
         for seed in (1, 2, 3):
-            meta = generate(seed, Path(f"/tmp/banter-train-selftest/{seed}"))
+            meta = generate(seed, Path(f"/tmp/mlpab-train-selftest/{seed}"))
             print(f"[train] seed={seed} rows={meta['row_count']} gates=OK "
                   "(incl. subprocess reproduction)")
         return 0

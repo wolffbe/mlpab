@@ -201,7 +201,7 @@ def generate(seed: int, out: Path) -> dict:
     from evals.inference.vector_search.grade import grade
 
     def run(answers: dict) -> dict:
-        with tempfile.TemporaryDirectory(prefix="banter-vs-gate-") as td:
+        with tempfile.TemporaryDirectory(prefix="mlpab-vs-gate-") as td:
             run_dir = Path(td)
             (run_dir / "submission").mkdir()
             (run_dir / "submission" / "answers.json").write_text(json.dumps(answers))
@@ -228,7 +228,7 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
     if args.selftest:
         for seed in (1, 2, 3):
-            meta = generate(seed, Path(f"/tmp/banter-vs-selftest/{seed}"))
+            meta = generate(seed, Path(f"/tmp/mlpab-vs-selftest/{seed}"))
             print(f"[vector_search] seed={seed} queries={meta['n_queries']} "
                   f"k={meta['k']} gates=OK")
         return 0

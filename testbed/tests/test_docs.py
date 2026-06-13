@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from banter import docs
+from mlpab import docs
 
 
 class StripAgentPlumbingTests(unittest.TestCase):

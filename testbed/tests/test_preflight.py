@@ -14,7 +14,7 @@ import time
 import unittest
 from pathlib import Path
 
-from banter import preflight
+from mlpab import preflight
 
 
 def _hold_build_lock(path: str, hold_s: float, started) -> None:

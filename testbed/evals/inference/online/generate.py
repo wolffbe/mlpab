@@ -93,7 +93,7 @@ def generate(seed: int, out: Path) -> dict:
     from evals.inference.online.grade import grade
 
     def run(answers: dict) -> bool:
-        with tempfile.TemporaryDirectory(prefix="banter-online-gate-") as td:
+        with tempfile.TemporaryDirectory(prefix="mlpab-online-gate-") as td:
             run_dir = Path(td)
             (run_dir / "submission").mkdir()
             (run_dir / "submission" / "answers.json").write_text(json.dumps(answers))
@@ -119,7 +119,7 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
     if args.selftest:
         for seed in (1, 2, 3):
-            meta = generate(seed, Path(f"/tmp/banter-online-selftest/{seed}"))
+            meta = generate(seed, Path(f"/tmp/mlpab-online-selftest/{seed}"))
             print(f"[online] seed={seed} keys={len(meta['keys'])} gates=OK")
         return 0
     if not args.out:
