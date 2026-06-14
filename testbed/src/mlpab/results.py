@@ -206,6 +206,10 @@ _RESULTS_VIEW = {
     #     tool execution + LLM generation. See `platform_tool_time`.
     "platform_time_s": "platform_time_s",
     "local_time_s": "local_time_s",
+    # In-task foreground `sleep` (polling waits): count + total seconds. Part of
+    # wall_time_s, broken out so idle waiting is distinguishable from compute.
+    "sleep_calls": "sleep_calls",
+    "sleep_time_s": "sleep_time_s",
     "input_tokens": "input_tokens",
     "output_tokens": "output_tokens",
     "total_tokens": "total_tokens",
@@ -427,6 +431,15 @@ class Row:
     # transcript events carry no timestamps.
     platform_time_s: float = 0.0
     local_time_s: float = 0.0
+    # In-task `sleep` (foreground waits the agent issued, e.g. polling a job to
+    # finish). Counted from issued Bash commands across ALL buckets — a sleep
+    # chained onto an interface command (`cmd && sleep N`, or a sleep line in a
+    # multi-line cli/sdk command) classifies as a cli/sdk call, so the sleep
+    # would be missed if only bash_calls were scanned. This time is INCLUDED in
+    # wall_time_s (foreground sleeps inflate compute), surfaced separately so it
+    # can be told apart from real work.
+    sleep_calls: int = 0
+    sleep_time_s: float = 0.0
     input_tokens: int = 0
     output_tokens: int = 0
     total_tokens: int = 0
@@ -899,6 +912,23 @@ def _denied_from_commands_log(commands_log: Path | None) -> int | None:
     return denied if seen_any else None
 
 
+# `sleep N[smhd]` in a shell command. Bare number = seconds; GNU suffixes scale.
+# Word boundary + required whitespace avoids matching `sleepy`/`asleep`; finditer
+# catches each occurrence so chained `sleep 5; cmd; sleep 10` counts twice.
+_SLEEP_RE = re.compile(r"\bsleep\s+(\d+(?:\.\d+)?)\s*([smhd])?\b", re.IGNORECASE)
+_SLEEP_UNIT_S = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+
+
+def _sleep_stats(command: str) -> tuple[int, float]:
+    """(count, total seconds) of `sleep` invocations in a shell command."""
+    n = 0
+    secs = 0.0
+    for m in _SLEEP_RE.finditer(command or ""):
+        n += 1
+        secs += float(m.group(1)) * _SLEEP_UNIT_S.get((m.group(2) or "").lower(), 1)
+    return n, secs
+
+
 def aggregate_commands(
     transcript_path: Path,
     cli_binary: str | None = None,
@@ -906,8 +936,10 @@ def aggregate_commands(
     run_dir: Path | None = None,
     cli_subcommand: str | None = None,
     commands_log: Path | None = None,
-) -> dict[str, int]:
+) -> dict[str, float]:
     """Count tool calls by category from the stream-json transcript.
+
+    Values are ints except `sleep_time_s` (seconds, float).
 
     Tool calls are `type=="tool_use"` blocks in each `assistant` event's
     `message.content`. `cli_binary` promotes matching Bash calls to cli_calls;
@@ -935,6 +967,8 @@ def aggregate_commands(
         "todo_calls": 0,
         "failed_commands": 0,
         "denied_calls": 0,
+        "sleep_calls": 0,
+        "sleep_time_s": 0.0,
     }
     bucket = {
         "cli": "cli_calls",
@@ -956,6 +990,14 @@ def aggregate_commands(
         run_dir = transcript_path.parent
     denied_from_log = _denied_from_commands_log(commands_log)
     total_errors = 0
+    # Sleep is paired tool_use→result by id: a sleep in a DENIED command never
+    # ran (the hook blocks it before execution → 0 wall seconds), so it must not
+    # inflate sleep_time_s. A merely FAILED command (bad args, non-zero exit)
+    # DID sleep first, so it still counts. Bash tool_uses carry an `id`; results
+    # reference it via `tool_use_id`. Blocks without an id (e.g. codex-normalized
+    # events) can't be paired and are counted directly as a safe fallback.
+    sleep_by_id: dict[str, tuple[int, float]] = {}
+    denied_ids: set[str] = set()
     for line in transcript_path.read_text().splitlines():
         if not line.strip():
             continue
@@ -977,6 +1019,9 @@ def aggregate_commands(
                 text = _flatten_text(block.get("content"))
                 if _DENIED_MARKER_RE.search(text):
                     counts["denied_calls"] += 1
+                    tid = block.get("tool_use_id")
+                    if tid:
+                        denied_ids.add(tid)
                 else:
                     counts["failed_commands"] += 1
             continue
@@ -985,6 +1030,20 @@ def aggregate_commands(
         for block in (event.get("message") or {}).get("content") or []:
             if not isinstance(block, dict) or block.get("type") != "tool_use":
                 continue
+            # Scan every Bash command for `sleep`, independent of its bucket: a
+            # sleep chained onto an interface command classifies as cli/sdk, not
+            # bash. Defer accounting by tool_use id so a later DENIED result can
+            # exclude it; unpaired (no-id) blocks count immediately.
+            if block.get("name") == "Bash":
+                sc, st = _sleep_stats((block.get("input") or {}).get("command", ""))
+                if sc:
+                    tid = block.get("id")
+                    if tid:
+                        prev = sleep_by_id.get(tid, (0, 0.0))
+                        sleep_by_id[tid] = (prev[0] + sc, prev[1] + st)
+                    else:
+                        counts["sleep_calls"] += sc
+                        counts["sleep_time_s"] += st
             category = _classify_tool_use(
                 block.get("name", ""),
                 block.get("input") or {},
@@ -1001,6 +1060,13 @@ def aggregate_commands(
         # one errored tool_result, so the remaining errors are real failures.
         counts["denied_calls"] = denied_from_log
         counts["failed_commands"] = max(0, total_errors - denied_from_log)
+    # Fold in paired sleeps, skipping commands whose result was DENIED (blocked
+    # before running, so no wall time elapsed).
+    for tid, (sc, st) in sleep_by_id.items():
+        if tid not in denied_ids:
+            counts["sleep_calls"] += sc
+            counts["sleep_time_s"] += st
+    counts["sleep_time_s"] = round(counts["sleep_time_s"], 2)
     return counts
 
 

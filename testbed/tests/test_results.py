@@ -564,6 +564,69 @@ class CommandClassificationTests(unittest.TestCase):
         self.assertEqual(counts["skill_calls"], 1)
         self.assertEqual(counts["bash_calls"], 1)
 
+    def test_sleep_stats_helper(self):
+        self.assertEqual(results._sleep_stats("sleep 60; databricks foo"), (1, 60.0))
+        self.assertEqual(results._sleep_stats("echo hi"), (0, 0.0))
+        self.assertEqual(results._sleep_stats("sleep 5; x; sleep 10"), (2, 15.0))
+        self.assertEqual(results._sleep_stats("sleep 2m"), (1, 120.0))
+        self.assertEqual(results._sleep_stats("sleep 0.5"), (1, 0.5))
+        # word-boundary guards: not a sleep call
+        self.assertEqual(results._sleep_stats("sleepy 5"), (0, 0.0))
+        self.assertEqual(results._sleep_stats(""), (0, 0.0))
+
+    def test_sleep_counted_across_buckets(self):
+        # A sleep chained onto an interface command classifies as a cli call, yet
+        # its sleep must still be counted (scan is independent of the bucket).
+        tr = self._transcript(
+            {"type": "tool_use", "name": "Bash", "input": {"command": "databricks fg get && sleep 90"}},
+            {"type": "tool_use", "name": "Bash", "input": {"command": "sleep 10"}},
+            {"type": "tool_use", "name": "Bash", "input": {"command": "ls"}},
+        )
+        counts = results.aggregate_commands(tr, cli_binary="databricks")
+        self.assertEqual(counts["sleep_calls"], 2)
+        self.assertEqual(counts["sleep_time_s"], 100.0)
+        self.assertEqual(counts["cli_calls"], 1)  # the chained databricks command
+
+    def test_sleep_excludes_denied_keeps_failed(self):
+        # t1: sleep in a DENIED command (blocked before running → 0s) → excluded.
+        # t2: sleep in a command that RAN then failed (bad args) → counted.
+        # t3: sleep in a clean command → counted.
+        import json
+
+        p = Path(tempfile.mkdtemp()) / "transcript.jsonl"
+        events = [
+            {
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {"type": "tool_use", "id": "t1", "name": "Bash",
+                         "input": {"command": "sleep 60; aws athena foo"}},
+                        {"type": "tool_use", "id": "t2", "name": "Bash",
+                         "input": {"command": "sleep 30; aws sagemaker bad-args"}},
+                        {"type": "tool_use", "id": "t3", "name": "Bash",
+                         "input": {"command": "sleep 5"}},
+                    ]
+                },
+            },
+            {
+                "type": "user",
+                "message": {
+                    "content": [
+                        {"type": "tool_result", "tool_use_id": "t1", "is_error": True,
+                         "content": "DENIED: aws athena is off-interface"},
+                        {"type": "tool_result", "tool_use_id": "t2", "is_error": True,
+                         "content": "aws: error: argument operation: Invalid choice"},
+                    ]
+                },
+            },
+        ]
+        p.write_text("\n".join(json.dumps(e) for e in events) + "\n")
+        counts = results.aggregate_commands(p)
+        self.assertEqual(counts["sleep_calls"], 2)  # t2 + t3, NOT t1 (denied)
+        self.assertEqual(counts["sleep_time_s"], 35.0)
+        self.assertEqual(counts["denied_calls"], 1)
+        self.assertEqual(counts["failed_commands"], 1)
+
     def test_workspace_tools_bucketed_explicitly(self):
         # Read/Write/Edit/Glob/Grep/TodoWrite get their own columns; tools
         # outside the map (denied ones like WebFetch) are not bucketed at all.

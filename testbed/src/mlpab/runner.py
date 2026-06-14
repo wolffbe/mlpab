@@ -834,6 +834,8 @@ def run(spec: RunSpec) -> results.Row:
                     "rate_limit_wait_s",
                     "platform_time_s",
                     "local_time_s",
+                    "sleep_calls",
+                    "sleep_time_s",
                     "input_tokens",
                     "output_tokens",
                     "total_tokens",
