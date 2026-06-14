@@ -2,8 +2,7 @@
 as the agent, mirroring `claude_runner.run`'s contract so `runner.run` can
 dispatch on the model name (`is_mistral_model`) and keep one downstream pipeline.
 
-Vibe is a terminal coding agent (https://github.com/mistralai/mistral-vibe).
-Headless invocation:
+Vibe is a terminal coding agent. Headless invocation:
 
     vibe --prompt "<task>" --model <id> --output streaming --workdir <run_dir> --trust
 
@@ -37,12 +36,15 @@ import json
 import os
 import shutil
 import subprocess
-import threading
-import time
 from pathlib import Path
 from typing import Any
 
-from mlpab.claude_runner import ClaudeResult
+from mlpab.claude_runner import (
+    ClaudeResult,
+    activate_run_venv,
+    run_streaming_with_backoff,
+    streaming_is_rate_limited,
+)
 
 # Testbed model id (alias, used in configs + `--model`) → Mistral API id (what
 # vibe sends). EDITABLE — point at version-pinned API ids instead of `-latest`
@@ -221,6 +223,19 @@ def _print_event(line: str) -> None:
         print(f"[agent:mistral] ERROR: {event.get('message')}", flush=True)
 
 
+def _rate_limited(raw_path: Path, stderr_path: Path) -> bool:
+    """A vibe run failed on a rate-limit / transient-server condition. vibe
+    surfaces errors as `{"type":"error","message":...}` (or a role=="error"
+    message) and on stderr."""
+
+    def _err_text(msg: dict) -> str:
+        if (msg.get("type") or "").lower() == "error" or (msg.get("role") or "").lower() == "error":
+            return str(msg.get("message") or msg.get("content") or "")
+        return ""
+
+    return streaming_is_rate_limited(raw_path, stderr_path, _err_text)
+
+
 def run(
     prompt: str,
     run_dir: Path,
@@ -264,6 +279,12 @@ def run(
     if extra_env:
         env.update({k: v for k, v in extra_env.items() if v})
 
+    # Activate the per-run venv so the agent's bash finds the interface binary
+    # (e.g. the `aws` / `databricks` console script) and its python/pip see the
+    # interface + ML deps. vibe inherits this env, so without it every CLI-mode
+    # call dies with `command not found` (rc 127).
+    activate_run_venv(env, run_dir)
+
     raw_path = run_dir / "vibe_events.jsonl"
     transcript_path = run_dir / "transcript.jsonl"
     stderr_path = run_dir / "vibe.stderr.log"
@@ -283,27 +304,27 @@ def run(
         "--auto-approve",
     ]
 
-    start = time.monotonic()
-    with open(raw_path, "w") as raw_f, open(stderr_path, "w") as err_f:
-        proc = subprocess.Popen(
-            cmd, cwd=run_dir, env=env, stdout=subprocess.PIPE, stderr=err_f, text=True
-        )
-        timer = threading.Timer(timeout_s, proc.kill) if timeout_s is not None else None
-        if timer is not None:
-            timer.start()
-        try:
-            for line in proc.stdout:  # type: ignore[union-attr]
-                raw_f.write(line)
-                raw_f.flush()
-                _print_event(line.rstrip("\n"))
-            exit_code = proc.wait()
-        finally:
-            if timer is not None:
-                timer.cancel()
-    wall = time.monotonic() - start
-    if timeout_s is not None and wall >= timeout_s:
+    # Same accounting as the Claude agent: exponential rate-limit back-off and a
+    # cumulative COMPUTE deadline. `wall` includes any back-off sleep; `rl_wait`
+    # is the slept portion, so the row's compute time = wall − rl_wait.
+    exit_code, wall, rl_wait = run_streaming_with_backoff(
+        cmd,
+        run_dir,
+        env,
+        raw_path,
+        stderr_path,
+        is_rate_limited=_rate_limited,
+        timeout_s=timeout_s,
+        on_line=_print_event,
+        log_prefix="mlpab:mistral",
+    )
+    if rl_wait:
         print(
-            f"[mlpab] mistral (vibe) agent hit the {timeout_s}s wall-clock cap and was killed.",
+            f"[mlpab] mistral rate-limit waits excluded from wall time: {rl_wait:.0f}s", flush=True
+        )
+    if exit_code == 124:
+        print(
+            f"[mlpab] mistral (vibe) agent hit the {timeout_s}s compute budget and was killed.",
             flush=True,
         )
 
@@ -318,6 +339,7 @@ def run(
         wall_time_s=wall,
         transcript_path=transcript_path,
         stderr_path=stderr_path,
+        rate_limit_wait_s=rl_wait,
     )
 
 
@@ -336,7 +358,6 @@ def engine_live(model: str, auth: str | None = None, timeout_s: int = 60) -> tup
     `vibe --prompt` and confirm it answers. Returns (ok, detail). Uses a
     throwaway VIBE_HOME so it touches no testbed state."""
     import shutil
-    import subprocess
     import tempfile
 
     ready, detail = engine_ready()

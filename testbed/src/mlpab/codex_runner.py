@@ -29,12 +29,15 @@ import json
 import os
 import shutil
 import subprocess
-import threading
-import time
 from pathlib import Path
 from typing import Any
 
-from mlpab.claude_runner import ClaudeResult
+from mlpab.claude_runner import (
+    ClaudeResult,
+    activate_run_venv,
+    run_streaming_with_backoff,
+    streaming_is_rate_limited,
+)
 
 
 def is_codex_model(model: str) -> bool:
@@ -219,6 +222,16 @@ def _print_event(line: str) -> None:
         print(f"[agent:codex] ERROR: {event.get('message')}", flush=True)
 
 
+def _rate_limited(raw_path: Path, stderr_path: Path) -> bool:
+    """A codex run failed on a rate-limit / transient-server condition. codex
+    surfaces these as `{"type":"error","message":...}` events (and on stderr)."""
+
+    def _err_text(event: dict) -> str:
+        return str(event.get("message") or "") if (event.get("type") or "").lower() == "error" else ""
+
+    return streaming_is_rate_limited(raw_path, stderr_path, _err_text)
+
+
 def run(
     prompt: str,
     run_dir: Path,
@@ -270,6 +283,12 @@ def run(
     if extra_env:
         env.update({k: v for k, v in extra_env.items() if v})
 
+    # Activate the per-run venv so the agent's bash finds the interface binary
+    # (e.g. the `aws` / `databricks` console script) and its python/pip see the
+    # interface + ML deps. codex inherits this env, so without it every CLI-mode
+    # call dies with `command not found` (rc 127).
+    activate_run_venv(env, run_dir)
+
     raw_path = run_dir / "codex_events.jsonl"
     transcript_path = run_dir / "transcript.jsonl"
     stderr_path = run_dir / "codex.stderr.log"
@@ -288,35 +307,25 @@ def run(
         prompt,
     ]
 
-    start = time.monotonic()
-    with open(raw_path, "w") as raw_f, open(stderr_path, "w") as err_f:
-        proc = subprocess.Popen(
-            cmd,
-            cwd=run_dir,
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=err_f,
-            text=True,
-        )
-        # Hard wall-clock cap (when set): a stalled command emits no output, so a
-        # read loop alone can block past the deadline — the timer kills the
-        # process. timeout_s=None → uncapped, no timer.
-        timer = threading.Timer(timeout_s, proc.kill) if timeout_s is not None else None
-        if timer is not None:
-            timer.start()
-        try:
-            for line in proc.stdout:  # type: ignore[union-attr]
-                raw_f.write(line)
-                raw_f.flush()
-                _print_event(line.rstrip("\n"))
-            exit_code = proc.wait()
-        finally:
-            if timer is not None:
-                timer.cancel()
-    wall = time.monotonic() - start
-    if timeout_s is not None and wall >= timeout_s:
+    # Same accounting as the Claude agent: exponential rate-limit back-off and a
+    # cumulative COMPUTE deadline. `wall` includes any back-off sleep; `rl_wait`
+    # is the slept portion, so the row's compute time = wall − rl_wait.
+    exit_code, wall, rl_wait = run_streaming_with_backoff(
+        cmd,
+        run_dir,
+        env,
+        raw_path,
+        stderr_path,
+        is_rate_limited=_rate_limited,
+        timeout_s=timeout_s,
+        on_line=_print_event,
+        log_prefix="mlpab:codex",
+    )
+    if rl_wait:
+        print(f"[mlpab] codex rate-limit waits excluded from wall time: {rl_wait:.0f}s", flush=True)
+    if exit_code == 124:
         print(
-            f"[mlpab] codex agent hit the {timeout_s}s wall-clock cap and was killed.", flush=True
+            f"[mlpab] codex agent hit the {timeout_s}s compute budget and was killed.", flush=True
         )
 
     normalize_events(raw_path, transcript_path)
@@ -333,6 +342,7 @@ def run(
         wall_time_s=wall,
         transcript_path=transcript_path,
         stderr_path=stderr_path,
+        rate_limit_wait_s=rl_wait,
     )
 
 

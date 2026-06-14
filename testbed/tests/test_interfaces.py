@@ -73,6 +73,39 @@ class KeysTests(InterfaceTestBase):
         self.assertEqual(got, {"ROLE_ARN": "arn:aws:iam::1:role/x"})
 
 
+class GraderInstallTests(InterfaceTestBase):
+    """install_for_grader prefers the SDK manifest's `grader_install` (a thin
+    read client) over its `runtime_install` (the full SDK), so CLI/MCP grading
+    doesn't drag in the whole SDK just to import a thin client like boto3."""
+
+    def _captured_steps(self, sdk_manifest: str) -> list:
+        self.write_manifest("svc", "sdk", sdk_manifest)
+        run_dir = self.root / "run"
+        run_dir.mkdir()
+        with mock.patch.object(interfaces, "_run_install") as ri:
+            interfaces.install_for_grader("svc", run_dir, run_dir / "venv" / "bin" / "python")
+        return list(ri.call_args[0][0]) if ri.called else []
+
+    def test_grader_install_preferred_over_runtime_install(self):
+        steps = self._captured_steps(
+            "runtime_install:\n  - pip install bigsdk\n"
+            "grader_install:\n  - pip install thinclient\nprompt: hi\n"
+        )
+        self.assertEqual(steps, ["pip install thinclient"])
+
+    def test_falls_back_to_runtime_install_when_no_grader_install(self):
+        steps = self._captured_steps("runtime_install:\n  - pip install bigsdk\nprompt: hi\n")
+        self.assertEqual(steps, ["pip install bigsdk"])
+
+    def test_noop_when_neither_declared(self):
+        self.write_manifest("svc", "sdk", "prompt: hi\n")
+        run_dir = self.root / "run2"
+        run_dir.mkdir()
+        with mock.patch.object(interfaces, "_run_install") as ri:
+            interfaces.install_for_grader("svc", run_dir, run_dir / "venv" / "bin" / "python")
+        self.assertFalse(ri.called)
+
+
 class AccountingFieldsTests(InterfaceTestBase):
     """cli_command / sdk_module drive cli_calls / sdk_calls accounting."""
 

@@ -3,11 +3,67 @@ into the Claude-style transcript (so the existing accounting pipeline works
 unchanged), and the per-run config.toml writer."""
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from mlpab import codex_runner, results
+
+
+class AgentEnvTests(unittest.TestCase):
+    """The agent's bash (run by codex) must find the interface binary, so the
+    per-run venv bin has to be on PATH — otherwise CLI-mode `aws ...` calls die
+    with `command not found`. Regression guard for that wiring."""
+
+    def _run_capture_env(self, run_dir: Path):
+        captured = {}
+
+        class _FakeProc:
+            stdout = iter(())
+
+            def wait(self):
+                return 0
+
+            def kill(self):
+                pass
+
+        def _fake_popen(cmd, cwd, env, **kwargs):
+            captured["env"] = env
+            return _FakeProc()
+
+        with mock.patch.object(codex_runner.shutil, "which", return_value="/usr/bin/codex"), \
+             mock.patch.object(codex_runner.subprocess, "Popen", _fake_popen), \
+             mock.patch.dict(os.environ, {"OPENAI_API_KEY": "x"}, clear=False):
+            codex_runner.run(
+                prompt="hi",
+                run_dir=run_dir,
+                auth="login",
+                model="gpt-5.1-codex",
+                cli_binary="aws",
+                sdk_module=None,
+                mcp_servers={},
+                command_log=run_dir / "commands.jsonl",
+                timeout_s=None,
+            )
+        return captured["env"]
+
+    def test_per_run_venv_bin_on_path(self):
+        run_dir = Path(tempfile.mkdtemp())
+        venv_bin = run_dir / "venv" / "bin"
+        venv_bin.mkdir(parents=True)
+        env = self._run_capture_env(run_dir)
+        self.assertTrue(
+            env["PATH"].startswith(f"{venv_bin}{os.pathsep}"),
+            f"per-run venv bin not first on PATH: {env['PATH']!r}",
+        )
+        self.assertEqual(env["VIRTUAL_ENV"], str(run_dir / "venv"))
+
+    def test_no_venv_dir_does_not_prepend(self):
+        run_dir = Path(tempfile.mkdtemp())  # no venv/bin
+        env = self._run_capture_env(run_dir)
+        self.assertFalse(env["PATH"].startswith(f"{run_dir / 'venv' / 'bin'}{os.pathsep}"))
 
 
 class ModelRoutingTests(unittest.TestCase):
@@ -180,6 +236,43 @@ class ConfigTomlTests(unittest.TestCase):
         d = Path(tempfile.mkdtemp())
         cfg = codex_runner._write_codex_config(d / ".codex", {}, run_dir=d)
         self.assertNotIn("[mcp_servers", cfg.read_text())
+
+
+class RateLimitDetectionTests(unittest.TestCase):
+    """`_rate_limited` decides whether a failed codex run gets retried with
+    back-off. It must fire on transient/rate-limit conditions and NOT on ordinary
+    failures (which would burn the 6h retry window for nothing)."""
+
+    def _files(self, raw_lines, stderr=""):
+        d = Path(tempfile.mkdtemp())
+        raw = d / "codex_events.jsonl"
+        raw.write_text("\n".join(raw_lines) + ("\n" if raw_lines else ""))
+        err = d / "codex.stderr.log"
+        err.write_text(stderr)
+        return raw, err
+
+    def test_error_event_with_429_is_rate_limited(self):
+        raw, err = self._files([json.dumps({"type": "error", "message": "HTTP 429 Too Many Requests"})])
+        self.assertTrue(codex_runner._rate_limited(raw, err))
+
+    def test_error_event_overloaded_is_rate_limited(self):
+        raw, err = self._files([json.dumps({"type": "error", "message": "server overloaded, retry"})])
+        self.assertTrue(codex_runner._rate_limited(raw, err))
+
+    def test_stderr_rate_limit_is_detected(self):
+        raw, err = self._files([], stderr="error: rate limit exceeded for org")
+        self.assertTrue(codex_runner._rate_limited(raw, err))
+
+    def test_ordinary_error_is_not_rate_limited(self):
+        raw, err = self._files([json.dumps({"type": "error", "message": "model_not_found: bad id"})])
+        self.assertFalse(codex_runner._rate_limited(raw, err))
+
+    def test_bare_number_in_normal_output_is_not_rate_limited(self):
+        # A 500 appearing as a line number / token count must not look transient.
+        raw, err = self._files(
+            [json.dumps({"type": "item.completed", "item": {"command": "head -n 500 f"}})]
+        )
+        self.assertFalse(codex_runner._rate_limited(raw, err))
 
 
 if __name__ == "__main__":

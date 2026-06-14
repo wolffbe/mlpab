@@ -237,6 +237,11 @@ def _resolved_config(platform: str, interface: str) -> dict[str, Any]:
     return {
         "binary": manifest.get("binary"),
         "runtime_install": manifest.get("runtime_install") or [],
+        # Optional override for the grader's read-client install (see
+        # install_for_grader): the checker adapter usually needs only a thin
+        # client (e.g. boto3), not the full SDK interface. Defaults to [] →
+        # install_for_grader falls back to runtime_install (unchanged behavior).
+        "grader_install": manifest.get("grader_install") or [],
         "mcp_servers": manifest.get("mcp_servers") or {},
         "prompt": manifest.get("prompt"),
         # Optional accounting overrides: invokable CLI command (for cli_calls) and
@@ -422,13 +427,17 @@ def install_for_grader(platform: str, run_dir: Path, venv_python: Path) -> None:
     evals/adapters/<platform>.py imports it) into the run venv, for grading runs
     whose interface (cli/mcp) didn't already provide it.
 
-    Reuses the platform's SDK-interface `runtime_install` — that IS the python
-    client the adapter reads through (e.g. `databricks-sdk`, or the hopsworks
-    wheel). Idempotent: pip reports already-satisfied installs as no-ops, so an
-    SDK-interface run (client already present) costs nothing. Called AFTER the
-    agent finishes, so it never relaxes the agent's interface-only confinement.
+    Prefers the SDK manifest's `grader_install` when set (a thin read client —
+    e.g. AWS grades through boto3 alone, not the full sagemaker SDK), else falls
+    back to the SDK-interface `runtime_install` — that IS the python client the
+    adapter reads through for most platforms (e.g. `databricks-sdk`, or the
+    hopsworks wheel). Idempotent: pip reports already-satisfied installs as
+    no-ops, so an SDK-interface run (client already present) costs nothing.
+    Called AFTER the agent finishes, so it never relaxes the agent's
+    interface-only confinement.
     """
-    steps = _resolved_config(platform, "sdk").get("runtime_install") or []
+    sdk_cfg = _resolved_config(platform, "sdk")
+    steps = sdk_cfg.get("grader_install") or sdk_cfg.get("runtime_install") or []
     if steps:
         _run_install(
             steps, cwd=run_dir, venv_python=venv_python, interface_dir=bin_dir(platform, "sdk")

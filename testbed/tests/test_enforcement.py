@@ -723,6 +723,138 @@ class RateLimitWaitAccountingTests(unittest.TestCase):
         self.assertGreaterEqual(wall, 0.0)
 
 
+class _FakeClock:
+    """monotonic() advances `read_step` per read (models compute elapsing);
+    sleep() advances by the slept amount (models back-off waiting). Lets a test
+    drive the compute-vs-wait split without real wall time."""
+
+    def __init__(self, read_step: float = 0.0) -> None:
+        self.t = 0.0
+        self.read_step = read_step
+
+    def monotonic(self) -> float:
+        v = self.t
+        self.t += self.read_step
+        return v
+
+    def sleep(self, s: float) -> None:
+        self.t += s
+
+
+class TimeoutExcludesBackoffTests(unittest.TestCase):
+    """`timeout_s` caps cumulative COMPUTE (execution − rate-limit waits): prior
+    attempts' compute draws the budget down, but back-off sleeps never do."""
+
+    def _rl_then_ok_script(self, marker: Path) -> str:
+        import json
+
+        rl = json.dumps(
+            {"type": "result", "is_error": True, "api_error_status": "429", "result": "rate_limit"}
+        )
+        ok = json.dumps({"type": "result", "is_error": False, "result": "ok"})
+        return f"if [ -e {marker} ]; then echo '{ok}'; else touch {marker}; echo '{rl}'; exit 1; fi"
+
+    def test_backoff_does_not_consume_the_compute_budget(self):
+        # No compute elapses (read_step=0); only a 2s back-off sleep. Even with
+        # timeout_s (1s) SMALLER than the back-off, the retry still runs and the
+        # run succeeds — waiting is not charged against the budget.
+        from unittest import mock
+
+        d = Path(tempfile.mkdtemp())
+        fake = _FakeClock(read_step=0.0)
+        with mock.patch("mlpab.claude_runner.time", fake):
+            exit_code, _wall, wait = claude_runner.run_with_retry(
+                cmd=["sh", "-c", self._rl_then_ok_script(d / "ran_once")],
+                cwd=d,
+                env={},
+                transcript_path=d / "transcript.jsonl",
+                stderr_path=d / "stderr.log",
+                timeout_s=1,
+            )
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(wait, claude_runner.RATE_LIMIT_BASE_BACKOFF_S)
+
+    def test_compute_budget_exhausted_across_retries_gives_up_124(self):
+        # Compute elapses (read_step>0) so the first attempt's execution time
+        # exceeds the 1s budget; the retry is refused with exit 124 rather than
+        # handed a fresh full budget. The 2s back-off in between is excluded.
+        import json
+        from unittest import mock
+
+        d = Path(tempfile.mkdtemp())
+        rl = json.dumps(
+            {"type": "result", "is_error": True, "api_error_status": "429", "result": "rate_limit"}
+        )
+        # Always rate-limited + non-zero exit, so the only way out is a budget.
+        script = f"echo '{rl}'; exit 1"
+        fake = _FakeClock(read_step=0.4)
+        with mock.patch("mlpab.claude_runner.time", fake):
+            exit_code, _wall, wait = claude_runner.run_with_retry(
+                cmd=["sh", "-c", script],
+                cwd=d,
+                env={},
+                transcript_path=d / "transcript.jsonl",
+                stderr_path=d / "stderr.log",
+                timeout_s=1,
+            )
+        self.assertEqual(exit_code, 124)
+        # Gave up on the COMPUTE budget after one back-off, not the 6h rate-limit
+        # window — exactly one sleep happened.
+        self.assertEqual(wait, claude_runner.RATE_LIMIT_BASE_BACKOFF_S)
+
+
+class TransientErrorClassifierTests(unittest.TestCase):
+    """text_is_transient_error (the single rate-limit/transient matcher shared by
+    the structured Claude path and the free-text codex/vibe engines): phrases
+    match as substrings, numeric codes match ONLY on word boundaries."""
+
+    def test_transient_phrases_and_codes_match(self):
+        for txt in (
+            "Error code: 429 - too many requests",
+            "the server is overloaded_error",
+            "ThrottlingException: Rate exceeded",
+            "HTTP 503 Service Unavailable",
+            "status 500: internal server error",
+            "529 overloaded",
+        ):
+            self.assertTrue(claude_runner.text_is_transient_error(txt), txt)
+
+    def test_codes_embedded_in_larger_numbers_do_not_match(self):
+        # The whole point of word-boundary matching: a code inside a request id
+        # or model name must NOT trigger a retry.
+        for txt in ("request req_4290 failed", "model gpt-5290 not found", "offset 5000 bytes"):
+            self.assertFalse(claude_runner.text_is_transient_error(txt), txt)
+
+    def test_non_transient_failures_not_matched(self):
+        # quota exhaustion is NOT transient; plain auth/validation errors aren't either.
+        for txt in (
+            "You exceeded your current quota",
+            "AccessDeniedException: not authorized",
+            "ValidationException: parameter invalid",
+        ):
+            self.assertFalse(claude_runner.text_is_transient_error(txt), txt)
+
+
+class ActivateRunVenvTests(unittest.TestCase):
+    """activate_run_venv prepends the per-run venv bin to PATH (so the agent's
+    bash finds the interface binary) and sets VIRTUAL_ENV; no-op without a venv."""
+
+    def test_prepends_venv_bin_and_sets_virtual_env(self):
+        d = Path(tempfile.mkdtemp())
+        (d / "venv" / "bin").mkdir(parents=True)
+        env = {"PATH": "/usr/bin"}
+        claude_runner.activate_run_venv(env, d)
+        self.assertEqual(env["PATH"], f"{d / 'venv' / 'bin'}{os.pathsep}/usr/bin")
+        self.assertEqual(env["VIRTUAL_ENV"], str(d / "venv"))
+
+    def test_noop_without_venv(self):
+        d = Path(tempfile.mkdtemp())  # no venv/bin
+        env = {"PATH": "/usr/bin"}
+        claude_runner.activate_run_venv(env, d)
+        self.assertEqual(env["PATH"], "/usr/bin")
+        self.assertNotIn("VIRTUAL_ENV", env)
+
+
 class DeadRowSchemaTests(unittest.TestCase):
     def test_error_column_present_and_last_is_run_dir(self):
         from mlpab import results

@@ -11,8 +11,11 @@ from __future__ import annotations
 import json
 import os
 import pwd
+import re
 import shutil
+import signal
 import subprocess
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -293,23 +296,46 @@ RATE_LIMIT_RETRY_WINDOW_S = 6 * 3600
 RATE_LIMIT_BASE_BACKOFF_S = 2
 RATE_LIMIT_MAX_BACKOFF_S = 3600
 
-# Anthropic rate limits (429/529, "overloaded") + transient 5xx. Without the 5xx
-# tokens, a mid-session 500 burns a whole run on retry.
-_RATE_LIMIT_TOKENS = (
-    "rate_limit",
+# Rate-limit / transient-server markers — the SINGLE source for "is this error
+# worth retrying?", used by BOTH the structured Claude path (`api_error_status`
+# blob) and the free-text engines (codex/vibe error events + stderr) via
+# `text_is_transient_error`. Two match modes so it works on free text without
+# false positives:
+#   * PHRASES — substring match (unambiguous; e.g. "rate limit", "overloaded").
+#   * CODES — WORD-BOUNDARY match only. A bare "in" check would fire on any
+#     number containing the code ("429" inside a request id "req_4290", "529"
+#     inside "gpt-5290"), dragging permanent failures into the 6h retry loop;
+#     `\b429\b` matches "status 429" but not "4290".
+# NOTE: quota exhaustion is NOT transient (it won't clear within the retry
+# window), so "quota" is deliberately absent.
+_TRANSIENT_PHRASES = (
     "rate limit",
+    "rate_limit",
+    "ratelimit",
+    "rate exceeded",
+    "too many requests",
+    "throttl",  # throttled / ThrottlingException
     "overloaded",
-    "429",
-    "529",
-    "500",
-    "502",
-    "503",
-    "504",
-    "internal server error",
-    "bad gateway",
     "service unavailable",
+    "service_unavailable",
+    "bad gateway",
     "gateway timeout",
+    "internal server error",
+    "server_error",
+    "temporarily unavailable",
+    "try again later",
 )
+_TRANSIENT_CODES = ("429", "529", "500", "502", "503", "504")
+_TRANSIENT_CODE_RE = re.compile(r"\b(?:" + "|".join(_TRANSIENT_CODES) + r")\b")
+
+
+def text_is_transient_error(text: str) -> bool:
+    """True if `text` names a rate-limit / transient-server condition worth
+    retrying. Phrases match as substrings; numeric HTTP codes match only on word
+    boundaries (so a code embedded in a larger number/id is not a false hit).
+    Shared by the structured Claude path and the free-text engines (codex/vibe)."""
+    t = (text or "").lower()
+    return any(p in t for p in _TRANSIENT_PHRASES) or bool(_TRANSIENT_CODE_RE.search(t))
 
 # Auth failures. The injected CLAUDE_CODE_OAUTH_TOKEN can expire mid-session on a
 # long run (a multi-hour session once died on a 401). On these we re-pull a
@@ -602,10 +628,9 @@ def run(
         env["TESTBED_INSTANCE_ALLOW"] = ",".join(instance_allowlist)
 
     # Activate per-run venv so claude's python/pip find ML deps via .pth.
+    activate_run_venv(env, run_dir)
     venv_bin = run_dir / "venv" / "bin"
     if venv_bin.is_dir():
-        env["PATH"] = f"{venv_bin}{os.pathsep}{env.get('PATH', '')}"
-        env["VIRTUAL_ENV"] = str(run_dir / "venv")
         # REST-endpoint coverage: log every outbound request from the agent's
         # SDK/CLI/MCP (all use `requests` in this venv) to api_calls.jsonl, which
         # `results.endpoint_hits` scores against the configured white/blacklist.
@@ -747,6 +772,10 @@ def run_with_retry(
     includes sleep time; `rate_limit_wait_s` is the slept portion, so callers
     can report compute time as `wall - wait` (it feeds the CSV's
     `rate_limit_wait_s` column).
+
+    `timeout_s` caps CUMULATIVE COMPUTE (execution time − rate-limit waits), not
+    each attempt: prior attempts' compute draws the budget down, but back-off
+    sleeps between attempts do not. A run that exhausts the budget exits 124.
     """
     import tempfile
 
@@ -763,6 +792,16 @@ def run_with_retry(
     err_tmp.close()
     while True:
         attempt += 1
+        # Per-attempt deadline = remaining COMPUTE budget. Total elapsed minus
+        # back-off sleeps is the compute spent so far; the cap counts that, so a
+        # rate-limited retry gets the *remaining* budget, not a fresh full one.
+        if timeout_s is not None:
+            attempt_timeout = timeout_s - ((time.monotonic() - start) - rl_wait_s)
+            if attempt_timeout <= 0:
+                exit_code = 124
+                break
+        else:
+            attempt_timeout = None
         if on_line is not None:
             with open(transcript_path, "ab") as tf, open(err_tmp_path, "ab") as sf:
                 proc = subprocess.Popen(
@@ -783,8 +822,8 @@ def run_with_retry(
                                 on_line(raw_line)
                             except Exception:
                                 pass
-                    if timeout_s is not None:
-                        exit_code = proc.wait(timeout=timeout_s)
+                    if attempt_timeout is not None:
+                        exit_code = proc.wait(timeout=attempt_timeout)
                     else:
                         exit_code = proc.wait()
                 except subprocess.TimeoutExpired:
@@ -802,8 +841,8 @@ def run_with_retry(
             with open(transcript_path, "ab") as out, open(err_tmp_path, "ab") as err:
                 proc = subprocess.Popen(cmd, cwd=str(cwd), env=env, stdout=out, stderr=err)
                 try:
-                    if timeout_s is not None:
-                        exit_code = proc.wait(timeout=timeout_s)
+                    if attempt_timeout is not None:
+                        exit_code = proc.wait(timeout=attempt_timeout)
                     else:
                         exit_code = proc.wait()
                 except subprocess.TimeoutExpired:
@@ -879,6 +918,181 @@ def run_with_retry(
     return exit_code, time.monotonic() - start, rl_wait_s
 
 
+def activate_run_venv(env: dict[str, str], run_dir: Path) -> None:
+    """Prepend the per-run venv's bin to `env['PATH']` (so the agent's bash finds
+    the interface binary — `aws`, `databricks`, … — and `python`/`pip` resolve to
+    the run venv with the interface + ML deps) and set `VIRTUAL_ENV`. No-op when
+    the venv isn't present. Shared by all three engines; the Claude runner layers
+    its API-log shim on top."""
+    venv_bin = run_dir / "venv" / "bin"
+    if venv_bin.is_dir():
+        env["PATH"] = f"{venv_bin}{os.pathsep}{env.get('PATH', '')}"
+        env["VIRTUAL_ENV"] = str(run_dir / "venv")
+
+
+def _read_tail(path: Path, max_bytes: int = 65536) -> str:
+    """Last `max_bytes` of a file decoded as utf-8 (lossy). Error markers from
+    codex/vibe land at/near the end of the stream, so a tail read avoids slurping
+    a multi-MB events file on every retry check."""
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return ""
+    return data[-max_bytes:].decode("utf-8", "replace")
+
+
+def streaming_is_rate_limited(
+    raw_path: Path,
+    stderr_path: Path,
+    event_blob: Callable[[dict[str, Any]], str],
+) -> bool:
+    """Shared rate-limit detector for streaming engines (codex/vibe). Scans the
+    tail of the raw events file — `event_blob(event)` maps a parsed event to its
+    error text (or "" if the event is not an error) — and the stderr tail, for
+    transient-error text. Engines differ only in `event_blob`."""
+    if raw_path.exists():
+        for line in _read_tail(raw_path).splitlines():
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if text_is_transient_error(event_blob(event)):
+                return True
+    return text_is_transient_error(_read_tail(stderr_path))
+
+
+def run_streaming_with_backoff(
+    cmd: list[str],
+    cwd: Path,
+    env: dict[str, str],
+    raw_path: Path,
+    stderr_path: Path,
+    *,
+    is_rate_limited: Callable[[Path, Path], bool],
+    timeout_s: int | None = None,
+    on_line: Callable[[str], None] | None = None,
+    log_prefix: str = "mlpab",
+) -> tuple[int, float, float]:
+    """Run a streaming JSON subprocess (codex `exec --json` / vibe `--output
+    streaming`) with the SAME accounting as `run_with_retry`: exponential
+    rate-limit back-off and a cumulative COMPUTE deadline.
+
+    - stdout is streamed line-by-line into `raw_path` (truncated each attempt, so
+      only the LAST attempt's events survive for the caller to normalize) and
+      forwarded to `on_line`. stderr goes to `stderr_path` (also per-attempt).
+    - A per-attempt `threading.Timer` kills the process at the REMAINING compute
+      budget (`timeout_s − compute-spent-so-far`); back-off sleeps don't draw it
+      down. Exhausting the budget yields exit 124.
+    - On a non-zero exit whose events/stderr look rate-limited (per
+      `is_rate_limited`), sleeps `min(2 * 2^(n-1), 3600)`s and retries until the
+      6h `RATE_LIMIT_RETRY_WINDOW_S` is spent.
+
+    Returns `(exit_code, total_wall_time_s, rate_limit_wait_s)` — `wall` includes
+    sleep time; subtract `wait` for compute time (mirrors `run_with_retry`).
+    """
+    start = time.monotonic()
+    attempt = 0
+    rl_attempts = 0
+    rl_wait_s = 0.0
+    exit_code = 1
+    while True:
+        attempt += 1
+        # Per-attempt deadline = remaining COMPUTE budget (see run_with_retry).
+        if timeout_s is not None:
+            attempt_timeout = timeout_s - ((time.monotonic() - start) - rl_wait_s)
+            if attempt_timeout <= 0:
+                exit_code = 124
+                break
+        else:
+            attempt_timeout = None
+
+        killed = {"timeout": False}
+        with open(raw_path, "w") as raw_f, open(stderr_path, "w") as err_f:
+            # start_new_session: run the child in its own process group so the
+            # timeout kills the WHOLE tree. A bare proc.kill() signals only the
+            # direct child, so a grandchild (e.g. a remote-job tail) holding the
+            # stdout pipe open keeps the read loop blocked past the deadline.
+            proc = subprocess.Popen(
+                cmd,
+                cwd=str(cwd),
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=err_f,
+                text=True,
+                start_new_session=True,
+            )
+
+            def _kill() -> None:
+                killed["timeout"] = True
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except (ProcessLookupError, PermissionError, OSError):
+                    proc.kill()
+
+            # A stalled command emits no output, so the read loop alone can block
+            # past the deadline — the timer kills the process. None → uncapped.
+            timer = threading.Timer(attempt_timeout, _kill) if attempt_timeout is not None else None
+            if timer is not None:
+                timer.start()
+            rc = 1
+            try:
+                for line in proc.stdout:  # type: ignore[union-attr]
+                    raw_f.write(line)
+                    raw_f.flush()
+                    if on_line is not None:
+                        try:
+                            on_line(line.rstrip("\n"))
+                        except Exception:
+                            pass
+                rc = proc.wait()
+            except KeyboardInterrupt:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                raise
+            finally:
+                if timer is not None:
+                    timer.cancel()
+
+        # `rc != 0` guard closes a race: if the process finishes cleanly right at
+        # the deadline, the timer can fire (setting killed) after `proc.wait()`
+        # returns 0 but before `timer.cancel()`. A real kill leaves rc != 0
+        # (negative signal), so a clean rc == 0 is honored as success, not 124.
+        exit_code = 124 if (killed["timeout"] and rc != 0) else rc
+        if exit_code == 0:
+            break
+        # Compute-budget kill is not a rate limit — don't retry it.
+        if killed["timeout"]:
+            break
+        if not is_rate_limited(raw_path, stderr_path):
+            break
+        rl_attempts += 1
+        elapsed = time.monotonic() - start
+        backoff = min(
+            RATE_LIMIT_BASE_BACKOFF_S * (2 ** (rl_attempts - 1)),
+            RATE_LIMIT_MAX_BACKOFF_S,
+        )
+        if elapsed + backoff > RATE_LIMIT_RETRY_WINDOW_S:
+            print(
+                f"[{log_prefix}] rate-limited after {rl_attempts} attempts "
+                f"({elapsed:.0f}s elapsed); {RATE_LIMIT_RETRY_WINDOW_S // 3600}h retry budget "
+                f"exhausted, giving up.",
+                flush=True,
+            )
+            break
+        print(
+            f"[{log_prefix}] rate-limited on attempt {attempt} "
+            f"({elapsed:.0f}s elapsed); sleeping {backoff}s before retry.",
+            flush=True,
+        )
+        time.sleep(backoff)
+        rl_wait_s += backoff
+
+    return exit_code, time.monotonic() - start, rl_wait_s
+
+
 def _last_result_error_blob(transcript_path: Path) -> str | None:
     """Lowercased error text of the last `result` event when it is an error, else
     None. Shared by the rate-limit and auth-error classifiers."""
@@ -904,7 +1118,7 @@ def _last_result_error_blob(transcript_path: Path) -> str | None:
 def _last_result_is_rate_limited(transcript_path: Path) -> bool:
     """The last `result` stopped on a 429/529-style / transient-5xx condition."""
     blob = _last_result_error_blob(transcript_path)
-    return bool(blob) and any(t in blob for t in _RATE_LIMIT_TOKENS)
+    return bool(blob) and text_is_transient_error(blob)
 
 
 def _last_result_is_auth_error(transcript_path: Path) -> bool:
