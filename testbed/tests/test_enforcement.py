@@ -28,9 +28,9 @@ _MARKERS = {
 class EnforceHookTests(unittest.TestCase):
     def _enforce(self, interface, tool, command=None, **input_extra):
         env = dict(_MARKERS, TESTBED_INTERFACE=interface)
-        # Also clear TESTBED_CLI_SUBCOMMAND so a subcommand-entrypoint test can't
+        # Also clear TESTBED_CLI_SUBCOMMAND/AUX so an entrypoint/aux test can't
         # leak into the default (single-token) cases.
-        for k in ("TESTBED_INTERFACE", "TESTBED_CLI_SUBCOMMAND", *_MARKERS):
+        for k in ("TESTBED_INTERFACE", "TESTBED_CLI_SUBCOMMAND", "TESTBED_CLI_AUX", *_MARKERS):
             os.environ.pop(k, None)
         os.environ.update(env)
         tool_input = dict(input_extra)
@@ -41,7 +41,7 @@ class EnforceHookTests(unittest.TestCase):
     def _enforce_entrypoint(self, command, cli_binary="aws", cli_subcommand="sagemaker"):
         """Enforce in CLI mode with a SUBCOMMAND ENTRYPOINT (e.g. `aws sagemaker`):
         only `<cli_binary> <cli_subcommand> …` is on-interface."""
-        for k in ("TESTBED_INTERFACE", "TESTBED_CLI_SUBCOMMAND", *_MARKERS):
+        for k in ("TESTBED_INTERFACE", "TESTBED_CLI_SUBCOMMAND", "TESTBED_CLI_AUX", *_MARKERS):
             os.environ.pop(k, None)
         os.environ.update(
             {
@@ -343,6 +343,47 @@ class EnforceHookTests(unittest.TestCase):
             self._enforce_entrypoint("aws --region us-east-1 ec2 describe-instances")
         )
         self.assertIsNotNone(self._enforce_entrypoint("aws --debug s3api create-bucket --bucket x"))
+
+    # --- aux on-interface binaries (e.g. GCP's `bq` alongside `gcloud`) ---
+    def _enforce_aux(self, command, interface="cli"):
+        """CLI mode with `gcloud {ai,storage}` + an aux binary `bq` — GCP's
+        split offline store (`bq`) is on-interface alongside the main binary."""
+        for k in ("TESTBED_INTERFACE", "TESTBED_CLI_SUBCOMMAND", "TESTBED_CLI_AUX", *_MARKERS):
+            os.environ.pop(k, None)
+        os.environ.update(
+            {
+                "TESTBED_INTERFACE": interface,
+                "TESTBED_CLI_BINARY": "gcloud",
+                "TESTBED_CLI_SUBCOMMAND": "ai,storage",
+                "TESTBED_CLI_AUX": "bq",
+                "TESTBED_SDK_MODULE": "google.cloud.aiplatform",
+                "TESTBED_PLATFORM": "gcp",
+                "TESTBED_COMPUTE_DENY": "torch,tensorflow,sklearn,xgboost",
+            }
+        )
+        return hook.enforce("Bash", {"command": command})
+
+    def test_aux_binary_allowed_any_subcommand(self):
+        # `bq` is on-interface with any subcommand (no subcommand allowlist).
+        self.assertIsNone(self._enforce_aux('bq query --use_legacy_sql=false "SELECT 1"'))
+        self.assertIsNone(self._enforce_aux("bq load --source_format=CSV ds.t ./data.csv"))
+        self.assertIsNone(self._enforce_aux("bq mk --table ds.transactions row_id:STRING"))
+
+    def test_aux_binary_alongside_main_binary(self):
+        # Main binary (`gcloud ai`) and aux (`bq`) both allowed in one pipeline.
+        self.assertIsNone(self._enforce_aux("gcloud ai models list && bq ls ds"))
+
+    def test_aux_binary_blocked_in_sdk_mode(self):
+        # The aux binary is a CLI tool — off-interface when the SDK is under test.
+        self.assertIsNotNone(self._enforce_aux("bq query 'SELECT 1'", interface="sdk"))
+
+    def test_aux_does_not_widen_main_binary_subcommands(self):
+        # Allowing `bq` must not relax the `gcloud` subcommand allowlist.
+        self.assertIsNotNone(self._enforce_aux("gcloud compute instances list"))
+
+    def test_non_aux_binary_still_denied(self):
+        # A stray binary not on cli/aux is still blocked.
+        self.assertIsNotNone(self._enforce_aux("gsutil ls gs://bkt"))
 
     def test_entrypoint_option_value_matching_service_not_entrypoint(self):
         # Fail closed: an option VALUE that happens to equal an allowed service

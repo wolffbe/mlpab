@@ -698,6 +698,7 @@ def _classify_tool_use(
     sdk_module: str | None = None,
     run_dir: Path | None = None,
     cli_subcommand: str | None = None,
+    cli_aux: list[str] | None = None,
 ) -> str:
     if tool_name == "Skill":
         return "skill"
@@ -753,7 +754,14 @@ def _classify_tool_use(
             _is_cli(seg[0]) and _hook_cli_arg_after(seg, cli_binary) in subs for seg in exec_segs
         )
 
-    if _cli_present():
+    def _aux_present() -> bool:
+        # Extra on-interface binaries (e.g. `bq` alongside `gcloud`) count as cli.
+        aux = [b for b in (cli_aux or []) if b]
+        return any(
+            t == b or t.endswith(f"/{b}") for t in exec_tokens for b in aux
+        )
+
+    if _cli_present() or _aux_present():
         return "cli"
     if any(_is_python_first(t) for t in exec_tokens):
         if sdk_module and _command_uses_sdk(tokens, command, sdk_module, run_dir):
@@ -936,6 +944,7 @@ def aggregate_commands(
     run_dir: Path | None = None,
     cli_subcommand: str | None = None,
     commands_log: Path | None = None,
+    cli_aux: list[str] | None = None,
 ) -> dict[str, float]:
     """Count tool calls by category from the stream-json transcript.
 
@@ -1051,6 +1060,7 @@ def aggregate_commands(
                 sdk_module=sdk_module,
                 run_dir=run_dir,
                 cli_subcommand=cli_subcommand,
+                cli_aux=cli_aux,
             )
             col = bucket.get(category)
             if col:
@@ -1081,6 +1091,7 @@ def platform_tool_time(
     sdk_module: str | None = None,
     run_dir: Path | None = None,
     cli_subcommand: str | None = None,
+    cli_aux: list[str] | None = None,
 ) -> float:
     """Seconds spent inside tool calls THROUGH the interface under test.
 
@@ -1101,6 +1112,7 @@ def platform_tool_time(
             sdk_module=sdk_module,
             run_dir=run_dir,
             cli_subcommand=cli_subcommand,
+            cli_aux=cli_aux,
         )
         if category in _REMOTE_CATEGORIES:
             platform += span.get("seconds") or 0.0
@@ -1114,6 +1126,7 @@ def write_commands_log(
     sdk_module: str | None = None,
     run_dir: Path | None = None,
     cli_subcommand: str | None = None,
+    cli_aux: list[str] | None = None,
 ) -> None:
     """Render one JSONL line per tool call from the stream-json transcript.
 
@@ -1150,6 +1163,7 @@ def write_commands_log(
                 sdk_module=sdk_module,
                 run_dir=run_dir,
                 cli_subcommand=cli_subcommand,
+                cli_aux=cli_aux,
             )
             record = {
                 "timestamp": timestamp,

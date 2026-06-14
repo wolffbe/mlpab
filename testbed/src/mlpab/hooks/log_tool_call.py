@@ -35,6 +35,14 @@ def _env_subcommands() -> list:
     return [s for s in (p.strip() for p in raw.split(",")) if s]
 
 
+def _env_aux_binaries() -> list:
+    """TESTBED_CLI_AUX is a comma-joined allowlist of EXTRA on-interface binaries
+    beyond TESTBED_CLI_BINARY (e.g. GCP's `bq` alongside `gcloud`). Each is
+    allowed with any subcommand in CLI mode; empty → none."""
+    raw = os.environ.get("TESTBED_CLI_AUX") or ""
+    return [s for s in (p.strip() for p in raw.split(",")) if s]
+
+
 def classify(tool_name: str, tool_input: dict) -> str:
     if tool_name.startswith("mcp__"):
         return "mcp"
@@ -61,6 +69,9 @@ def classify(tool_name: str, tool_input: dict) -> str:
         # `_cli_arg_after` skips global options (`aws --region x sagemaker …`).
         if not cli_subcommands or _cli_arg_after(tokens, cli_binary) in cli_subcommands:
             return "cli"
+    # An aux on-interface binary (e.g. `bq` alongside `gcloud`) counts as cli.
+    if any(first == aux or first.endswith(f"/{aux}") for aux in _env_aux_binaries()):
+        return "cli"
     is_python = (
         first in PYTHON_PREFIXES
         or first.endswith(("/python", "/python3", "/pip", "/pip3"))
@@ -481,13 +492,15 @@ def _use_only(interface: str) -> str:
     if interface == "cli":
         binary = os.environ.get("TESTBED_CLI_BINARY") or None
         subs = _env_subcommands()
+        aux = _env_aux_binaries()
+        aux_note = f" (plus `{'`/`'.join(aux)}`)" if aux else ""
         if not binary:
             return "the platform CLI"
         if len(subs) == 1:
-            return f"the `{binary} {subs[0]}` CLI"
+            return f"the `{binary} {subs[0]}` CLI{aux_note}"
         if subs:
-            return f"the `{binary}` CLI ({'/'.join(subs)} services only)"
-        return f"the `{binary}` CLI"
+            return f"the `{binary}` CLI ({'/'.join(subs)} services only){aux_note}"
+        return f"the `{binary}` CLI{aux_note}"
     if interface == "mcp":
         platform = os.environ.get("TESTBED_PLATFORM") or None
         return f"the MCP tools (`mcp__{platform}__*`)" if platform else "the platform's MCP tools"
@@ -532,6 +545,9 @@ def enforce(tool_name: str, tool_input: dict, segments: list | None = None) -> s
     # on-interface — other services of the same binary (`aws ec2 …`) are
     # off-interface escapes.
     cli_subcommands = _env_subcommands()
+    # Extra on-interface binaries (e.g. `bq` alongside `gcloud`), on-interface in
+    # CLI mode with any subcommand.
+    cli_aux = _env_aux_binaries()
     compute_deny = [m for m in (os.environ.get("TESTBED_COMPUTE_DENY") or "").split(",") if m]
     platform = os.environ.get("TESTBED_PLATFORM") or "the remote platform"
     use_only = _use_only(interface)
@@ -623,6 +639,10 @@ def enforce(tool_name: str, tool_input: dict, segments: list | None = None) -> s
                     f"DENIED: the {cli_binary!r} CLI is off-interface in "
                     f"{interface!r} mode. Use only {use_only}."
                 )
+            # Aux on-interface binary (e.g. `bq` alongside `gcloud`): allowed with
+            # any subcommand, but ONLY in CLI mode — never in mcp/sdk.
+            if interface == "cli" and base in cli_aux:
+                continue
             return (
                 f"DENIED: {base!r} is off-interface in {interface!r} mode — only "
                 f"{use_only} may do work on {platform}; local interpreters, network "

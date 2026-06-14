@@ -105,6 +105,7 @@ def set_enforcement_env(
     compute_deny: list[str] | None,
     instance_allowlist: list[str] | None,
     platform: str | None,
+    cli_aux_commands: list[str] | None = None,
 ) -> None:
     """Populate the TESTBED_* env the enforcement logic (`hooks.log_tool_call`)
     reads — used by the Claude PreToolUse hook AND the exec gate for vibe/codex,
@@ -126,6 +127,7 @@ def set_enforcement_env(
     _put("TESTBED_BOUNDARY", str(Path(run_dir).resolve()))
     _put("TESTBED_CLI_BINARY", cli_binary)
     _put("TESTBED_CLI_SUBCOMMAND", cli_subcommand)
+    _put("TESTBED_CLI_AUX", ",".join(cli_aux_commands) if cli_aux_commands else None)
     _put("TESTBED_SDK_MODULE", sdk_module)
     _put("TESTBED_PLATFORM", platform if platform and platform != "none" else None)
     # Enforce ONLY for real delegation interfaces; a none/none baseline trains
@@ -626,6 +628,7 @@ def run(
     mcp_servers: dict[str, Any],
     command_log: Path,
     cli_subcommand: str | None = None,
+    cli_aux_commands: list[str] | None = None,
     timeout_s: int | None = 60 * 60,  # None → NO wall-clock cap
     extra_env: dict[str, str] | None = None,
     allowed_domains: list[str] | None = None,
@@ -696,6 +699,7 @@ def run(
         interface=interface,
         cli_binary=cli_binary,
         cli_subcommand=cli_subcommand,
+        cli_aux_commands=cli_aux_commands,
         sdk_module=sdk_module,
         compute_deny=compute_deny,
         instance_allowlist=instance_allowlist,

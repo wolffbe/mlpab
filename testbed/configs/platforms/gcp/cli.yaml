@@ -23,12 +23,23 @@ install:
 # its bytes are folded into the interface hash.
 binary: google-cloud-sdk/bin/gcloud
 cli_command: gcloud
-cli_subcommand: [ai, auth, config, components, storage]
+# `monitoring` is on-interface because the grader reads alerting back through
+# Cloud Monitoring alert policies (evals/adapters/gcp.py get_alert).
+cli_subcommand: [ai, auth, config, components, storage, monitoring]
 
-# Copy the SDK tree INTO the run venv (sandbox-readable) and put gcloud on PATH.
+# Auxiliary on-interface binaries shipped INSIDE the same Cloud SDK. Unlike AWS
+# (one `aws` binary for every service), GCP splits the offline store onto a
+# SEPARATE binary: the feature store is BigQuery-backed and the grader reads it
+# straight through the BigQuery client (evals/adapters/gcp.py), but `gcloud` has
+# no table create/load — only `bq` does. Without it, every feature/* and
+# training-dataset task is unwinnable in CLI mode. Allowed with any subcommand.
+cli_aux_commands: [bq]
+
+# Copy the SDK tree INTO the run venv (sandbox-readable) and put gcloud + bq on PATH.
 runtime_install:
   - 'cp -R "$INTERFACE_DIR/google-cloud-sdk" ./venv/google-cloud-sdk'
   - 'ln -sf "../google-cloud-sdk/bin/gcloud" ./venv/bin/gcloud'
+  - 'ln -sf "../google-cloud-sdk/bin/bq" ./venv/bin/bq'
 
 # OFFLINE "does it run?" check.
 test_command: gcloud version
@@ -54,10 +65,13 @@ allowed_domains:
 # gcloud (like gh/terraform) cannot reach the macOS trust daemon inside the
 # Seatbelt sandbox → TLS handshakes fail; run it OUTSIDE the sandbox. It only
 # talks to Google APIs, and the PreToolUse hook still enforces the exec
-# allowlist + path denies on every call.
+# allowlist + path denies on every call. `bq` ships in the same SDK and hits the
+# same TLS wall, so it is excluded too.
 sandbox_excluded_commands:
   - "gcloud"
   - "gcloud *"
+  - "bq"
+  - "bq *"
 
 # Plumbing (setup/teardown) needs the BigQuery/aiplatform PYTHON client, which a
 # CLI run venv lacks (gcloud ships as a tarball, not pip). Run them under

@@ -627,6 +627,7 @@ def run(spec: RunSpec) -> results.Row:
             model=spec.model,
             cli_binary=interface_setup.cli_binary,
             cli_subcommand=interface_setup.cli_subcommand,
+            cli_aux_commands=interface_setup.cli_aux_commands,
             sdk_module=interface_setup.sdk_module,
             mcp_servers=interface_setup.mcp_servers,
             command_log=run_dir / "commands.jsonl",
@@ -681,6 +682,9 @@ def run(spec: RunSpec) -> results.Row:
         count_cli_sub = (
             interface_setup.cli_subcommand if interface_setup.interface == "cli" else None
         )
+        count_cli_aux = (
+            interface_setup.cli_aux_commands if interface_setup.interface == "cli" else None
+        )
         count_sdk = interface_setup.sdk_module if interface_setup.interface == "sdk" else None
         counts = results.aggregate_commands(
             cr.transcript_path,
@@ -688,6 +692,7 @@ def run(spec: RunSpec) -> results.Row:
             sdk_module=count_sdk,
             run_dir=run_dir,
             cli_subcommand=count_cli_sub,
+            cli_aux=count_cli_aux,
             # The hook's own log (pre-rebuild): its `denied: true` records are
             # the structured source for denied_calls.
             commands_log=run_dir / "commands.jsonl",
@@ -701,6 +706,7 @@ def run(spec: RunSpec) -> results.Row:
             sdk_module=count_sdk,
             run_dir=run_dir,
             cli_subcommand=count_cli_sub,
+            cli_aux=count_cli_aux,
         )
         # Surface the interface CLIENT's runtime logs + crashes into a per-run
         # <platform>_client.logs (cli/mcp/sdk). For mcp this rescues the stdio
@@ -791,6 +797,7 @@ def run(spec: RunSpec) -> results.Row:
                 sdk_module=count_sdk,
                 run_dir=run_dir,
                 cli_subcommand=count_cli_sub,
+                cli_aux=count_cli_aux,
             ),
             wall,
         )

@@ -57,6 +57,10 @@ class InterfaceSetup:
     ref: str = ""
     cli_binary: str | None = None
     cli_subcommand: str | None = None
+    # Extra on-interface binaries beyond `cli_binary` (e.g. GCP's `bq`, shipped in
+    # the same Cloud SDK as `gcloud`). Each is allowed with ANY subcommand in CLI
+    # mode. Empty for the usual single-binary CLIs (aws/az/databricks/hops).
+    cli_aux_commands: list[str] = field(default_factory=list)
     sdk_module: str | None = None
     mcp_servers: dict[str, Any] = field(default_factory=dict)
     keys: dict[str, str] = field(default_factory=dict)
@@ -252,6 +256,8 @@ def _resolved_config(platform: str, interface: str) -> dict[str, Any]:
         # `[sagemaker, sagemaker-runtime, s3]` with `cli_command: aws`): scopes
         # the CLI interface to `<cli_command> <one of these> …`.
         "cli_subcommand": manifest.get("cli_subcommand"),
+        # Optional extra on-interface binaries (e.g. `[bq]` alongside `gcloud`).
+        "cli_aux_commands": manifest.get("cli_aux_commands") or [],
         "sdk_module": manifest.get("sdk_module"),
         # Per-run shell steps in the run venv to START the agent's servers (e.g.
         # the MCP HTTP server claude connects to at launch), after stale-server
@@ -512,6 +518,7 @@ def setup(
         #     — true when package == platform name).
         cli_binary=cfg.get("cli_command") or (binary if interface == "cli" else None),
         cli_subcommand=_norm_subcommands(cfg.get("cli_subcommand")),
+        cli_aux_commands=[str(b).strip() for b in (cfg.get("cli_aux_commands") or []) if str(b).strip()],
         sdk_module=cfg.get("sdk_module") or platform,
         mcp_servers=mcp_servers,
         keys=_resolved_keys(platform, interface),

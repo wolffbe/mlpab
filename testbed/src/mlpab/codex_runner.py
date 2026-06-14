@@ -291,6 +291,7 @@ def run(
     mcp_servers: dict[str, Any],
     command_log: Path,
     cli_subcommand: str | None = None,
+    cli_aux_commands: list[str] | None = None,
     timeout_s: int | None = 60 * 60,  # None → NO wall-clock cap
     extra_env: dict[str, str] | None = None,
     allowed_domains: list[str] | None = None,
@@ -351,6 +352,7 @@ def run(
         interface=interface,
         cli_binary=cli_binary,
         cli_subcommand=cli_subcommand,
+        cli_aux_commands=cli_aux_commands,
         sdk_module=sdk_module,
         compute_deny=compute_deny,
         instance_allowlist=instance_allowlist,
