@@ -82,11 +82,14 @@ def generate(seed: int, out: Path) -> dict:
 
     # batches, delivered OUT OF ORDER: batch_1 contains the CORRECTIONS (latest
     # data, delivered first), batches 2+3 the original load split in two.
-    halves = np.array_split(base.sample(frac=1.0, random_state=seed), 2)
+    # Split the shuffled base in two with iloc (NOT np.array_split, which returns
+    # numpy ndarrays — not DataFrames — under pandas 3.0, breaking pd.concat).
+    shuffled = base.sample(frac=1.0, random_state=seed)
+    mid = len(shuffled) // 2
     batches = {
         "batch_1.csv": corrections.sample(frac=1.0, random_state=seed),
-        "batch_2.csv": halves[0],
-        "batch_3.csv": halves[1],
+        "batch_2.csv": shuffled.iloc[:mid],
+        "batch_3.csv": shuffled.iloc[mid:],
     }
 
     # --- gates ---------------------------------------------------------------

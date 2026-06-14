@@ -72,13 +72,17 @@ def generate(seed: int, out: Path) -> dict:
     )
 
     # The emitted view: ISO strings, with a seeded subset as epoch-milliseconds.
+    # Force ns resolution before the int cast: `astype("int64")` yields the
+    # column's UNIT-many ticks since epoch, and pandas 3.0 defaults datetimes to
+    # microseconds (2.x used nanoseconds). Pinning to ns makes `// 10**6` reliably
+    # produce milliseconds on both — else under pandas 3.0 the "epoch-ms" values
+    # come out as seconds and every consumer misparses them to ~1970.
     emit = truth_df.copy()
     iso = emit["event_time"].dt.strftime("%Y-%m-%dT%H:%M:%SZ")
     epoch_idx = rng.choice(n, int(n * EPOCH_FRACTION), replace=False)
     mixed = iso.astype(object)
-    mixed.iloc[epoch_idx] = (emit["event_time"].iloc[epoch_idx].astype("int64") // 10**6).astype(
-        str
-    )
+    ev_ns = emit["event_time"].iloc[epoch_idx].dt.as_unit("ns").astype("int64")
+    mixed.iloc[epoch_idx] = (ev_ns // 10**6).astype(str)
     emit["event_time"] = mixed
 
     split = n - OVERLAP - rng.integers(150, 250)
@@ -164,18 +168,27 @@ def generate(seed: int, out: Path) -> dict:
 
 
 def _parse_mixed(s: pd.Series) -> pd.Series:
-    """ISO strings + epoch-millisecond strings → tz-aware timestamps."""
-    out = pd.to_datetime(s.where(~s.str.fullmatch(r"\d+"), None), utc=True)
+    """ISO strings + epoch-millisecond strings → tz-aware timestamps.
+
+    Both branches are forced to nanosecond resolution before combining: pandas
+    3.0 defaults ISO parses to microsecond and `unit="ms"` to millisecond, and a
+    cross-resolution `fillna` reinterprets the raw integers (an epoch-ms value
+    lands as ~1970). Aligning the unit keeps this correct on pandas 2.x and 3.x.
+    """
+    out = pd.to_datetime(s.where(~s.str.fullmatch(r"\d+"), None), utc=True).dt.as_unit("ns")
     epoch = pd.to_datetime(
         pd.to_numeric(s.where(s.str.fullmatch(r"\d+"), None)), unit="ms", utc=True
-    )
+    ).dt.as_unit("ns")
     return out.fillna(epoch)
 
 
 def _parse_naive(s: pd.Series) -> pd.Series:
-    """The naive load: epoch values parsed as if they were nanosecond ints."""
-    out = pd.to_datetime(s.where(~s.str.fullmatch(r"\d+"), None), utc=True)
-    naive = pd.to_datetime(pd.to_numeric(s.where(s.str.fullmatch(r"\d+"), None)), utc=True)
+    """The naive load: epoch values parsed as if they were nanosecond ints.
+    Units aligned to ns before combining (same pandas-3.0 reason as _parse_mixed)."""
+    out = pd.to_datetime(s.where(~s.str.fullmatch(r"\d+"), None), utc=True).dt.as_unit("ns")
+    naive = pd.to_datetime(
+        pd.to_numeric(s.where(s.str.fullmatch(r"\d+"), None)), utc=True
+    ).dt.as_unit("ns")
     return out.fillna(naive)
 
 
