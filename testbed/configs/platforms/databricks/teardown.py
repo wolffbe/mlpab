@@ -44,6 +44,10 @@ import urllib.parse
 import urllib.request
 
 HOST = (os.environ.get("DATABRICKS_HOST") or "").rstrip("/")
+# DATABRICKS_HOST is commonly set scheme-less (e.g. dbc-xxxx.cloud.databricks.com);
+# the CLI/SDK tolerate that but urllib needs an explicit scheme, so add one.
+if HOST and "://" not in HOST:
+    HOST = "https://" + HOST
 TOKEN = os.environ.get("DATABRICKS_TOKEN") or ""
 
 # Never deleted, even when owned by the token user (default/system plumbing the

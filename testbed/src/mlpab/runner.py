@@ -246,12 +246,16 @@ def _verify_platform(
     script = interfaces.CONFIGS_DIR / platform / f"{phase}.py"
     if not script.exists():
         return True, ""
-    venv_py = run_dir / "venv" / "bin" / "python"
+    # Absolute paths: the subprocess runs with cwd=run_dir, so a venv-python path
+    # relative to the CURRENT cwd would resolve against run_dir and miss (the
+    # single-task form passes a relative run_dir). .absolute() does NOT follow the
+    # bin/python symlink out of the venv (unlike .resolve()).
+    venv_py = (run_dir / "venv" / "bin" / "python").absolute()
     py = str(venv_py) if venv_py.exists() else sys.executable
     verify_env = {k: v for k, v in env.items() if k not in ("MLPAB_API_LOG", "MLPAB_IFACE_SDK")}
     try:
         proc = subprocess.run(
-            [py, str(script), "verify"],
+            [py, str(script.absolute()), "verify"],
             cwd=str(run_dir),
             env=verify_env,
             stdin=subprocess.DEVNULL,
@@ -619,8 +623,19 @@ def run(spec: RunSpec) -> results.Row:
 
         # Grade by replaying the instance's assertion suite against the
         # platform's read paths (or the local deliverable for platform `none`).
-        # Runs BEFORE venv teardown: the grader uses the run venv's python,
-        # whose platform client was installed from the committed pinned wheel.
+        # Runs BEFORE venv teardown, with the run venv's python.
+        #
+        # The checker adapter reads the deliverable back through the platform's
+        # PYTHON client (databricks-sdk, boto3, …). An SDK-interface run venv
+        # already has it; a CLI/MCP venv does NOT, so install it now — after the
+        # agent has finished, so its interface purity stands, and the venv is torn
+        # down right after. Idempotent (a no-op when already present).
+        if spec.platform in evals_provider.ADAPTERS and spec.interface != "sdk":
+            try:
+                interfaces.install_for_grader(spec.platform, run_dir, venv_python)
+            except Exception as e:
+                print(f"[mlpab] grader-deps install failed for {spec.platform}: {e}",
+                      file=sys.stderr)
         try:
             grading = evals_provider.grade(spec.task, run_dir, spec.platform, venv_python)
         except Exception as e:

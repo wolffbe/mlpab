@@ -335,6 +335,23 @@ def keys_for(platform: str, interface: str) -> dict[str, str]:
     return out
 
 
+def optional_keys(platform: str, interface: str) -> set[str]:
+    """Declared keys flagged `optional: true` in the manifest's `keys:` list
+    (as `{name: NAME, optional: true}`). These are still resolved and injected
+    into the agent env when a value exists, but their ABSENCE does not fail the
+    availability gate — used for values a platform `serve:`/setup step provisions
+    at run time (e.g. SAGEMAKER_ROLE_ARN, which setup.py creates and exports)."""
+    if platform == "none" and interface == "none":
+        return set()
+    raw = load_manifest(platform, interface).get("keys") or {}
+    out: set[str] = set()
+    if isinstance(raw, list):
+        for entry in raw:
+            if isinstance(entry, dict) and entry.get("name") and entry.get("optional"):
+                out.add(str(entry["name"]))
+    return out
+
+
 def _resolved_keys(
     platform: str, interface: str, env: dict[str, str] | None = None
 ) -> dict[str, str]:
@@ -349,9 +366,15 @@ def _resolved_keys(
 def missing_keys(platform: str, interface: str, env: dict[str, str] | None = None) -> list[str]:
     """Declared credential keys with no value (neither in the manifest nor the
     env) — the cheap, no-network 'are creds present?' check used by the
-    session-start availability gate."""
+    session-start availability gate. Keys flagged `optional` are excluded —
+    a platform setup step provisions them at run time."""
     base = env if env is not None else os.environ
-    return [k for k, v in keys_for(platform, interface).items() if not (v or base.get(k, ""))]
+    optional = optional_keys(platform, interface)
+    return [
+        k
+        for k, v in keys_for(platform, interface).items()
+        if k not in optional and not (v or base.get(k, ""))
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -392,6 +415,24 @@ def variant_for(platform: str, interface: str) -> str:
         return ""
     _check_known(platform, interface)
     return _compute_hash(platform, interface)
+
+
+def install_for_grader(platform: str, run_dir: Path, venv_python: Path) -> None:
+    """Install the platform's READ client (the checker adapter in
+    evals/adapters/<platform>.py imports it) into the run venv, for grading runs
+    whose interface (cli/mcp) didn't already provide it.
+
+    Reuses the platform's SDK-interface `runtime_install` — that IS the python
+    client the adapter reads through (e.g. `databricks-sdk`, or the hopsworks
+    wheel). Idempotent: pip reports already-satisfied installs as no-ops, so an
+    SDK-interface run (client already present) costs nothing. Called AFTER the
+    agent finishes, so it never relaxes the agent's interface-only confinement.
+    """
+    steps = _resolved_config(platform, "sdk").get("runtime_install") or []
+    if steps:
+        _run_install(
+            steps, cwd=run_dir, venv_python=venv_python, interface_dir=bin_dir(platform, "sdk")
+        )
 
 
 def setup(
@@ -746,6 +787,7 @@ def _preflight_impl(
     # (interfaces.login_status). check_login=True (single-task form) also checks
     # login here.
     keys = keys_for(platform, interface)
+    optional = optional_keys(platform, interface)
     base_env = dict(env) if env is not None else dict(os.environ)
     merged_env = dict(base_env)
     missing = []
@@ -753,7 +795,7 @@ def _preflight_impl(
         val = declared or base_env.get(k, "")
         if val:
             merged_env[k] = val
-        else:
+        elif k not in optional:
             missing.append(k)
 
     manifest = load_manifest(platform, interface)

@@ -47,6 +47,31 @@ class KeysTests(InterfaceTestBase):
         got = interfaces._resolved_keys("svc", "sdk", env={"API_KEY": "from-env"})
         self.assertEqual(got, {"API_KEY": "from-env"})
 
+    def test_optional_key_excluded_from_missing(self):
+        # An `optional: true` key is declared (so it's resolved/injected when a
+        # value exists) but its absence must NOT trip the availability gate — a
+        # platform setup step provisions it at run time (e.g. SAGEMAKER_ROLE_ARN).
+        self.write_manifest(
+            "svc",
+            "sdk",
+            "keys:\n  - API_KEY\n  - {name: ROLE_ARN, optional: true}\nprompt: hi\n",
+        )
+        self.assertEqual(interfaces.optional_keys("svc", "sdk"), {"ROLE_ARN"})
+        self.assertEqual(interfaces.keys_for("svc", "sdk"), {"API_KEY": "", "ROLE_ARN": ""})
+        # API_KEY present in env, ROLE_ARN absent → nothing missing.
+        self.assertEqual(
+            interfaces.missing_keys("svc", "sdk", env={"API_KEY": "x"}), []
+        )
+        # API_KEY absent → only the required key is reported.
+        self.assertEqual(interfaces.missing_keys("svc", "sdk", env={}), ["API_KEY"])
+
+    def test_optional_key_still_injected_when_present(self):
+        self.write_manifest(
+            "svc", "sdk", "keys:\n  - {name: ROLE_ARN, optional: true}\nprompt: hi\n"
+        )
+        got = interfaces._resolved_keys("svc", "sdk", env={"ROLE_ARN": "arn:aws:iam::1:role/x"})
+        self.assertEqual(got, {"ROLE_ARN": "arn:aws:iam::1:role/x"})
+
 
 class AccountingFieldsTests(InterfaceTestBase):
     """cli_command / sdk_module drive cli_calls / sdk_calls accounting."""
