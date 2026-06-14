@@ -33,6 +33,7 @@ from seed-derived sub-seeds. Naive variants (gates assert they differ from
 truth): reporting base_eval_loss as eval_loss (no_finetune — the agent
 skipped the fine-tune) and training for only 40 iterations (undertrained).
 """
+
 from __future__ import annotations
 
 import argparse
@@ -53,21 +54,21 @@ RANK = 4
 LEARNING_RATE = 2.0
 ITERATIONS = 400
 ADAPTER_SCALE = 0.5
-N_BASE = 60_000      # base ("pre-training") corpus — consumed in-generator only
+N_BASE = 60_000  # base ("pre-training") corpus — consumed in-generator only
 N_FINETUNE = 30_000  # data/finetune.txt
-N_EVAL = 8_000       # data/eval.txt
+N_EVAL = 8_000  # data/eval.txt
 MIN_IMPROVEMENT = 0.05  # pre-rounding: base_eval_loss - eval_loss must exceed this
-TIE_MARGIN = 1e-6       # min distance of a pre-rounding loss from a 4-dp boundary
+TIE_MARGIN = 1e-6  # min distance of a pre-rounding loss from a 4-dp boundary
 MAX_RESAMPLES = 64
-JOB_BASE = "ftjob"      # per-instance: f"{JOB_BASE}{instance_suffix(seed)}"
+JOB_BASE = "ftjob"  # per-instance: f"{JOB_BASE}{instance_suffix(seed)}"
 MODEL_BASE = "ftmodel"  # per-instance: f"{MODEL_BASE}{instance_suffix(seed)}"
 VERSION = 1
 
 VARIANT_DIAGNOSIS = {
     "no_finetune": "eval_loss is the UNADAPTED base model's loss — the "
-                   "fine-tune was skipped (or its output ignored)",
+    "fine-tune was skipped (or its output ignored)",
     "undertrained": "eval_loss comes from an undertrained adapter "
-                    "(40 iterations instead of the script's 400)",
+    "(40 iterations instead of the script's 400)",
 }
 
 FINETUNE_SCRIPT = '''"""Provided fine-tuning script — deterministic LoRA-style adapter update.
@@ -146,6 +147,7 @@ class GateError(RuntimeError):
 
 # --- the identical fine-tuning math, reimplemented inline (see FINETUNE_SCRIPT) ---
 
+
 def _bigram_counts(idx: np.ndarray) -> np.ndarray:
     counts = np.zeros((len(VOCAB), len(VOCAB)), dtype=float)
     np.add.at(counts, (idx[:-1], idx[1:]), 1.0)
@@ -158,8 +160,7 @@ def _cross_entropy(logits: np.ndarray, counts: np.ndarray) -> float:
     return float(-(counts * logp).sum() / counts.sum())
 
 
-def _finetune(base_logits: np.ndarray, ft_counts: np.ndarray,
-              iterations: int) -> np.ndarray:
+def _finetune(base_logits: np.ndarray, ft_counts: np.ndarray, iterations: int) -> np.ndarray:
     """Adapter training — expression-for-expression the script's loop, so the
     inline truth and the emitted script are bit-identical."""
     n_vocab = base_logits.shape[0]
@@ -204,7 +205,7 @@ def _world(seed: int, attempt: int):
     n_vocab = len(VOCAB)
     base_trans = rng.dirichlet(np.full(n_vocab, 0.5), size=n_vocab)
     other = rng.dirichlet(np.full(n_vocab, 0.5), size=n_vocab)
-    shifted = 0.3 * base_trans + 0.7 * other       # the SHIFTED distribution
+    shifted = 0.3 * base_trans + 0.7 * other  # the SHIFTED distribution
     shifted = shifted / shifted.sum(axis=1, keepdims=True)
     base_idx = _sample_chain(rng, base_trans, N_BASE)
     ft_idx = _sample_chain(rng, shifted, N_FINETUNE)
@@ -226,10 +227,10 @@ def generate(seed: int, out: Path) -> dict:
         ft_counts = _bigram_counts(ft_idx)
         eval_counts = _bigram_counts(eval_idx)
         base_loss = _cross_entropy(base_logits, eval_counts)
-        truth_loss = _cross_entropy(_finetune(base_logits, ft_counts, ITERATIONS),
-                                    eval_counts)
-        under_loss = _cross_entropy(_finetune(base_logits, ft_counts, ITERATIONS // 10),
-                                    eval_counts)
+        truth_loss = _cross_entropy(_finetune(base_logits, ft_counts, ITERATIONS), eval_counts)
+        under_loss = _cross_entropy(
+            _finetune(base_logits, ft_counts, ITERATIONS // 10), eval_counts
+        )
         if base_loss - truth_loss < MIN_IMPROVEMENT:
             continue  # fine-tuning must measurably help
         if any(_near_tie(x) for x in (truth_loss, base_loss, under_loss)):
@@ -240,10 +241,8 @@ def generate(seed: int, out: Path) -> dict:
 
     metrics = {"eval_loss": round(truth_loss, 4), "base_eval_loss": round(base_loss, 4)}
     variant_metrics = {
-        "no_finetune": {"eval_loss": round(base_loss, 4),
-                        "base_eval_loss": round(base_loss, 4)},
-        "undertrained": {"eval_loss": round(under_loss, 4),
-                         "base_eval_loss": round(base_loss, 4)},
+        "no_finetune": {"eval_loss": round(base_loss, 4), "base_eval_loss": round(base_loss, 4)},
+        "undertrained": {"eval_loss": round(under_loss, 4), "base_eval_loss": round(base_loss, 4)},
     }
     for name, vm in variant_metrics.items():
         if vm["eval_loss"] == metrics["eval_loss"]:
@@ -254,8 +253,7 @@ def generate(seed: int, out: Path) -> dict:
         shutil.rmtree(out)
     (out / "data").mkdir(parents=True)
     (out / "solution").mkdir()
-    np.savez(out / "data" / "base_model.npz",
-             logits=base_logits, vocab=np.array(VOCAB))
+    np.savez(out / "data" / "base_model.npz", logits=base_logits, vocab=np.array(VOCAB))
     (out / "data" / "finetune.txt").write_text("".join(VOCAB[i] for i in ft_idx))
     (out / "data" / "eval.txt").write_text("".join(VOCAB[i] for i in eval_idx))
     (out / "data" / "finetune_model.py").write_text(FINETUNE_SCRIPT)
@@ -265,15 +263,21 @@ def generate(seed: int, out: Path) -> dict:
     with tempfile.TemporaryDirectory(prefix="mlpab-finetune-gate-") as td:
         for f in ("base_model.npz", "finetune.txt", "eval.txt", "finetune_model.py"):
             shutil.copy(out / "data" / f, Path(td) / f)
-        proc = subprocess.run([sys.executable, "finetune_model.py"], cwd=td,
-                              capture_output=True, text=True, timeout=300)
+        proc = subprocess.run(
+            [sys.executable, "finetune_model.py"],
+            cwd=td,
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
         if proc.returncode != 0:
-            raise GateError(f"emitted finetune_model.py failed (seed={seed}): "
-                            f"{proc.stderr[-500:]}")
+            raise GateError(f"emitted finetune_model.py failed (seed={seed}): {proc.stderr[-500:]}")
         got = json.loads((Path(td) / "metrics.json").read_text())
         if got != metrics:
-            raise GateError(f"emitted finetune_model.py does not reproduce the "
-                            f"truth metrics (seed={seed}): {got} != {metrics}")
+            raise GateError(
+                f"emitted finetune_model.py does not reproduce the "
+                f"truth metrics (seed={seed}): {got} != {metrics}"
+            )
 
     (out / "prompt.txt").write_text(
         "The directory data/ contains a base character-level language model "
@@ -296,15 +300,19 @@ def generate(seed: int, out: Path) -> dict:
         '"base_eval_loss": <metrics.json base_eval_loss>}\n'
     )
     truth = {
-        "family": "llm_finetuning", "seed": seed,
-        "job_name": job_name, "model_name": model_name, "version": VERSION,
+        "family": "llm_finetuning",
+        "seed": seed,
+        "job_name": job_name,
+        "model_name": model_name,
+        "version": VERSION,
         "metrics": metrics,
         "variant_metrics": variant_metrics,
         "variant_diagnosis": VARIANT_DIAGNOSIS,
     }
     (out / "solution" / "truth.json").write_text(json.dumps(truth, indent=2))
     (out / "instance.json").write_text(
-        json.dumps({"family": "llm_finetuning", "seed": seed}, indent=2))
+        json.dumps({"family": "llm_finetuning", "seed": seed}, indent=2)
+    )
 
     # --- gates (call the grade fn directly — no platform needed) ----------------
     reference = {"job_name": job_name, "model_name": model_name, **metrics}
@@ -313,13 +321,15 @@ def generate(seed: int, out: Path) -> dict:
     no_ft = {**reference, "eval_loss": metrics["base_eval_loss"]}
     rep = grade_answers(out, "none", no_ft)
     if rep["success"] or rep.get("diagnostic") != VARIANT_DIAGNOSIS["no_finetune"]:
-        raise GateError(f"no_finetune answers not rejected with their diagnosis "
-                        f"(seed={seed}): {rep}")
+        raise GateError(
+            f"no_finetune answers not rejected with their diagnosis (seed={seed}): {rep}"
+        )
     under = {**reference, "eval_loss": variant_metrics["undertrained"]["eval_loss"]}
     rep = grade_answers(out, "none", under)
     if rep["success"] or rep.get("diagnostic") != VARIANT_DIAGNOSIS["undertrained"]:
-        raise GateError(f"undertrained answers not rejected with their diagnosis "
-                        f"(seed={seed}): {rep}")
+        raise GateError(
+            f"undertrained answers not rejected with their diagnosis (seed={seed}): {rep}"
+        )
     wrong_name = {**reference, "model_name": f"{model_name}final"}
     if grade_answers(out, "none", wrong_name)["success"]:
         raise GateError(f"wrong-name answers pass the grade fn (seed={seed})")
@@ -336,8 +346,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.selftest:
         for seed in (1, 2, 3):
             meta = generate(seed, Path(f"/tmp/mlpab-llm-finetuning-selftest/{seed}"))
-            print(f"[llm_finetuning] seed={seed} metrics={meta['metrics']} gates=OK "
-                  "(incl. subprocess reproduction)")
+            print(
+                f"[llm_finetuning] seed={seed} metrics={meta['metrics']} gates=OK "
+                "(incl. subprocess reproduction)"
+            )
         return 0
     if not args.out:
         ap.error("--out is required (or use --selftest)")

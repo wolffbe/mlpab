@@ -15,6 +15,7 @@ Ground truth by construction: the generator seeded the violations. Naive
 variants (gates assert they differ): ingesting everything; applying only the
 null rule (range + enum violations kept).
 """
+
 from __future__ import annotations
 
 import argparse
@@ -31,9 +32,9 @@ from evals.common import canonicalize, digest, instance_suffix
 
 ORIGIN = pd.Timestamp("2026-02-01", tz="UTC")
 N_ROWS = 700
-NULL_FRACTION = 0.03    # nulls in amount
-RANGE_FRACTION = 0.02   # amounts outside [0, 10000]
-ENUM_FRACTION = 0.02    # categories outside the enum
+NULL_FRACTION = 0.03  # nulls in amount
+RANGE_FRACTION = 0.02  # amounts outside [0, 10000]
+ENUM_FRACTION = 0.02  # categories outside the enum
 TABLE_BASE = "events"  # per-instance: f"{TABLE_BASE}{instance_suffix(seed)}"
 CATEGORIES = ["grocery", "travel", "salary", "rent", "other"]
 BAD_CATEGORIES = ["misc", "uncategorized", "promo??", "REFUND"]
@@ -59,14 +60,18 @@ def generate(seed: int, out: Path) -> dict:
     rng = np.random.default_rng(seed)
     table = TABLE_BASE + instance_suffix(seed)
     n = N_ROWS
-    df = pd.DataFrame({
-        "row_id": [f"R{i:05d}" for i in range(n)],
-        "account_id": [f"A{int(a):04d}" for a in rng.integers(0, 150, n)],
-        "event_time": [(ORIGIN + pd.Timedelta(minutes=int(m))).floor("s").strftime(
-            "%Y-%m-%dT%H:%M:%SZ") for m in np.sort(rng.integers(0, 45 * 24 * 60, n))],
-        "amount": np.round(rng.uniform(1.0, 9500.0, n), 2),
-        "category": rng.choice(CATEGORIES, n),
-    })
+    df = pd.DataFrame(
+        {
+            "row_id": [f"R{i:05d}" for i in range(n)],
+            "account_id": [f"A{int(a):04d}" for a in rng.integers(0, 150, n)],
+            "event_time": [
+                (ORIGIN + pd.Timedelta(minutes=int(m))).floor("s").strftime("%Y-%m-%dT%H:%M:%SZ")
+                for m in np.sort(rng.integers(0, 45 * 24 * 60, n))
+            ],
+            "amount": np.round(rng.uniform(1.0, 9500.0, n), 2),
+            "category": rng.choice(CATEGORIES, n),
+        }
+    )
 
     # Seed disjoint violation sets at known row indices.
     n_null = int(n * NULL_FRACTION)
@@ -78,14 +83,15 @@ def generate(seed: int, out: Path) -> dict:
     df.loc[null_idx, "amount"] = np.nan
     low = rng.uniform(-900.0, -1.0, n_range)
     high = rng.uniform(AMOUNT_MAX + 1.0, 25000.0, n_range)
-    df.loc[range_idx, "amount"] = np.round(
-        np.where(rng.uniform(size=n_range) < 0.5, low, high), 2)
+    df.loc[range_idx, "amount"] = np.round(np.where(rng.uniform(size=n_range) < 0.5, low, high), 2)
     df.loc[enum_idx, "category"] = rng.choice(BAD_CATEGORIES, n_enum)
 
     rejected_ids = sorted(df.loc[np.sort(bad_idx), "row_id"].tolist())
-    clean_mask = (df["amount"].notna()
-                  & df["amount"].between(AMOUNT_MIN, AMOUNT_MAX)
-                  & df["category"].isin(CATEGORIES))
+    clean_mask = (
+        df["amount"].notna()
+        & df["amount"].between(AMOUNT_MIN, AMOUNT_MAX)
+        & df["category"].isin(CATEGORIES)
+    )
     truth = canonicalize(df.loc[clean_mask], SPEC)
 
     # --- gates ---------------------------------------------------------------
@@ -100,9 +106,12 @@ def generate(seed: int, out: Path) -> dict:
             raise GateError(f"variant {name!r} matches truth (seed={seed})")
     # reference: apply all 3 documented rules == truth (independent re-read path)
     ref_df = pd.read_csv(io.StringIO(df.to_csv(index=False)))
-    ref_mask = (ref_df["amount"].notna()
-                & (ref_df["amount"] >= AMOUNT_MIN) & (ref_df["amount"] <= AMOUNT_MAX)
-                & ref_df["category"].isin(CATEGORIES))
+    ref_mask = (
+        ref_df["amount"].notna()
+        & (ref_df["amount"] >= AMOUNT_MIN)
+        & (ref_df["amount"] <= AMOUNT_MAX)
+        & ref_df["category"].isin(CATEGORIES)
+    )
     if digest(canonicalize(ref_df.loc[ref_mask], SPEC)) != digest(truth):
         raise GateError(f"reference clean load disagrees with truth (seed={seed})")
 
@@ -135,9 +144,13 @@ def generate(seed: int, out: Path) -> dict:
         '    {"rejected": ["<row_id>", ...]}\n'
     )
     meta = {
-        "family": "validate", "seed": seed,
-        "table_name": table, "table_version": 1,
-        "spec": SPEC, "row_count": len(truth), "digest": digest(truth),
+        "family": "validate",
+        "seed": seed,
+        "table_name": table,
+        "table_version": 1,
+        "spec": SPEC,
+        "row_count": len(truth),
+        "digest": digest(truth),
         "record_ids": truth["row_id"].tolist(),
         "rejected_ids": rejected_ids,
         "variant_digests": {k: digest(v) for k, v in variants.items()},
@@ -158,8 +171,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.selftest:
         for seed in (1, 2, 3):
             meta = generate(seed, Path(f"/tmp/mlpab-validate-selftest/{seed}"))
-            print(f"[validate] seed={seed} clean_rows={meta['row_count']} "
-                  f"rejected={len(meta['rejected_ids'])} gates=OK")
+            print(
+                f"[validate] seed={seed} clean_rows={meta['row_count']} "
+                f"rejected={len(meta['rejected_ids'])} gates=OK"
+            )
         return 0
     if not args.out:
         ap.error("--out is required (or use --selftest)")

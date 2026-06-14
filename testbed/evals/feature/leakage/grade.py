@@ -3,6 +3,7 @@
 Usage:
     python -m evals.feature.leakage.grade --instance <dir> --answers submission/answers.json
 """
+
 from __future__ import annotations
 
 import json
@@ -17,20 +18,31 @@ def grade(instance_dir: Path, answers: dict) -> dict:
     asserts: list[dict] = []
 
     def check(name, ok, detail=""):
-        asserts.append({"name": name, "passed": bool(ok),
-                        **({"detail": detail} if detail and not ok else {})})
+        asserts.append(
+            {"name": name, "passed": bool(ok), **({"detail": detail} if detail and not ok else {})}
+        )
         return bool(ok)
 
-    a1 = check("A1_answers_present",
-               isinstance(answers, dict) and "feature" in answers,
-               "answers.json must contain 'feature'")
+    a1 = check(
+        "A1_answers_present",
+        isinstance(answers, dict) and "feature" in answers,
+        "answers.json must contain 'feature'",
+    )
     a2 = False
     if a1:
-        a2 = check("A2_feature", str(answers["feature"]).strip() == truth["feature"],
-                   f"got {answers['feature']!r}, leaky feature differs")
-    return {"family": "leakage", "seed": truth["seed"], "success": a1 and a2,
-            "asserts_passed": sum(a["passed"] for a in asserts),
-            "asserts_total": len(asserts), "asserts": asserts}
+        a2 = check(
+            "A2_feature",
+            str(answers["feature"]).strip() == truth["feature"],
+            f"got {answers['feature']!r}, leaky feature differs",
+        )
+    return {
+        "family": "leakage",
+        "seed": truth["seed"],
+        "success": a1 and a2,
+        "asserts_passed": sum(a["passed"] for a in asserts),
+        "asserts_total": len(asserts),
+        "asserts": asserts,
+    }
 
 
 def main(argv=None) -> int:

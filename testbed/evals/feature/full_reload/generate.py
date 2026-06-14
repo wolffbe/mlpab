@@ -19,6 +19,7 @@ assert they differ): merging instead of reloading (retired rows survive);
 keeping the old column name for the balance (caught by A1_columns; its digest
 is precomputed for diagnosis).
 """
+
 from __future__ import annotations
 
 import argparse
@@ -35,14 +36,38 @@ from evals.common import canonicalize, digest, instance_suffix
 ORIGIN_OLD = pd.Timestamp("2026-01-15", tz="UTC")
 ORIGIN_NEW = pd.Timestamp("2026-04-01", tz="UTC")
 N_OLD = 180
-N_RETIRED = (25, 40)     # seeded range of retired old row_ids
-N_NEW = (30, 50)         # seeded range of newly added row_ids
+N_RETIRED = (25, 40)  # seeded range of retired old row_ids
+N_NEW = (30, 50)  # seeded range of newly added row_ids
 TABLE_BASE = "customers"  # per-instance: f"{TABLE_BASE}{instance_suffix(seed)}"
 CURRENCIES = ["EUR", "USD", "GBP", "SEK"]
-FIRST = ["Ada", "Grace", "Alan", "Edsger", "Barbara", "Donald", "Margaret", "John",
-         "Radia", "Vint", "Tim", "Frances"]
-LAST = ["Lovelace", "Hopper", "Turing", "Dijkstra", "Liskov", "Knuth", "Hamilton",
-        "McCarthy", "Perlman", "Cerf", "Berners-Lee", "Allen"]
+FIRST = [
+    "Ada",
+    "Grace",
+    "Alan",
+    "Edsger",
+    "Barbara",
+    "Donald",
+    "Margaret",
+    "John",
+    "Radia",
+    "Vint",
+    "Tim",
+    "Frances",
+]
+LAST = [
+    "Lovelace",
+    "Hopper",
+    "Turing",
+    "Dijkstra",
+    "Liskov",
+    "Knuth",
+    "Hamilton",
+    "McCarthy",
+    "Perlman",
+    "Cerf",
+    "Berners-Lee",
+    "Allen",
+]
 
 SPEC = {  # schema B — the graded version-2 table
     "columns": ["row_id", "full_name", "balance", "currency", "updated_at"],
@@ -67,8 +92,10 @@ class GateError(RuntimeError):
 
 
 def _names(rng: np.random.Generator, n: int) -> list[str]:
-    return [f"{FIRST[int(i)]} {LAST[int(j)]}"
-            for i, j in zip(rng.integers(0, len(FIRST), n), rng.integers(0, len(LAST), n))]
+    return [
+        f"{FIRST[int(i)]} {LAST[int(j)]}"
+        for i, j in zip(rng.integers(0, len(FIRST), n), rng.integers(0, len(LAST), n))
+    ]
 
 
 def generate(seed: int, out: Path) -> dict:
@@ -76,13 +103,19 @@ def generate(seed: int, out: Path) -> dict:
     table = TABLE_BASE + instance_suffix(seed)
 
     # Schema A — the initial export.
-    old = pd.DataFrame({
-        "row_id": [f"C{i:05d}" for i in range(N_OLD)],
-        "name": _names(rng, N_OLD),
-        "balance_eur": np.round(rng.uniform(-2000.0, 50000.0, N_OLD), 2),
-        "updated_at": [(ORIGIN_OLD + pd.Timedelta(minutes=int(m))).floor("s").strftime(
-            "%Y-%m-%dT%H:%M:%SZ") for m in np.sort(rng.integers(0, 30 * 24 * 60, N_OLD))],
-    })
+    old = pd.DataFrame(
+        {
+            "row_id": [f"C{i:05d}" for i in range(N_OLD)],
+            "name": _names(rng, N_OLD),
+            "balance_eur": np.round(rng.uniform(-2000.0, 50000.0, N_OLD), 2),
+            "updated_at": [
+                (ORIGIN_OLD + pd.Timedelta(minutes=int(m)))
+                .floor("s")
+                .strftime("%Y-%m-%dT%H:%M:%SZ")
+                for m in np.sort(rng.integers(0, 30 * 24 * 60, N_OLD))
+            ],
+        }
+    )
 
     # Schema B — full re-export: every surviving row re-issued with new values,
     # some old ids retired, some new ids added.
@@ -92,14 +125,24 @@ def generate(seed: int, out: Path) -> dict:
     surviving = [r for r in old["row_id"] if r not in retired]
     ids = surviving + [f"C{i:05d}" for i in range(N_OLD, N_OLD + n_added)]
     n = len(ids)
-    new = pd.DataFrame({
-        "row_id": ids,
-        "full_name": _names(rng, n),
-        "balance": np.round(rng.uniform(-2000.0, 50000.0, n), 2),
-        "currency": rng.choice(CURRENCIES, n),
-        "updated_at": [(ORIGIN_NEW + pd.Timedelta(minutes=int(m))).floor("s").strftime(
-            "%Y-%m-%dT%H:%M:%SZ") for m in np.sort(rng.integers(0, 7 * 24 * 60, n))],
-    }).sample(frac=1.0, random_state=seed).reset_index(drop=True)
+    new = (
+        pd.DataFrame(
+            {
+                "row_id": ids,
+                "full_name": _names(rng, n),
+                "balance": np.round(rng.uniform(-2000.0, 50000.0, n), 2),
+                "currency": rng.choice(CURRENCIES, n),
+                "updated_at": [
+                    (ORIGIN_NEW + pd.Timedelta(minutes=int(m)))
+                    .floor("s")
+                    .strftime("%Y-%m-%dT%H:%M:%SZ")
+                    for m in np.sort(rng.integers(0, 7 * 24 * 60, n))
+                ],
+            }
+        )
+        .sample(frac=1.0, random_state=seed)
+        .reset_index(drop=True)
+    )
 
     truth = canonicalize(new, SPEC)
 
@@ -107,12 +150,16 @@ def generate(seed: int, out: Path) -> dict:
     # merged: retired old rows survive, naively mapped into schema B (the
     # natural-but-wrong migration: name -> full_name, balance_eur -> balance,
     # currency assumed EUR), new rows win on overlapping ids.
-    stale = old[old["row_id"].isin(retired)].rename(
-        columns={"name": "full_name", "balance_eur": "balance"}).assign(currency="EUR")
+    stale = (
+        old[old["row_id"].isin(retired)]
+        .rename(columns={"name": "full_name", "balance_eur": "balance"})
+        .assign(currency="EUR")
+    )
     variants = {
         "merged": canonicalize(pd.concat([new, stale], ignore_index=True), SPEC),
         "old_schema_kept": canonicalize(
-            new.rename(columns={"balance": "balance_eur"}), SPEC_OLD_NAME),
+            new.rename(columns={"balance": "balance_eur"}), SPEC_OLD_NAME
+        ),
     }
     for name, v in variants.items():
         if digest(v) == digest(truth):
@@ -162,9 +209,13 @@ def generate(seed: int, out: Path) -> dict:
         "(online/real-time access), where the platform distinguishes the two.\n"
     )
     meta = {
-        "family": "full_reload", "seed": seed,
-        "table_name": table, "table_version": 2,
-        "spec": SPEC, "row_count": len(truth), "digest": digest(truth),
+        "family": "full_reload",
+        "seed": seed,
+        "table_name": table,
+        "table_version": 2,
+        "spec": SPEC,
+        "row_count": len(truth),
+        "digest": digest(truth),
         "record_ids": truth["row_id"].tolist(),
         "retired_ids": sorted(retired),
         "variant_digests": {k: digest(v) for k, v in variants.items()},
@@ -173,7 +224,8 @@ def generate(seed: int, out: Path) -> dict:
     }
     (out / "solution" / "truth.json").write_text(json.dumps(meta, indent=2))
     (out / "instance.json").write_text(
-        json.dumps({"family": "full_reload", "seed": seed}, indent=2))
+        json.dumps({"family": "full_reload", "seed": seed}, indent=2)
+    )
     return meta
 
 
@@ -186,8 +238,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.selftest:
         for seed in (1, 2, 3):
             meta = generate(seed, Path(f"/tmp/mlpab-full_reload-selftest/{seed}"))
-            print(f"[full_reload] seed={seed} rows={meta['row_count']} "
-                  f"retired={len(meta['retired_ids'])} gates=OK")
+            print(
+                f"[full_reload] seed={seed} rows={meta['row_count']} "
+                f"retired={len(meta['retired_ids'])} gates=OK"
+            )
         return 0
     if not args.out:
         ap.error("--out is required (or use --selftest)")

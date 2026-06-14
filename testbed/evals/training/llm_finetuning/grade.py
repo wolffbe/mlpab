@@ -15,6 +15,7 @@ as a failure, since not every registry can return metrics). Adapter `none`
 Usage:
     python -m evals.training.llm_finetuning.grade --instance <dir> --adapter <name|none>
 """
+
 from __future__ import annotations
 
 import json
@@ -36,8 +37,7 @@ def grade_answers(instance_dir: Path, adapter: str, answers: dict | None) -> dic
     diagnostic = None
 
     def check(name, ok, detail=""):
-        asserts.append({"name": name, "passed": bool(ok),
-                        **({"detail": detail} if detail else {})})
+        asserts.append({"name": name, "passed": bool(ok), **({"detail": detail} if detail else {})})
         return bool(ok)
 
     # --- A1: answers present with matching job/model names ----------------------
@@ -46,26 +46,33 @@ def grade_answers(instance_dir: Path, adapter: str, answers: dict | None) -> dic
     elif "_parse_error" in answers:
         check("A1_format", False, f"answers.json is not valid JSON: {answers['_parse_error']}")
     else:
-        missing = [k for k in ("job_name", "model_name", *METRIC_KEYS)
-                   if k not in answers]
+        missing = [k for k in ("job_name", "model_name", *METRIC_KEYS) if k not in answers]
         job_ok = str(answers.get("job_name", "")).strip() == truth["job_name"]
         model_ok = str(answers.get("model_name", "")).strip() == truth["model_name"]
-        problems = ([f"missing keys: {missing}"] if missing else []) + \
-                   ([f"expected job_name={truth['job_name']!r} "
-                     f"model_name={truth['model_name']!r}, "
-                     f"got job_name={answers.get('job_name')!r} "
-                     f"model_name={answers.get('model_name')!r}"]
-                    if not (job_ok and model_ok) else [])
+        problems = ([f"missing keys: {missing}"] if missing else []) + (
+            [
+                f"expected job_name={truth['job_name']!r} "
+                f"model_name={truth['model_name']!r}, "
+                f"got job_name={answers.get('job_name')!r} "
+                f"model_name={answers.get('model_name')!r}"
+            ]
+            if not (job_ok and model_ok)
+            else []
+        )
         check("A1_format", not problems, "; ".join(problems))
 
     # --- A2: answers metrics == the truth metrics exactly ------------------------
     if answers and "_parse_error" not in answers:
         want = truth["metrics"]
-        a2 = all(isinstance(answers.get(k), (int, float))
-                 and float(answers[k]) == float(want[k]) for k in METRIC_KEYS)
-        check("A2_metrics", a2,
-              "" if a2 else "eval_loss/base_eval_loss differ from the script's "
-                            "metrics.json")
+        a2 = all(
+            isinstance(answers.get(k), (int, float)) and float(answers[k]) == float(want[k])
+            for k in METRIC_KEYS
+        )
+        check(
+            "A2_metrics",
+            a2,
+            "" if a2 else "eval_loss/base_eval_loss differ from the script's metrics.json",
+        )
         if not a2 and isinstance(answers.get("eval_loss"), (int, float)):
             got = float(answers["eval_loss"])
             for vname, vm in truth.get("variant_metrics", {}).items():
@@ -77,20 +84,30 @@ def grade_answers(instance_dir: Path, adapter: str, answers: dict | None) -> dic
 
     # --- A3: job evidence on the platform ----------------------------------------
     if adapter == "none":
-        asserts.append({"name": "A3_job_exists", "passed": True,
-                        "detail": "no platform — job assert skipped"})
+        asserts.append(
+            {"name": "A3_job_exists", "passed": True, "detail": "no platform — job assert skipped"}
+        )
     else:
         job = state_checker(adapter).get_job(truth["job_name"])
         ok = bool(job.get("exists"))
-        detail = ", ".join(f"{k}={job[k]}" for k in ("kind", "scheduled", "last_run_state")
-                           if k in job)
-        check("A3_job_exists", ok,
-              detail if ok else f"job {truth['job_name']!r} not found on the platform: {job}")
+        detail = ", ".join(
+            f"{k}={job[k]}" for k in ("kind", "scheduled", "last_run_state") if k in job
+        )
+        check(
+            "A3_job_exists",
+            ok,
+            detail if ok else f"job {truth['job_name']!r} not found on the platform: {job}",
+        )
 
     # --- A4: registry entry exists on the platform --------------------------------
     if adapter == "none":
-        asserts.append({"name": "A4_registry_entry", "passed": True,
-                        "detail": "no platform — registry assert skipped"})
+        asserts.append(
+            {
+                "name": "A4_registry_entry",
+                "passed": True,
+                "detail": "no platform — registry assert skipped",
+            }
+        )
     else:
         m = state_checker(adapter).get_model(truth["model_name"], truth["version"])
         ok = bool(m.get("exists"))
@@ -100,13 +117,18 @@ def grade_answers(instance_dir: Path, adapter: str, answers: dict | None) -> dic
             if isinstance(platform_metrics, dict) and platform_metrics:
                 overlap = set(platform_metrics) & set(truth["metrics"])
                 if overlap:
-                    diffs = [k for k in overlap
-                             if abs(float(platform_metrics[k]) - float(truth["metrics"][k]))
-                             > METRIC_TOL]
-                    detail = ("platform metrics match on " + ", ".join(sorted(overlap))
-                              if not diffs else
-                              "platform metrics DIFFER on " + ", ".join(sorted(diffs))
-                              + " (informative — not a failure)")
+                    diffs = [
+                        k
+                        for k in overlap
+                        if abs(float(platform_metrics[k]) - float(truth["metrics"][k])) > METRIC_TOL
+                    ]
+                    detail = (
+                        "platform metrics match on " + ", ".join(sorted(overlap))
+                        if not diffs
+                        else "platform metrics DIFFER on "
+                        + ", ".join(sorted(diffs))
+                        + " (informative — not a failure)"
+                    )
                 else:
                     detail = "platform returned metrics but none overlap the provided keys"
             else:
@@ -116,10 +138,15 @@ def grade_answers(instance_dir: Path, adapter: str, answers: dict | None) -> dic
         asserts.append({"name": "A4_registry_entry", "passed": ok, "detail": detail})
 
     success = all(a["passed"] for a in asserts)
-    return {"family": FAMILY, "seed": truth["seed"], "success": success,
-            "asserts_passed": sum(a["passed"] for a in asserts),
-            "asserts_total": len(asserts), "asserts": asserts,
-            **({"diagnostic": diagnostic} if diagnostic else {})}
+    return {
+        "family": FAMILY,
+        "seed": truth["seed"],
+        "success": success,
+        "asserts_passed": sum(a["passed"] for a in asserts),
+        "asserts_total": len(asserts),
+        "asserts": asserts,
+        **({"diagnostic": diagnostic} if diagnostic else {}),
+    }
 
 
 def grade(instance_dir: Path, adapter: str, run_dir: Path) -> dict:

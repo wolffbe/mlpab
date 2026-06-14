@@ -12,6 +12,7 @@ Two locations:
 `mlpab run` resolves the committed manifest, builds the artifact at preflight
 when missing, and installs the interface fresh into each run's own venv.
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -27,6 +28,7 @@ from typing import Any
 
 import yaml
 
+from mlpab import redact
 
 INTERFACES = ("cli", "mcp", "sdk", "none")
 _TESTBED_ROOT = Path(__file__).resolve().parents[2]
@@ -58,8 +60,8 @@ class InterfaceSetup:
     sdk_module: str | None = None
     mcp_servers: dict[str, Any] = field(default_factory=dict)
     keys: dict[str, str] = field(default_factory=dict)
-    serve: list[str] = field(default_factory=list)      # per-run server-start steps
-    teardown: list[str] = field(default_factory=list)   # run start+end cleanup steps
+    serve: list[str] = field(default_factory=list)  # per-run server-start steps
+    teardown: list[str] = field(default_factory=list)  # run start+end cleanup steps
     # Outbound hosts THIS interface needs reachable, beyond the testbed baseline
     # (claude API + loopback). Drives the agent sandbox `allowedDomains`. e.g.
     # `["api.openai.com", "*.openai.com"]` for a cloud SDK; empty for local-only.
@@ -94,6 +96,7 @@ def _norm_subcommands(value: Any) -> str | None:
 @dataclass
 class InterfaceStatus:
     """Outcome of an interface preflight check."""
+
     platform: str
     interface: str
     ok: bool
@@ -141,6 +144,59 @@ def bin_dir(platform: str, interface: str) -> Path:
     """The interface's BUILD HOME: checked-out code + built binary
     ($INTERFACE_DIR), at the gitignored build/<platform>/<interface>/."""
     return BUILD_DIR / platform / interface
+
+
+# The PREPARED venv lives inside the build home. `prepare()` materializes it
+# ONCE (base libs + this interface's runtime_install); every run CLONES it
+# read-only, so runs never pip-install or mutate shared state — and the
+# cross-session build barrier is unnecessary. `_PREPARED_STAMP` next to it holds
+# the manifest+binary hash the venv was built for, so prepare() is idempotent.
+_PREPARED_VENV_NAME = "venv"
+_PREPARED_STAMP = ".prepared.hash"
+
+
+def prepared_venv_dir(platform: str, interface: str) -> Path:
+    """The interface's PREPARED venv ($INTERFACE_DIR/venv) — see `prepare()`."""
+    return bin_dir(platform, interface) / _PREPARED_VENV_NAME
+
+
+def venv_site_packages(venv_dir: Path) -> Path | None:
+    """A venv's `site-packages` for the RUNNING interpreter's version, PINNED —
+    not a wildcard `glob`. A venv (incl. the base .venv) can carry stale
+    `lib/pythonX.Y/site-packages` trees from a previous interpreter; `glob`
+    returns them in arbitrary order, so a clone could copy a 3.13 tree into a
+    3.12 venv (ABI mismatch). Per-run venvs are created from the same interpreter
+    that runs mlpab, so its `X.Y` is the correct, unambiguous tree. Falls back to
+    the sole globbed tree if the pinned one is absent."""
+    name = f"python{sys.version_info.major}.{sys.version_info.minor}"
+    pinned = venv_dir / "lib" / name / "site-packages"
+    if pinned.is_dir():
+        return pinned
+    return next((venv_dir / "lib").glob("python*/site-packages"), None)
+
+
+def _base_venv_fingerprint() -> str:
+    """Short hash of the base .venv's installed distributions + python version.
+
+    Folded into the prepared-venv stamp: a prepared venv is a CLONE of the base
+    .venv plus the interface, so a change to the base (a new/removed/upgraded
+    package, a python bump) must invalidate it — otherwise runs clone stale base
+    libs. `*.dist-info` / `*.egg-info` directory names carry the package name AND
+    version, so the set of them is a faithful, cheap fingerprint of base."""
+    base = _TESTBED_ROOT / ".venv"
+    h = hashlib.sha256()
+    h.update(f"py{sys.version_info.major}.{sys.version_info.minor}".encode())
+    sp = venv_site_packages(base)
+    if sp and sp.is_dir():
+        names = sorted(p.name for p in sp.iterdir() if p.name.endswith((".dist-info", ".egg-info")))
+        h.update(b"\0".join(n.encode() for n in names))
+    return h.hexdigest()[:8]
+
+
+def _prepared_stamp_value(platform: str, interface: str) -> str:
+    """What the prepared venv was built FOR: the interface content hash (manifest
+    + binary) AND the base-venv fingerprint. Either changing means rebuild."""
+    return f"{_compute_hash(platform, interface)}:{_base_venv_fingerprint()}"
 
 
 _PIN_RE = re.compile(r"==([0-9][\w.\-]*)")
@@ -279,13 +335,23 @@ def keys_for(platform: str, interface: str) -> dict[str, str]:
     return out
 
 
-def _resolved_keys(platform: str, interface: str, env: dict[str, str] | None = None) -> dict[str, str]:
+def _resolved_keys(
+    platform: str, interface: str, env: dict[str, str] | None = None
+) -> dict[str, str]:
     """Key values to inject into the agent env: manifest value, else env."""
     base = env if env is not None else os.environ
     out: dict[str, str] = {}
     for k, v in keys_for(platform, interface).items():
         out[k] = v or base.get(k, "")
     return {k: v for k, v in out.items() if v}
+
+
+def missing_keys(platform: str, interface: str, env: dict[str, str] | None = None) -> list[str]:
+    """Declared credential keys with no value (neither in the manifest nor the
+    env) — the cheap, no-network 'are creds present?' check used by the
+    session-start availability gate."""
+    base = env if env is not None else os.environ
+    return [k for k, v in keys_for(platform, interface).items() if not (v or base.get(k, ""))]
 
 
 # ---------------------------------------------------------------------------
@@ -333,7 +399,12 @@ def setup(
     interface: str,
     run_dir: Path,
     venv_python: Path,
+    run_install: bool = True,
 ) -> InterfaceSetup:
+    """Resolve the interface for a run. `run_install=True` runs the manifest's
+    `runtime_install` into the run venv (the legacy per-run install). Pass
+    False when the run venv was cloned from a PREPARED venv (see `prepare()`) —
+    the interface is already installed, so there's nothing to install per run."""
     if interface not in INTERFACES:
         raise ValueError(f"Unknown interface {interface!r}; expected one of {INTERFACES}")
 
@@ -353,8 +424,15 @@ def setup(
     interface_dir = bin_dir(platform, interface)
 
     # Guard: if runtime steps reference $INTERFACE_DIR (pre-built binary), it must
-    # exist. Preflight builds it before here; this is a backstop.
-    if binary and runtime_install and any("$INTERFACE_DIR" in s for s in runtime_install):
+    # exist. Preflight builds it before here; this is a backstop. Only relevant
+    # when we actually run the install steps (run_install); a prepared-venv clone
+    # already baked them in.
+    if (
+        run_install
+        and binary
+        and runtime_install
+        and any("$INTERFACE_DIR" in s for s in runtime_install)
+    ):
         if not (interface_dir / binary).exists():
             raise RuntimeError(
                 f"Interface {platform!r}/{interface!r} binary '{binary}' not found at "
@@ -362,8 +440,10 @@ def setup(
                 f"check configs/platforms/{platform}/{interface}.yaml install steps."
             )
 
-    if runtime_install:
-        _run_install(runtime_install, cwd=run_dir, venv_python=venv_python, interface_dir=interface_dir)
+    if run_install and runtime_install:
+        _run_install(
+            runtime_install, cwd=run_dir, venv_python=venv_python, interface_dir=interface_dir
+        )
 
     return InterfaceSetup(
         platform=platform,
@@ -400,14 +480,12 @@ def _make_check_venv(target: Path) -> Path:
     """
     base_py = _TESTBED_ROOT / ".venv" / "bin" / "python"
     base = base_py if base_py.exists() else Path(sys.executable)
-    subprocess.run(
-        [str(base), "-m", "venv", "--system-site-packages", str(target)], check=True
-    )
+    subprocess.run([str(base), "-m", "venv", "--system-site-packages", str(target)], check=True)
     py = target / "bin" / "python"
     # Expose the base venv's site-packages (shared libs) explicitly, like runner.
     if base_py.exists():
-        vsp = next((target / "lib").glob("python*/site-packages"), None)
-        bsp = next((_TESTBED_ROOT / ".venv" / "lib").glob("python*/site-packages"), None)
+        vsp = venv_site_packages(target)
+        bsp = venv_site_packages(_TESTBED_ROOT / ".venv")
         if vsp and bsp:
             (vsp / "_base_venv.pth").write_text(f"{bsp}\n")
     return py
@@ -453,20 +531,28 @@ def ensure_base_clean(platform: str, interface: str) -> None:
     if not dist:
         return
     # Installed IN base? `pip show` exits 0 iff the distribution is present.
-    present = subprocess.run(
-        [str(base_py), "-m", "pip", "show", dist],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    ).returncode == 0
+    present = (
+        subprocess.run(
+            [str(base_py), "-m", "pip", "show", dist],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=60,
+        ).returncode
+        == 0
+    )
     if not present:
         return
     subprocess.run(
         [str(base_py), "-m", "pip", "uninstall", "-y", dist],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        timeout=120,
     )
     print(
         f"[mlpab] removed interface package {dist!r} from the base .venv — it must "
         f"stay free of interface packages so each run installs the wheel fresh.",
-        file=sys.stderr, flush=True,
+        file=sys.stderr,
+        flush=True,
     )
 
 
@@ -486,8 +572,15 @@ def preflight(
     place (treatment runs put the agent against it directly)."""
     try:
         return _preflight_impl(
-            platform, interface,
-            check_login=check_login, auto_build=auto_build, timeout_s=timeout_s, env=env,
+            platform,
+            interface,
+            check_login=check_login,
+            auto_build=auto_build,
+            timeout_s=timeout_s,
+            env=env,
+            # `mlpab test` tears the build home down right after, so don't bother
+            # materializing a prepared venv only to delete it.
+            prepare_venv=not cleanup_build,
         )
     finally:
         if cleanup_build:
@@ -501,7 +594,7 @@ def _force_rmtree(path: Path) -> None:
     if not path.exists():
         return
     try:
-        os.chmod(path, 0o700)            # the top dir itself, so its entries unlink
+        os.chmod(path, 0o700)  # the top dir itself, so its entries unlink
     except OSError:
         pass
     for root, dirs, files in os.walk(path):
@@ -520,8 +613,9 @@ def _clean_build_artifacts(platform: str, interface: str) -> None:
     base = BUILD_DIR / platform / interface
     if not base.is_dir():
         return
-    for d in ("build", "dist", "src"):
+    for d in ("build", "dist", "src", _PREPARED_VENV_NAME):
         _force_rmtree(base / d)
+    (base / _PREPARED_STAMP).unlink(missing_ok=True)
     for p in list(base.glob("*.egg-info")):
         _force_rmtree(p)
     for p in list(base.glob("*.whl")):
@@ -544,6 +638,7 @@ def _preflight_impl(
     auto_build: bool = True,
     timeout_s: int = 120,
     env: dict[str, str] | None = None,
+    prepare_venv: bool = True,
 ) -> InterfaceStatus:
     """Build (if needed), then verify an interface is installed + logged in + healthy.
 
@@ -564,7 +659,11 @@ def _preflight_impl(
         return InterfaceStatus(platform, interface, ok=True, installed=True, authenticated=True)
     if interface not in INTERFACES:
         return InterfaceStatus(
-            platform, interface, ok=False, installed=False, authenticated=False,
+            platform,
+            interface,
+            ok=False,
+            installed=False,
+            authenticated=False,
             reason=f"unknown interface {interface!r}",
         )
 
@@ -573,8 +672,13 @@ def _preflight_impl(
         _check_known(platform, interface)
     except ValueError as e:
         return InterfaceStatus(
-            platform, interface, ok=False, installed=False, authenticated=False,
-            reason=str(e), fix_command=config_fix,
+            platform,
+            interface,
+            ok=False,
+            installed=False,
+            authenticated=False,
+            reason=str(e),
+            fix_command=config_fix,
         )
     cfg = _resolved_config(platform, interface)
     binary = cfg.get("binary")
@@ -599,14 +703,41 @@ def _preflight_impl(
             build(platform, interface)
         except Exception as e:  # build is shell-out heavy; surface failures
             return InterfaceStatus(
-                platform, interface, ok=False, installed=False, authenticated=False,
-                reason=f"build failed: {e}", fix_command=config_fix,
+                platform,
+                interface,
+                ok=False,
+                installed=False,
+                authenticated=False,
+                reason=f"build failed: {e}",
+                fix_command=config_fix,
             )
     if bpath is not None and not bpath.exists():
         return InterfaceStatus(
-            platform, interface, ok=False, installed=False, authenticated=False,
-            reason=f"binary {binary!r} missing at {bpath}", fix_command=config_fix,
+            platform,
+            interface,
+            ok=False,
+            installed=False,
+            authenticated=False,
+            reason=f"binary {binary!r} missing at {bpath}",
+            fix_command=config_fix,
         )
+
+    # Materialize the PREPARED venv once, here in the (serial) setup phase — runs
+    # then CLONE it read-only, so no run pip-installs or mutates shared state and
+    # the cross-session build barrier is unnecessary. Idempotent (hash-stamped).
+    if prepare_venv and auto_build:
+        try:
+            prepare(platform, interface)
+        except Exception as e:  # shell-out heavy; surface failures like build
+            return InterfaceStatus(
+                platform,
+                interface,
+                ok=False,
+                installed=False,
+                authenticated=False,
+                reason=f"prepare failed: {e}",
+                fix_command=config_fix,
+            )
 
     # Verify in an EPHEMERAL venv that shares base libs but installs ONLY this
     # interface (its runtime_install) — exactly what an agent run gets — then is
@@ -631,7 +762,11 @@ def _preflight_impl(
     # No auth_command → login is satisfied only when every declared key is present.
     if check_login and not auth_command and keys and missing:
         return InterfaceStatus(
-            platform, interface, ok=False, installed=True, authenticated=False,
+            platform,
+            interface,
+            ok=False,
+            installed=True,
+            authenticated=False,
             missing_keys=missing,
             reason=f"missing credential key(s): {', '.join(missing)}",
             fix_command=setup_fix,
@@ -639,7 +774,12 @@ def _preflight_impl(
     # Nothing to verify in a venv (no login to check here, no test) → done.
     if not auth_command and not test_command:
         return InterfaceStatus(
-            platform, interface, ok=True, installed=True, authenticated=True, missing_keys=missing,
+            platform,
+            interface,
+            ok=True,
+            installed=True,
+            authenticated=True,
+            missing_keys=missing,
         )
 
     # Only stand up a throwaway venv when there's something to install (real
@@ -652,13 +792,20 @@ def _preflight_impl(
             check_python = _make_check_venv(tmp / "venv")
             try:
                 _run_install(
-                    runtime_install, cwd=tmp, venv_python=check_python,
+                    runtime_install,
+                    cwd=tmp,
+                    venv_python=check_python,
                     interface_dir=bin_dir(platform, interface),
                 )
             except Exception as e:
                 return InterfaceStatus(
-                    platform, interface, ok=False, installed=False, authenticated=False,
-                    reason=f"interface install failed: {e}", fix_command=config_fix,
+                    platform,
+                    interface,
+                    ok=False,
+                    installed=False,
+                    authenticated=False,
+                    reason=f"interface install failed: {e}",
+                    fix_command=config_fix,
                 )
             check_bin = str(check_python.parent)
             merged_env["VIRTUAL_ENV"] = str(tmp / "venv")
@@ -671,14 +818,22 @@ def _preflight_impl(
 
         if auth_command and not _run_check(auth_command, merged_env, timeout_s):
             return InterfaceStatus(
-                platform, interface, ok=False, installed=True, authenticated=False,
+                platform,
+                interface,
+                ok=False,
+                installed=True,
+                authenticated=False,
                 missing_keys=missing,
                 reason=f"login check failed (`{auth_command}` returned non-zero or timed out)",
                 fix_command=setup_fix,
             )
         if test_command and not _run_check(test_command, merged_env, timeout_s):
             return InterfaceStatus(
-                platform, interface, ok=False, installed=True, authenticated=True,
+                platform,
+                interface,
+                ok=False,
+                installed=True,
+                authenticated=True,
                 missing_keys=missing,
                 reason=f"interface did not run reliably (`{test_command}` returned non-zero or timed out)",
                 fix_command=config_fix,
@@ -688,7 +843,12 @@ def _preflight_impl(
             shutil.rmtree(tmp, ignore_errors=True)
 
     return InterfaceStatus(
-        platform, interface, ok=True, installed=True, authenticated=True, missing_keys=missing,
+        platform,
+        interface,
+        ok=True,
+        installed=True,
+        authenticated=True,
+        missing_keys=missing,
     )
 
 
@@ -700,19 +860,25 @@ def _run_check(command: str, env: dict[str, str], timeout_s: int) -> bool:
     identical to a silent stall.
     """
     import sys as _sys
+
     try:
         proc = subprocess.run(
-            command, shell=True, env=env,
+            command,
+            shell=True,
+            env=env,
             stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
             timeout=timeout_s,
         )
         if proc.returncode != 0:
             print(
                 f"[mlpab] check FAILED (exit {proc.returncode}): {command}\n"
-                f"--- captured output ---\n{proc.stdout.decode('utf-8', 'replace')}"
+                f"--- captured output ---\n"
+                f"{redact.redact(proc.stdout.decode('utf-8', 'replace'))}"
                 f"\n--- end ---",
-                file=_sys.stderr, flush=True,
+                file=_sys.stderr,
+                flush=True,
             )
             return False
         return True
@@ -720,8 +886,9 @@ def _run_check(command: str, env: dict[str, str], timeout_s: int) -> bool:
         out = (e.output or b"").decode("utf-8", "replace") if e.output else "(no output)"
         print(
             f"[mlpab] check TIMED OUT after {timeout_s}s: {command}\n"
-            f"--- captured output before timeout ---\n{out}\n--- end ---",
-            file=_sys.stderr, flush=True,
+            f"--- captured output before timeout ---\n{redact.redact(out)}\n--- end ---",
+            file=_sys.stderr,
+            flush=True,
         )
         return False
     except OSError as e:
@@ -760,9 +927,14 @@ def login_status(
         # No auth_command → login is satisfied only when all declared keys exist.
         if declared and missing:
             return InterfaceStatus(
-                platform, interface, ok=False, installed=True, authenticated=False,
+                platform,
+                interface,
+                ok=False,
+                installed=True,
+                authenticated=False,
                 missing_keys=missing,
-                reason=f"missing credential key(s): {', '.join(missing)}", fix_command=setup_fix,
+                reason=f"missing credential key(s): {', '.join(missing)}",
+                fix_command=setup_fix,
             )
         return InterfaceStatus(platform, interface, ok=True, installed=True, authenticated=True)
 
@@ -772,12 +944,22 @@ def login_status(
     env["VIRTUAL_ENV"] = str(venv_python.parent.parent)
     if not _run_check(auth_command, env, timeout_s):
         return InterfaceStatus(
-            platform, interface, ok=False, installed=True, authenticated=False, missing_keys=missing,
+            platform,
+            interface,
+            ok=False,
+            installed=True,
+            authenticated=False,
+            missing_keys=missing,
             reason=f"login check failed (`{auth_command}` returned non-zero or timed out)",
             fix_command=setup_fix,
         )
     return InterfaceStatus(
-        platform, interface, ok=True, installed=True, authenticated=True, missing_keys=missing,
+        platform,
+        interface,
+        ok=True,
+        installed=True,
+        authenticated=True,
+        missing_keys=missing,
     )
 
 
@@ -789,6 +971,7 @@ def _render_pyproject(pkg: dict) -> str:
     (list), scripts (name→target map), optional-dependencies (extra→[deps]),
     packages (list). Build backend: setuptools.
     """
+
     def arr(xs: list) -> str:
         return "[" + ", ".join(f'"{x}"' for x in xs) + "]"
 
@@ -806,7 +989,7 @@ def _render_pyproject(pkg: dict) -> str:
     if pkg.get("description"):
         lines.append(f'description = "{pkg["description"]}"')
     if pkg.get("dependencies"):
-        lines.append(f'dependencies = {arr(pkg["dependencies"])}')
+        lines.append(f"dependencies = {arr(pkg['dependencies'])}")
     if pkg.get("scripts"):
         lines += ["", "[project.scripts]"] + [f'{k} = "{v}"' for k, v in pkg["scripts"].items()]
     if pkg.get("optional-dependencies"):
@@ -814,7 +997,7 @@ def _render_pyproject(pkg: dict) -> str:
             f"{k} = {arr(v)}" for k, v in pkg["optional-dependencies"].items()
         ]
     if pkg.get("packages"):
-        lines += ["", "[tool.setuptools]", f'packages = {arr(pkg["packages"])}']
+        lines += ["", "[tool.setuptools]", f"packages = {arr(pkg['packages'])}"]
     return "\n".join(lines) + "\n"
 
 
@@ -836,7 +1019,7 @@ def build(platform: str, interface: str) -> Path:
     repo = manifest.get("repo")
     ref = manifest.get("ref", "main")
     install_steps = manifest.get("install") or []
-    iface_dir = bin_dir(platform, interface)   # source checkout + built artifact
+    iface_dir = bin_dir(platform, interface)  # source checkout + built artifact
     iface_dir.mkdir(parents=True, exist_ok=True)
     venv_bin = _TESTBED_ROOT / ".venv" / "bin"
 
@@ -855,18 +1038,24 @@ def build(platform: str, interface: str) -> Path:
             # drift between runs. To refresh, delete src/.
             if not (src / ".git").exists():
                 src.mkdir(parents=True, exist_ok=True)
-                subprocess.run(["git", "-C", str(src), "init", "-q"], check=True)
+                subprocess.run(["git", "-C", str(src), "init", "-q"], check=True, timeout=60)
                 subprocess.run(
-                    ["git", "-C", str(src), "remote", "add", "origin", repo], check=True
+                    ["git", "-C", str(src), "remote", "add", "origin", repo],
+                    check=True,
+                    timeout=60,
                 )
                 # Fetch just the pinned ref at depth 1 (GitHub serves a reachable
-                # SHA this way), then check out detached.
+                # SHA this way), then check out detached. Network — cap it so a
+                # stalled fetch can't hang the build indefinitely.
                 subprocess.run(
                     ["git", "-C", str(src), "fetch", "--depth", "1", "origin", ref],
                     check=True,
+                    timeout=600,
                 )
                 subprocess.run(
-                    ["git", "-C", str(src), "checkout", "-q", "FETCH_HEAD"], check=True
+                    ["git", "-C", str(src), "checkout", "-q", "FETCH_HEAD"],
+                    check=True,
+                    timeout=120,
                 )
             src_cwd = src
         # Always strip a cloned/copied repo's own agent instructions (.claude/,
@@ -874,6 +1063,7 @@ def build(platform: str, interface: str) -> Path:
         # never auto-loaded as directives by the agent working in or near the
         # interface source.
         from mlpab import docs as _docs
+
         _docs.strip_agent_plumbing(src_cwd)
 
     # `package:` in config.yaml IS the build manifest — write the needed
@@ -894,7 +1084,9 @@ def build(platform: str, interface: str) -> Path:
         # agent (deny patterns), triggering a pip warning otherwise.
         env["PIP_NO_CACHE_DIR"] = "1"
         for step in install_steps:
-            subprocess.run(step, shell=True, env=env, cwd=str(src_cwd), check=True)
+            # Generous cap (build/install can be minutes) that still bounds a
+            # truly hung step.
+            subprocess.run(step, shell=True, env=env, cwd=str(src_cwd), check=True, timeout=1800)
     return iface_dir
 
 
@@ -914,4 +1106,92 @@ def _run_install(
     # agent (deny patterns), and runtime_install steps are tiny.
     env["PIP_NO_CACHE_DIR"] = "1"
     for step in steps:
-        subprocess.run(step, shell=True, cwd=cwd, env=env, check=True)
+        subprocess.run(step, shell=True, cwd=cwd, env=env, check=True, timeout=1800)
+
+
+def _materialize_venv(target: Path) -> Path:
+    """Create a venv at `target` that FULLY materializes the base .venv's
+    site-packages inside it — no `.pth` to an outside path — so it can be CLONED
+    into a sandboxed run dir and stand on its own. Returns its python.
+
+    Mirrors runner._make_venv's base path: the per-run venv is later a clone of
+    this, so the two must produce the same self-contained layout.
+    """
+    base_py = _TESTBED_ROOT / ".venv" / "bin" / "python"
+    base = base_py if base_py.exists() else Path(sys.executable)
+    subprocess.run(
+        [str(base), "-m", "venv", "--system-site-packages", str(target)],
+        check=True,
+        timeout=300,
+    )
+    py = target / "bin" / "python"
+    if base_py.exists():
+        vsp = venv_site_packages(target)
+        bsp = venv_site_packages(_TESTBED_ROOT / ".venv")
+        if vsp and bsp:
+            for child in bsp.iterdir():
+                dst = vsp / child.name
+                if dst.exists():
+                    continue
+                try:
+                    subprocess.run(["cp", "-Rc", str(child), str(dst)], check=True, timeout=600)
+                except subprocess.CalledProcessError:
+                    subprocess.run(["cp", "-R", str(child), str(dst)], check=True, timeout=600)
+    return py
+
+
+def prepare(platform: str, interface: str, *, force: bool = False) -> Path | None:
+    """Build the artifact (if missing) AND materialize the interface's PREPARED
+    venv ONCE, so each run only CLONES it (read-only): no per-run pip install, no
+    shared-state mutation, no cross-session build barrier. Returns the prepared
+    venv dir (None for none/none).
+
+    Idempotent: a prepared venv whose stamp matches the current manifest+binary
+    hash is reused. `force=True` rebuilds unconditionally.
+    """
+    if platform == "none" and interface == "none":
+        return None
+    _check_known(platform, interface)
+    cfg = _resolved_config(platform, interface)
+    binary = cfg.get("binary")
+    runtime_install = cfg.get("runtime_install") or []
+    iface_dir = bin_dir(platform, interface)
+
+    # Build the pinned artifact first (idempotent; only when missing) so the hash
+    # below — and the runtime_install steps that reference $INTERFACE_DIR — see it.
+    uses_prebuilt = bool(
+        binary and runtime_install and any("$INTERFACE_DIR" in s for s in runtime_install)
+    )
+    if (
+        uses_prebuilt
+        and not (iface_dir / binary).exists()
+        and load_manifest(platform, interface).get("install")
+    ):
+        build(platform, interface)
+
+    venv_dir = prepared_venv_dir(platform, interface)
+    stamp = iface_dir / _PREPARED_STAMP
+    want = _prepared_stamp_value(platform, interface)
+    if (
+        not force
+        and (venv_dir / "bin" / "python").exists()
+        and stamp.exists()
+        and stamp.read_text().strip() == want
+    ):
+        return venv_dir
+
+    # (Re)build the prepared venv from scratch — a stale or partial one must not
+    # linger. The stamp is written last, so a crash mid-build is re-detected as
+    # "not prepared" (missing/mismatched stamp) and rebuilt next time.
+    _force_rmtree(venv_dir)
+    stamp.unlink(missing_ok=True)
+    venv_python = _materialize_venv(venv_dir)
+    if runtime_install:
+        # cwd = iface_dir so a step's `./venv` IS this prepared venv (the
+        # databricks/gcp CLIs copy a binary/SDK tree into `./venv`), and
+        # $INTERFACE_DIR = iface_dir (pinned wheels/binaries live there).
+        _run_install(
+            runtime_install, cwd=iface_dir, venv_python=venv_python, interface_dir=iface_dir
+        )
+    stamp.write_text(want + "\n")
+    return venv_dir

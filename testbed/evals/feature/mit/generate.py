@@ -19,6 +19,7 @@ an inclusive-of-8-days window and a window EXCLUDING the current row both
 differ from truth. Truth is computed by a per-row scan and cross-checked
 against an independent vectorized implementation.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -65,16 +66,22 @@ def _scan_7d(df: pd.DataFrame, days: int = 7, include_self: bool = True) -> pd.S
 
 def _rolling_7d(df: pd.DataFrame, days: int = 7) -> pd.Series:
     """Independent vectorized implementation (pandas time-based rolling)."""
-    s = (df.set_index("event_time")
-           .groupby("account_id")["amount"]
-           .rolling(f"{days}D", closed="right")
-           .sum())
+    s = (
+        df.set_index("event_time")
+        .groupby("account_id")["amount"]
+        .rolling(f"{days}D", closed="right")
+        .sum()
+    )
     s.index = s.index.droplevel(0)
     # rolling is positional within groups sorted by time; map back via order
     df_sorted = df.sort_values(["account_id", "event_time"])
-    vals = (df_sorted.set_index("event_time")
-            .groupby("account_id")["amount"]
-            .rolling(f"{days}D", closed="right").sum().to_numpy())
+    vals = (
+        df_sorted.set_index("event_time")
+        .groupby("account_id")["amount"]
+        .rolling(f"{days}D", closed="right")
+        .sum()
+        .to_numpy()
+    )
     out = pd.Series(np.round(vals, 2), index=df_sorted.index)
     return out.reindex(df.index)
 
@@ -87,14 +94,18 @@ def generate(seed: int, out: Path) -> dict:
     rng = np.random.default_rng(seed)
     table = TABLE_BASE + instance_suffix(seed)
     n = N_ROWS
-    df = pd.DataFrame({
-        "row_id": [f"R{i:05d}" for i in range(n)],
-        "account_id": [f"A{int(a):04d}" for a in rng.integers(0, N_ACCOUNTS, n)],
-        "event_time": sorted((ORIGIN + pd.Timedelta(minutes=int(m))).floor("s")
-                             for m in rng.integers(0, 60 * 24 * 45, n)),
-        "amount": np.round(rng.lognormal(3.0, 1.0, n), 2),
-        "currency": rng.choice(list(FX), n),
-    })
+    df = pd.DataFrame(
+        {
+            "row_id": [f"R{i:05d}" for i in range(n)],
+            "account_id": [f"A{int(a):04d}" for a in rng.integers(0, N_ACCOUNTS, n)],
+            "event_time": sorted(
+                (ORIGIN + pd.Timedelta(minutes=int(m))).floor("s")
+                for m in rng.integers(0, 60 * 24 * 45, n)
+            ),
+            "amount": np.round(rng.lognormal(3.0, 1.0, n), 2),
+            "currency": rng.choice(list(FX), n),
+        }
+    )
 
     derived = df[["row_id", "account_id", "event_time"]].copy()
     derived["amount_usd"] = np.round(df["amount"] * df["currency"].map(FX), 6)
@@ -109,7 +120,8 @@ def generate(seed: int, out: Path) -> dict:
     variants = {
         "window_8d": canonicalize(derived.assign(amount_7d=_scan_7d(df, days=8)), SPEC),
         "window_excl_self": canonicalize(
-            derived.assign(amount_7d=_scan_7d(df, include_self=False)), SPEC),
+            derived.assign(amount_7d=_scan_7d(df, include_self=False)), SPEC
+        ),
     }
     for name, v in variants.items():
         if digest(v) == digest(truth):
@@ -124,7 +136,8 @@ def generate(seed: int, out: Path) -> dict:
     emit["event_time"] = emit["event_time"].dt.strftime("%Y-%m-%dT%H:%M:%SZ")
     emit.to_csv(out / "data" / "transactions.csv", index=False)
     pd.DataFrame({"currency": list(FX), "fx_rate": [FX[c] for c in FX]}).to_csv(
-        out / "data" / "fx_rates.csv", index=False)
+        out / "data" / "fx_rates.csv", index=False
+    )
     (out / "data" / "schema.md").write_text(
         "# Schema\n\n- **transactions.csv**: row_id (unique key), account_id, "
         "event_time (ISO UTC), amount, currency\n"
@@ -147,9 +160,13 @@ def generate(seed: int, out: Path) -> dict:
         "the two.\n"
     )
     meta = {
-        "family": "mit", "seed": seed,
-        "table_name": table, "table_version": 1,
-        "spec": SPEC, "row_count": len(truth), "digest": digest(truth),
+        "family": "mit",
+        "seed": seed,
+        "table_name": table,
+        "table_version": 1,
+        "spec": SPEC,
+        "row_count": len(truth),
+        "digest": digest(truth),
         "record_ids": truth["row_id"].tolist(),
         "variant_digests": {k: digest(v) for k, v in variants.items()},
         "variant_diagnosis": VARIANT_DIAGNOSIS,

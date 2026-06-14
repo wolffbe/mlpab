@@ -1,4 +1,5 @@
 """Tests for the live stream-json terminal display (mlpab.streaming)."""
+
 import io
 import json
 import os
@@ -207,10 +208,15 @@ class ToolResultLinesTests(unittest.TestCase):
         # tool_result.content can carry multiple text blocks; each one's
         # lines should be surfaced (joined with a real newline, not a space,
         # so multi-line file reads don't collapse into one terminal line).
-        ev = self._user({"type": "tool_result", "content": [
-            {"type": "text", "text": "1\tline-a"},
-            {"type": "text", "text": "2\tline-b"},
-        ]})
+        ev = self._user(
+            {
+                "type": "tool_result",
+                "content": [
+                    {"type": "text", "text": "1\tline-a"},
+                    {"type": "text", "text": "2\tline-b"},
+                ],
+            }
+        )
         self.assertEqual(
             streaming.tool_result_lines(ev, "eng"),
             ["[eng:result] 1\tline-a", "[eng:result] 2\tline-b"],
@@ -236,11 +242,15 @@ class PrinterTests(unittest.TestCase):
         return buf.getvalue()
 
     def test_prints_assistant_tool_use(self):
-        line = json.dumps(_assistant({"type": "tool_use", "name": "Bash", "input": {"command": "ls"}}))
+        line = json.dumps(
+            _assistant({"type": "tool_use", "name": "Bash", "input": {"command": "ls"}})
+        )
         self.assertEqual(self._capture(line), "[agent:bash] ls\n")
 
     def test_result_line(self):
-        line = json.dumps({"type": "result", "num_turns": 7, "total_cost_usd": 0.1234, "subtype": "success"})
+        line = json.dumps(
+            {"type": "result", "num_turns": 7, "total_cost_usd": 0.1234, "subtype": "success"}
+        )
         out = self._capture(line)
         self.assertIn("[agent] done: 7 turns", out)
         self.assertIn("$0.1234", out)
@@ -251,17 +261,29 @@ class PrinterTests(unittest.TestCase):
 
 
 class TeeToTests(unittest.TestCase):
-
     def test_captures_python_and_subprocess_output(self):
         import subprocess
         import sys as _sys
+        import textwrap
 
         log = Path(tempfile.mkdtemp()) / "stream.log"
-        # passthrough=False so the test's own terminal stays clean.
-        with streaming.tee_to(log, passthrough=False):
-            print("py-stdout-line", flush=True)
-            print("py-stderr-line", file=_sys.stderr, flush=True)
-            subprocess.run(["echo", "subprocess-line"], check=True)
+        # Run the tee_to block in a SUBPROCESS with clean FDs. tee_to redirects
+        # at the FILE-DESCRIPTOR level (dup2 on FD 1/2); nesting it inside
+        # pytest's own FD capture lets pytest intercept python-level writes
+        # before tee_to sees them, so an in-process assertion is testing the
+        # test runner, not tee_to. A child process has its own real FDs, so this
+        # exercises the actual behavior: python stdout/stderr AND child-process
+        # stdout all land in the log.
+        script = textwrap.dedent(f"""
+            import subprocess, sys
+            from pathlib import Path
+            from mlpab import streaming
+            with streaming.tee_to(Path({str(log)!r}), passthrough=False):
+                print("py-stdout-line", flush=True)
+                print("py-stderr-line", file=sys.stderr, flush=True)
+                subprocess.run(["echo", "subprocess-line"], check=True)
+        """)
+        subprocess.run([_sys.executable, "-c", script], check=True)
         text = log.read_text()
         self.assertIn("py-stdout-line", text)
         self.assertIn("py-stderr-line", text)

@@ -1,5 +1,8 @@
-.PHONY: help install setup test uninstall venv check-git ml-libs link unlink claude codex vibe \
-        run start stop attach status iface-test clean-runs bootstrap-azure bootstrap-gcp
+.PHONY: help install setup check test lint fmt uninstall venv check-git ml-libs link unlink claude codex vibe \
+        run start stop attach status iface-test clean-runs bootstrap-aws bootstrap-azure bootstrap-gcp
+
+# Python sources to lint/format: the two packages + the platform config scripts.
+LINT_PATHS := src tests evals configs
 
 # Pin to a Python that orjson/PyO3 supports. PyO3 0.23 caps at 3.13; pip-built
 # orjson on 3.14 fails. Override with `make install PYTHON=python3.13`.
@@ -31,8 +34,11 @@ help:
 	@echo ""
 	@echo "Targets:"
 	@echo "  make install   — create venv, install mlpab + evals, link mlpab onto PATH, then run setup"
-	@echo "  make setup     — auth for the agent (Claude)"
+	@echo "  make setup     — interactive: pick agent engine(s) to authenticate + platform(s) to set up"
+	@echo "  make check     — verify a config is runnable: platform + LLM reachable/responsive (CONFIG=...)"
 	@echo "  make test      — run the unit tests"
+	@echo "  make lint      — ruff check + isort/format check (no changes)"
+	@echo "  make fmt       — auto-fix: isort imports, ruff format, ruff --fix"
 	@echo "  make uninstall — remove the venv + build artifacts (install state)"
 	@echo ""
 	@echo "Run a treatment session in tmux (detached from any terminal/Claude):"
@@ -55,7 +61,7 @@ $(VENV)/.installed: pyproject.toml requirements.txt
 	@echo ">> using interpreter: $(PYTHON)"
 	$(PYTHON) -m venv $(VENV)
 	$(PIP) install --upgrade pip
-	$(PIP) install -e .
+	$(PIP) install -e ".[dev]"
 	$(PIP) install -r requirements.txt
 	touch $(VENV)/.installed
 
@@ -125,8 +131,27 @@ unlink:
 setup: venv
 	@$(MLPAB) setup
 
+# Verify a treatment CONFIG can actually run: each platform is reachable +
+# responsive (live auth/test) and each model's LLM answers a live probe.
+#   make check CONFIG=configs/treatments/aws/aws-claude.yaml
+check: venv
+	$(MLPAB) check $(CONFIG)
+
 test: venv
 	$(PY) -m unittest discover -s tests -p 'test_*.py' -v
+
+# Lint (no changes): ruff check + isort/ruff-format in --check mode. CI-friendly.
+lint: venv
+	$(VENV)/bin/ruff check $(LINT_PATHS)
+	$(VENV)/bin/isort --check-only --diff $(LINT_PATHS)
+	$(VENV)/bin/ruff format --check $(LINT_PATHS)
+
+# Auto-fix: sort imports (isort), then format (ruff), then apply ruff's safe
+# lint fixes. isort runs FIRST so ruff format only tidies the already-sorted file.
+fmt: venv
+	$(VENV)/bin/isort $(LINT_PATHS)
+	$(VENV)/bin/ruff format $(LINT_PATHS)
+	$(VENV)/bin/ruff check --fix $(LINT_PATHS)
 
 
 uninstall: unlink
@@ -157,6 +182,8 @@ clean-runs: venv
 
 # One-time cloud bootstrap: install CLI, login, create resources, write .env.
 # Idempotent. GCP needs a project:  PROJECT=my-proj make bootstrap-gcp
+bootstrap-aws:
+	bash configs/platforms/aws/bootstrap.sh
 bootstrap-azure:
 	bash configs/platforms/azure/bootstrap.sh
 bootstrap-gcp:

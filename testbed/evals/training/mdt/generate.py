@@ -15,6 +15,7 @@ Ground truth by construction. Naive variants (gates assert they differ):
 fitting the statistics on both splits combined; standardizing each split with
 its own statistics.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -42,9 +43,8 @@ SPEC = {
 }
 VARIANT_DIAGNOSIS = {
     "fit_on_all": "scaling statistics were fitted on both splits combined "
-                  "instead of the train split only",
-    "per_split": "each split was standardized with its own statistics "
-                 "instead of the train split's",
+    "instead of the train split only",
+    "per_split": "each split was standardized with its own statistics instead of the train split's",
 }
 
 
@@ -78,21 +78,33 @@ def generate(seed: int, out: Path) -> dict:
     # so wrong fit populations provably change the result
     serve_df = make(N_SERVE, N_TRAIN, float(rng.uniform(1.5, 4.0)))
 
-    both = pd.concat([train_df.assign(split="train"), serve_df.assign(split="serve")],
-                     ignore_index=True)
+    both = pd.concat(
+        [train_df.assign(split="train"), serve_df.assign(split="serve")], ignore_index=True
+    )
     truth = canonicalize(
-        pd.concat([_standardize(train_df, train_df).assign(split="train"),
-                   _standardize(serve_df, train_df).assign(split="serve")],
-                  ignore_index=True), SPEC)
+        pd.concat(
+            [
+                _standardize(train_df, train_df).assign(split="train"),
+                _standardize(serve_df, train_df).assign(split="serve"),
+            ],
+            ignore_index=True,
+        ),
+        SPEC,
+    )
 
     # --- gates ---------------------------------------------------------------
     variants = {
-        "fit_on_all": canonicalize(
-            _standardize(both, both[["row_id"] + FEATURES]), SPEC),
+        "fit_on_all": canonicalize(_standardize(both, both[["row_id"] + FEATURES]), SPEC),
         "per_split": canonicalize(
-            pd.concat([_standardize(train_df, train_df).assign(split="train"),
-                       _standardize(serve_df, serve_df).assign(split="serve")],
-                      ignore_index=True), SPEC),
+            pd.concat(
+                [
+                    _standardize(train_df, train_df).assign(split="train"),
+                    _standardize(serve_df, serve_df).assign(split="serve"),
+                ],
+                ignore_index=True,
+            ),
+            SPEC,
+        ),
     }
     for name, v in variants.items():
         if digest(v) == digest(truth):
@@ -115,9 +127,9 @@ def generate(seed: int, out: Path) -> dict:
     (out / "data" / "schema.md").write_text(
         "# Schema\n\nTwo splits of the same numeric features; `row_id` is unique "
         "across both files.\n\n- **features_train.csv**: row_id, "
-        + ", ".join(FEATURES) + " — the training split\n"
-        "- **features_serve.csv**: row_id, "
-        + ", ".join(FEATURES) + " — the serving split\n"
+        + ", ".join(FEATURES)
+        + " — the training split\n"
+        "- **features_serve.csv**: row_id, " + ", ".join(FEATURES) + " — the serving split\n"
     )
     (out / "prompt.txt").write_text(
         "The directory data/ contains a training split (data/features_train.csv) "
@@ -137,9 +149,13 @@ def generate(seed: int, out: Path) -> dict:
         "(online/real-time access), where the platform distinguishes the two.\n"
     )
     meta = {
-        "family": "mdt", "seed": seed,
-        "table_name": table, "table_version": 1,
-        "spec": SPEC, "row_count": len(truth), "digest": digest(truth),
+        "family": "mdt",
+        "seed": seed,
+        "table_name": table,
+        "table_version": 1,
+        "spec": SPEC,
+        "row_count": len(truth),
+        "digest": digest(truth),
         "record_ids": truth["row_id"].tolist(),
         "variant_digests": {k: digest(v) for k, v in variants.items()},
         "variant_diagnosis": VARIANT_DIAGNOSIS,

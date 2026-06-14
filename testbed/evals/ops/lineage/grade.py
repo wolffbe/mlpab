@@ -13,6 +13,7 @@ Usage:
     python -m evals.ops.lineage.grade --instance <dir> --adapter <hopsworks|databricks|sagemaker|none>
 (cwd must be the run dir — the provider runs graders there.)
 """
+
 from __future__ import annotations
 
 import json
@@ -21,8 +22,14 @@ from pathlib import Path
 
 import pandas as pd
 
-from evals.common import (canonicalize, digest, fetch_table, grade_platform_main,
-                          load_answers, table_exists_info)
+from evals.common import (
+    canonicalize,
+    digest,
+    fetch_table,
+    grade_platform_main,
+    load_answers,
+    table_exists_info,
+)
 
 
 def grade(instance_dir: Path, adapter: str, run_dir: Path) -> dict:
@@ -32,8 +39,7 @@ def grade(instance_dir: Path, adapter: str, run_dir: Path) -> dict:
     diagnostic = None
 
     def check(name, ok, detail=""):
-        asserts.append({"name": name, "passed": bool(ok),
-                        **({"detail": detail} if detail else {})})
+        asserts.append({"name": name, "passed": bool(ok), **({"detail": detail} if detail else {})})
         return bool(ok)
 
     # A1 — derived table content
@@ -46,8 +52,7 @@ def grade(instance_dir: Path, adapter: str, run_dir: Path) -> dict:
             src_err = f"no local deliverable at {local}"
     else:
         try:
-            produced = fetch_table(adapter, table, truth["table_version"],
-                                   truth.get("record_ids"))
+            produced = fetch_table(adapter, table, truth["table_version"], truth.get("record_ids"))
         except (LookupError, NotImplementedError) as e:
             src_err = str(e)
     a1 = False
@@ -60,7 +65,7 @@ def grade(instance_dir: Path, adapter: str, run_dir: Path) -> dict:
             a1 = (len(norm) == truth["row_count"]) and d == truth["digest"]
             detail = ""
             if not a1:
-                detail = (f"content mismatch (rows {len(norm)} vs {truth['row_count']})")
+                detail = f"content mismatch (rows {len(norm)} vs {truth['row_count']})"
                 for vname, vdig in truth.get("variant_digests", {}).items():
                     if d == vdig:
                         diagnostic = truth.get("variant_diagnosis", {}).get(vname, vname)
@@ -70,31 +75,39 @@ def grade(instance_dir: Path, adapter: str, run_dir: Path) -> dict:
 
     # A2 — source tables exist
     if adapter == "none":
-        a2 = check("A2_sources_exist", True,
-                   "no checker adapter (platform none) — skipped")
+        a2 = check("A2_sources_exist", True, "no checker adapter (platform none) — skipped")
     else:
-        missing = [s for s in truth["source_tables"]
-                   if table_exists_info(adapter, s, truth["table_version"]) is None]
-        a2 = check("A2_sources_exist", not missing,
-                   f"missing source tables: {missing}" if missing else "")
+        missing = [
+            s
+            for s in truth["source_tables"]
+            if table_exists_info(adapter, s, truth["table_version"]) is None
+        ]
+        a2 = check(
+            "A2_sources_exist", not missing, f"missing source tables: {missing}" if missing else ""
+        )
 
     # A3 — lineage answer
     answers = load_answers(Path(run_dir) / "submission" / "answers.json")
     if not isinstance(answers, dict) or "_parse_error" in (answers or {}):
-        a3 = check("A3_lineage_answer", False,
-                   "no parseable submission/answers.json with 'derived_from'")
+        a3 = check(
+            "A3_lineage_answer", False, "no parseable submission/answers.json with 'derived_from'"
+        )
     else:
         got = answers.get("derived_from")
         want = sorted(truth["source_tables"])
         ok = isinstance(got, list) and sorted(str(x).strip().lower() for x in got) == want
-        a3 = check("A3_lineage_answer", ok,
-                   "" if ok else f"derived_from {got!r} != {want}")
+        a3 = check("A3_lineage_answer", ok, "" if ok else f"derived_from {got!r} != {want}")
 
     success = a1 and a2 and a3
-    return {"family": "lineage", "seed": truth["seed"], "success": success,
-            "asserts_passed": sum(a["passed"] for a in asserts),
-            "asserts_total": len(asserts), "asserts": asserts,
-            **({"diagnostic": diagnostic} if diagnostic else {})}
+    return {
+        "family": "lineage",
+        "seed": truth["seed"],
+        "success": success,
+        "asserts_passed": sum(a["passed"] for a in asserts),
+        "asserts_total": len(asserts),
+        "asserts": asserts,
+        **({"diagnostic": diagnostic} if diagnostic else {}),
+    }
 
 
 def main(argv=None) -> int:

@@ -16,6 +16,7 @@ Platform realization notes for `fetch_table`:
                outside the testbed policy), so table tasks carry a unique
                per-row record key and require the online store enabled.
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -45,7 +46,8 @@ def canonicalize(df: pd.DataFrame, spec: dict) -> pd.DataFrame:
     for c in spec["columns"]:
         if c in spec.get("ts_cols", []):
             out[c] = pd.to_datetime(out[c], utc=True, format="mixed").dt.strftime(
-                "%Y-%m-%dT%H:%M:%SZ")
+                "%Y-%m-%dT%H:%M:%SZ"
+            )
         elif c in spec.get("int_cols", []):
             out[c] = pd.to_numeric(out[c]).astype("int64")
         elif pd.api.types.is_float_dtype(out[c]) or c in spec.get("float_cols", []):
@@ -59,16 +61,21 @@ def digest(df: pd.DataFrame) -> str:
     return "sha256:" + hashlib.sha256(df.to_csv(index=False).encode()).hexdigest()
 
 
-def fetch_table(adapter: str, table: str, version: int, record_ids: list[str] | None) -> pd.DataFrame:
+def fetch_table(
+    adapter: str, table: str, version: int, record_ids: list[str] | None
+) -> pd.DataFrame:
     """Read a feature table back through the platform (see module docstring)."""
     if adapter == "hopsworks":
         from evals.adapters.hopsworks import HopsworksChecker
+
         return HopsworksChecker().read_rows(table, version)
     if adapter == "databricks":
         from evals.adapters.databricks import DatabricksChecker
+
         return DatabricksChecker().read_rows(table)
     if adapter == "aws":
         from evals.adapters.aws import SageMakerChecker
+
         if not record_ids:
             raise LookupError("sagemaker table reads need the truth's record ids")
         df = SageMakerChecker().get_records(table, record_ids)
@@ -77,9 +84,11 @@ def fetch_table(adapter: str, table: str, version: int, record_ids: list[str] | 
         return df
     if adapter == "azure":
         from evals.adapters.azure import AzureMLChecker
+
         return AzureMLChecker().read_rows(table, version)
     if adapter == "gcp":
         from evals.adapters.gcp import VertexChecker
+
         return VertexChecker().read_rows(table, version)
     raise LookupError(f"no checker adapter for {adapter!r}")
 
@@ -88,18 +97,23 @@ def table_exists_info(adapter: str, table: str, version: int):
     """TableInfo via the platform's metadata read, or None."""
     if adapter == "hopsworks":
         from evals.adapters.hopsworks import HopsworksChecker
+
         return HopsworksChecker().get_feature_table(table, version)
     if adapter == "databricks":
         from evals.adapters.databricks import DatabricksChecker
+
         return DatabricksChecker().get_feature_table(table)
     if adapter == "aws":
         from evals.adapters.aws import SageMakerChecker
+
         return SageMakerChecker().get_feature_table(table)
     if adapter == "azure":
         from evals.adapters.azure import AzureMLChecker
+
         return AzureMLChecker().get_feature_table(table, version)
     if adapter == "gcp":
         from evals.adapters.gcp import VertexChecker
+
         return VertexChecker().get_feature_table(table, version)
     return None
 
@@ -108,12 +122,12 @@ def grade_table_main(family: str, grade_fn, argv: list[str] | None = None) -> in
     """CLI shared by table-deliverable families: --instance + (--csv | --adapter).
     `grade_fn(instance_dir, produced_df, adapter_or_none) -> report`."""
     import argparse
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--instance", type=Path, required=True)
     src = ap.add_mutually_exclusive_group(required=True)
     src.add_argument("--csv", type=Path)
-    src.add_argument("--adapter",
-                     choices=["hopsworks", "databricks", "aws", "azure", "gcp"])
+    src.add_argument("--adapter", choices=["hopsworks", "databricks", "aws", "azure", "gcp"])
     args = ap.parse_args(argv)
 
     truth = json.loads((args.instance / "solution" / "truth.json").read_text())
@@ -121,13 +135,21 @@ def grade_table_main(family: str, grade_fn, argv: list[str] | None = None) -> in
         produced = pd.read_csv(args.csv)
     else:
         try:
-            produced = fetch_table(args.adapter, truth["table_name"],
-                                   truth.get("table_version", 1), truth.get("record_ids"))
+            produced = fetch_table(
+                args.adapter,
+                truth["table_name"],
+                truth.get("table_version", 1),
+                truth.get("record_ids"),
+            )
         except (LookupError, NotImplementedError) as e:
-            report = {"family": family, "seed": truth["seed"], "success": False,
-                      "asserts_passed": 0, "asserts_total": 1,
-                      "asserts": [{"name": "A0_deliverable_exists", "passed": False,
-                                   "detail": str(e)}]}
+            report = {
+                "family": family,
+                "seed": truth["seed"],
+                "success": False,
+                "asserts_passed": 0,
+                "asserts_total": 1,
+                "asserts": [{"name": "A0_deliverable_exists", "passed": False, "detail": str(e)}],
+            }
             print(json.dumps(report, indent=2, default=str))
             return 1
     report = grade_fn(args.instance, produced, args.adapter)
@@ -144,8 +166,9 @@ def grade_table_content(family: str, instance_dir: Path, produced: pd.DataFrame)
     diagnostic = None
 
     def check(name, ok, detail=""):
-        asserts.append({"name": name, "passed": bool(ok),
-                        **({"detail": detail} if detail and not ok else {})})
+        asserts.append(
+            {"name": name, "passed": bool(ok), **({"detail": detail} if detail and not ok else {})}
+        )
         return bool(ok)
 
     produced.columns = [str(c).strip().lower() for c in produced.columns]
@@ -159,8 +182,11 @@ def grade_table_content(family: str, instance_dir: Path, produced: pd.DataFrame)
             check("A2_canonical_form", False, f"could not normalize: {e}")
             norm = None
         if norm is not None:
-            a2 = check("A2_row_count", len(norm) == truth["row_count"],
-                       f"got {len(norm)}, expected {truth['row_count']}")
+            a2 = check(
+                "A2_row_count",
+                len(norm) == truth["row_count"],
+                f"got {len(norm)}, expected {truth['row_count']}",
+            )
             d = digest(norm)
             a3 = check("A3_content", d == truth["digest"], "content digest mismatch")
             if not a3:
@@ -170,10 +196,15 @@ def grade_table_content(family: str, instance_dir: Path, produced: pd.DataFrame)
                         break
 
     success = a1 and a2 and a3
-    return {"family": family, "seed": truth["seed"], "success": success,
-            "asserts_passed": sum(a["passed"] for a in asserts),
-            "asserts_total": len(asserts), "asserts": asserts,
-            **({"diagnostic": diagnostic} if diagnostic else {})}
+    return {
+        "family": family,
+        "seed": truth["seed"],
+        "success": success,
+        "asserts_passed": sum(a["passed"] for a in asserts),
+        "asserts_total": len(asserts),
+        "asserts": asserts,
+        **({"diagnostic": diagnostic} if diagnostic else {}),
+    }
 
 
 def load_answers(path: Path) -> dict | None:
@@ -188,6 +219,7 @@ def load_answers(path: Path) -> dict | None:
 def grade_answers_main(family: str, grade_fn, argv: list[str] | None = None) -> int:
     """CLI shared by answers-deliverable families: --instance + --answers."""
     import argparse
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--instance", type=Path, required=True)
     ap.add_argument("--answers", type=Path, required=True)
@@ -195,10 +227,19 @@ def grade_answers_main(family: str, grade_fn, argv: list[str] | None = None) -> 
 
     answers = load_answers(args.answers)
     if answers is None:
-        report = {"family": family, "success": False, "asserts_passed": 0,
-                  "asserts_total": 1,
-                  "asserts": [{"name": "A0_deliverable_exists", "passed": False,
-                               "detail": f"no answers file at {args.answers}"}]}
+        report = {
+            "family": family,
+            "success": False,
+            "asserts_passed": 0,
+            "asserts_total": 1,
+            "asserts": [
+                {
+                    "name": "A0_deliverable_exists",
+                    "passed": False,
+                    "detail": f"no answers file at {args.answers}",
+                }
+            ],
+        }
     else:
         report = grade_fn(args.instance, answers)
     print(json.dumps(report, indent=2, default=str))
@@ -210,18 +251,23 @@ def state_checker(adapter: str):
     get_endpoint / get_alert / get_records …), or None for `none`."""
     if adapter == "hopsworks":
         from evals.adapters.hopsworks import HopsworksChecker
+
         return HopsworksChecker()
     if adapter == "databricks":
         from evals.adapters.databricks import DatabricksChecker
+
         return DatabricksChecker()
     if adapter == "aws":
         from evals.adapters.aws import SageMakerChecker
+
         return SageMakerChecker()
     if adapter == "azure":
         from evals.adapters.azure import AzureMLChecker
+
         return AzureMLChecker()
     if adapter == "gcp":
         from evals.adapters.gcp import VertexChecker
+
         return VertexChecker()
     return None
 
@@ -232,10 +278,14 @@ def grade_platform_main(family: str, grade_fn, argv: list[str] | None = None) ->
     module reads whatever mix of submission/ files and platform state it needs
     (the provider runs graders with cwd = the run dir)."""
     import argparse
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--instance", type=Path, required=True)
-    ap.add_argument("--adapter", required=True,
-                    choices=["hopsworks", "databricks", "aws", "azure", "gcp", "none"])
+    ap.add_argument(
+        "--adapter",
+        required=True,
+        choices=["hopsworks", "databricks", "aws", "azure", "gcp", "none"],
+    )
     args = ap.parse_args(argv)
     report = grade_fn(args.instance, args.adapter, Path.cwd())
     print(json.dumps(report, indent=2, default=str))

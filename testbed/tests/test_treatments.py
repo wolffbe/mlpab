@@ -1,12 +1,12 @@
-"""Treatment session orchestration around the cross-session build barrier.
+"""Treatment session orchestration after the build barrier was removed.
 
-The barrier window must cover the WHOLE setup phase — platform preflight and
-interface builds — not just the build: parallel rq1 sessions otherwise sail
-past the agent gate while a sibling is still setting up, and open their
-agent (claude) mid-setup. Each agent run must also HOLD its slot
-(`agent_slot`) for the run's duration, so a sibling session started after
-the agent opened waits instead of building under it.
+Setup is a single up-front phase: preflight builds + tests each platform AND
+materializes its prepared venv (interfaces.prepare). Every run then just clones
+its prepared venv read-only, so there is no per-run build and no barrier — runs
+are no longer wrapped in an agent slot. These tests assert the surviving
+contract: setup runs ONCE before any run, and every configured run executes.
 """
+
 import contextlib
 import io
 import tempfile
@@ -14,76 +14,123 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from mlpab import treatments, claude_runner, preflight, results, runner
+from mlpab import claude_runner, preflight, results, runner, treatments
 
 
-class SetupBarrierWindowTests(unittest.TestCase):
-    def test_setup_phase_holds_barrier_and_every_run_gates_on_it(self):
+class SetupPhaseTests(unittest.TestCase):
+    def test_preflight_runs_once_before_every_run(self):
         events = []
-        state = {"building": False, "slot": False}
-
-        @contextlib.contextmanager
-        def fake_building(lock_path=None):
-            state["building"] = True
-            events.append("building-enter")
-            try:
-                yield
-            finally:
-                state["building"] = False
-                events.append("building-exit")
-
-        @contextlib.contextmanager
-        def fake_slot(lock_path=None, run_lock_path=None):
-            events.append(("slot-enter", state["building"]))
-            state["slot"] = True
-            try:
-                yield 0.0
-            finally:
-                state["slot"] = False
-                events.append("slot-exit")
 
         cfg = treatments.TreatmentConfig(
             runs=[
-                treatments.RunEntry(task="training_data", platform="hopsworks",
-                                   interface="cli", category="feature"),
-                treatments.RunEntry(task="training_data", platform="hopsworks",
-                                   interface="cli", category="feature2"),
+                treatments.RunEntry(
+                    task="training_data", platform="hopsworks", interface="cli", category="feature"
+                ),
+                treatments.RunEntry(
+                    task="training_data", platform="hopsworks", interface="cli", category="feature2"
+                ),
             ],
         )
         tmp = Path(tempfile.mkdtemp())
 
-        with mock.patch.object(preflight, "building", fake_building), \
-             mock.patch.object(preflight, "agent_slot", fake_slot), \
-             mock.patch.object(preflight, "preflight",
-                               lambda *a, **k: events.append(("preflight", state["building"]))), \
-             mock.patch.object(claude_runner, "oauth_token_from_keychain", lambda: None), \
-             mock.patch.object(results, "roll_up_results", lambda *a, **k: None), \
-             mock.patch.object(runner, "run", mock.Mock(
-                 side_effect=lambda spec: events.append(("run", state["building"], state["slot"]))
-                 or (_ for _ in ()).throw(RuntimeError("stop after spawn point")))), \
-             contextlib.redirect_stdout(io.StringIO()), \
-             contextlib.redirect_stderr(io.StringIO()):
+        def fake_run(spec):
+            events.append("run")
+            # Stop before per-run post-processing (results row, notebook): the
+            # loop catches this and records a failure, which is fine here.
+            raise RuntimeError("stop after run")
+
+        with (
+            mock.patch.object(preflight, "check_availability", lambda *a, **k: None),
+            mock.patch.object(treatments, "check_readiness", lambda cfg: (True, [])),
+            mock.patch.object(treatments, "check_llm_live", lambda *a, **k: (True, [])),
+            mock.patch.object(preflight, "preflight", lambda *a, **k: events.append("preflight")),
+            mock.patch.object(claude_runner, "oauth_token_from_keychain", lambda: None),
+            mock.patch.object(results, "roll_up_results", lambda *a, **k: None),
+            mock.patch.object(runner, "run", side_effect=fake_run),
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
             treatments.run_treatments(cfg, tmp, config_name="t")
 
-        # The whole setup phase ran INSIDE the barrier window.
-        self.assertIn(("preflight", True), events)
+        # Setup happened exactly once, before any run; then every run executed.
+        self.assertEqual(events.count("preflight"), 1)
+        self.assertEqual(events[0], "preflight")
+        self.assertEqual(events.count("run"), 2)
+        # No barrier wrappers survive on the module.
+        self.assertFalse(hasattr(preflight, "agent_slot"))
 
-        # The window closed before any agent run; every run start gated on
-        # (and then HELD) its agent slot for the run's duration.
-        exit_idx = events.index("building-exit")
-        run_idxs = [i for i, e in enumerate(events) if e == ("run", False, True)]
-        slot_idxs = [i for i, e in enumerate(events) if e == ("slot-enter", False)]
-        self.assertEqual(len(run_idxs), 2)
-        self.assertEqual(len(slot_idxs), 2)
-        for s, r in zip(slot_idxs, run_idxs):
-            self.assertGreater(s, exit_idx)
-            self.assertLess(s, r)
-        # Slots were released between runs (held per run, not for the session).
-        self.assertEqual(events.count("slot-exit"), 2)
-        # No agent ever ran while this session's own barrier was held, and
-        # none ran outside a held slot.
-        self.assertNotIn(("run", True, True), events)
-        self.assertNotIn(("run", False, False), events)
+
+class SetupVerifyAbortsConfigTests(unittest.TestCase):
+    def test_platform_not_ready_aborts_whole_config(self):
+        calls = []
+
+        def fake_run(spec):
+            calls.append(spec)
+            raise preflight.PlatformNotReadyError("databricks not ready")
+
+        cfg = treatments.TreatmentConfig(
+            runs=[
+                treatments.RunEntry(
+                    task="training_data", platform="databricks", interface="cli", category="feature"
+                ),
+                treatments.RunEntry(
+                    task="training_data",
+                    platform="databricks",
+                    interface="cli",
+                    category="feature2",
+                ),
+            ],
+        )
+        tmp = Path(tempfile.mkdtemp())
+        with (
+            mock.patch.object(preflight, "check_availability", lambda *a, **k: None),
+            mock.patch.object(treatments, "check_readiness", lambda cfg: (True, [])),
+            mock.patch.object(treatments, "check_llm_live", lambda *a, **k: (True, [])),
+            mock.patch.object(preflight, "preflight", lambda *a, **k: None),
+            mock.patch.object(claude_runner, "oauth_token_from_keychain", lambda: None),
+            mock.patch.object(results, "roll_up_results", lambda *a, **k: None),
+            mock.patch.object(runner, "run", side_effect=fake_run),
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            with self.assertRaises(preflight.PlatformNotReadyError):
+                treatments.run_treatments(cfg, tmp, config_name="t")
+        # Aborted on the FIRST run — never attempted the second.
+        self.assertEqual(len(calls), 1)
+
+
+class LivenessAbortsConfigTests(unittest.TestCase):
+    def test_unreachable_model_aborts_before_any_run(self):
+        # A model that passes static readiness but fails the live probe must
+        # abort the session before any run (prevents zero-activity runs).
+        ran = []
+        cfg = treatments.TreatmentConfig(
+            runs=[
+                treatments.RunEntry(
+                    task="training_data", platform="databricks", interface="cli", category="feature"
+                )
+            ],
+        )
+        with (
+            mock.patch.object(preflight, "check_availability", lambda *a, **k: None),
+            mock.patch.object(treatments, "check_readiness", lambda cfg: (True, [])),
+            mock.patch.object(
+                treatments,
+                "check_llm_live",
+                lambda *a, **k: (False, [("mistral-medium-3.5", False, "exit 1: model not found")]),
+            ),
+            mock.patch.object(
+                preflight,
+                "preflight",
+                mock.Mock(side_effect=AssertionError("must not reach build")),
+            ),
+            mock.patch.object(runner, "run", mock.Mock(side_effect=lambda s: ran.append(s))),
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            with self.assertRaises(preflight.PreflightError):
+                treatments.run_treatments(cfg, Path(tempfile.mkdtemp()), config_name="t")
+        self.assertEqual(ran, [])
 
 
 class UnimplementedFamilyFailFastTests(unittest.TestCase):
@@ -91,13 +138,19 @@ class UnimplementedFamilyFailFastTests(unittest.TestCase):
         # run_treatments validates every task against the evals registry
         # BEFORE building anything — an unimplemented family must raise.
         cfg = treatments.TreatmentConfig(
-            runs=[treatments.RunEntry(task="no-such-eval", platform="hopsworks",
-                                     interface="cli")],
+            runs=[treatments.RunEntry(task="no-such-eval", platform="hopsworks", interface="cli")],
         )
-        with mock.patch.object(preflight, "preflight",
-                               mock.Mock(side_effect=AssertionError("must not reach preflight"))), \
-             contextlib.redirect_stdout(io.StringIO()), \
-             contextlib.redirect_stderr(io.StringIO()):
+        with (
+            mock.patch.object(preflight, "check_availability", lambda *a, **k: None),
+            mock.patch.object(treatments, "check_readiness", lambda cfg: (True, [])),
+            mock.patch.object(
+                preflight,
+                "preflight",
+                mock.Mock(side_effect=AssertionError("must not reach preflight")),
+            ),
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
             with self.assertRaises(ValueError):
                 treatments.run_treatments(cfg, Path(tempfile.mkdtemp()), config_name="t")
 

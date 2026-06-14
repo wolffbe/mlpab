@@ -35,6 +35,7 @@ Best-effort by design: invoked via the interface `teardown:` step, whose runner
 (`_run_aux`) ignores failures and discards output. Nothing here may raise out of
 `main()` — a teardown hiccup must never fail an engineer run.
 """
+
 from __future__ import annotations
 
 import json
@@ -47,28 +48,39 @@ TOKEN = os.environ.get("DATABRICKS_TOKEN") or ""
 
 # Never deleted, even when owned by the token user (default/system plumbing the
 # next run relies on — the MCP interface binds the `workspace.default` schema).
-KEEP_CATALOGS = {"system", "samples", "main", "workspace", "hive_metastore",
-                 "__databricks_internal"}
+KEEP_CATALOGS = {
+    "system",
+    "samples",
+    "main",
+    "workspace",
+    "hive_metastore",
+    "__databricks_internal",
+}
 # Catalogs not even swept inside (system-managed or not UC-governed).
 SKIP_SWEEP_CATALOGS = {"system", "samples", "hive_metastore", "__databricks_internal"}
 KEEP_SCHEMAS = {"default", "information_schema"}
 
 
-def _api(method: str, path: str, payload: dict | None = None,
-         query: dict | None = None) -> dict:
+def _api(method: str, path: str, payload: dict | None = None, query: dict | None = None) -> dict:
     url = HOST + path + (("?" + urllib.parse.urlencode(query)) if query else "")
     data = json.dumps(payload).encode() if payload is not None else None
-    req = urllib.request.Request(url, data=data, method=method, headers={
-        "Authorization": f"Bearer {TOKEN}",
-        "Content-Type": "application/json",
-    })
+    req = urllib.request.Request(
+        url,
+        data=data,
+        method=method,
+        headers={
+            "Authorization": f"Bearer {TOKEN}",
+            "Content-Type": "application/json",
+        },
+    )
     with urllib.request.urlopen(req, timeout=20) as resp:
         body = resp.read()
     return json.loads(body) if body else {}
 
 
-def _try(method: str, path: str, payload: dict | None = None,
-         query: dict | None = None, label: str = "") -> dict | None:
+def _try(
+    method: str, path: str, payload: dict | None = None, query: dict | None = None, label: str = ""
+) -> dict | None:
     """Best-effort _api: None on any failure (logged only when labelled)."""
     try:
         return _api(method, path, payload, query)
@@ -92,8 +104,9 @@ def _delete_uc_model(full_name: str) -> None:
     versions = _try("GET", f"/api/2.1/unity-catalog/models/{quoted}/versions") or {}
     for v in versions.get("model_versions") or []:
         _try("DELETE", f"/api/2.1/unity-catalog/models/{quoted}/versions/{v.get('version')}")
-    _try("DELETE", f"/api/2.1/unity-catalog/models/{quoted}",
-         label=f"delete uc model {full_name!r}")
+    _try(
+        "DELETE", f"/api/2.1/unity-catalog/models/{quoted}", label=f"delete uc model {full_name!r}"
+    )
     print(f"[databricks teardown] deleted uc model {full_name!r}")
 
 
@@ -112,8 +125,10 @@ def _sweep_schema_objects(catalog: str, schema: str, me: str) -> None:
                 continue
             quoted = urllib.parse.quote(full, safe="")
             query = {"force": "true"} if force else None
-            if _try("DELETE", f"{base}/{quoted}", query=query,
-                    label=f"delete uc {kind} {full!r}") is not None:
+            if (
+                _try("DELETE", f"{base}/{quoted}", query=query, label=f"delete uc {kind} {full!r}")
+                is not None
+            ):
                 print(f"[databricks teardown] deleted uc {kind} {full!r}")
     resp = _try("GET", "/api/2.1/unity-catalog/models", query=scope) or {}
     for obj in resp.get("registered_models") or []:
@@ -130,21 +145,36 @@ def _sweep_unity_catalog(me: str) -> None:
             continue
         # Agent-created catalog → force delete cascades all of its contents.
         if name not in KEEP_CATALOGS and _mine(cat, me, "created_by"):
-            if _try("DELETE", f"/api/2.1/unity-catalog/catalogs/{name}",
-                    query={"force": "true"}, label=f"delete catalog {name!r}") is not None:
+            if (
+                _try(
+                    "DELETE",
+                    f"/api/2.1/unity-catalog/catalogs/{name}",
+                    query={"force": "true"},
+                    label=f"delete catalog {name!r}",
+                )
+                is not None
+            ):
                 print(f"[databricks teardown] deleted catalog {name!r}")
             continue
         # Kept catalog → sweep agent-created schemas, then objects in kept schemas.
-        schemas = (_try("GET", "/api/2.1/unity-catalog/schemas",
-                        query={"catalog_name": name}) or {}).get("schemas") or []
+        schemas = (
+            _try("GET", "/api/2.1/unity-catalog/schemas", query={"catalog_name": name}) or {}
+        ).get("schemas") or []
         for sch in schemas:
             sname = sch.get("name")
             if not sname:
                 continue
             if sname not in KEEP_SCHEMAS and _mine(sch, me, "created_by"):
                 full = sch.get("full_name") or f"{name}.{sname}"
-                if _try("DELETE", f"/api/2.1/unity-catalog/schemas/{full}",
-                        query={"force": "true"}, label=f"delete schema {full!r}") is not None:
+                if (
+                    _try(
+                        "DELETE",
+                        f"/api/2.1/unity-catalog/schemas/{full}",
+                        query={"force": "true"},
+                        label=f"delete schema {full!r}",
+                    )
+                    is not None
+                ):
                     print(f"[databricks teardown] deleted schema {full!r}")
             elif sname != "information_schema":
                 _sweep_schema_objects(name, sname, me)
@@ -164,8 +194,14 @@ def main() -> None:
     resp = _try("GET", "/api/2.0/serving-endpoints", label="list serving endpoints") or {}
     for ep in resp.get("endpoints") or []:
         if ep.get("name") and _mine(ep, me, "creator"):
-            if _try("DELETE", f"/api/2.0/serving-endpoints/{ep['name']}",
-                    label=f"delete serving endpoint {ep['name']!r}") is not None:
+            if (
+                _try(
+                    "DELETE",
+                    f"/api/2.0/serving-endpoints/{ep['name']}",
+                    label=f"delete serving endpoint {ep['name']!r}",
+                )
+                is not None
+            ):
                 print(f"[databricks teardown] deleted serving endpoint {ep['name']!r}")
     resp = _try("GET", "/api/2.0/vector-search/endpoints") or {}
     for ep in resp.get("endpoints") or []:
@@ -193,18 +229,27 @@ def main() -> None:
         if cl.get("cluster_source") == "JOB":  # ephemeral; dies with its run
             continue
         if cl.get("cluster_id") and _mine(cl, me, "creator_user_name"):
-            if _try("POST", "/api/2.0/clusters/permanent-delete",
+            if (
+                _try(
+                    "POST",
+                    "/api/2.0/clusters/permanent-delete",
                     {"cluster_id": cl["cluster_id"]},
-                    label=f"delete cluster {cl['cluster_id']}") is not None:
-                print(f"[databricks teardown] deleted cluster {cl['cluster_id']} "
-                      f"({cl.get('cluster_name')!r})")
+                    label=f"delete cluster {cl['cluster_id']}",
+                )
+                is not None
+            ):
+                print(
+                    f"[databricks teardown] deleted cluster {cl['cluster_id']} "
+                    f"({cl.get('cluster_name')!r})"
+                )
 
     resp = _try("GET", "/api/2.0/sql/warehouses") or {}
     for wh in resp.get("warehouses") or []:
         if wh.get("id") and _mine(wh, me, "creator_name"):
             if _try("DELETE", f"/api/2.0/sql/warehouses/{wh['id']}") is not None:
-                print(f"[databricks teardown] deleted sql warehouse {wh['id']} "
-                      f"({wh.get('name')!r})")
+                print(
+                    f"[databricks teardown] deleted sql warehouse {wh['id']} ({wh.get('name')!r})"
+                )
 
     token = None
     while True:
@@ -240,16 +285,25 @@ def main() -> None:
     for exp in resp.get("experiments") or []:
         # Experiments carry no creator field; the user's home path scopes them.
         if (exp.get("name") or "").startswith(home + "/") and exp.get("experiment_id"):
-            if _try("POST", "/api/2.0/mlflow/experiments/delete",
-                    {"experiment_id": exp["experiment_id"]}) is not None:
+            if (
+                _try(
+                    "POST",
+                    "/api/2.0/mlflow/experiments/delete",
+                    {"experiment_id": exp["experiment_id"]},
+                )
+                is not None
+            ):
                 print(f"[databricks teardown] deleted experiment {exp['name']!r}")
 
-    resp = _try("GET", "/api/2.0/mlflow/registered-models/search",
-                query={"max_results": "1000"}) or {}
+    resp = (
+        _try("GET", "/api/2.0/mlflow/registered-models/search", query={"max_results": "1000"}) or {}
+    )
     for rm in resp.get("registered_models") or []:
         if rm.get("name") and _mine(rm, me, "user_id"):
-            if _try("DELETE", "/api/2.0/mlflow/registered-models/delete",
-                    {"name": rm["name"]}) is not None:
+            if (
+                _try("DELETE", "/api/2.0/mlflow/registered-models/delete", {"name": rm["name"]})
+                is not None
+            ):
                 print(f"[databricks teardown] deleted registered model {rm['name']!r}")
 
     # 4) Unity Catalog (absent on non-UC workspaces — every call is best-effort).
@@ -260,20 +314,107 @@ def main() -> None:
     resp = _try("GET", "/api/2.0/workspace/list", query={"path": home}) or {}
     for obj in resp.get("objects") or []:
         path = obj.get("path")
-        if path and _try("POST", "/api/2.0/workspace/delete",
-                         {"path": path, "recursive": True},
-                         label=f"delete workspace path {path!r}") is not None:
+        if (
+            path
+            and _try(
+                "POST",
+                "/api/2.0/workspace/delete",
+                {"path": path, "recursive": True},
+                label=f"delete workspace path {path!r}",
+            )
+            is not None
+        ):
             print(f"[databricks teardown] deleted workspace path {path!r}")
 
     resp = _try("GET", "/api/2.0/dbfs/list", query={"path": "/FileStore"}) or {}
     for f in resp.get("files") or []:
         path = f.get("path")
-        if path and _try("POST", "/api/2.0/dbfs/delete",
-                         {"path": path, "recursive": True}) is not None:
+        if (
+            path
+            and _try("POST", "/api/2.0/dbfs/delete", {"path": path, "recursive": True}) is not None
+        ):
             print(f"[databricks teardown] deleted dbfs path {path!r}")
 
     print("[databricks teardown] done")
 
 
+def verify() -> int:
+    """Twofold teardown check (`teardown.py verify`): (1) the workspace CONNECTS,
+    then (2) NONE of the agent's billed resources survive the sweep. Read-only.
+
+    Re-scans the cost-bearing, agent-owned resource types main() deletes —
+    serving + vector-search endpoints, non-job clusters, SQL warehouses, jobs,
+    and agent-created Unity Catalog catalogs/schemas. Exit 0 iff clean; non-zero
+    listing the leaks otherwise (the runner WARNS rather than failing — the run
+    already happened, and the next run's start-teardown sweeps again). UC absence
+    or an unreachable type is ignored (best-effort, like main())."""
+    if not HOST or not TOKEN:
+        print("[databricks verify-teardown] DATABRICKS_HOST/DATABRICKS_TOKEN unset")
+        return 1
+    who = _try("GET", "/api/2.0/preview/scim/v2/Me")
+    if not who:
+        print(f"[databricks verify-teardown] NO CONNECTION ({HOST!r})")
+        return 1
+    me = who.get("userName") or ""
+    leaks: list[str] = []
+
+    resp = _try("GET", "/api/2.0/serving-endpoints") or {}
+    leaks += [
+        f"serving-endpoint {e['name']!r}"
+        for e in (resp.get("endpoints") or [])
+        if e.get("name") and _mine(e, me, "creator")
+    ]
+    resp = _try("GET", "/api/2.0/vector-search/endpoints") or {}
+    leaks += [
+        f"vector-search-endpoint {e['name']!r}"
+        for e in (resp.get("endpoints") or [])
+        if e.get("name") and _mine(e, me, "creator")
+    ]
+    resp = _try("GET", "/api/2.0/clusters/list") or {}
+    leaks += [
+        f"cluster {c['cluster_id']}"
+        for c in (resp.get("clusters") or [])
+        if c.get("cluster_source") != "JOB"
+        and c.get("cluster_id")
+        and _mine(c, me, "creator_user_name")
+    ]
+    resp = _try("GET", "/api/2.0/sql/warehouses") or {}
+    leaks += [
+        f"warehouse {w['id']}"
+        for w in (resp.get("warehouses") or [])
+        if w.get("id") and _mine(w, me, "creator_name")
+    ]
+    resp = _try("GET", "/api/2.1/jobs/list", query={"limit": "100"}) or {}
+    leaks += [
+        f"job {j['job_id']}"
+        for j in (resp.get("jobs") or [])
+        if j.get("job_id") and _mine(j, me, "creator_user_name")
+    ]
+    cats = (_try("GET", "/api/2.1/unity-catalog/catalogs") or {}).get("catalogs") or []
+    for cat in cats:
+        name = cat.get("name")
+        if not name or name in SKIP_SWEEP_CATALOGS:
+            continue
+        if name not in KEEP_CATALOGS and _mine(cat, me, "created_by"):
+            leaks.append(f"catalog {name!r}")
+            continue
+        schemas = (
+            _try("GET", "/api/2.1/unity-catalog/schemas", query={"catalog_name": name}) or {}
+        ).get("schemas") or []
+        leaks += [
+            f"schema {sch.get('full_name') or (name + '.' + sch.get('name'))!r}"
+            for sch in schemas
+            if sch.get("name") and sch["name"] not in KEEP_SCHEMAS and _mine(sch, me, "created_by")
+        ]
+
+    if leaks:
+        print("[databricks verify-teardown] LEAKS remain:\n  - " + "\n  - ".join(leaks))
+        return 1
+    print("[databricks verify-teardown] OK: connected; no agent resources remain")
+    return 0
+
+
 if __name__ == "__main__":
-    main()
+    import sys
+
+    sys.exit(verify() if sys.argv[1:2] == ["verify"] else (main() or 0))

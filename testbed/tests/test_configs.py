@@ -1,9 +1,11 @@
 """Tests for config parsing: platform config references + unified tasks."""
+
 import tempfile
 import unittest
 from pathlib import Path
 
-from mlpab import treatments as bm, interfaces
+from mlpab import interfaces
+from mlpab import treatments as bm
 
 
 class PlatformInterfaceFromConfigTests(unittest.TestCase):
@@ -31,11 +33,15 @@ class TreatmentRepeatsTests(unittest.TestCase):
         self.assertEqual(bm.load_config(p).repeats, 1)
 
     def test_n_key_sets_repeats(self):
-        p = _write("n: 3\ntasks: {feature: [t1]}\ninterfaces: [{platform: none, interface: none}]\n")
+        p = _write(
+            "n: 3\ntasks: {feature: [t1]}\ninterfaces: [{platform: none, interface: none}]\n"
+        )
         self.assertEqual(bm.load_config(p).repeats, 3)
 
     def test_repeats_key_alias(self):
-        p = _write("repeats: 2\ntasks: {feature: [t1]}\ninterfaces: [{platform: none, interface: none}]\n")
+        p = _write(
+            "repeats: 2\ntasks: {feature: [t1]}\ninterfaces: [{platform: none, interface: none}]\n"
+        )
         self.assertEqual(bm.load_config(p).repeats, 2)
 
 
@@ -69,8 +75,10 @@ skills: [none]
 """
         )
         cfg = bm.load_config(p)
-        self.assertEqual([(r.category, r.task) for r in cfg.runs],
-                         [("feature", "training_data"), ("inference", "batch_scoring")])
+        self.assertEqual(
+            [(r.category, r.task) for r in cfg.runs],
+            [("feature", "training_data"), ("inference", "batch_scoring")],
+        )
 
     def test_runs_entries_use_task_and_category_keys(self):
         p = _write(

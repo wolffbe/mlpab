@@ -15,6 +15,7 @@ feature carries only a weak signal. The agent must identify it and write
 Gates: the committed reference detector (per-feature separation between label
 classes) finds the seeded feature uniquely; wrong-feature answers fail.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -74,7 +75,8 @@ def generate(seed: int, out: Path) -> dict:
     df.to_csv(out / "data" / "training_data.csv", index=False)
     (out / "data" / "schema.md").write_text(
         "# Schema\n\n- **training_data.csv**: row_id, "
-        + ", ".join(FEATURES) + " (numeric features), label (0/1 — the prediction target)\n"
+        + ", ".join(FEATURES)
+        + " (numeric features), label (0/1 — the prediction target)\n"
     )
     (out / "prompt.txt").write_text(
         "The directory data/ contains an existing training dataset "
@@ -84,7 +86,7 @@ def generate(seed: int, out: Path) -> dict:
         "post-outcome data, so it predicts the label far too well to be a real "
         "feature. Identify it and write your answer to submission/answers.json as:\n"
         '    {"feature": "<name>"}\n'
-        "You may add a free-text \"evidence\" key describing what you found "
+        'You may add a free-text "evidence" key describing what you found '
         "(optional).\n"
     )
     truth = {"family": "leakage", "seed": seed, "feature": leaky}

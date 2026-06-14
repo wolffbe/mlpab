@@ -18,6 +18,7 @@ Ground truth by construction: the generator made the rows. Naive variants
 (gates assert they differ): keeping the overlap duplicated; loading the epoch
 timestamps unconverted.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -33,7 +34,7 @@ from evals.common import canonicalize, digest, instance_suffix
 
 ORIGIN = pd.Timestamp("2026-01-01", tz="UTC")
 N_ROWS = 600
-OVERLAP = 80          # rows re-delivered in the second file
+OVERLAP = 80  # rows re-delivered in the second file
 EPOCH_FRACTION = 0.2  # rows whose event_time is epoch-milliseconds
 TABLE_BASE = "transactions"  # per-instance: f"{TABLE_BASE}{instance_suffix(seed)}"
 
@@ -57,25 +58,31 @@ def generate(seed: int, out: Path) -> dict:
     rng = np.random.default_rng(seed)
     table = TABLE_BASE + instance_suffix(seed)
     n = N_ROWS
-    truth_df = pd.DataFrame({
-        "row_id": [f"R{i:05d}" for i in range(n)],
-        "account_id": [f"A{int(a):04d}" for a in rng.integers(0, 120, n)],
-        "event_time": [(ORIGIN + pd.Timedelta(minutes=int(m))).floor("s")
-                       for m in np.sort(rng.integers(0, 60 * 24 * 60, n))],
-        "amount": np.round(rng.lognormal(3.0, 1.0, n), 2),
-        "category": rng.choice(["grocery", "travel", "salary", "rent", "other"], n),
-    })
+    truth_df = pd.DataFrame(
+        {
+            "row_id": [f"R{i:05d}" for i in range(n)],
+            "account_id": [f"A{int(a):04d}" for a in rng.integers(0, 120, n)],
+            "event_time": [
+                (ORIGIN + pd.Timedelta(minutes=int(m))).floor("s")
+                for m in np.sort(rng.integers(0, 60 * 24 * 60, n))
+            ],
+            "amount": np.round(rng.lognormal(3.0, 1.0, n), 2),
+            "category": rng.choice(["grocery", "travel", "salary", "rent", "other"], n),
+        }
+    )
 
     # The emitted view: ISO strings, with a seeded subset as epoch-milliseconds.
     emit = truth_df.copy()
     iso = emit["event_time"].dt.strftime("%Y-%m-%dT%H:%M:%SZ")
     epoch_idx = rng.choice(n, int(n * EPOCH_FRACTION), replace=False)
     mixed = iso.astype(object)
-    mixed.iloc[epoch_idx] = (emit["event_time"].iloc[epoch_idx].astype("int64") // 10**6).astype(str)
+    mixed.iloc[epoch_idx] = (emit["event_time"].iloc[epoch_idx].astype("int64") // 10**6).astype(
+        str
+    )
     emit["event_time"] = mixed
 
     split = n - OVERLAP - rng.integers(150, 250)
-    part1 = emit.iloc[:split + OVERLAP]                  # ...includes the overlap tail
+    part1 = emit.iloc[: split + OVERLAP]  # ...includes the overlap tail
     part2 = emit.iloc[split:].sample(frac=1.0, random_state=seed)  # re-delivery, shuffled
 
     truth = canonicalize(truth_df, SPEC)
@@ -86,12 +93,15 @@ def generate(seed: int, out: Path) -> dict:
             pd.concat([part1, part2], ignore_index=True)
             .assign(event_time=lambda d: _parse_mixed(d["event_time"]))
             # duplicates kept: disambiguate the sort so the digest is stable
-            .sort_values(["row_id", "event_time"]), {**SPEC, "sort_cols": ["row_id"]}
-            | {"columns": SPEC["columns"]}),
+            .sort_values(["row_id", "event_time"]),
+            {**SPEC, "sort_cols": ["row_id"]} | {"columns": SPEC["columns"]},
+        ),
         "raw_epoch": canonicalize(
             pd.concat([part1, part2], ignore_index=True)
             .drop_duplicates(subset="row_id")
-            .assign(event_time=lambda d: _parse_naive(d["event_time"])), SPEC),
+            .assign(event_time=lambda d: _parse_naive(d["event_time"])),
+            SPEC,
+        ),
     }
     for name, v in variants.items():
         if digest(v) == digest(truth):
@@ -100,7 +110,9 @@ def generate(seed: int, out: Path) -> dict:
     ref = canonicalize(
         pd.concat([part1, part2], ignore_index=True)
         .drop_duplicates(subset="row_id")
-        .assign(event_time=lambda d: _parse_mixed(d["event_time"])), SPEC)
+        .assign(event_time=lambda d: _parse_mixed(d["event_time"])),
+        SPEC,
+    )
     if digest(ref) != digest(truth):
         raise GateError(f"reference load disagrees with truth (seed={seed})")
 
@@ -134,9 +146,13 @@ def generate(seed: int, out: Path) -> dict:
         "(online/real-time access), where the platform distinguishes the two.\n"
     )
     meta = {
-        "family": "ingest", "seed": seed,
-        "table_name": table, "table_version": 1,
-        "spec": SPEC, "row_count": len(truth), "digest": digest(truth),
+        "family": "ingest",
+        "seed": seed,
+        "table_name": table,
+        "table_version": 1,
+        "spec": SPEC,
+        "row_count": len(truth),
+        "digest": digest(truth),
         "record_ids": truth["row_id"].tolist(),
         "variant_digests": {k: digest(v) for k, v in variants.items()},
         "variant_diagnosis": VARIANT_DIAGNOSIS,
@@ -150,8 +166,9 @@ def generate(seed: int, out: Path) -> dict:
 def _parse_mixed(s: pd.Series) -> pd.Series:
     """ISO strings + epoch-millisecond strings → tz-aware timestamps."""
     out = pd.to_datetime(s.where(~s.str.fullmatch(r"\d+"), None), utc=True)
-    epoch = pd.to_datetime(pd.to_numeric(s.where(s.str.fullmatch(r"\d+"), None)),
-                           unit="ms", utc=True)
+    epoch = pd.to_datetime(
+        pd.to_numeric(s.where(s.str.fullmatch(r"\d+"), None)), unit="ms", utc=True
+    )
     return out.fillna(epoch)
 
 

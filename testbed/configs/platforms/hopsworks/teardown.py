@@ -20,6 +20,7 @@ Best-effort by design: invoked via the interface `teardown:` step, whose runner
 project OWNED by the API key's user, so it cleans whatever the agent created
 regardless of the project name it chose.
 """
+
 from __future__ import annotations
 
 
@@ -73,5 +74,48 @@ def main() -> None:
     print(f"[hopsworks teardown] done — {deleted} project(s) deleted")
 
 
+def verify() -> int:
+    """Twofold teardown check (`teardown.py verify`): confirm no project OWNED by
+    this key survives the sweep. Read-only. Only positively reports a leak
+    (return 1) — if it can't connect/list (e.g. post-teardown there's no project
+    to attach to), it assumes clean (return 0); the next run's start-teardown
+    re-sweeps regardless, and the runner only WARNS on this check."""
+    try:
+        import hopsworks
+        from hopsworks_common import client
+    except Exception as e:
+        print(f"[hopsworks verify-teardown] SDK unavailable (assuming clean): {e}")
+        return 0
+    try:
+        hopsworks.login()
+        teams = client.get_instance()._send_request("GET", ["project"]) or []
+    except Exception as e:
+        print(f"[hopsworks verify-teardown] could not confirm (assuming clean): {e}")
+        return 0
+    my_uid = None
+    for t in teams:
+        my_uid = (t.get("user") or {}).get("uid")
+        if my_uid is not None:
+            break
+    owned, seen = [], set()
+    for t in teams:
+        proj = t.get("project") or {}
+        pid = proj.get("id")
+        if pid is None or pid in seen:
+            continue
+        owner_uid = (proj.get("owner") or {}).get("uid")
+        if my_uid is not None and owner_uid is not None and owner_uid != my_uid:
+            continue
+        seen.add(pid)
+        owned.append(proj.get("name"))
+    if owned:
+        print("[hopsworks verify-teardown] LEAKS: project(s) " + ", ".join(map(str, owned)))
+        return 1
+    print("[hopsworks verify-teardown] OK: connected; no owned projects remain")
+    return 0
+
+
 if __name__ == "__main__":
-    main()
+    import sys
+
+    sys.exit(verify() if sys.argv[1:2] == ["verify"] else (main() or 0))

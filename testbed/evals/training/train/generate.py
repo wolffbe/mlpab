@@ -19,6 +19,7 @@ subprocess in a temp dir and requires it to reproduce the truth digest
 EXACTLY. Naive variant (gates assert it differs): training for only 30
 iterations.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -40,7 +41,7 @@ FEATURES = ["f1", "f2", "f3", "f4", "f5"]
 LEARNING_RATE = 0.1
 ITERATIONS = 300
 TABLE_BASE = "predictions"  # per-instance: f"{TABLE_BASE}{instance_suffix(seed)}"
-JOB_BASE = "trainjob"       # per-instance: f"{JOB_BASE}{instance_suffix(seed)}"
+JOB_BASE = "trainjob"  # per-instance: f"{JOB_BASE}{instance_suffix(seed)}"
 
 SPEC = {
     "columns": ["row_id", "score"],
@@ -51,7 +52,7 @@ SPEC = {
 }
 VARIANT_DIAGNOSIS = {
     "undertrained": "predictions come from an undertrained model "
-                    "(30 iterations instead of the script's 300)",
+    "(30 iterations instead of the script's 300)",
 }
 
 TRAIN_SCRIPT = '''"""Provided training script — deterministic logistic regression.
@@ -96,8 +97,7 @@ class GateError(RuntimeError):
     pass
 
 
-def _train_predict(train_df: pd.DataFrame, score_df: pd.DataFrame,
-                   iterations: int) -> pd.DataFrame:
+def _train_predict(train_df: pd.DataFrame, score_df: pd.DataFrame, iterations: int) -> pd.DataFrame:
     """The identical training math, reimplemented inline (see TRAIN_SCRIPT)."""
     X = train_df[FEATURES].to_numpy(dtype=float)
     y = train_df["label"].to_numpy(dtype=float)
@@ -158,15 +158,16 @@ def generate(seed: int, out: Path) -> dict:
     with tempfile.TemporaryDirectory(prefix="mlpab-train-gate-") as td:
         for f in ("train.csv", "score.csv", "train_model.py"):
             shutil.copy(out / "data" / f, Path(td) / f)
-        proc = subprocess.run([sys.executable, "train_model.py"], cwd=td,
-                              capture_output=True, text=True, timeout=300)
+        proc = subprocess.run(
+            [sys.executable, "train_model.py"], cwd=td, capture_output=True, text=True, timeout=300
+        )
         if proc.returncode != 0:
-            raise GateError(f"emitted train_model.py failed (seed={seed}): "
-                            f"{proc.stderr[-500:]}")
+            raise GateError(f"emitted train_model.py failed (seed={seed}): {proc.stderr[-500:]}")
         got = canonicalize(pd.read_csv(Path(td) / "predictions.csv"), SPEC)
         if digest(got) != digest(truth):
-            raise GateError(f"emitted train_model.py does not reproduce the "
-                            f"truth digest (seed={seed})")
+            raise GateError(
+                f"emitted train_model.py does not reproduce the truth digest (seed={seed})"
+            )
 
     (out / "prompt.txt").write_text(
         "The directory data/ contains a training set (data/train.csv: row_id, "
@@ -185,10 +186,14 @@ def generate(seed: int, out: Path) -> dict:
         f'    {{"job_name": "{job_name}"}}\n'
     )
     meta = {
-        "family": "train", "seed": seed,
-        "table_name": table, "table_version": 1,
+        "family": "train",
+        "seed": seed,
+        "table_name": table,
+        "table_version": 1,
         "job_name": job_name,
-        "spec": SPEC, "row_count": len(truth), "digest": digest(truth),
+        "spec": SPEC,
+        "row_count": len(truth),
+        "digest": digest(truth),
         "record_ids": truth["row_id"].tolist(),
         "variant_digests": {k: digest(v) for k, v in variants.items()},
         "variant_diagnosis": VARIANT_DIAGNOSIS,
@@ -208,8 +213,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.selftest:
         for seed in (1, 2, 3):
             meta = generate(seed, Path(f"/tmp/mlpab-train-selftest/{seed}"))
-            print(f"[train] seed={seed} rows={meta['row_count']} gates=OK "
-                  "(incl. subprocess reproduction)")
+            print(
+                f"[train] seed={seed} rows={meta['row_count']} gates=OK "
+                "(incl. subprocess reproduction)"
+            )
         return 0
     if not args.out:
         ap.error("--out is required (or use --selftest)")

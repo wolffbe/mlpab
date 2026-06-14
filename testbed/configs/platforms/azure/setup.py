@@ -14,6 +14,7 @@ slow — so we reuse AZUREML_FEATURE_STORE_NAME if set, else ensure a default
 
 ⚠ LIVE-VALIDATION REQUIRED — the feature-store create call is convention-based.
 """
+
 from __future__ import annotations
 
 import os
@@ -48,13 +49,44 @@ def main() -> None:
             print(f"[azure setup] feature store {fs_name!r} already exists")
         except Exception:
             print(f"[azure setup] creating feature store {fs_name!r} in {location} …")
-            ml.feature_stores.begin_create(
-                FeatureStore(name=fs_name, location=location)).result()
+            ml.feature_stores.begin_create(FeatureStore(name=fs_name, location=location)).result()
             print(f"[azure setup] created feature store {fs_name!r}")
         _export("AZUREML_FEATURE_STORE_NAME", fs_name)
     except Exception as e:
         print(f"[azure setup] best-effort skip: {e}")
 
 
+def verify() -> int:
+    """Twofold setup check (`setup.py verify`): (1) Azure ML CONNECTS, then (2)
+    the managed feature store setup guarantees is PRESENT. Connection is the hard
+    gate; the feature store is best-effort. Read-only."""
+    fs_name = os.environ.get("AZUREML_FEATURE_STORE_NAME") or DEFAULT_FS
+    sub = os.environ.get("AZURE_SUBSCRIPTION_ID")
+    rg = os.environ.get("AZURE_RESOURCE_GROUP")
+    if not (sub and rg):
+        print("[azure verify-setup] missing AZURE_SUBSCRIPTION_ID/RESOURCE_GROUP")
+        return 1
+    try:
+        from azure.ai.ml import MLClient
+        from azure.identity import DefaultAzureCredential
+
+        ml = MLClient(DefaultAzureCredential(), sub, rg)
+        list(ml.workspaces.list())  # forces a real authenticated round-trip
+    except Exception as e:
+        print(f"[azure verify-setup] NO CONNECTION: {e}")
+        return 1
+    try:
+        ml.feature_stores.get(name=fs_name)
+        print(f"[azure verify-setup] OK: connected; feature store {fs_name!r} present")
+    except Exception as e:
+        print(
+            f"[azure verify-setup] OK: connected; feature store {fs_name!r} absent "
+            f"(best-effort, not failing): {e}"
+        )
+    return 0
+
+
 if __name__ == "__main__":
-    main()
+    import sys
+
+    sys.exit(verify() if sys.argv[1:2] == ["verify"] else (main() or 0))

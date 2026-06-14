@@ -20,6 +20,7 @@ The agent must identify the skewed feature and write
 committed reference detector recovers the seeded feature from the emitted CSVs
 and finds exactly one diverging feature; wrong-feature answers fail the grader.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -41,8 +42,7 @@ def _detect(train: pd.DataFrame, served: pd.DataFrame) -> str | None:
     per-entity values systematically differ. Returns the single diverging
     feature, or None if zero/multiple diverge."""
     j = train.merge(served, on="entity_id", suffixes=("_t", "_s"))
-    diverging = [f for f in FEATURES
-                 if (j[f + "_t"] - j[f + "_s"]).abs().mean() > 1e-9]
+    diverging = [f for f in FEATURES if (j[f + "_t"] - j[f + "_s"]).abs().mean() > 1e-9]
     return diverging[0] if len(diverging) == 1 else None
 
 
@@ -88,9 +88,11 @@ def generate(seed: int, out: Path) -> dict:
     served.to_csv(out / "data" / "serving_log.csv", index=False)
     (out / "data" / "schema.md").write_text(
         "# Schema\n\n- **training_sample.csv**: entity_id, "
-        + ", ".join(FEATURES) + " — features as the TRAINING pipeline computed them\n"
+        + ", ".join(FEATURES)
+        + " — features as the TRAINING pipeline computed them\n"
         "- **serving_log.csv**: entity_id, "
-        + ", ".join(FEATURES) + " — feature vectors the ONLINE service actually served\n"
+        + ", ".join(FEATURES)
+        + " — feature vectors the ONLINE service actually served\n"
     )
     (out / "prompt.txt").write_text(
         "A model was trained on the feature matrix in data/training_sample.csv. "
@@ -100,14 +102,17 @@ def generate(seed: int, out: Path) -> dict:
         "and the serving path (training/serving skew). Identify which feature "
         "diverges and write your answer to submission/answers.json as:\n"
         '    {"feature": "<name>"}\n'
-        "You may add a free-text \"cause\" key describing what you think went "
+        'You may add a free-text "cause" key describing what you think went '
         "wrong (optional).\n"
     )
-    truth = {"family": "skew", "seed": seed, "feature": skewed,
-             "cause": "training applied log1p; serving uses raw values"}
+    truth = {
+        "family": "skew",
+        "seed": seed,
+        "feature": skewed,
+        "cause": "training applied log1p; serving uses raw values",
+    }
     (out / "solution" / "truth.json").write_text(json.dumps(truth, indent=2))
-    (out / "instance.json").write_text(json.dumps(
-        {"family": "skew", "seed": seed}, indent=2))
+    (out / "instance.json").write_text(json.dumps({"family": "skew", "seed": seed}, indent=2))
     return truth
 
 

@@ -39,6 +39,7 @@ create still RETRIES briefly for transient backend hiccups; the runner's serve
 timeout (runner.py `_run_aux`) must stay comfortably above
 CREATE_RETRY_SECONDS.
 """
+
 from __future__ import annotations
 
 import secrets
@@ -75,10 +76,7 @@ def main() -> None:
         attempt += 1
         try:
             hopsworks.create_project(PROJECT_NAME)
-            print(
-                f"[hopsworks setup] created empty project {PROJECT_NAME!r}"
-                f" (attempt {attempt})"
-            )
+            print(f"[hopsworks setup] created empty project {PROJECT_NAME!r} (attempt {attempt})")
             return
         except Exception as e:
             # Most commonly the previous run's namespace is still being deleted
@@ -91,11 +89,37 @@ def main() -> None:
                     f" after {attempt} attempt(s): {e}"
                 )
                 return
-            print(
-                f"[hopsworks setup] create attempt {attempt} failed, retrying: {e}"
-            )
+            print(f"[hopsworks setup] create attempt {attempt} failed, retrying: {e}")
             time.sleep(CREATE_RETRY_SLEEP)
 
 
+def verify() -> int:
+    """Twofold setup check (`setup.py verify`): (1) the cluster CONNECTS (login),
+    then (2) a project is AVAILABLE for the agent's login to select. Connection
+    is the hard gate; the project count is best-effort. Read-only."""
+    try:
+        import hopsworks
+    except Exception as e:
+        print(f"[hopsworks verify-setup] SDK unavailable: {e}")
+        return 1
+    try:
+        hopsworks.login()  # reads HOPSWORKS_API_KEY / HOPSWORKS_HOST from env
+    except Exception as e:
+        print(f"[hopsworks verify-setup] NO CONNECTION (or no project): {e}")
+        return 1
+    try:
+        from hopsworks_common import client
+
+        teams = client.get_instance()._send_request("GET", ["project"]) or []
+        print(f"[hopsworks verify-setup] OK: connected; {len(teams)} project(s) available")
+    except Exception as e:
+        print(
+            f"[hopsworks verify-setup] OK: connected; project list unavailable (best-effort): {e}"
+        )
+    return 0
+
+
 if __name__ == "__main__":
-    main()
+    import sys
+
+    sys.exit(verify() if sys.argv[1:2] == ["verify"] else (main() or 0))

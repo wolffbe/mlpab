@@ -1,7 +1,9 @@
 """Unit tests for interface resolution, keys, and preflight (no AI, no network)."""
+
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from mlpab import interfaces, preflight
 
@@ -34,14 +36,14 @@ class InterfaceTestBase(unittest.TestCase):
 
 class KeysTests(InterfaceTestBase):
     def test_keys_for_mapping(self):
-        self.write_manifest("svc", "sdk", "keys:\n  API_KEY: \"abc\"\n  HOST: \"\"\nprompt: hi\n")
+        self.write_manifest("svc", "sdk", 'keys:\n  API_KEY: "abc"\n  HOST: ""\nprompt: hi\n')
         self.assertEqual(interfaces.keys_for("svc", "sdk"), {"API_KEY": "abc", "HOST": ""})
 
     def test_keys_for_none(self):
         self.assertEqual(interfaces.keys_for("none", "none"), {})
 
     def test_resolved_keys_fall_back_to_env(self):
-        self.write_manifest("svc", "sdk", "keys:\n  API_KEY: \"\"\nprompt: hi\n")
+        self.write_manifest("svc", "sdk", 'keys:\n  API_KEY: ""\nprompt: hi\n')
         got = interfaces._resolved_keys("svc", "sdk", env={"API_KEY": "from-env"})
         self.assertEqual(got, {"API_KEY": "from-env"})
 
@@ -51,7 +53,8 @@ class AccountingFieldsTests(InterfaceTestBase):
 
     def test_resolved_config_surfaces_overrides(self):
         self.write_manifest(
-            "svc", "cli",
+            "svc",
+            "cli",
             "binary: svc_cli-0.1.0-py3-none-any.whl\ncli_command: svc\nprompt: hi\n",
         )
         cfg = interfaces._resolved_config("svc", "cli")
@@ -61,9 +64,9 @@ class AccountingFieldsTests(InterfaceTestBase):
     def test_resolved_config_defaults_none_when_absent(self):
         self.write_manifest("svc", "cli", "binary: hops\nprompt: hi\n")
         cfg = interfaces._resolved_config("svc", "cli")
-        self.assertIsNone(cfg["cli_command"])   # falls back to binary in setup()
+        self.assertIsNone(cfg["cli_command"])  # falls back to binary in setup()
         self.assertIsNone(cfg["sdk_module"])
-        self.assertEqual(cfg["teardown"], [])   # default: nothing to tear down
+        self.assertEqual(cfg["teardown"], [])  # default: nothing to tear down
 
     def test_resolved_config_surfaces_teardown(self):
         self.write_manifest("svc", "cli", "teardown:\n  - 'echo bye'\nprompt: hi\n")
@@ -90,8 +93,7 @@ class BaseCleanTests(InterfaceTestBase):
     def test_dist_name_from_wheel_binary(self):
         # `<dist>-<version>-...whl` → first '-'-delimited token is the dist name.
         self.assertEqual(
-            interfaces._interface_dist_name(
-                {}, "hopsworks", "hopsworks-0-py3-none-any.whl"),
+            interfaces._interface_dist_name({}, "hopsworks", "hopsworks-0-py3-none-any.whl"),
             "hopsworks",
         )
 
@@ -100,20 +102,20 @@ class BaseCleanTests(InterfaceTestBase):
             interfaces._interface_dist_name({"sdk_module": "hsfs"}, "hopsworks", None),
             "hsfs",
         )
-        self.assertEqual(
-            interfaces._interface_dist_name({}, "hopsworks", None), "hopsworks")
+        self.assertEqual(interfaces._interface_dist_name({}, "hopsworks", None), "hopsworks")
 
     def test_ensure_base_clean_noop_for_none(self):
         # No-op for the null interface — and must not shell out to pip.
         import unittest.mock as mock
+
         with mock.patch.object(interfaces.subprocess, "run") as run:
             interfaces.ensure_base_clean("none", "none")
         run.assert_not_called()
 
     def test_ensure_base_clean_uninstalls_when_present(self):
         import unittest.mock as mock
-        self.write_manifest(
-            "svc", "sdk", "binary: svc_pkg-0-py3-none-any.whl\nprompt: hi\n")
+
+        self.write_manifest("svc", "sdk", "binary: svc_pkg-0-py3-none-any.whl\nprompt: hi\n")
         calls = []
 
         def fake_run(cmd, *a, **k):
@@ -126,13 +128,12 @@ class BaseCleanTests(InterfaceTestBase):
 
         # A `pip show svc_pkg` probe followed by a `pip uninstall -y svc_pkg`.
         self.assertTrue(any("show" in c and "svc_pkg" in c for c in calls))
-        self.assertTrue(
-            any("uninstall" in c and "-y" in c and "svc_pkg" in c for c in calls))
+        self.assertTrue(any("uninstall" in c and "-y" in c and "svc_pkg" in c for c in calls))
 
     def test_ensure_base_clean_skips_uninstall_when_absent(self):
         import unittest.mock as mock
-        self.write_manifest(
-            "svc", "sdk", "binary: svc_pkg-0-py3-none-any.whl\nprompt: hi\n")
+
+        self.write_manifest("svc", "sdk", "binary: svc_pkg-0-py3-none-any.whl\nprompt: hi\n")
         calls = []
 
         def fake_run(cmd, *a, **k):
@@ -176,10 +177,9 @@ class ResolutionTests(InterfaceTestBase):
 
     def test_sandbox_keys_resolved_from_manifest(self):
         self.write_manifest(
-            "svc", "sdk",
-            "prompt: base\n"
-            "allowed_domains: [api.svc.com]\n"
-            "instance_allowlist: [ml.m5.large]\n",
+            "svc",
+            "sdk",
+            "prompt: base\nallowed_domains: [api.svc.com]\ninstance_allowlist: [ml.m5.large]\n",
         )
         cfg = interfaces._resolved_config("svc", "sdk")
         self.assertEqual(cfg["allowed_domains"], ["api.svc.com"])
@@ -206,37 +206,38 @@ class PreflightTests(InterfaceTestBase):
 
     def test_sdk_missing_keys_fails_login(self):
         # No auth_command + declared keys → login satisfied only when keys set.
-        self.write_manifest("svc", "sdk", "keys:\n  API_KEY: \"\"\nprompt: hi\n")
+        self.write_manifest("svc", "sdk", 'keys:\n  API_KEY: ""\nprompt: hi\n')
         st = interfaces.preflight("svc", "sdk", env={})
         self.assertFalse(st.ok)
         self.assertIn("API_KEY", st.missing_keys)
         self.assertIn("setup", st.fix_command)
 
     def test_sdk_keys_present_passes(self):
-        self.write_manifest("svc", "sdk", "keys:\n  API_KEY: \"\"\nprompt: hi\n")
+        self.write_manifest("svc", "sdk", 'keys:\n  API_KEY: ""\nprompt: hi\n')
         st = interfaces.preflight("svc", "sdk", env={"API_KEY": "x"})
         self.assertTrue(st.ok)
         self.assertTrue(st.authenticated)
 
     def test_auth_command_success(self):
-        self.write_manifest("svc", "cli", "auth_command: \"true\"\nprompt: hi\n")
+        self.write_manifest("svc", "cli", 'auth_command: "true"\nprompt: hi\n')
         st = interfaces.preflight("svc", "cli", env={})
         self.assertTrue(st.ok)
 
     def test_auth_command_failure(self):
-        self.write_manifest("svc", "cli", "auth_command: \"false\"\nprompt: hi\n")
+        self.write_manifest("svc", "cli", 'auth_command: "false"\nprompt: hi\n')
         st = interfaces.preflight("svc", "cli", env={})
         self.assertFalse(st.ok)
         self.assertFalse(st.authenticated)
 
     def test_test_command_failure(self):
-        self.write_manifest("svc", "cli", "test_command: \"false\"\nprompt: hi\n")
+        self.write_manifest("svc", "cli", 'test_command: "false"\nprompt: hi\n')
         st = interfaces.preflight("svc", "cli", env={})
         self.assertFalse(st.ok)
 
     def test_missing_binary_without_build(self):
         self.write_manifest(
-            "svc", "cli",
+            "svc",
+            "cli",
             "binary: tool\nruntime_install:\n  - cp $INTERFACE_DIR/tool .\nprompt: hi\n",
         )
         st = interfaces.preflight("svc", "cli", auto_build=False, env={})
@@ -244,19 +245,161 @@ class PreflightTests(InterfaceTestBase):
         self.assertFalse(st.installed)
 
 
+class CheckAvailabilityTests(InterfaceTestBase):
+    """Fast session-start gate: config present + creds present + skill bundle
+    well-formed, with no build and no network."""
+
+    def test_none_requirement_passes(self):
+        preflight.check_availability([preflight.Requirement(platform="none", interface="none")])
+
+    def test_missing_config_is_reported(self):
+        with self.assertRaises(preflight.PreflightError) as cm:
+            preflight.check_availability([preflight.Requirement(platform="ghost", interface="cli")])
+        self.assertIn("no config manifest", str(cm.exception))
+
+    def test_missing_credentials_reported(self):
+        self.write_manifest("svc", "sdk", 'keys:\n  API_KEY: ""\nprompt: hi\n')
+        with self.assertRaises(preflight.PreflightError) as cm:
+            preflight.check_availability(
+                [preflight.Requirement(platform="svc", interface="sdk")], env={}
+            )
+        self.assertIn("API_KEY", str(cm.exception))
+
+    def test_credentials_present_passes(self):
+        self.write_manifest("svc", "sdk", 'keys:\n  API_KEY: ""\nprompt: hi\n')
+        preflight.check_availability(
+            [preflight.Requirement(platform="svc", interface="sdk")], env={"API_KEY": "x"}
+        )
+
+    def test_all_problems_collected_in_one_raise(self):
+        self.write_manifest("svc", "sdk", 'keys:\n  API_KEY: ""\nprompt: hi\n')
+        with self.assertRaises(preflight.PreflightError) as cm:
+            preflight.check_availability(
+                [
+                    preflight.Requirement(platform="svc", interface="sdk"),  # missing key
+                    preflight.Requirement(platform="ghost", interface="cli"),  # no config
+                ],
+                env={},
+            )
+        msg = str(cm.exception)
+        self.assertIn("API_KEY", msg)
+        self.assertIn("no config manifest", msg)
+
+
 class PreflightModuleTests(InterfaceTestBase):
     def test_none_requirement_passes(self):
         preflight.preflight(
             [preflight.Requirement(platform="none", interface="none")],
-            auth="api-key", model="claude-sonnet-4-6", probe_skills=False,
+            auth="api-key",
+            model="claude-sonnet-4-6",
+            probe_skills=False,
         )
 
     def test_missing_interface_raises(self):
         with self.assertRaises(preflight.PreflightError):
             preflight.preflight(
                 [preflight.Requirement(platform="ghost", interface="cli")],
-                auth="api-key", model="claude-sonnet-4-6", probe_skills=False,
+                auth="api-key",
+                model="claude-sonnet-4-6",
+                probe_skills=False,
             )
+
+
+class PrepareTests(InterfaceTestBase):
+    """interfaces.prepare materializes a per-interface venv ONCE (hash-stamped),
+    so runs clone it read-only instead of pip-installing per run."""
+
+    def _fake_materialize(self, target: Path):
+        # Stand in for the real venv build (no `python -m venv`, no base clone).
+        (target / "bin").mkdir(parents=True, exist_ok=True)
+        (target / "bin" / "python").write_text("#!/bin/sh\n")
+        return target / "bin" / "python"
+
+    def test_prepare_none_returns_none(self):
+        self.assertIsNone(interfaces.prepare("none", "none"))
+
+    def test_prepare_materializes_once_and_is_idempotent(self):
+        self.write_manifest(
+            "svc",
+            "sdk",
+            "runtime_install:\n  - pip install thing==1.0\nprompt: hi\n",
+        )
+        installs = []
+        with (
+            mock.patch.object(interfaces, "_materialize_venv", self._fake_materialize),
+            mock.patch.object(
+                interfaces, "_run_install", side_effect=lambda *a, **k: installs.append(a)
+            ),
+        ):
+            venv = interfaces.prepare("svc", "sdk")
+            self.assertTrue((venv / "bin" / "python").exists())
+            self.assertEqual(venv, interfaces.prepared_venv_dir("svc", "sdk"))
+            stamp = interfaces.bin_dir("svc", "sdk") / interfaces._PREPARED_STAMP
+            self.assertTrue(stamp.exists())
+            self.assertEqual(len(installs), 1)
+
+            # Same manifest → same hash → reuse, no second install.
+            interfaces.prepare("svc", "sdk")
+            self.assertEqual(len(installs), 1)
+
+            # Manifest change → hash change → rebuild + re-install.
+            self.write_manifest(
+                "svc",
+                "sdk",
+                "runtime_install:\n  - pip install thing==2.0\nprompt: hi\n",
+            )
+            interfaces.prepare("svc", "sdk")
+            self.assertEqual(len(installs), 2)
+
+    def test_base_venv_change_invalidates_prepared(self):
+        # The stamp folds in a base-venv fingerprint, so a base change (new/
+        # upgraded package, python bump) forces a rebuild — runs must not clone
+        # a prepared venv built on a stale base.
+        self.write_manifest(
+            "svc", "sdk", "runtime_install:\n  - pip install thing==1.0\nprompt: hi\n"
+        )
+        installs = []
+        with (
+            mock.patch.object(interfaces, "_materialize_venv", self._fake_materialize),
+            mock.patch.object(
+                interfaces, "_run_install", side_effect=lambda *a, **k: installs.append(a)
+            ),
+            mock.patch.object(interfaces, "_base_venv_fingerprint", return_value="aaaa"),
+        ):
+            interfaces.prepare("svc", "sdk")
+            interfaces.prepare("svc", "sdk")  # same base → reuse
+            self.assertEqual(len(installs), 1)
+        with (
+            mock.patch.object(interfaces, "_materialize_venv", self._fake_materialize),
+            mock.patch.object(
+                interfaces, "_run_install", side_effect=lambda *a, **k: installs.append(a)
+            ),
+            mock.patch.object(interfaces, "_base_venv_fingerprint", return_value="bbbb"),
+        ):
+            interfaces.prepare("svc", "sdk")  # base changed → rebuild
+            self.assertEqual(len(installs), 2)
+
+    def test_venv_site_packages_pins_to_running_version(self):
+        # A venv carrying a STALE tree from another python must resolve to the
+        # running interpreter's tree, not an arbitrary glob pick (ABI safety).
+        import sys
+
+        venv = self.root / "v"
+        cur = f"python{sys.version_info.major}.{sys.version_info.minor}"
+        (venv / "lib" / cur / "site-packages").mkdir(parents=True)
+        (venv / "lib" / "python2.7" / "site-packages").mkdir(parents=True)  # stale
+        self.assertEqual(interfaces.venv_site_packages(venv), venv / "lib" / cur / "site-packages")
+
+    def test_clean_build_artifacts_removes_prepared_venv(self):
+        self.write_manifest("svc", "sdk", "prompt: hi\n")
+        venv = interfaces.prepared_venv_dir("svc", "sdk")
+        (venv / "bin").mkdir(parents=True, exist_ok=True)
+        (venv / "bin" / "python").write_text("x")
+        stamp = interfaces.bin_dir("svc", "sdk") / interfaces._PREPARED_STAMP
+        stamp.write_text("abc")
+        interfaces._clean_build_artifacts("svc", "sdk")
+        self.assertFalse(venv.exists())
+        self.assertFalse(stamp.exists())
 
 
 if __name__ == "__main__":

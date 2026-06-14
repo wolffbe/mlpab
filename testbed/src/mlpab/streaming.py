@@ -16,6 +16,7 @@ stdout; printing agent lines there would bloat its context, so under
 `MLPAB_NESTED=1` the agent writes only `agent.log` and the parent tails
 those files (`FileTailer`) to show them live.
 """
+
 from __future__ import annotations
 
 import contextlib
@@ -190,7 +191,7 @@ def tee_to(log_path: Path, passthrough: bool = True) -> Iterator[None]:
         sys.stderr.flush()
         os.dup2(saved_out, 1)
         os.dup2(saved_err, 2)
-        os.close(write_fd)        # EOF → pump drains and exits
+        os.close(write_fd)  # EOF → pump drains and exits
         pump.join(timeout=2)
         for fd in (saved_out, saved_err):
             try:
@@ -229,7 +230,7 @@ class FileTailer(threading.Thread):
             except OSError:
                 continue
             off = self._offsets.get(p, 0)
-            if size < off:           # file was truncated/recreated → re-read
+            if size < off:  # file was truncated/recreated → re-read
                 off = 0
             if size <= off:
                 self._offsets[p] = size

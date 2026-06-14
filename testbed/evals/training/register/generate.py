@@ -15,6 +15,7 @@ Gates (no platform needed — the grade fn is called directly with adapter
 `none`): the reference answers dict passes; wrong metrics fail; a wrong model
 name fails.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -69,19 +70,25 @@ def generate(seed: int, out: Path) -> dict:
         f'    {{"model_name": "{model_name}", "version": {VERSION}, '
         '"metrics": <the metrics you attached>}\n'
     )
-    truth = {"family": "register", "seed": seed,
-             "model_name": model_name, "version": VERSION, "metrics": metrics}
+    truth = {
+        "family": "register",
+        "seed": seed,
+        "model_name": model_name,
+        "version": VERSION,
+        "metrics": metrics,
+    }
     (out / "solution" / "truth.json").write_text(json.dumps(truth, indent=2))
-    (out / "instance.json").write_text(
-        json.dumps({"family": "register", "seed": seed}, indent=2))
+    (out / "instance.json").write_text(json.dumps({"family": "register", "seed": seed}, indent=2))
 
     # --- gates (call the grade fn directly — no platform needed) ----------------
-    reference = {"model_name": model_name, "version": VERSION,
-                 "metrics": json.loads((out / "data" / "metrics.json").read_text())}
+    reference = {
+        "model_name": model_name,
+        "version": VERSION,
+        "metrics": json.loads((out / "data" / "metrics.json").read_text()),
+    }
     if not grade_answers(out, "none", reference)["success"]:
         raise GateError(f"reference answers fail the grade fn (seed={seed})")
-    wrong_metrics = {**reference,
-                     "metrics": {k: round(v + 0.01, 4) for k, v in metrics.items()}}
+    wrong_metrics = {**reference, "metrics": {k: round(v + 0.01, 4) for k, v in metrics.items()}}
     if grade_answers(out, "none", wrong_metrics)["success"]:
         raise GateError(f"wrong-metrics answers pass the grade fn (seed={seed})")
     wrong_name = {**reference, "model_name": f"{model_name}final"}

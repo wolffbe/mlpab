@@ -21,6 +21,7 @@ row_ids that exist in only one source and filling the missing value with 0.
 Generation-time gates also run the grade function: the reference deliverables
 pass; a spoiled col_sum and a wrong derived_from both fail.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -35,9 +36,9 @@ import pandas as pd
 
 from evals.common import canonicalize, digest, instance_suffix
 
-N_IDS = 320            # universe of row ids
-N_A = 250              # ids present in raw_a
-N_B = 240              # ids present in raw_b (overlap is partial by construction)
+N_IDS = 320  # universe of row ids
+N_A = 250  # ids present in raw_a
+N_B = 240  # ids present in raw_b (overlap is partial by construction)
 # Per-instance platform table names: f"{base}{instance_suffix(seed)}" (the
 # local data/raw_a.csv / data/raw_b.csv filenames stay fixed).
 TABLE_BASE = "derived"
@@ -52,8 +53,8 @@ SPEC = {
 }
 VARIANT_DIAGNOSIS = {
     "outer_join_fill0": "row_ids present in only ONE source were kept with the "
-                        "missing value treated as 0 — the derived table must "
-                        "contain only row_ids present in BOTH sources",
+    "missing value treated as 0 — the derived table must "
+    "contain only row_ids present in BOTH sources",
 }
 
 
@@ -69,33 +70,39 @@ def generate(seed: int, out: Path) -> dict:
     ids = np.array([f"R{i:05d}" for i in range(N_IDS)])
     a_ids = np.sort(rng.choice(ids, N_A, replace=False))
     b_ids = np.sort(rng.choice(ids, N_B, replace=False))
-    raw_a = pd.DataFrame({"row_id": a_ids,
-                          "a_val": np.round(rng.normal(10, 4, N_A), 4)})
-    raw_b = pd.DataFrame({"row_id": b_ids,
-                          "b_val": np.round(rng.normal(-3, 5, N_B), 4)})
+    raw_a = pd.DataFrame({"row_id": a_ids, "a_val": np.round(rng.normal(10, 4, N_A), 4)})
+    raw_b = pd.DataFrame({"row_id": b_ids, "b_val": np.round(rng.normal(-3, 5, N_B), 4)})
     both = sorted(set(a_ids) & set(b_ids))
-    only_one = (set(a_ids) ^ set(b_ids))
+    only_one = set(a_ids) ^ set(b_ids)
     if len(both) < 50 or not only_one:
-        raise GateError(f"degenerate overlap (seed={seed}): "
-                        f"{len(both)} shared, {len(only_one)} exclusive")
+        raise GateError(
+            f"degenerate overlap (seed={seed}): {len(both)} shared, {len(only_one)} exclusive"
+        )
 
     inner = raw_a.merge(raw_b, on="row_id", how="inner")
-    truth_df = pd.DataFrame({"row_id": inner["row_id"],
-                             "col_sum": np.round(inner["a_val"] + inner["b_val"], 6)})
+    truth_df = pd.DataFrame(
+        {"row_id": inner["row_id"], "col_sum": np.round(inner["a_val"] + inner["b_val"], 6)}
+    )
     truth = canonicalize(truth_df, SPEC)
 
     # --- gates ---------------------------------------------------------------
     # independent reference: dict-based scan over the intersection
     a_map = dict(zip(raw_a["row_id"], raw_a["a_val"]))
     b_map = dict(zip(raw_b["row_id"], raw_b["b_val"]))
-    ref = canonicalize(pd.DataFrame(
-        [{"row_id": r, "col_sum": round(a_map[r] + b_map[r], 6)} for r in both]), SPEC)
+    ref = canonicalize(
+        pd.DataFrame([{"row_id": r, "col_sum": round(a_map[r] + b_map[r], 6)} for r in both]), SPEC
+    )
     if digest(ref) != digest(truth):
         raise GateError(f"scan reference disagrees with inner join (seed={seed})")
     outer = raw_a.merge(raw_b, on="row_id", how="outer").fillna(0.0)
-    variants = {"outer_join_fill0": canonicalize(pd.DataFrame({
-        "row_id": outer["row_id"],
-        "col_sum": np.round(outer["a_val"] + outer["b_val"], 6)}), SPEC)}
+    variants = {
+        "outer_join_fill0": canonicalize(
+            pd.DataFrame(
+                {"row_id": outer["row_id"], "col_sum": np.round(outer["a_val"] + outer["b_val"], 6)}
+            ),
+            SPEC,
+        )
+    }
     for name, v in variants.items():
         if digest(v) == digest(truth):
             raise GateError(f"variant {name!r} matches truth (seed={seed})")
@@ -136,10 +143,14 @@ def generate(seed: int, out: Path) -> dict:
         f"submission/{table}.csv.\n"
     )
     meta = {
-        "family": "lineage", "seed": seed,
-        "table_name": table, "table_version": 1,
+        "family": "lineage",
+        "seed": seed,
+        "table_name": table,
+        "table_version": 1,
         "source_tables": sources,
-        "spec": SPEC, "row_count": len(truth), "digest": digest(truth),
+        "spec": SPEC,
+        "row_count": len(truth),
+        "digest": digest(truth),
         "record_ids": truth["row_id"].tolist(),
         "variant_digests": {k: digest(v) for k, v in variants.items()},
         "variant_diagnosis": VARIANT_DIAGNOSIS,
@@ -152,8 +163,7 @@ def generate(seed: int, out: Path) -> dict:
     return meta
 
 
-def _gate_grader(inst: Path, truth_df: pd.DataFrame, table: str,
-                 sources: list[str]) -> None:
+def _gate_grader(inst: Path, truth_df: pd.DataFrame, table: str, sources: list[str]) -> None:
     """Generation-time gates through the actual grade function (adapter none)."""
     from evals.ops.lineage.grade import grade
 

@@ -15,6 +15,7 @@ Naive variants (gates assert they differ): concatenating everything (duplicate
 row_ids survive); processing batches in FILE order with first-write-wins
 (corrections lost).
 """
+
 from __future__ import annotations
 
 import argparse
@@ -30,7 +31,7 @@ from evals.common import canonicalize, digest, instance_suffix
 
 ORIGIN = pd.Timestamp("2026-02-01", tz="UTC")
 N_ROWS = 400
-N_CORRECTED = 90          # rows that receive a later correction
+N_CORRECTED = 90  # rows that receive a later correction
 TABLE_BASE = "accounts"  # per-instance: f"{TABLE_BASE}{instance_suffix(seed)}"
 
 SPEC = {
@@ -42,8 +43,8 @@ SPEC = {
 VARIANT_DIAGNOSIS = {
     "concat_all": "corrected rows were loaded twice — duplicates by row_id survive",
     "load_order_upsert": "batches were upserted in file order (last write wins by "
-                         "LOAD order, not by updated_at) — the out-of-order "
-                         "corrections were overwritten by older rows",
+    "LOAD order, not by updated_at) — the out-of-order "
+    "corrections were overwritten by older rows",
 }
 
 
@@ -55,19 +56,24 @@ def generate(seed: int, out: Path) -> dict:
     rng = np.random.default_rng(seed)
     table = TABLE_BASE + instance_suffix(seed)
 
-    base = pd.DataFrame({
-        "row_id": [f"R{i:05d}" for i in range(N_ROWS)],
-        "status": rng.choice(["active", "dormant", "closed"], N_ROWS),
-        "balance": np.round(rng.normal(5000, 2000, N_ROWS), 2),
-        "updated_at": [(ORIGIN + pd.Timedelta(minutes=int(m))).floor("s")
-                       for m in rng.integers(0, 10_000, N_ROWS)],
-    })
+    base = pd.DataFrame(
+        {
+            "row_id": [f"R{i:05d}" for i in range(N_ROWS)],
+            "status": rng.choice(["active", "dormant", "closed"], N_ROWS),
+            "balance": np.round(rng.normal(5000, 2000, N_ROWS), 2),
+            "updated_at": [
+                (ORIGIN + pd.Timedelta(minutes=int(m))).floor("s")
+                for m in rng.integers(0, 10_000, N_ROWS)
+            ],
+        }
+    )
     corrected_ids = rng.choice(N_ROWS, N_CORRECTED, replace=False)
     corrections = base.iloc[corrected_ids].copy()
     corrections["status"] = rng.choice(["active", "dormant", "closed"], N_CORRECTED)
     corrections["balance"] = np.round(corrections["balance"] + rng.normal(0, 800, N_CORRECTED), 2)
     corrections["updated_at"] = corrections["updated_at"] + pd.to_timedelta(
-        rng.integers(60, 5_000, N_CORRECTED), unit="m")
+        rng.integers(60, 5_000, N_CORRECTED), unit="m"
+    )
 
     # truth: latest updated_at per row_id
     full = pd.concat([base, corrections], ignore_index=True)
@@ -84,18 +90,22 @@ def generate(seed: int, out: Path) -> dict:
     }
 
     # --- gates ---------------------------------------------------------------
-    concat_all = canonicalize(
-        full.sort_values(["row_id", "updated_at"]), SPEC)
+    concat_all = canonicalize(full.sort_values(["row_id", "updated_at"]), SPEC)
     in_load_order = pd.concat(list(batches.values()), ignore_index=True)
     load_order_upsert = canonicalize(
-        in_load_order.drop_duplicates(subset="row_id", keep="last"), SPEC)
+        in_load_order.drop_duplicates(subset="row_id", keep="last"), SPEC
+    )
     variants = {"concat_all": concat_all, "load_order_upsert": load_order_upsert}
     for name, v in variants.items():
         if digest(v) == digest(truth):
             raise GateError(f"variant {name!r} matches truth (seed={seed})")
     ref = canonicalize(
         pd.concat(list(batches.values()), ignore_index=True)
-        .sort_values("updated_at").groupby("row_id", as_index=False).tail(1), SPEC)
+        .sort_values("updated_at")
+        .groupby("row_id", as_index=False)
+        .tail(1),
+        SPEC,
+    )
     if digest(ref) != digest(truth):
         raise GateError(f"reference latest-revision load disagrees with truth (seed={seed})")
 
@@ -130,9 +140,13 @@ def generate(seed: int, out: Path) -> dict:
         "(online/real-time access), where the platform distinguishes the two.\n"
     )
     meta = {
-        "family": "backfill", "seed": seed,
-        "table_name": table, "table_version": 1,
-        "spec": SPEC, "row_count": len(truth), "digest": digest(truth),
+        "family": "backfill",
+        "seed": seed,
+        "table_name": table,
+        "table_version": 1,
+        "spec": SPEC,
+        "row_count": len(truth),
+        "digest": digest(truth),
         "record_ids": truth["row_id"].tolist(),
         "variant_digests": {k: digest(v) for k, v in variants.items()},
         "variant_diagnosis": VARIANT_DIAGNOSIS,

@@ -24,6 +24,7 @@ CLI (for live probing):
     python -m evals.adapters.aws describe-fg --name transactions
     python -m evals.adapters.aws read-td --name churn_training --version 1 --out /tmp/td.csv
 """
+
 from __future__ import annotations
 
 import argparse
@@ -66,8 +67,7 @@ class SageMakerChecker:
             version=None,
             primary_key=[d["RecordIdentifierFeatureName"]],
             event_time=d.get("EventTimeFeatureName"),
-            schema={f["FeatureName"]: f["FeatureType"]
-                    for f in d.get("FeatureDefinitions", [])},
+            schema={f["FeatureName"]: f["FeatureType"] for f in d.get("FeatureDefinitions", [])},
         )
 
     def read_rows(self, name: str, version: int | None = None) -> pd.DataFrame:
@@ -80,10 +80,15 @@ class SageMakerChecker:
     def get_records(self, name: str, record_ids: list[str]) -> pd.DataFrame:
         """Online-store reads for known keys (content asserts on SageMaker)."""
         out = []
-        for chunk in (record_ids[i:i + 100] for i in range(0, len(record_ids), 100)):
-            resp = self._fsr.batch_get_record(Identifiers=[{
-                "FeatureGroupName": name, "RecordIdentifiersValueAsString": chunk,
-            }])
+        for chunk in (record_ids[i : i + 100] for i in range(0, len(record_ids), 100)):
+            resp = self._fsr.batch_get_record(
+                Identifiers=[
+                    {
+                        "FeatureGroupName": name,
+                        "RecordIdentifiersValueAsString": chunk,
+                    }
+                ]
+            )
             for rec in resp.get("Records", []):
                 out.append({f["FeatureName"]: f["ValueAsString"] for f in rec["Record"]})
         return pd.DataFrame(out)
@@ -97,8 +102,7 @@ class SageMakerChecker:
         for page in paginator.paginate(Bucket=self._bucket):
             for obj in page.get("Contents", []):
                 k = obj["Key"]
-                if name in k and any(m in k for m in markers) \
-                        and re.search(r"\.(csv|parquet)$", k):
+                if name in k and any(m in k for m in markers) and re.search(r"\.(csv|parquet)$", k):
                     keys.append(k)
         return sorted(keys)
 
@@ -135,9 +139,13 @@ def main(argv: list[str] | None = None) -> int:
     checker = SageMakerChecker()
     if args.cmd == "describe-fg":
         info = checker.get_feature_table(args.name)
-        print(json.dumps({"exists": info is not None,
-                          **(info.__dict__ if info else {"name": args.name})},
-                         default=str, indent=2))
+        print(
+            json.dumps(
+                {"exists": info is not None, **(info.__dict__ if info else {"name": args.name})},
+                default=str,
+                indent=2,
+            )
+        )
         return 0 if info else 1
     checker.read_training_dataset(args.name, args.version).to_csv(args.out, index=False)
     print(f"wrote {args.out}")
@@ -153,6 +161,7 @@ if __name__ == "__main__":
 # assert on `exists` plus whichever detail keys the API provides).
 # --------------------------------------------------------------------------
 
+
 def _state_reads(cls):
     def get_model(self, name: str, version: int = 1) -> dict:
         """Model registry realization: a model package group named `name`
@@ -162,8 +171,9 @@ def _state_reads(cls):
         except Exception as e:
             return {"exists": False, "error": str(e)}
         try:
-            pkgs = self._sm.list_model_packages(
-                ModelPackageGroupName=name)["ModelPackageSummaryList"]
+            pkgs = self._sm.list_model_packages(ModelPackageGroupName=name)[
+                "ModelPackageSummaryList"
+            ]
             return {"exists": True, "version": len(pkgs)}
         except Exception:
             return {"exists": True}
@@ -173,10 +183,13 @@ def _state_reads(cls):
         pipelines), training job, processing job."""
         try:
             p = self._sm.describe_pipeline(PipelineName=name)
-            return {"exists": True, "kind": "pipeline",
-                    "scheduled": True,  # schedule lives in EventBridge; presence of
-                                        # the pipeline is the gradable platform state
-                    "last_run_state": p.get("PipelineStatus", "")}
+            return {
+                "exists": True,
+                "kind": "pipeline",
+                "scheduled": True,  # schedule lives in EventBridge; presence of
+                # the pipeline is the gradable platform state
+                "last_run_state": p.get("PipelineStatus", ""),
+            }
         except Exception:
             pass
         for kind, describe, key in (
@@ -184,10 +197,15 @@ def _state_reads(cls):
             ("processing-job", "describe_processing_job", "ProcessingJobStatus"),
         ):
             try:
-                d = getattr(self._sm, describe)(**{
-                    "TrainingJobName" if kind == "training-job" else "ProcessingJobName": name})
-                return {"exists": True, "kind": kind,
-                        "scheduled": False, "last_run_state": d.get(key, "")}
+                d = getattr(self._sm, describe)(
+                    **{"TrainingJobName" if kind == "training-job" else "ProcessingJobName": name}
+                )
+                return {
+                    "exists": True,
+                    "kind": kind,
+                    "scheduled": False,
+                    "last_run_state": d.get(key, ""),
+                }
             except Exception:
                 continue
         return {"exists": False}
@@ -204,7 +222,10 @@ def _state_reads(cls):
         """Alerting realization on SageMaker = a CloudWatch alarm whose name
         contains the hint."""
         try:
-            import boto3, os
+            import os
+
+            import boto3
+
             cw = boto3.client("cloudwatch", region_name=os.environ.get("AWS_REGION"))
             alarms = cw.describe_alarms()["MetricAlarms"]
             hits = [a for a in alarms if name_or_hint in a["AlarmName"]]
@@ -225,31 +246,46 @@ def _state_reads(cls):
            sagemaker-vector-store-microservice sample).
         """
         try:
-            import boto3, os
+            import os
+
+            import boto3
+
             s3v = boto3.client("s3vectors", region_name=os.environ.get("AWS_REGION"))
             for vb in s3v.list_vector_buckets().get("vectorBuckets", []):
                 bname = vb.get("vectorBucketName")
-                for idx in s3v.list_indexes(
-                        vectorBucketName=bname).get("indexes", []):
+                for idx in s3v.list_indexes(vectorBucketName=bname).get("indexes", []):
                     if idx.get("indexName") == name:
-                        return {"exists": True, "kind": "s3vectors-index",
-                                "native_ann": True, "vector_bucket": bname}
+                        return {
+                            "exists": True,
+                            "kind": "s3vectors-index",
+                            "native_ann": True,
+                            "vector_bucket": bname,
+                        }
         except Exception:
             pass  # no IAM grant / old botocore → fall through to other shapes
         try:
             d = self._sm.describe_feature_group(FeatureGroupName=name)
-            return {"exists": True, "kind": "feature-group", "native_ann": False,
-                    "online_store": bool((d.get("OnlineStoreConfig") or {})
-                                         .get("EnableOnlineStore"))}
+            return {
+                "exists": True,
+                "kind": "feature-group",
+                "native_ann": False,
+                "online_store": bool((d.get("OnlineStoreConfig") or {}).get("EnableOnlineStore")),
+            }
         except Exception:
             pass
         try:
             e = self._sm.describe_endpoint(EndpointName=name)
             if e.get("EndpointStatus") == "InService":
-                return {"exists": True, "kind": "endpoint",
-                        "native_ann": False, "self_hosted": True}
-            return {"exists": False,
-                    "error": f"endpoint {name!r} status {e.get('EndpointStatus')!r}"}
+                return {
+                    "exists": True,
+                    "kind": "endpoint",
+                    "native_ann": False,
+                    "self_hosted": True,
+                }
+            return {
+                "exists": False,
+                "error": f"endpoint {name!r} status {e.get('EndpointStatus')!r}",
+            }
         except Exception as e:
             return {"exists": False, "error": str(e)}
 

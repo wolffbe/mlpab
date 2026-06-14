@@ -2,6 +2,7 @@
 prices the claude-*/gpt-* ids directly and the mistral-* ids under the `mistral/`
 provider prefix (results.usd_cost maps the alias). Models litellm can't price
 return None, so the caller keeps any engine-reported cost."""
+
 import json
 import tempfile
 import unittest
@@ -12,10 +13,15 @@ from mlpab import results
 
 class UsdCostTests(unittest.TestCase):
     def test_litellm_prices_claude_gpt_and_mistral(self):
-        for m in ("claude-opus-4-8", "gpt-5.5",
-                  "mistral-medium-3.5", "mistral-small-4", "mistral-large-3"):
+        for m in (
+            "claude-opus-4-8",
+            "gpt-5.5",
+            "mistral-medium-3.5",
+            "mistral-small-4",
+            "mistral-large-3",
+        ):
             c = results.usd_cost(m, 1000, 1000)
-            self.assertIsNotNone(c, m)        # mistral via the `mistral/<api-id>` mapping
+            self.assertIsNotNone(c, m)  # mistral via the `mistral/<api-id>` mapping
             self.assertGreater(c, 0.0, m)
 
     def test_unpriceable_and_none_yield_none(self):
@@ -28,17 +34,33 @@ class UsdCostTests(unittest.TestCase):
     def test_parse_transcript_fills_zero_cost_via_litellm(self):
         t = Path(tempfile.mkdtemp()) / "transcript.jsonl"
         # vibe/codex report total_cost_usd=0; litellm should fill it from tokens.
-        t.write_text(json.dumps({"type": "result",
-                                 "usage": {"input_tokens": 1000, "output_tokens": 1000},
-                                 "num_turns": 1, "total_cost_usd": 0.0}) + "\n")
+        t.write_text(
+            json.dumps(
+                {
+                    "type": "result",
+                    "usage": {"input_tokens": 1000, "output_tokens": 1000},
+                    "num_turns": 1,
+                    "total_cost_usd": 0.0,
+                }
+            )
+            + "\n"
+        )
         u = results.parse_transcript_usage(t, model="mistral-medium-3.5")
         self.assertGreater(u["cost_usd"], 0.0)
 
     def test_parse_transcript_keeps_engine_cost_when_litellm_cant_price(self):
         t = Path(tempfile.mkdtemp()) / "transcript.jsonl"
-        t.write_text(json.dumps({"type": "result",
-                                 "usage": {"input_tokens": 1000, "output_tokens": 1000},
-                                 "num_turns": 1, "total_cost_usd": 0.42}) + "\n")
+        t.write_text(
+            json.dumps(
+                {
+                    "type": "result",
+                    "usage": {"input_tokens": 1000, "output_tokens": 1000},
+                    "num_turns": 1,
+                    "total_cost_usd": 0.42,
+                }
+            )
+            + "\n"
+        )
         u = results.parse_transcript_usage(t, model="fable-5")  # unknown to litellm
         self.assertAlmostEqual(u["cost_usd"], 0.42)  # Claude-engine reported cost preserved
 

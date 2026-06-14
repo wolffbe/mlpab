@@ -9,6 +9,7 @@ either one fails generation instead of silently producing a wrong answer key.
 `latest_join`— naive baseline: overall latest row per account (uses the future).
 Both take `tables` as {name: dataframe-with(account_id, event_time, features…)}.
 """
+
 from __future__ import annotations
 
 import pandas as pd

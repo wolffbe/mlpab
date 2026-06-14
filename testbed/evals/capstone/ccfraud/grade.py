@@ -1,5 +1,6 @@
 """Capstone ccfraud — grader: hybrid metric (held-out ROC AUC) + on-platform
 FTI artifacts, via `evals.capstone.common.grade_capstone`."""
+
 from __future__ import annotations
 
 import sys

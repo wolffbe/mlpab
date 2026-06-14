@@ -1,11 +1,12 @@
 """Unit tests for the Mistral Vibe agent engine: model routing (mutually
 exclusive with codex/claude) and the streaming-event → transcript normalizer."""
+
 import json
 import tempfile
 import unittest
 from pathlib import Path
 
-from mlpab import mistral_runner, codex_runner
+from mlpab import codex_runner, mistral_runner
 
 
 class ModelRoutingTests(unittest.TestCase):
@@ -22,7 +23,8 @@ class ModelRoutingTests(unittest.TestCase):
         # is claimed by both engines.
         for m in ("mistral-medium-3.5", "mistral-large-3", "gpt-5.5", "claude-opus-4-8"):
             self.assertFalse(
-                mistral_runner.is_mistral_model(m) and codex_runner.is_codex_model(m), m)
+                mistral_runner.is_mistral_model(m) and codex_runner.is_codex_model(m), m
+            )
 
 
 class NormalizeEventsTests(unittest.TestCase):
@@ -39,23 +41,32 @@ class NormalizeEventsTests(unittest.TestCase):
     def test_vibe_messages_map_to_tool_use_and_turns(self):
         # vibe --output streaming emits role-based messages (assistant w/ tool_calls,
         # tool results); no usage in the stream.
-        lines, result = self._normalize([
-            {"role": "assistant", "content": "running",
-             "tool_calls": [{"function": {"name": "bash", "arguments": '{"command": "ls -la"}'}}]},
-            {"role": "tool", "content": "file1\nfile2"},
-            {"role": "assistant", "content": "done"},
-        ])
+        lines, result = self._normalize(
+            [
+                {
+                    "role": "assistant",
+                    "content": "running",
+                    "tool_calls": [
+                        {"function": {"name": "bash", "arguments": '{"command": "ls -la"}'}}
+                    ],
+                },
+                {"role": "tool", "content": "file1\nfile2"},
+                {"role": "assistant", "content": "done"},
+            ]
+        )
         tools = [l for l in lines if l["type"] == "assistant"]
         block = tools[0]["message"]["content"][0]
         self.assertEqual(block["name"], "Bash")
         self.assertEqual(block["input"]["command"], "ls -la")
-        self.assertEqual(result["num_turns"], 2)              # two assistant messages
+        self.assertEqual(result["num_turns"], 2)  # two assistant messages
         self.assertEqual(result["usage"], {"input_tokens": 0, "output_tokens": 0})  # no meta
 
     def test_explicit_error_signal_flagged(self):
         # vibe's own error flag (or status) marks the tool result as an error.
-        for msg in ({"role": "tool", "content": "boom", "is_error": True},
-                    {"role": "tool", "content": "boom", "status": "error"}):
+        for msg in (
+            {"role": "tool", "content": "boom", "is_error": True},
+            {"role": "tool", "content": "boom", "status": "error"},
+        ):
             lines, _ = self._normalize([msg])
             errs = [l for l in lines if l["type"] == "user"]
             self.assertTrue(errs and errs[0]["message"]["content"][0]["is_error"])
@@ -71,12 +82,14 @@ class NormalizeEventsTests(unittest.TestCase):
 
     def test_tokens_from_session_meta(self):
         import json as _json
+
         d = Path(tempfile.mkdtemp())
         (d / "vibe_events.jsonl").write_text("")
         meta = d / ".vibe" / "logs" / "session" / "s1"
         meta.mkdir(parents=True)
-        (meta / "meta.json").write_text(_json.dumps(
-            {"session_prompt_tokens": 1234, "session_completion_tokens": 56}))
+        (meta / "meta.json").write_text(
+            _json.dumps({"session_prompt_tokens": 1234, "session_completion_tokens": 56})
+        )
         out = d / "transcript.jsonl"
         mistral_runner.normalize_events(d / "vibe_events.jsonl", out)
         result = [json.loads(l) for l in out.read_text().splitlines()][-1]

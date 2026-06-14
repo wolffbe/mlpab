@@ -20,6 +20,7 @@ The schema is identical across modes, so swapping fixtures needs no code changes
     python -m evals.capstone._data.build_airquality --aqicn-csv hist.csv --lat 59.33 --lon 18.07
     python -m evals.capstone._data.build_airquality --synthetic
 """
+
 from __future__ import annotations
 
 import argparse
@@ -39,7 +40,7 @@ def _synthetic(days: int) -> pd.DataFrame:
     rng = np.random.default_rng(SYNTH_SEED)
     dates = pd.date_range("2023-01-01", periods=days, freq="D")
     doy = dates.dayofyear.to_numpy()
-    season = 10 * np.cos(2 * np.pi * (doy - 15) / 365)            # winter peak
+    season = 10 * np.cos(2 * np.pi * (doy - 15) / 365)  # winter peak
     temp = 12 + 11 * np.cos(2 * np.pi * (doy - 200) / 365) + rng.normal(0, 2.5, days)
     humidity = np.clip(70 - 0.4 * (temp - 12) + rng.normal(0, 8, days), 20, 100)
     wind = np.clip(rng.gamma(2.0, 1.6, days), 0.2, None)
@@ -47,20 +48,34 @@ def _synthetic(days: int) -> pd.DataFrame:
     precip = rng.gamma(0.4, 4.0, days) * (rng.random(days) < 0.35)
     pm = np.empty(days)
     pm[0] = 25.0
-    for i in range(1, days):                                     # autocorrelation
-        drive = (18 + season[i] - 2.4 * wind[i] + 0.12 * humidity[i]
-                 - 3.0 * np.log1p(precip[i]) + 0.05 * (pressure[i] - 1013))
+    for i in range(1, days):  # autocorrelation
+        drive = (
+            18
+            + season[i]
+            - 2.4 * wind[i]
+            + 0.12 * humidity[i]
+            - 3.0 * np.log1p(precip[i])
+            + 0.05 * (pressure[i] - 1013)
+        )
         pm[i] = max(1.0, 0.55 * pm[i - 1] + 0.45 * drive + rng.normal(0, 3.0))
-    df = pd.DataFrame({"date": dates.strftime("%Y-%m-%d"), "pm25": np.round(pm, 1),
-                       "temperature": np.round(temp, 1), "humidity": np.round(humidity, 1),
-                       "wind_speed": np.round(wind, 2), "pressure": np.round(pressure, 1),
-                       "precipitation": np.round(precip, 2)})
+    df = pd.DataFrame(
+        {
+            "date": dates.strftime("%Y-%m-%d"),
+            "pm25": np.round(pm, 1),
+            "temperature": np.round(temp, 1),
+            "humidity": np.round(humidity, 1),
+            "wind_speed": np.round(wind, 2),
+            "pressure": np.round(pressure, 1),
+            "precipitation": np.round(precip, 2),
+        }
+    )
     return df[COLUMNS]
 
 
 def _waqi_geo(token: str, city: str) -> tuple[float, float, str]:
     """Resolve a real WAQI station's coordinates (validates the token)."""
     import requests
+
     r = requests.get(f"https://api.waqi.info/feed/{city}/", params={"token": token}, timeout=30)
     r.raise_for_status()
     js = r.json()
@@ -74,9 +89,19 @@ def _waqi_geo(token: str, city: str) -> tuple[float, float, str]:
 def _open_meteo_pm25(lat: float, lon: float, start: str, end: str) -> pd.DataFrame:
     """Historical daily-mean PM2.5 from Open-Meteo's air-quality archive (keyless)."""
     import requests
-    r = requests.get("https://air-quality-api.open-meteo.com/v1/air-quality", params={
-        "latitude": lat, "longitude": lon, "start_date": start, "end_date": end,
-        "hourly": "pm2_5", "timezone": "UTC"}, timeout=120)
+
+    r = requests.get(
+        "https://air-quality-api.open-meteo.com/v1/air-quality",
+        params={
+            "latitude": lat,
+            "longitude": lon,
+            "start_date": start,
+            "end_date": end,
+            "hourly": "pm2_5",
+            "timezone": "UTC",
+        },
+        timeout=120,
+    )
     r.raise_for_status()
     h = r.json()["hourly"]
     s = pd.DataFrame({"dt": pd.to_datetime(h["time"]), "pm25": h["pm2_5"]}).dropna()
@@ -86,29 +111,45 @@ def _open_meteo_pm25(lat: float, lon: float, start: str, end: str) -> pd.DataFra
 
 def _open_meteo_weather(lat: float, lon: float, start: str, end: str) -> pd.DataFrame:
     import requests
-    r = requests.get("https://archive-api.open-meteo.com/v1/archive", params={
-        "latitude": lat, "longitude": lon, "start_date": start, "end_date": end,
-        "daily": ("temperature_2m_mean,relative_humidity_2m_mean,wind_speed_10m_max,"
-                  "surface_pressure_mean,precipitation_sum"),
-        "timezone": "UTC"}, timeout=120)
+
+    r = requests.get(
+        "https://archive-api.open-meteo.com/v1/archive",
+        params={
+            "latitude": lat,
+            "longitude": lon,
+            "start_date": start,
+            "end_date": end,
+            "daily": (
+                "temperature_2m_mean,relative_humidity_2m_mean,wind_speed_10m_max,"
+                "surface_pressure_mean,precipitation_sum"
+            ),
+            "timezone": "UTC",
+        },
+        timeout=120,
+    )
     r.raise_for_status()
     d = r.json()["daily"]
-    return pd.DataFrame({"date": d["time"], "temperature": d["temperature_2m_mean"],
-                         "humidity": d["relative_humidity_2m_mean"],
-                         "wind_speed": d["wind_speed_10m_max"],
-                         "pressure": d["surface_pressure_mean"],
-                         "precipitation": d["precipitation_sum"]})
+    return pd.DataFrame(
+        {
+            "date": d["time"],
+            "temperature": d["temperature_2m_mean"],
+            "humidity": d["relative_humidity_2m_mean"],
+            "wind_speed": d["wind_speed_10m_max"],
+            "pressure": d["surface_pressure_mean"],
+            "precipitation": d["precipitation_sum"],
+        }
+    )
 
 
-def _real(lat: float, lon: float, start: str, end: str,
-          aqicn_csv: Path | None) -> pd.DataFrame:
+def _real(lat: float, lon: float, start: str, end: str, aqicn_csv: Path | None) -> pd.DataFrame:
     if aqicn_csv is not None:
         pm = pd.read_csv(aqicn_csv)
         pm.columns = [c.strip().lower() for c in pm.columns]
         if "pm25" not in pm.columns:
             for c in ("pm2.5", "pm2_5", "value", "median"):
                 if c in pm.columns:
-                    pm = pm.rename(columns={c: "pm25"}); break
+                    pm = pm.rename(columns={c: "pm25"})
+                    break
         pm["date"] = pd.to_datetime(pm["date"]).dt.strftime("%Y-%m-%d")
         pm = pm[["date", "pm25"]].dropna().drop_duplicates("date")
         start, end = pm["date"].min(), pm["date"].max()
@@ -120,8 +161,11 @@ def _real(lat: float, lon: float, start: str, end: str,
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--synthetic", action="store_true",
-                    help="emit an offline schema-correct placeholder (no key)")
+    ap.add_argument(
+        "--synthetic",
+        action="store_true",
+        help="emit an offline schema-correct placeholder (no key)",
+    )
     ap.add_argument("--days", type=int, default=900, help="synthetic horizon")
     ap.add_argument("--waqi-token", help="WAQI token (resolves the station's lat/lon)")
     ap.add_argument("--city", default="stockholm", help="WAQI city/station slug")

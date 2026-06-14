@@ -1,6 +1,7 @@
 """Batch-scoring task — grader: the standard table suite (columns/rows/content)
 over the scores table (truth.json `table_name`) read back through the
 platform (or --csv)."""
+
 from __future__ import annotations
 
 import sys

@@ -1,212 +1,112 @@
-# banter
+<p align="center">
+  <img src="testbed/docs/logo.png" alt="MLPlatformAgentBench" width="420">
+</p>
 
-A testbed that drives Claude Code against vendor CLIs, MCP servers, and
-Python SDKs on top of [MLE-bench](https://github.com/openai/mle-bench).
-Two loops sit on top of the engineer-runs-one-challenge primitive:
+# MLPlatformAgentBench (MLPAB)
 
-- **benchmark** — run a fixed list of (challenge × interface × skills)
-  once each and compare.
-- **autoresearch** — let a researcher Claude *iteratively edit the
-  interface source* across versions, re-running the engineer after each
-  edit, until the engineer's metrics improve.
+MLPlatformAgentBench is a benchmark for evaluating large language model coding
+agents on machine learning platform tasks. It measures how the interface given
+to the agent, a command-line interface (CLI), a Python SDK, or an MCP server,
+affects how well the agent completes those tasks.
 
-Supporting work for the KTH master's thesis in `thesis/`
-(`thesis/thesis.tex`). The thesis answers three research questions:
+## What it measures
 
-- **RQ1** — Can an LLM-driven research loop improve a *CLI* interface
-  measurably (score / cost / tool-call mix) over committed baseline?
-- **RQ2** — Same question for an *MCP server* interface.
-- **RQ3** — Does providing per-interface *skills* / docs further shift
-  the result, and how does the answer differ across CLI / MCP / SDK?
+Each task is run across a grid of conditions so the conditions can be compared
+directly.
 
-The testbed validates these RQs with a *fake* SaaS platform (`mlkit`,
-ships in-repo) and the real `hopsworks` platform.
+- **Platform.** Hopsworks, Databricks, AWS SageMaker, Azure ML, GCP Vertex, and a `local` baseline (`none`).
+- **Interface.** The platform CLI, the Python SDK, or an MCP server for that platform (or `none`).
+- **Skills.** With or without a bundle of platform skills (Claude Code slash-commands and docs).
+- **Agent engine and model.** `claude-*` (Claude Code), `gpt-*` (Codex), `mistral-*` (Mistral Vibe).
+
+The agent's work is graded by reading the result back through the platform's own
+data paths, not by inspecting the agent transcript. Tasks are generated as fresh,
+seeded instances of the Feature, Training, and Inference (FTI) lifecycle, plus
+Ops and Capstone tasks. Each run uses a new seed, so runs are reproducible but
+not identical. The agent runs in a sandbox confined to its run directory and is
+restricted to the one interface under test. Per-platform setup and teardown
+scripts provision and remove cloud resources around each run.
+
+MLPAB is the testbed for a KTH master's thesis on how interface design and
+supporting skills affect agent performance on ML platform operations. The thesis
+is in `thesis/`.
 
 ```
 banter/
-  testbed/   ← framework, configs, results — everything below assumes `cd testbed`
-  thesis/    ← KTH LaTeX thesis (thesis/thesis.tex)
+  testbed/   MLPlatformAgentBench: framework, configs, evals, results (cd here)
+  thesis/    KTH LaTeX thesis (thesis/thesis.tex)
 ```
 
----
+## How a run works
 
-## Install
+1. A treatment config (`configs/treatments/<platform>/<platform>-<family>.yaml`) expands into a grid of runs over models, interfaces, skills, and tasks.
+2. A session-start check confirms that every platform credential, skill bundle, and model is available and responds to a live probe before any work begins.
+3. Each interface is built once and installed into a per-interface prepared virtual environment. Every run then clones that environment read-only, so runs do not reinstall anything or mutate shared state, and parallel sessions do not interfere.
+4. For each run: a fresh seeded task instance is generated, `setup.py` provisions the platform and a `verify` step confirms it is ready, the sandboxed agent attempts the task using only its interface, then `teardown.py` removes what the agent created and a `verify` step confirms nothing was left behind.
+5. A platform adapter (`evals/adapters/<platform>.py`) reads the deliverable back through the platform and runs the task's assertion suite.
+6. One row per run is appended to `results/results.csv`, and an analysis notebook is regenerated.
+
+### Eval families (`evals/`)
+
+| Family | Example tasks |
+|---|---|
+| feature | `ingest`, `backfill`, `mit`, `validate`, `incremental_load`, `full_reload`, `training_data` (point-in-time correct), `leakage` |
+| training | `train`, `mdt`, `register`, `llm_finetuning` |
+| inference | `batch`, `online`, `odt`, `skew`, `llm_serving`, `recsys`, `vector_search` |
+| ops | `drift`, `prediction_monitoring`, `scheduled_jobs`, `alerting`, `lineage` |
+| capstone | `ccfraud`, `airquality` |
+
+## Quickstart
 
 ```bash
 cd testbed
-make install        # creates .venv, installs banter + deps, libomp, etc.
-banter setup interfaces/mlkit/sdk/config.yaml   # optional — writes any API keys
+make install        # create .venv, install mlpab + evals + dev tools, link `mlpab` onto PATH
+make setup          # interactive: authenticate agent engine(s) and set up platform(s)
+
+# Verify a config is runnable: platform reachable, and each model answers a live probe
+make check CONFIG=configs/treatments/aws/aws-claude.yaml
+
+# Run a treatment session in tmux, detached from any terminal
+mlpab start configs/treatments/databricks/databricks-claude.yaml
+mlpab status                # list running sessions
+mlpab attach <config.yaml>  # watch live (detach with Ctrl-b d)
+
+# Or run inline
+mlpab run configs/treatments/gcp/gcp-mistral.yaml
 ```
 
-`make install` is the only install target. macOS only for now (uses APFS
-clones + Keychain for the Claude OAuth token).
+Credentials are read from `testbed/.env`. macOS is the primary target. It uses
+APFS copy-on-write clones for the per-run virtual environments and the macOS
+Keychain for the Claude OAuth token. Other systems fall back to plain copies.
 
----
-
-## Run the mlkit example
-
-`mlkit` is a fake AutoML platform (Python + tiny local HTTP server) that
-ships with the repo in three shapes — CLI, SDK, MCP server. The engineer
-solves MLE-bench's `aerial-cactus-identification` using whichever shape
-is configured.
+## Development
 
 ```bash
-# one-shot benchmark — engineer runs the mlkit sdk once
-banter interfaces/mlkit/benchmark/sdk/config.yaml
-
-# autoresearch — researcher iterates the mlkit sdk source across v0..v3
-banter interfaces/mlkit/autoresearch/sdk/config.yaml
+make test        # unit tests
+make lint        # ruff check plus isort and format checks (no changes)
+make fmt         # auto-fix: isort imports, then ruff format, then ruff --fix
 ```
-
-Swap `sdk` for `cli` or `mcp` for the other two shapes. Each run
-produces a folder under `results/benchmark/` or `results/autoresearch/`
-with the engineer's transcript, `submission.csv`, MLE-bench grading,
-and a `results.csv` summary.
-
----
-
-## Add your own interface
-
-An interface is a directory under `testbed/interfaces/<name>/<type>/`
-where `<type> ∈ {cli, mcp, sdk}`. It needs:
-
-- a buildable client (wheel, npm package, binary — anything `install:`
-  can produce) plus its source,
-- a `config.yaml` describing how to build, auth, test, and run it.
-
-### Interface `config.yaml`
-
-```yaml
-# interfaces/myapi/sdk/config.yaml
-install:                           # build → produces a wheel/binary in $INTERFACE_DIR
-  - pip wheel . --no-deps --no-build-isolation -w $INTERFACE_DIR
-
-auth_command: python -c "import myapi; myapi.login()"
-test_command: python -c "import myapi; assert myapi.__version__"
-
-binary: myapi-0.1.0-py3-none-any.whl
-runtime_install:                   # installed into each per-challenge venv
-  - pip install --no-deps $INTERFACE_DIR/myapi-0.1.0-py3-none-any.whl
-
-keys:                              # surfaced to engineer + researcher env
-  MYAPI_API_KEY: ""
-
-allowed_domains:                   # network allowlist (sandbox)
-  - api.myapi.example
-
-prompt: |
-  An `myapi` Python SDK is installed. Use it to solve the competition:
-    import myapi; myapi.login()
-    myapi.fit("data")
-    myapi.predict(model, "data", "submission/submission.csv")
-```
-
-### Benchmark config that uses it
-
-```yaml
-# interfaces/myapi/benchmark/sdk/config.yaml
-engineer_model: claude-sonnet-4-6
-max_seconds: 3600
-tasks:
-  image_classification: [aerial-cactus-identification]
-interfaces:
-  - {config: interfaces/myapi/sdk/config.yaml}
-skills: [none]
-```
-
-Run with `banter interfaces/myapi/benchmark/sdk/config.yaml`.
-
-### Autoresearch config that improves it
-
-```yaml
-# interfaces/myapi/autoresearch/sdk/config.yaml
-engineer_model: claude-sonnet-4-6
-researcher_model: claude-opus-4-7
-
-tasks:
-  image_classification: [aerial-cactus-identification]
-
-interfaces:
-  - config: interfaces/myapi/sdk/config.yaml
-
-skills: none
-docs: https://github.com/myorg/myapi-docs.git    # optional — cloned per run
-improve:
-  - interface                                    # researcher may edit the SDK source
-
-goals:                                           # optimisation targets
-  - {metric: score,         direction: maximize}
-  - {metric: total_tokens,  direction: minimize}
-  - {metric: wall_time_s,   direction: minimize}
-  - {metric: sdk_calls,     direction: maximize}
-  - {metric: python_calls,  direction: minimize}
-
-budget:
-  max_increments: 3                              # produces v0 + v1..v3
-  max_cost_usd: .inf
-```
-
-Run with `banter interfaces/myapi/autoresearch/sdk/config.yaml`. The
-researcher will produce `v0..v3`, each a full engineer run with edits
-to the interface source, and write a per-version row to `results.csv`.
-
----
-
-## Skills
-
-A skill is a Claude Code slash command bundled with an interface. Drop
-a `SKILL.md` at:
-
-```
-interfaces/<name>/skills/<skill-name>/SKILL.md
-```
-
-…and reference it from a benchmark / autoresearch config:
-
-```yaml
-skills:
-  - <skill-name>          # or `none`
-```
-
-The engineer's prompt gets the available skills appended; the
-researcher can also edit them when `improve:` includes `skills`.
-
----
-
-## Docs
-
-Reference documentation that should be visible to both researcher and
-engineer is set per autoresearch config:
-
-```yaml
-docs: https://github.com/myorg/myapi-docs.git   # git URL (shallow-cloned per run)
-# docs: /Users/me/local/docs                    # or a local path
-# docs: none                                    # default — no docs bundle
-```
-
-A copy lands at `<run>/docs/` and `<challenge>/docs/`. The engineer and
-researcher see a `Reference docs` section in their prompts pointing at
-those paths.
-
----
 
 ## Results
 
 ```
-testbed/results/benchmark/      ← one folder per benchmark run
-testbed/results/autoresearch/   ← one folder per autoresearch run; v0..vN inside
-testbed/results/*/results.csv   ← rollup, one row per challenge (or version)
+testbed/results/results.csv     one row per run (the single results table)
+testbed/results/<config>/...    per-run artifacts: agent.log, submission/, grading, commands
+testbed/results/results.ipynb   generated analysis, regenerated after each run
 ```
 
-Each run dir contains the engineer's full stream-json transcript,
-`submission.csv`, MLE-bench's `grading.json`, and a per-tool-call
-`commands.jsonl` — enough to reproduce any number in the rollup.
+Each row records the identity of the cell (`model`, `platform`, `interface`,
+`version`, `skills`, `category`, `task`, `n`) and its outcome (`valid`,
+`success`, `asserts_passed`, `asserts_total`), along with cost, latency, and the
+agent's tool-call counts. This is enough to reproduce and compare any value in
+the table.
 
----
+## Adding a platform interface
 
-## Tests
-
-```bash
-make test               # 106 unit tests
-make test-integration   # 2 live sandbox / OAuth integration tests
-```
+A platform lives in `configs/platforms/<platform>/`. It has one flat manifest per
+interface (`cli.yaml`, `sdk.yaml`, `mcp.yaml`) describing how to build, install,
+authenticate, and test that interface. It also has `setup.py` and `teardown.py`
+(each supporting a `verify` mode) and a `skills/` bundle. A matching grader
+adapter goes in `evals/adapters/<platform>.py` and implements the read-back
+contract (`get_feature_table`, `read_rows`, `read_training_dataset`, and the
+state reads).

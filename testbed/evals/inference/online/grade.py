@@ -14,6 +14,7 @@ Usage:
     python -m evals.inference.online.grade --instance <dir> --adapter <hopsworks|databricks|sagemaker|none>
 (cwd must be the run dir — the provider runs graders there.)
 """
+
 from __future__ import annotations
 
 import json
@@ -31,39 +32,43 @@ def grade(instance_dir: Path, adapter: str, run_dir: Path) -> dict:
     asserts: list[dict] = []
 
     def check(name, ok, detail=""):
-        asserts.append({"name": name, "passed": bool(ok),
-                        **({"detail": detail} if detail else {})})
+        asserts.append({"name": name, "passed": bool(ok), **({"detail": detail} if detail else {})})
         return bool(ok)
 
     # A1 — feature table exists
     if adapter == "none":
-        a1 = check("A1_table_exists", True,
-                   "no checker adapter (platform none) — skipped")
+        a1 = check("A1_table_exists", True, "no checker adapter (platform none) — skipped")
     else:
         info = table_exists_info(adapter, truth["table_name"], truth["table_version"])
-        a1 = check("A1_table_exists", info is not None,
-                   "" if info else f"feature table {truth['table_name']!r} not found")
+        a1 = check(
+            "A1_table_exists",
+            info is not None,
+            "" if info else f"feature table {truth['table_name']!r} not found",
+        )
 
     # A2 — answered vectors match truth for every lookup key
     answers = load_answers(Path(run_dir) / "submission" / "answers.json")
     vectors = (answers or {}).get("vectors") if isinstance(answers, dict) else None
     if not isinstance(vectors, dict):
-        a2 = check("A2_vectors", False,
-                   "submission/answers.json must contain a 'vectors' object")
+        a2 = check("A2_vectors", False, "submission/answers.json must contain a 'vectors' object")
     else:
         bad = []
         for k in keys:
             got = vectors.get(k)
             want = truth["vectors"][k]
             try:
-                ok = (isinstance(got, list) and len(got) == len(want)
-                      and all(abs(float(g) - w) <= TOL for g, w in zip(got, want)))
+                ok = (
+                    isinstance(got, list)
+                    and len(got) == len(want)
+                    and all(abs(float(g) - w) <= TOL for g, w in zip(got, want))
+                )
             except (TypeError, ValueError):
                 ok = False
             if not ok:
                 bad.append(k)
-        a2 = check("A2_vectors", not bad,
-                   f"wrong/missing vectors for keys: {bad[:5]}" if bad else "")
+        a2 = check(
+            "A2_vectors", not bad, f"wrong/missing vectors for keys: {bad[:5]}" if bad else ""
+        )
 
     # A3 — independent online read (sagemaker only)
     if adapter == "sagemaker":
@@ -73,25 +78,30 @@ def grade(instance_dir: Path, adapter: str, run_dir: Path) -> dict:
             for k in keys[:5]:
                 row = df[df["account_id"].astype(str) == k]
                 want = truth["vectors"][k]
-                ok = (not row.empty and all(
-                    abs(float(row.iloc[0][f]) - w) <= TOL for f, w in zip(feats, want)))
+                ok = not row.empty and all(
+                    abs(float(row.iloc[0][f]) - w) <= TOL for f, w in zip(feats, want)
+                )
                 if not ok:
                     bad.append(k)
-            a3 = check("A3_online_read", not bad,
-                       f"online store disagrees for keys: {bad}" if bad else "")
+            a3 = check(
+                "A3_online_read", not bad, f"online store disagrees for keys: {bad}" if bad else ""
+            )
         except Exception as e:
             a3 = check("A3_online_read", False, f"online read failed: {e}")
     elif adapter == "none":
-        a3 = check("A3_online_read", True,
-                   "no checker adapter (platform none) — skipped")
+        a3 = check("A3_online_read", True, "no checker adapter (platform none) — skipped")
     else:
-        a3 = check("A3_online_read", True,
-                   "independent online read only implemented for sagemaker")
+        a3 = check("A3_online_read", True, "independent online read only implemented for sagemaker")
 
     success = a1 and a2 and a3
-    return {"family": "online", "seed": truth["seed"], "success": success,
-            "asserts_passed": sum(a["passed"] for a in asserts),
-            "asserts_total": len(asserts), "asserts": asserts}
+    return {
+        "family": "online",
+        "seed": truth["seed"],
+        "success": success,
+        "asserts_passed": sum(a["passed"] for a in asserts),
+        "asserts_total": len(asserts),
+        "asserts": asserts,
+    }
 
 
 def main(argv=None) -> int:

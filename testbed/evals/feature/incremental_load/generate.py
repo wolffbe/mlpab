@@ -13,6 +13,7 @@ schedule.
 Ground truth by construction: truth = all increments concatenated. Naive
 variant (gates assert it differs): skipping the last increment.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -28,9 +29,9 @@ from evals.common import canonicalize, digest, instance_suffix
 
 ORIGIN = pd.Timestamp("2026-03-02", tz="UTC")
 N_INCREMENTS = 6
-ROWS_PER_INCREMENT = (90, 130)   # seeded per-file row count range
-TABLE_BASE = "incremental"      # per-instance: f"{TABLE_BASE}{instance_suffix(seed)}"
-JOB_BASE = "incrementaljob"     # per-instance: f"{JOB_BASE}{instance_suffix(seed)}"
+ROWS_PER_INCREMENT = (90, 130)  # seeded per-file row count range
+TABLE_BASE = "incremental"  # per-instance: f"{TABLE_BASE}{instance_suffix(seed)}"
+JOB_BASE = "incrementaljob"  # per-instance: f"{JOB_BASE}{instance_suffix(seed)}"
 CATEGORIES = ["grocery", "travel", "salary", "rent", "other"]
 
 SPEC = {
@@ -59,14 +60,20 @@ def generate(seed: int, out: Path) -> dict:
     for day, cnt in enumerate(counts):
         n = int(cnt)
         day_origin = ORIGIN + pd.Timedelta(days=day)
-        part = pd.DataFrame({
-            "row_id": [f"R{i:05d}" for i in range(next_id, next_id + n)],
-            "account_id": [f"A{int(a):04d}" for a in rng.integers(0, 150, n)],
-            "event_time": [(day_origin + pd.Timedelta(minutes=int(m))).floor("s").strftime(
-                "%Y-%m-%dT%H:%M:%SZ") for m in np.sort(rng.integers(0, 24 * 60, n))],
-            "amount": np.round(rng.lognormal(3.0, 1.0, n), 2),
-            "category": rng.choice(CATEGORIES, n),
-        })
+        part = pd.DataFrame(
+            {
+                "row_id": [f"R{i:05d}" for i in range(next_id, next_id + n)],
+                "account_id": [f"A{int(a):04d}" for a in rng.integers(0, 150, n)],
+                "event_time": [
+                    (day_origin + pd.Timedelta(minutes=int(m)))
+                    .floor("s")
+                    .strftime("%Y-%m-%dT%H:%M:%SZ")
+                    for m in np.sort(rng.integers(0, 24 * 60, n))
+                ],
+                "amount": np.round(rng.lognormal(3.0, 1.0, n), 2),
+                "category": rng.choice(CATEGORIES, n),
+            }
+        )
         next_id += n
         parts.append(part)
 
@@ -74,16 +81,18 @@ def generate(seed: int, out: Path) -> dict:
 
     # --- gates ---------------------------------------------------------------
     variants = {
-        "skip_last_increment": canonicalize(
-            pd.concat(parts[:-1], ignore_index=True), SPEC),
+        "skip_last_increment": canonicalize(pd.concat(parts[:-1], ignore_index=True), SPEC),
     }
     for name, v in variants.items():
         if digest(v) == digest(truth):
             raise GateError(f"variant {name!r} matches truth (seed={seed})")
     # reference: concat every increment, shuffled load order does not matter
     ref = canonicalize(
-        pd.concat([p.sample(frac=1.0, random_state=seed) for p in reversed(parts)],
-                  ignore_index=True), SPEC)
+        pd.concat(
+            [p.sample(frac=1.0, random_state=seed) for p in reversed(parts)], ignore_index=True
+        ),
+        SPEC,
+    )
     if digest(ref) != digest(truth):
         raise GateError(f"reference concat disagrees with truth (seed={seed})")
 
@@ -118,10 +127,14 @@ def generate(seed: int, out: Path) -> dict:
         f'    {{"job_name": "{job_name}"}}\n'
     )
     meta = {
-        "family": "incremental_load", "seed": seed,
-        "table_name": table, "table_version": 1,
+        "family": "incremental_load",
+        "seed": seed,
+        "table_name": table,
+        "table_version": 1,
         "job_name": job_name,
-        "spec": SPEC, "row_count": len(truth), "digest": digest(truth),
+        "spec": SPEC,
+        "row_count": len(truth),
+        "digest": digest(truth),
         "record_ids": truth["row_id"].tolist(),
         "variant_digests": {k: digest(v) for k, v in variants.items()},
         "variant_diagnosis": VARIANT_DIAGNOSIS,
@@ -129,7 +142,8 @@ def generate(seed: int, out: Path) -> dict:
     }
     (out / "solution" / "truth.json").write_text(json.dumps(meta, indent=2))
     (out / "instance.json").write_text(
-        json.dumps({"family": "incremental_load", "seed": seed}, indent=2))
+        json.dumps({"family": "incremental_load", "seed": seed}, indent=2)
+    )
     return meta
 
 

@@ -1,5 +1,6 @@
 """Recsys task — grader: the standard table suite over the recommendations
 table (truth.json `table_name`) read back through the platform (or --csv locally)."""
+
 from __future__ import annotations
 
 import sys

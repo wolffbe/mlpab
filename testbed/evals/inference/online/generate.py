@@ -18,6 +18,7 @@ Ground truth by construction (the generator made the rows). Generation-time
 gates run the grade function (adapter `none`): the reference vectors pass; a
 corrupted vector and a missing key both fail.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -49,8 +50,7 @@ def generate(seed: int, out: Path) -> dict:
     for f in FEATURES:
         df[f] = np.round(rng.normal(rng.uniform(-5, 5), rng.uniform(0.5, 3), N_ACCOUNTS), 4)
     keys = sorted(rng.choice(df["account_id"], N_LOOKUPS, replace=False).tolist())
-    vectors = {k: [float(df.loc[df["account_id"] == k, f].iloc[0]) for f in FEATURES]
-               for k in keys}
+    vectors = {k: [float(df.loc[df["account_id"] == k, f].iloc[0]) for f in FEATURES] for k in keys}
 
     # --- write instance --------------------------------------------------------
     if out.exists():
@@ -62,7 +62,8 @@ def generate(seed: int, out: Path) -> dict:
     (out / "data" / "schema.md").write_text(
         "# Schema\n\n"
         "- **features.csv**: account_id (unique key), "
-        + ", ".join(FEATURES) + " (numeric features)\n"
+        + ", ".join(FEATURES)
+        + " (numeric features)\n"
         "- **lookup_keys.txt**: one account_id per line — the keys to serve\n"
     )
     (out / "prompt.txt").write_text(
@@ -81,9 +82,13 @@ def generate(seed: int, out: Path) -> dict:
         f"{', '.join(FEATURES)}), one entry per lookup key.\n"
     )
     truth = {
-        "family": "online", "seed": seed,
-        "table_name": table, "table_version": 1,
-        "features": FEATURES, "keys": keys, "vectors": vectors,
+        "family": "online",
+        "seed": seed,
+        "table_name": table,
+        "table_version": 1,
+        "features": FEATURES,
+        "keys": keys,
+        "vectors": vectors,
         "record_ids": df["account_id"].tolist(),
     }
     (out / "solution" / "truth.json").write_text(json.dumps(truth, indent=2))

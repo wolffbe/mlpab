@@ -16,6 +16,7 @@ CLI (for live probing):
     python -m evals.adapters.hopsworks read-fg     --name transactions --out /tmp/fg.csv
     python -m evals.adapters.hopsworks read-td     --name churn_training --version 1 --out /tmp/td.csv
 """
+
 from __future__ import annotations
 
 import argparse
@@ -93,6 +94,7 @@ class HopsworksChecker:
 # CLI
 # --------------------------------------------------------------------------
 
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -139,6 +141,7 @@ if __name__ == "__main__":
 # assert on `exists` plus whichever detail keys the platform can provide).
 # --------------------------------------------------------------------------
 
+
 def _state_reads(cls):
     def get_model(self, name: str, version: int = 1) -> dict:
         """Model registry entry: {exists, version, metrics}."""
@@ -147,8 +150,11 @@ def _state_reads(cls):
             m = mr.get_model(name, version=version)
             if m is None:
                 return {"exists": False}
-            return {"exists": True, "version": getattr(m, "version", None),
-                    "metrics": dict(getattr(m, "training_metrics", None) or {})}
+            return {
+                "exists": True,
+                "version": getattr(m, "version", None),
+                "metrics": dict(getattr(m, "training_metrics", None) or {}),
+            }
         except Exception as e:
             return {"exists": False, "error": str(e)}
 
@@ -159,15 +165,19 @@ def _state_reads(cls):
             job = jobs_api.get_job(name)
             if job is None:
                 return {"exists": False}
-            out = {"exists": True,
-                   "scheduled": bool(getattr(job, "job_schedule", None)
-                                     or getattr(job, "schedule", None))}
+            out = {
+                "exists": True,
+                "scheduled": bool(
+                    getattr(job, "job_schedule", None) or getattr(job, "schedule", None)
+                ),
+            }
             try:
                 exes = job.get_executions() or []
                 if exes:
                     last = exes[0]
                     out["last_run_state"] = str(
-                        getattr(last, "final_status", None) or getattr(last, "state", ""))
+                        getattr(last, "final_status", None) or getattr(last, "state", "")
+                    )
             except Exception:
                 pass
             return out
@@ -220,10 +230,12 @@ def _state_reads(cls):
                 fgs = [fg] if fg is not None else []
             if not fgs:
                 return {"exists": False, "error": f"feature group {name!r} not found"}
-            indexed = [fg for fg in fgs
-                       if getattr(fg, "embedding_index", None) is not None]
-            out = {"exists": bool(indexed), "kind": "feature-group-embedding-index",
-                   "versions": [getattr(fg, "version", None) for fg in fgs]}
+            indexed = [fg for fg in fgs if getattr(fg, "embedding_index", None) is not None]
+            out = {
+                "exists": bool(indexed),
+                "kind": "feature-group-embedding-index",
+                "versions": [getattr(fg, "version", None) for fg in fgs],
+            }
             if not indexed:
                 out["error"] = "feature group exists but carries no embedding index"
             return out

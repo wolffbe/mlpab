@@ -1,5 +1,6 @@
 """Tests for REST-endpoint coverage tracking: the `endpoint_hits` matcher, the
 metric registration, and the venv request-logging shim."""
+
 import json
 import os
 import sys
@@ -25,9 +26,18 @@ FV_CREATE = "POST /hopsworks-api/api/project/[0-9]+/featurestores/[0-9]+/feature
 class EndpointHitsTests(unittest.TestCase):
     def test_distinct_coverage_not_volume(self):
         log = _log(
-            {"method": "POST", "path": "/hopsworks-api/api/project/1/featurestores/9/featuregroups"},
-            {"method": "GET", "path": "/hopsworks-api/api/project/1/featurestores/9/featuregroups/fg"},
-            {"method": "GET", "path": "/hopsworks-api/api/project/1/featurestores/9/featuregroups/fg"},  # dup
+            {
+                "method": "POST",
+                "path": "/hopsworks-api/api/project/1/featurestores/9/featuregroups",
+            },
+            {
+                "method": "GET",
+                "path": "/hopsworks-api/api/project/1/featurestores/9/featuregroups/fg",
+            },
+            {
+                "method": "GET",
+                "path": "/hopsworks-api/api/project/1/featurestores/9/featuregroups/fg",
+            },  # dup
         )
         r = results.endpoint_hits(log, [FG_CREATE, FG_GET, FV_CREATE], [])
         # 2 distinct whitelisted patterns hit (create + get); the dup get doesn't add.
@@ -43,7 +53,9 @@ class EndpointHitsTests(unittest.TestCase):
         self.assertEqual(r["blacklist_hits"], 2)
 
     def test_method_must_match(self):
-        log = _log({"method": "GET", "path": "/hopsworks-api/api/project/1/featurestores/9/featuregroups"})
+        log = _log(
+            {"method": "GET", "path": "/hopsworks-api/api/project/1/featurestores/9/featuregroups"}
+        )
         # whitelist wants POST for create → GET shouldn't match it.
         self.assertEqual(results.endpoint_hits(log, [FG_CREATE], [])["whitelist_hits"], 0)
 
@@ -59,24 +71,38 @@ class EndpointHitsTests(unittest.TestCase):
 
     def test_no_patterns_zeros(self):
         log = _log({"method": "GET", "path": "/x"})
-        self.assertEqual(results.endpoint_hits(log, [], []), {"whitelist_hits": 0, "blacklist_hits": 0})
+        self.assertEqual(
+            results.endpoint_hits(log, [], []), {"whitelist_hits": 0, "blacklist_hits": 0}
+        )
 
     def test_prefix_pattern_does_not_overmatch_deeper_path(self):
         # FV-create POST .../featureview must NOT match the deeper TD-create path
         # .../featureview/{name}/version/{v}/trainingdatasets (end-anchored).
-        td_create = {"method": "POST",
-                     "path": "/hopsworks-api/api/project/1/featurestores/9/featureview/fv/version/1/trainingdatasets"}
+        td_create = {
+            "method": "POST",
+            "path": "/hopsworks-api/api/project/1/featurestores/9/featureview/fv/version/1/trainingdatasets",
+        }
         log = _log(td_create)
         r = results.endpoint_hits(log, [FV_CREATE], [])
         self.assertEqual(r["whitelist_hits"], 0)  # the TD path is not an FV-create
 
     def test_fg_get_does_not_match_ingestion_subpath(self):
         # FG-get .../featuregroups/[^/]+ must not match .../featuregroups/5/ingestion
-        log = _log({"method": "POST", "path": "/hopsworks-api/api/project/1/featurestores/9/featuregroups/5/ingestion"})
+        log = _log(
+            {
+                "method": "POST",
+                "path": "/hopsworks-api/api/project/1/featurestores/9/featuregroups/5/ingestion",
+            }
+        )
         self.assertEqual(results.endpoint_hits(log, [FG_GET], [])["whitelist_hits"], 0)
 
     def test_trailing_slash_tolerated(self):
-        log = _log({"method": "POST", "path": "/hopsworks-api/api/project/1/featurestores/9/featuregroups/"})
+        log = _log(
+            {
+                "method": "POST",
+                "path": "/hopsworks-api/api/project/1/featurestores/9/featuregroups/",
+            }
+        )
         self.assertEqual(results.endpoint_hits(log, [FG_CREATE], [])["whitelist_hits"], 1)
 
     def test_real_sdk_get_paths_match(self):
@@ -87,20 +113,31 @@ class EndpointHitsTests(unittest.TestCase):
         dep_get = "GET /hopsworks-api/api/project/[0-9]+/serving(?:/[0-9]+)?"
         app_get = "GET /hopsworks-api/api/project/[0-9]+/apps(?:/[^/]+)?"
         log = _log(
-            {"method": "GET", "path": "/hopsworks-api/api/project/1/featurestores/9/featureview/fv/version/1"},
+            {
+                "method": "GET",
+                "path": "/hopsworks-api/api/project/1/featurestores/9/featureview/fv/version/1",
+            },
             {"method": "GET", "path": "/hopsworks-api/api/project/1/serving/5"},
             {"method": "GET", "path": "/hopsworks-api/api/project/1/apps/myapp"},
         )
-        self.assertEqual(results.endpoint_hits(log, [fv_get, dep_get, app_get], [])["whitelist_hits"], 3)
+        self.assertEqual(
+            results.endpoint_hits(log, [fv_get, dep_get, app_get], [])["whitelist_hits"], 3
+        )
         # FV-get must NOT also swallow the deeper TD path.
-        td = _log({"method": "GET",
-                   "path": "/hopsworks-api/api/project/1/featurestores/9/featureview/fv/version/1/trainingdatasets"})
+        td = _log(
+            {
+                "method": "GET",
+                "path": "/hopsworks-api/api/project/1/featurestores/9/featureview/fv/version/1/trainingdatasets",
+            }
+        )
         self.assertEqual(results.endpoint_hits(td, [fv_get], [])["whitelist_hits"], 0)
 
 
 class EndpointCoverageTests(unittest.TestCase):
     def test_covered_and_missed_split(self):
-        log = _log({"method": "POST", "path": "/hopsworks-api/api/project/1/featurestores/9/featuregroups"})
+        log = _log(
+            {"method": "POST", "path": "/hopsworks-api/api/project/1/featurestores/9/featuregroups"}
+        )
         cov = results.endpoint_coverage(log, [FG_CREATE, FG_GET, FV_CREATE], [])
         self.assertEqual(cov["whitelist_hits"], 1)
         self.assertEqual(cov["total_whitelist"], 3)
@@ -114,7 +151,9 @@ class EndpointCoverageTests(unittest.TestCase):
         self.assertEqual(cov["missed"], [FG_CREATE, FG_GET])
 
     def test_endpoint_hits_matches_coverage_counts(self):
-        log = _log({"method": "POST", "path": "/hopsworks-api/api/project/1/featurestores/9/featuregroups"})
+        log = _log(
+            {"method": "POST", "path": "/hopsworks-api/api/project/1/featurestores/9/featuregroups"}
+        )
         cov = results.endpoint_coverage(log, [FG_CREATE, FG_GET], ["DELETE /x"])
         hits = results.endpoint_hits(log, [FG_CREATE, FG_GET], ["DELETE /x"])
         self.assertEqual(hits["whitelist_hits"], cov["whitelist_hits"])
@@ -123,7 +162,9 @@ class EndpointCoverageTests(unittest.TestCase):
     def test_coverage_embeds_original_patterns(self):
         # endpoint_coverage.json must be self-contained once api_calls.jsonl is
         # discarded: it carries the exact whitelist/blacklist it was scored against.
-        log = _log({"method": "POST", "path": "/hopsworks-api/api/project/1/featurestores/9/featuregroups"})
+        log = _log(
+            {"method": "POST", "path": "/hopsworks-api/api/project/1/featurestores/9/featuregroups"}
+        )
         cov = results.endpoint_coverage(log, [FG_CREATE, FG_GET], ["DELETE /x"])
         self.assertEqual(cov["whitelist"], [FG_CREATE, FG_GET])
         self.assertEqual(cov["blacklist"], ["DELETE /x"])
@@ -143,16 +184,26 @@ class AttributionTests(unittest.TestCase):
 
     def test_only_active_interface_src_counts(self):
         log = _log({**self.FG, "src": "mcp"})
-        self.assertEqual(results.endpoint_hits(log, [FG_CREATE], [], interface="mcp")["whitelist_hits"], 1)
+        self.assertEqual(
+            results.endpoint_hits(log, [FG_CREATE], [], interface="mcp")["whitelist_hits"], 1
+        )
         # Same call attributed to MCP does NOT count for a CLI/SDK run.
-        self.assertEqual(results.endpoint_hits(log, [FG_CREATE], [], interface="cli")["whitelist_hits"], 0)
-        self.assertEqual(results.endpoint_hits(log, [FG_CREATE], [], interface="sdk")["whitelist_hits"], 0)
+        self.assertEqual(
+            results.endpoint_hits(log, [FG_CREATE], [], interface="cli")["whitelist_hits"], 0
+        )
+        self.assertEqual(
+            results.endpoint_hits(log, [FG_CREATE], [], interface="sdk")["whitelist_hits"], 0
+        )
 
     def test_other_src_never_counts_when_attributed(self):
         # A hand-rolled `requests.post(...)` (not via the interface) → src "other".
         log = _log({**self.FG, "src": "other"})
-        self.assertEqual(results.endpoint_hits(log, [FG_CREATE], [], interface="mcp")["whitelist_hits"], 0)
-        self.assertEqual(results.endpoint_hits(log, [FG_CREATE], [], interface="sdk")["whitelist_hits"], 0)
+        self.assertEqual(
+            results.endpoint_hits(log, [FG_CREATE], [], interface="mcp")["whitelist_hits"], 0
+        )
+        self.assertEqual(
+            results.endpoint_hits(log, [FG_CREATE], [], interface="sdk")["whitelist_hits"], 0
+        )
 
     def test_no_interface_counts_any_src(self):
         # Back-compat: interface=None (e.g. none/none baseline or legacy logs)
@@ -165,7 +216,9 @@ class AttributionTests(unittest.TestCase):
         # interface=None, never credited to a specific interface.
         log = _log(dict(self.FG))  # no "src" key
         self.assertEqual(results.endpoint_hits(log, [FG_CREATE], [])["whitelist_hits"], 1)
-        self.assertEqual(results.endpoint_hits(log, [FG_CREATE], [], interface="mcp")["whitelist_hits"], 0)
+        self.assertEqual(
+            results.endpoint_hits(log, [FG_CREATE], [], interface="mcp")["whitelist_hits"], 0
+        )
 
     def test_blacklist_not_attribution_filtered(self):
         # A forbidden call is a violation however it was made — blacklist counts
@@ -186,12 +239,20 @@ class EndpointSchemaTests(unittest.TestCase):
 
     def test_row_carries_endpoint_metrics_but_csv_drops_them(self):
         import csv
+
         out = Path(tempfile.mkdtemp()) / "results.csv"
         row = results.Row(
-            started_at="2026-06-04T00:00:00+00:00", run="1", version="v1",
-            platform="hopsworks", interface="cli", skills="none",
-            category="t", task="c",
-            whitelist_hits=5, blacklist_hits=0, run_dir=str(out.parent),
+            started_at="2026-06-04T00:00:00+00:00",
+            run="1",
+            version="v1",
+            platform="hopsworks",
+            interface="cli",
+            skills="none",
+            category="t",
+            task="c",
+            whitelist_hits=5,
+            blacklist_hits=0,
+            run_dir=str(out.parent),
         )
         self.assertEqual(row.whitelist_hits, 5)  # still recorded on the Row
         results.append(out, row)
@@ -222,7 +283,9 @@ class ApiLogShimTests(unittest.TestCase):
             self.assertEqual(fake.Session().send(req), "RESP")  # original still called
             rec = json.loads(log.read_text().splitlines()[0])
             self.assertEqual(rec["method"], "POST")
-            self.assertEqual(rec["path"], "/hopsworks-api/api/project/1/featurestores/9/featuregroups")
+            self.assertEqual(
+                rec["path"], "/hopsworks-api/api/project/1/featurestores/9/featuregroups"
+            )
             self.assertIn("src", rec)  # attribution tag always present
         finally:
             if old is not None:

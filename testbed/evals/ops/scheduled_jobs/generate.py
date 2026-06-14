@@ -17,6 +17,7 @@ scheduled); on adapter `none` the platform asserts are skipped-pass, so the
 generation-time gates exercise the answers asserts directly: the reference
 answers pass the grade function, a wrong/missing job name fails.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -76,11 +77,11 @@ def generate(seed: int, out: Path) -> dict:
         "submission/answers.json as:\n"
         f'    {{"job_name": "{job}"}}\n'
     )
-    truth = {"family": "scheduled_jobs", "seed": seed,
-             "job_name": job, "token": token}
+    truth = {"family": "scheduled_jobs", "seed": seed, "job_name": job, "token": token}
     (out / "solution" / "truth.json").write_text(json.dumps(truth, indent=2))
-    (out / "instance.json").write_text(json.dumps(
-        {"family": "scheduled_jobs", "seed": seed}, indent=2))
+    (out / "instance.json").write_text(
+        json.dumps({"family": "scheduled_jobs", "seed": seed}, indent=2)
+    )
 
     # --- gates: answers asserts via the grade function (adapter none) ----------
     from evals.ops.scheduled_jobs.grade import grade

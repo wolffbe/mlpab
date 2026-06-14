@@ -40,6 +40,7 @@ Platform realization (encoded in the graders/adapters, asymmetric by design):
                platform's best native representation is the vectors stored in
                an (online) feature group; neighbors are computed interface-side.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -64,9 +65,9 @@ TABLE_BASE = "items"  # per-instance: f"{TABLE_BASE}{instance_suffix(seed)}"
 
 VARIANT_DIAGNOSIS = {
     "cosine_metric": "neighbors ranked by COSINE distance instead of Euclidean "
-                     "(L2) — magnitude information was discarded",
+    "(L2) — magnitude information was discarded",
     "dot_product": "neighbors ranked by HIGHEST DOT PRODUCT instead of smallest "
-                   "Euclidean (L2) distance",
+    "Euclidean (L2) distance",
 }
 
 
@@ -91,7 +92,7 @@ def _stable(items: np.ndarray, q: np.ndarray) -> bool:
     """True when the query's top-(K+1) L2 distances are pairwise separated by
     the relative margin — adjacent check on the ascending sort covers every
     pair, including the rank-5/rank-6 k-boundary."""
-    d = np.sort(np.linalg.norm(items - q, axis=1))[:K + 1]
+    d = np.sort(np.linalg.norm(items - q, axis=1))[: K + 1]
     return all(d[i + 1] > 0 and d[i] <= (1.0 - MARGIN) * d[i + 1] for i in range(K))
 
 
@@ -99,6 +100,7 @@ def _cdist_ref(items: np.ndarray, ids: list[str], queries: np.ndarray) -> list[l
     """Independently-written second implementation (scipy cdist on the full
     query×item matrix) for the cross-check gate."""
     from scipy.spatial.distance import cdist
+
     d = cdist(queries, items, metric="euclidean")
     return [[ids[i] for i in np.argsort(row, kind="stable")[:K]] for row in d]
 
@@ -131,13 +133,14 @@ def generate(seed: int, out: Path) -> dict:
     query_ids = [f"Q{i:03d}" for i in range(N_QUERIES)]
 
     # --- truth + naive variants ------------------------------------------------
-    neighbors = {qid: _rank(items, item_ids, q, "l2")
-                 for qid, q in zip(query_ids, queries)}
+    neighbors = {qid: _rank(items, item_ids, q, "l2") for qid, q in zip(query_ids, queries)}
     variants = {
-        "cosine_metric": {qid: _rank(items, item_ids, q, "cosine")
-                          for qid, q in zip(query_ids, queries)},
-        "dot_product": {qid: _rank(items, item_ids, q, "dot_product")
-                        for qid, q in zip(query_ids, queries)},
+        "cosine_metric": {
+            qid: _rank(items, item_ids, q, "cosine") for qid, q in zip(query_ids, queries)
+        },
+        "dot_product": {
+            qid: _rank(items, item_ids, q, "dot_product") for qid, q in zip(query_ids, queries)
+        },
     }
 
     # --- gates -------------------------------------------------------------------
@@ -154,15 +157,19 @@ def generate(seed: int, out: Path) -> dict:
         shutil.rmtree(out)
     (out / "data").mkdir(parents=True)
     (out / "solution").mkdir()
-    pd.DataFrame({
-        "item_id": item_ids,
-        "embedding": [json.dumps([float(x) for x in row]) for row in items],
-        "label": [f"c{c}" for c in item_cluster],
-    }).to_csv(out / "data" / "items.csv", index=False)
-    pd.DataFrame({
-        "query_id": query_ids,
-        "embedding": [json.dumps([float(x) for x in row]) for row in queries],
-    }).to_csv(out / "data" / "queries.csv", index=False)
+    pd.DataFrame(
+        {
+            "item_id": item_ids,
+            "embedding": [json.dumps([float(x) for x in row]) for row in items],
+            "label": [f"c{c}" for c in item_cluster],
+        }
+    ).to_csv(out / "data" / "items.csv", index=False)
+    pd.DataFrame(
+        {
+            "query_id": query_ids,
+            "embedding": [json.dumps([float(x) for x in row]) for row in queries],
+        }
+    ).to_csv(out / "data" / "queries.csv", index=False)
     (out / "data" / "schema.md").write_text(
         "# Schema\n\n"
         f"- **items.csv**: item_id (unique key), embedding (a JSON array of "
@@ -186,16 +193,22 @@ def generate(seed: int, out: Path) -> dict:
         '"neighbors": {"<query_id>": [<five item_ids, nearest first>]}}\n'
     )
     truth = {
-        "family": "vector_search", "seed": seed,
-        "table_name": table, "k": K, "metric": "l2", "dim": DIM,
-        "n_items": N_ITEMS, "n_queries": N_QUERIES,
+        "family": "vector_search",
+        "seed": seed,
+        "table_name": table,
+        "k": K,
+        "metric": "l2",
+        "dim": DIM,
+        "n_items": N_ITEMS,
+        "n_queries": N_QUERIES,
         "neighbors": neighbors,
         "variant_neighbors": variants,
         "variant_diagnosis": VARIANT_DIAGNOSIS,
     }
     (out / "solution" / "truth.json").write_text(json.dumps(truth, indent=2))
-    (out / "instance.json").write_text(json.dumps(
-        {"family": "vector_search", "seed": seed}, indent=2))
+    (out / "instance.json").write_text(
+        json.dumps({"family": "vector_search", "seed": seed}, indent=2)
+    )
 
     # --- gates: the grade function accepts truth, rejects corruptions ----------
     from evals.inference.vector_search.grade import grade
@@ -229,8 +242,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.selftest:
         for seed in (1, 2, 3):
             meta = generate(seed, Path(f"/tmp/mlpab-vs-selftest/{seed}"))
-            print(f"[vector_search] seed={seed} queries={meta['n_queries']} "
-                  f"k={meta['k']} gates=OK")
+            print(f"[vector_search] seed={seed} queries={meta['n_queries']} k={meta['k']} gates=OK")
         return 0
     if not args.out:
         ap.error("--out is required (or use --selftest)")

@@ -6,6 +6,7 @@ e.g. hopsworks-api ships a `.claude/` — must never be auto-loaded as directive
 by the agent working in or near that source. Functional VCS metadata (`.git`)
 is left alone, since rebuilds rely on the pinned checkout.
 """
+
 from __future__ import annotations
 
 import shutil

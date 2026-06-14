@@ -31,6 +31,7 @@ boundary, where equally-correct implementations legitimately disagree
 nudges request coordinates until no distance ends in that digit; a gate
 asserts the property holds on the final truth.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -59,9 +60,9 @@ SPEC = {
 }
 VARIANT_DIAGNOSIS = {
     "swapped_sign": "the distance penalty was ADDED to base_score (it must be "
-                    "subtracted: score = base_score - 0.1*distance_deg)",
+    "subtracted: score = base_score - 0.1*distance_deg)",
     "manhattan": "Manhattan |dlat|+|dlon| distance used instead of the Euclidean "
-                 "sqrt(dlat^2 + dlon^2)",
+    "sqrt(dlat^2 + dlon^2)",
 }
 
 
@@ -69,8 +70,9 @@ class GateError(RuntimeError):
     pass
 
 
-def _scan(requests: pd.DataFrame, profiles: pd.DataFrame,
-          metric: str = "euclidean", sign: float = -1.0) -> pd.DataFrame:
+def _scan(
+    requests: pd.DataFrame, profiles: pd.DataFrame, metric: str = "euclidean", sign: float = -1.0
+) -> pd.DataFrame:
     """Per-row scan (truth and naive variants share the loop, parameterized)."""
     prof = profiles.set_index("account_id")
     rows = []
@@ -117,33 +119,46 @@ def _detie(requests: pd.DataFrame, profiles: pd.DataFrame) -> pd.DataFrame:
 def _vectorized_ref(requests: pd.DataFrame, profiles: pd.DataFrame) -> pd.DataFrame:
     """Independently-written vectorized reference (numpy hypot on the join)."""
     m = requests.merge(profiles, on="account_id", how="left")
-    dist = np.round(np.hypot(m["request_lat"] - m["home_lat"],
-                             m["request_lon"] - m["home_lon"]), 6)
+    dist = np.round(np.hypot(m["request_lat"] - m["home_lat"], m["request_lon"] - m["home_lon"]), 6)
     score = np.round(m["base_score"] - 0.1 * dist, 6)
-    return pd.DataFrame({"request_id": m["request_id"], "account_id": m["account_id"],
-                         "distance_deg": dist, "score": score})
+    return pd.DataFrame(
+        {
+            "request_id": m["request_id"],
+            "account_id": m["account_id"],
+            "distance_deg": dist,
+            "score": score,
+        }
+    )
 
 
 def generate(seed: int, out: Path) -> dict:
     rng = np.random.default_rng(seed)
     table = TABLE_BASE + instance_suffix(seed)
-    profiles = pd.DataFrame({
-        "account_id": [f"A{i:04d}" for i in range(N_ACCOUNTS)],
-        "home_lat": np.round(rng.uniform(-60, 60, N_ACCOUNTS), 6),
-        "home_lon": np.round(rng.uniform(-170, 170, N_ACCOUNTS), 6),
-        "base_score": np.round(rng.uniform(0.3, 0.95, N_ACCOUNTS), 6),
-    })
+    profiles = pd.DataFrame(
+        {
+            "account_id": [f"A{i:04d}" for i in range(N_ACCOUNTS)],
+            "home_lat": np.round(rng.uniform(-60, 60, N_ACCOUNTS), 6),
+            "home_lon": np.round(rng.uniform(-170, 170, N_ACCOUNTS), 6),
+            "base_score": np.round(rng.uniform(0.3, 0.95, N_ACCOUNTS), 6),
+        }
+    )
     acct_idx = rng.integers(0, N_ACCOUNTS, N_REQUESTS)
-    requests = pd.DataFrame({
-        "request_id": [f"Q{i:05d}" for i in range(N_REQUESTS)],
-        "account_id": profiles["account_id"].to_numpy()[acct_idx],
-        "request_lat": np.round(profiles["home_lat"].to_numpy()[acct_idx]
-                                + rng.normal(0, 1.5, N_REQUESTS), 6),
-        "request_lon": np.round(profiles["home_lon"].to_numpy()[acct_idx]
-                                + rng.normal(0, 1.5, N_REQUESTS), 6),
-        "requested_at": [(ORIGIN + pd.Timedelta(minutes=int(m))).strftime("%Y-%m-%dT%H:%M:%SZ")
-                         for m in np.sort(rng.integers(0, 60 * 24 * 14, N_REQUESTS))],
-    })
+    requests = pd.DataFrame(
+        {
+            "request_id": [f"Q{i:05d}" for i in range(N_REQUESTS)],
+            "account_id": profiles["account_id"].to_numpy()[acct_idx],
+            "request_lat": np.round(
+                profiles["home_lat"].to_numpy()[acct_idx] + rng.normal(0, 1.5, N_REQUESTS), 6
+            ),
+            "request_lon": np.round(
+                profiles["home_lon"].to_numpy()[acct_idx] + rng.normal(0, 1.5, N_REQUESTS), 6
+            ),
+            "requested_at": [
+                (ORIGIN + pd.Timedelta(minutes=int(m))).strftime("%Y-%m-%dT%H:%M:%SZ")
+                for m in np.sort(rng.integers(0, 60 * 24 * 14, N_REQUESTS))
+            ],
+        }
+    )
 
     requests = _detie(requests, profiles)
     truth = canonicalize(_scan(requests, profiles), SPEC)
@@ -194,9 +209,13 @@ def generate(seed: int, out: Path) -> dict:
         "(online/real-time access), where the platform distinguishes the two.\n"
     )
     meta = {
-        "family": "odt", "seed": seed,
-        "table_name": table, "table_version": 1,
-        "spec": SPEC, "row_count": len(truth), "digest": digest(truth),
+        "family": "odt",
+        "seed": seed,
+        "table_name": table,
+        "table_version": 1,
+        "spec": SPEC,
+        "row_count": len(truth),
+        "digest": digest(truth),
         "record_ids": truth["request_id"].tolist(),
         "variant_digests": {k: digest(v) for k, v in variants.items()},
         "variant_diagnosis": VARIANT_DIAGNOSIS,

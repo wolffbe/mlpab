@@ -1,6 +1,7 @@
 """Tests for the remote-only / single-interface enforcement added to the
 PreToolUse hook, the agent-prompt mode gating, and the auth-error retry
 detection in claude_runner."""
+
 import importlib.util
 import os
 import tempfile
@@ -42,14 +43,16 @@ class EnforceHookTests(unittest.TestCase):
         only `<cli_binary> <cli_subcommand> …` is on-interface."""
         for k in ("TESTBED_INTERFACE", "TESTBED_CLI_SUBCOMMAND", *_MARKERS):
             os.environ.pop(k, None)
-        os.environ.update({
-            "TESTBED_INTERFACE": "cli",
-            "TESTBED_CLI_BINARY": cli_binary,
-            "TESTBED_CLI_SUBCOMMAND": cli_subcommand,
-            "TESTBED_SDK_MODULE": "sagemaker",
-            "TESTBED_PLATFORM": "aws",
-            "TESTBED_COMPUTE_DENY": "torch,tensorflow,sklearn,xgboost",
-        })
+        os.environ.update(
+            {
+                "TESTBED_INTERFACE": "cli",
+                "TESTBED_CLI_BINARY": cli_binary,
+                "TESTBED_CLI_SUBCOMMAND": cli_subcommand,
+                "TESTBED_SDK_MODULE": "sagemaker",
+                "TESTBED_PLATFORM": "aws",
+                "TESTBED_COMPUTE_DENY": "torch,tensorflow,sklearn,xgboost",
+            }
+        )
         return hook.enforce("Bash", {"command": command})
 
     # --- compute libraries: blocked locally in every mode ---
@@ -88,7 +91,11 @@ class EnforceHookTests(unittest.TestCase):
 
     def test_cli_cp_floor_submission_allowed(self):
         self.assertIsNone(
-            self._enforce("cli", "Bash", "mkdir -p submission && cp data/sample_submission.csv submission/submission.csv")
+            self._enforce(
+                "cli",
+                "Bash",
+                "mkdir -p submission && cp data/sample_submission.csv submission/submission.csv",
+            )
         )
 
     def test_cli_mcp_tool_blocked(self):
@@ -109,7 +116,9 @@ class EnforceHookTests(unittest.TestCase):
         # only the MCP tools may touch the platform. (Shipping SDK code to a
         # remote Job is server-side and uncounted; using it locally is the escape.)
         self.assertIsNotNone(
-            self._enforce("mcp", "Bash", 'python -c "import hopsworks; hopsworks.login().get_feature_store()"')
+            self._enforce(
+                "mcp", "Bash", 'python -c "import hopsworks; hopsworks.login().get_feature_store()"'
+            )
         )
 
     def test_cli_native_sdk_blocked(self):
@@ -125,7 +134,9 @@ class EnforceHookTests(unittest.TestCase):
         )
 
     def test_sdk_pandas_glue_allowed(self):
-        self.assertIsNone(self._enforce("sdk", "Bash", 'python -c "import pandas as pd; pd.read_csv(1)"'))
+        self.assertIsNone(
+            self._enforce("sdk", "Bash", 'python -c "import pandas as pd; pd.read_csv(1)"')
+        )
 
     def test_sdk_hops_blocked(self):
         self.assertIsNotNone(self._enforce("sdk", "Bash", "hops jobs run x"))
@@ -171,7 +182,12 @@ class EnforceHookTests(unittest.TestCase):
         self.assertIsNone(self._enforce("mcp", "Bash", "which ruby node perl jq"))
 
     def test_basic_shell_inspection_allowed_in_mcp(self):
-        for cmd in ("cat data/train.csv", "head -20 data/train.csv", "wc -l data/train.csv", "ls -la data/"):
+        for cmd in (
+            "cat data/train.csv",
+            "head -20 data/train.csv",
+            "wc -l data/train.csv",
+            "ls -la data/",
+        ):
             self.assertIsNone(self._enforce("mcp", "Bash", cmd), cmd)
 
     def test_pipeline_of_basic_shell_allowed(self):
@@ -194,7 +210,7 @@ class EnforceHookTests(unittest.TestCase):
     def test_line_continuation_real_separator_still_splits(self):
         # Folding `\<nl>` must not swallow a genuine separator on the next line:
         # a backgrounded interpreter after the continuation is still denied.
-        cmd = 'hops fg create --name t \\\n  --primary-key id\nnode evil.js'
+        cmd = "hops fg create --name t \\\n  --primary-key id\nnode evil.js"
         self.assertIsNotNone(self._enforce("cli", "Bash", cmd))
 
     def test_escaped_char_not_treated_as_separator(self):
@@ -225,27 +241,36 @@ class EnforceHookTests(unittest.TestCase):
 
     def test_entrypoint_other_service_after_separator_denied(self):
         # `aws sagemaker …; aws s3 …` — the second segment is off-interface.
-        self.assertIsNotNone(
-            self._enforce_entrypoint("aws sagemaker list-models; aws s3 cp x y")
-        )
+        self.assertIsNotNone(self._enforce_entrypoint("aws sagemaker list-models; aws s3 cp x y"))
 
     def test_entrypoint_allowlist_multiple_services(self):
         # `cli_subcommand` is an allowlist (comma-joined in the env): sagemaker
         # needs its S3 data plane and the runtime for endpoint invocation.
         subs = "sagemaker,sagemaker-runtime,s3"
-        self.assertIsNone(self._enforce_entrypoint(
-            "aws s3 cp data/train s3://bkt/train --recursive", cli_subcommand=subs))
-        self.assertIsNone(self._enforce_entrypoint(
-            "aws sagemaker-runtime invoke-endpoint --endpoint-name e out.json",
-            cli_subcommand=subs))
-        self.assertIsNone(self._enforce_entrypoint(
-            "aws sagemaker list-training-jobs", cli_subcommand=subs))
+        self.assertIsNone(
+            self._enforce_entrypoint(
+                "aws s3 cp data/train s3://bkt/train --recursive", cli_subcommand=subs
+            )
+        )
+        self.assertIsNone(
+            self._enforce_entrypoint(
+                "aws sagemaker-runtime invoke-endpoint --endpoint-name e out.json",
+                cli_subcommand=subs,
+            )
+        )
+        self.assertIsNone(
+            self._enforce_entrypoint("aws sagemaker list-training-jobs", cli_subcommand=subs)
+        )
 
     def test_entrypoint_allowlist_other_services_still_denied(self):
         subs = "sagemaker,sagemaker-runtime,s3"
         # s3api is a DIFFERENT service token than s3 — not on the allowlist.
-        for cmd in ("aws ec2 describe-instances", "aws iam create-role --role-name x",
-                    "aws s3api create-bucket --bucket x", "aws configure list"):
+        for cmd in (
+            "aws ec2 describe-instances",
+            "aws iam create-role --role-name x",
+            "aws s3api create-bucket --bucket x",
+            "aws configure list",
+        ):
             msg = self._enforce_entrypoint(cmd, cli_subcommand=subs)
             self.assertIsNotNone(msg, cmd)
         # The denial names the full allowlist so the agent knows its options.
@@ -254,29 +279,35 @@ class EnforceHookTests(unittest.TestCase):
     def test_entrypoint_global_options_before_service_allowed(self):
         # The AWS CLI accepts global options BEFORE the service; the service
         # token after them is still the entrypoint, not the option.
-        self.assertIsNone(self._enforce_entrypoint(
-            "aws --region us-east-1 sagemaker list-models"))
-        self.assertIsNone(self._enforce_entrypoint(
-            "aws --output json --region us-east-1 sagemaker list-training-jobs"))
-        self.assertIsNone(self._enforce_entrypoint(
-            "aws --region=us-east-1 sagemaker list-models"))   # --opt=value form
-        self.assertIsNone(self._enforce_entrypoint(
-            "aws --debug sagemaker list-models"))              # valueless flag
-        self.assertIsNone(self._enforce_entrypoint(
-            "aws --no-cli-pager sagemaker list-models"))       # --no-* flag
+        self.assertIsNone(self._enforce_entrypoint("aws --region us-east-1 sagemaker list-models"))
+        self.assertIsNone(
+            self._enforce_entrypoint(
+                "aws --output json --region us-east-1 sagemaker list-training-jobs"
+            )
+        )
+        self.assertIsNone(
+            self._enforce_entrypoint("aws --region=us-east-1 sagemaker list-models")
+        )  # --opt=value form
+        self.assertIsNone(
+            self._enforce_entrypoint("aws --debug sagemaker list-models")
+        )  # valueless flag
+        self.assertIsNone(
+            self._enforce_entrypoint("aws --no-cli-pager sagemaker list-models")
+        )  # --no-* flag
 
     def test_entrypoint_global_options_other_service_still_denied(self):
         # Skipping options must not skip PAST an off-interface service.
-        self.assertIsNotNone(self._enforce_entrypoint(
-            "aws --region us-east-1 ec2 describe-instances"))
-        self.assertIsNotNone(self._enforce_entrypoint(
-            "aws --debug s3api create-bucket --bucket x"))
+        self.assertIsNotNone(
+            self._enforce_entrypoint("aws --region us-east-1 ec2 describe-instances")
+        )
+        self.assertIsNotNone(self._enforce_entrypoint("aws --debug s3api create-bucket --bucket x"))
 
     def test_entrypoint_option_value_matching_service_not_entrypoint(self):
         # Fail closed: an option VALUE that happens to equal an allowed service
         # must not legitimize the real (off-interface) service after it.
-        self.assertIsNotNone(self._enforce_entrypoint(
-            "aws --profile sagemaker ec2 describe-instances"))
+        self.assertIsNotNone(
+            self._enforce_entrypoint("aws --profile sagemaker ec2 describe-instances")
+        )
 
     def test_denials_logged_structurally(self):
         # A denied call must land in TESTBED_COMMAND_LOG with `denied: true` +
@@ -285,14 +316,13 @@ class EnforceHookTests(unittest.TestCase):
         import io
         import json
         from unittest import mock
+
         log = Path(tempfile.mkdtemp()) / "commands.jsonl"
         for k in ("TESTBED_INTERFACE", "TESTBED_CLI_SUBCOMMAND", *_MARKERS):
             os.environ.pop(k, None)
-        os.environ.update(dict(_MARKERS, TESTBED_INTERFACE="cli",
-                               TESTBED_COMMAND_LOG=str(log)))
+        os.environ.update(dict(_MARKERS, TESTBED_INTERFACE="cli", TESTBED_COMMAND_LOG=str(log)))
         try:
-            payload = {"tool_name": "Bash",
-                       "tool_input": {"command": 'python -c "import torch"'}}
+            payload = {"tool_name": "Bash", "tool_input": {"command": 'python -c "import torch"'}}
             with mock.patch("sys.stdin", io.StringIO(json.dumps(payload))):
                 rc = hook.main()
             self.assertEqual(rc, 2)
@@ -334,14 +364,16 @@ class EnforceHookTests(unittest.TestCase):
 
     def test_mcp_floor_submission_allowed(self):
         self.assertIsNone(
-            self._enforce("mcp", "Bash", "mkdir -p submission && cp data/sample_submission.csv submission/submission.csv")
+            self._enforce(
+                "mcp",
+                "Bash",
+                "mkdir -p submission && cp data/sample_submission.csv submission/submission.csv",
+            )
         )
 
     def test_compound_keywords_not_denied(self):
         # Shell control-flow keywords are skipped, not treated as binaries.
-        self.assertIsNone(
-            self._enforce("cli", "Bash", 'for f in a b; do cp "$f" out/; done')
-        )
+        self.assertIsNone(self._enforce("cli", "Bash", 'for f in a b; do cp "$f" out/; done'))
 
     # --- parser-bypass regressions (separators, interpreters, dynamic import) ---
     def test_semicolon_glued_separator_blocked(self):
@@ -361,9 +393,11 @@ class EnforceHookTests(unittest.TestCase):
         self.assertIsNotNone(self._enforce("cli", "Bash", "uv run python train.py"))
 
     def test_dynamic_import_of_ml_lib_blocked(self):
-        self.assertIsNotNone(self._enforce("sdk", "Bash", 'python -c "__import__(\'torch\')"'))
+        self.assertIsNotNone(self._enforce("sdk", "Bash", "python -c \"__import__('torch')\""))
         self.assertIsNotNone(
-            self._enforce("sdk", "Bash", 'python -c "import importlib; importlib.import_module(\'sklearn\')"')
+            self._enforce(
+                "sdk", "Bash", "python -c \"import importlib; importlib.import_module('sklearn')\""
+            )
         )
 
     # --- installs stay LOCKED in CLI/MCP: mlpab installs the interface + deps
@@ -371,7 +405,9 @@ class EnforceHookTests(unittest.TestCase):
     def test_pip_blocked_in_cli_and_mcp(self):
         for iface in ("cli", "mcp"):
             self.assertIsNotNone(self._enforce(iface, "Bash", "pip install pandas"), iface)
-            self.assertIsNotNone(self._enforce(iface, "Bash", "python -m pip install pandas"), iface)
+            self.assertIsNotNone(
+                self._enforce(iface, "Bash", "python -m pip install pandas"), iface
+            )
 
     def test_pip_allowed_in_sdk_mode(self):
         # SDK mode is python-allowed (the SDK IS python); pip is just tooling and
@@ -393,9 +429,12 @@ class EnforceHookTests(unittest.TestCase):
         # script readable and ML-free, the command is allowed.
         d = Path(tempfile.mkdtemp())
         (d / "drive.py").write_text("import hopsworks\nhopsworks.login()\n")
-        cwd = os.getcwd(); os.chdir(d)
+        cwd = os.getcwd()
+        os.chdir(d)
         try:
-            self.assertIsNone(self._enforce("sdk", "Bash", "python drive.py --config missing_cfg.py"))
+            self.assertIsNone(
+                self._enforce("sdk", "Bash", "python drive.py --config missing_cfg.py")
+            )
         finally:
             os.chdir(cwd)
 
@@ -433,44 +472,78 @@ class InstanceTypeGuardTests(unittest.TestCase):
             os.environ.pop("TESTBED_INSTANCE_ALLOW", None)
 
     def test_no_allowlist_no_enforcement(self):
-        self.assertIsNone(self._check(
-            "Bash", {"command": "aws sagemaker create-training-job --resource-config "
-                                "InstanceType=ml.p3.2xlarge,InstanceCount=1"},
-            allow=None))
+        self.assertIsNone(
+            self._check(
+                "Bash",
+                {
+                    "command": "aws sagemaker create-training-job --resource-config "
+                    "InstanceType=ml.p3.2xlarge,InstanceCount=1"
+                },
+                allow=None,
+            )
+        )
 
     def test_cli_free_tier_instance_allowed(self):
-        self.assertIsNone(self._check(
-            "Bash", {"command": "aws sagemaker create-training-job --resource-config "
-                                "InstanceType=ml.m5.xlarge,InstanceCount=1,VolumeSizeInGB=10"}))
+        self.assertIsNone(
+            self._check(
+                "Bash",
+                {
+                    "command": "aws sagemaker create-training-job --resource-config "
+                    "InstanceType=ml.m5.xlarge,InstanceCount=1,VolumeSizeInGB=10"
+                },
+            )
+        )
 
     def test_cli_gpu_instance_denied(self):
         reason = self._check(
-            "Bash", {"command": "aws sagemaker create-training-job --resource-config "
-                                "InstanceType=ml.p3.2xlarge,InstanceCount=1"})
+            "Bash",
+            {
+                "command": "aws sagemaker create-training-job --resource-config "
+                "InstanceType=ml.p3.2xlarge,InstanceCount=1"
+            },
+        )
         self.assertIsNotNone(reason)
         self.assertIn("ml.p3.2xlarge", reason)
 
     def test_cli_big_cpu_instance_denied(self):
-        self.assertIsNotNone(self._check(
-            "Bash", {"command": "aws sagemaker create-endpoint-config --production-variants "
-                                "VariantName=v1,InstanceType=ml.m5.24xlarge,InitialInstanceCount=1"}))
+        self.assertIsNotNone(
+            self._check(
+                "Bash",
+                {
+                    "command": "aws sagemaker create-endpoint-config --production-variants "
+                    "VariantName=v1,InstanceType=ml.m5.24xlarge,InitialInstanceCount=1"
+                },
+            )
+        )
 
     def test_mcp_args_denied(self):
-        self.assertIsNotNone(self._check(
-            "mcp__sagemaker__create_training_job",
-            {"resource_config": {"InstanceType": "ml.g5.xlarge", "InstanceCount": 1}}))
+        self.assertIsNotNone(
+            self._check(
+                "mcp__sagemaker__create_training_job",
+                {"resource_config": {"InstanceType": "ml.g5.xlarge", "InstanceCount": 1}},
+            )
+        )
 
     def test_mcp_args_free_tier_allowed(self):
-        self.assertIsNone(self._check(
-            "mcp__sagemaker__create_training_job",
-            {"resource_config": {"InstanceType": "ml.m4.xlarge", "InstanceCount": 1}}))
+        self.assertIsNone(
+            self._check(
+                "mcp__sagemaker__create_training_job",
+                {"resource_config": {"InstanceType": "ml.m4.xlarge", "InstanceCount": 1}},
+            )
+        )
 
     def test_write_job_spec_denied(self):
         # A job spec written to disk first (`--cli-input-json file://job.json`)
         # is caught at Write time.
-        self.assertIsNotNone(self._check(
-            "Write", {"file_path": "/x/job.json",
-                      "content": '{"ResourceConfig": {"InstanceType": "ml.trn1.32xlarge"}}'}))
+        self.assertIsNotNone(
+            self._check(
+                "Write",
+                {
+                    "file_path": "/x/job.json",
+                    "content": '{"ResourceConfig": {"InstanceType": "ml.trn1.32xlarge"}}',
+                },
+            )
+        )
 
     def test_executed_script_payload_denied(self):
         with tempfile.TemporaryDirectory() as td:
@@ -484,14 +557,21 @@ class InstanceTypeGuardTests(unittest.TestCase):
                 os.chdir(cwd)
 
     def test_serverless_no_instance_type_allowed(self):
-        self.assertIsNone(self._check(
-            "Bash", {"command": "aws sagemaker create-endpoint-config --production-variants "
-                                "VariantName=v1,ServerlessConfig={MemorySizeInMB=2048,MaxConcurrency=1}"}))
+        self.assertIsNone(
+            self._check(
+                "Bash",
+                {
+                    "command": "aws sagemaker create-endpoint-config --production-variants "
+                    "VariantName=v1,ServerlessConfig={MemorySizeInMB=2048,MaxConcurrency=1}"
+                },
+            )
+        )
 
     def test_plain_text_not_misflagged(self):
         # `html.parser` etc. must not match the ml.<family>.<size> pattern.
-        self.assertIsNone(self._check(
-            "Bash", {"command": 'grep "html.parser" data/description.md'}))
+        self.assertIsNone(
+            self._check("Bash", {"command": 'grep "html.parser" data/description.md'})
+        )
 
 
 class MlpabRunForegroundTests(unittest.TestCase):
@@ -524,9 +604,7 @@ class MlpabRunForegroundTests(unittest.TestCase):
 
     def test_pipe_after_cd_guard_blocked(self):
         # The cd-guard prefix is fine; the trailing pipe on `mlpab run` is not.
-        self.assertIsNotNone(
-            self._misuse('cd /run && mlpab run --category t --task c | head -100')
-        )
+        self.assertIsNotNone(self._misuse("cd /run && mlpab run --category t --task c | head -100"))
 
     # --- allowed: foreground, redirects, other subcommands ---
     def test_plain_foreground_allowed(self):
@@ -561,11 +639,11 @@ class PromptModeGatingTests(unittest.TestCase):
     def test_under_test_is_remote_only(self):
         text = runner._build_prompt("comp", "FRAG", interface_under_test=True)
         self.assertIn("nothing runs locally", text.lower())
-        self.assertIn("HARD-ENFORCED", text)        # restrictions stated explicitly
+        self.assertIn("HARD-ENFORCED", text)  # restrictions stated explicitly
         self.assertIn("Always BLOCKED", text)
         self.assertIn("give up", text.lower())
-        self.assertNotIn("HF_HOME", text)           # local-only block stripped
-        self.assertNotIn("UNDER_TEST", text)        # markers consumed
+        self.assertNotIn("HF_HOME", text)  # local-only block stripped
+        self.assertNotIn("UNDER_TEST", text)  # markers consumed
         self.assertNotIn("LOCAL_ONLY", text)
 
     def test_baseline_is_local_training(self):
@@ -580,19 +658,26 @@ class PromptModeGatingTests(unittest.TestCase):
 class AuthRetryDetectionTests(unittest.TestCase):
     def _transcript(self, result_event):
         import json
+
         p = Path(tempfile.mkdtemp()) / "transcript.jsonl"
         p.write_text(json.dumps(result_event) + "\n")
         return p
 
     def test_401_detected_as_auth_error(self):
-        tr = self._transcript({"type": "result", "is_error": True,
-                               "result": "API Error: 401 Invalid authentication credentials"})
+        tr = self._transcript(
+            {
+                "type": "result",
+                "is_error": True,
+                "result": "API Error: 401 Invalid authentication credentials",
+            }
+        )
         self.assertTrue(claude_runner._last_result_is_auth_error(tr))
         self.assertFalse(claude_runner._last_result_is_rate_limited(tr))
 
     def test_429_is_rate_limit_not_auth(self):
-        tr = self._transcript({"type": "result", "is_error": True,
-                               "api_error_status": "429", "result": "rate_limit"})
+        tr = self._transcript(
+            {"type": "result", "is_error": True, "api_error_status": "429", "result": "rate_limit"}
+        )
         self.assertTrue(claude_runner._last_result_is_rate_limited(tr))
         self.assertFalse(claude_runner._last_result_is_auth_error(tr))
 
@@ -610,15 +695,18 @@ class RateLimitWaitAccountingTests(unittest.TestCase):
     def test_backoff_wait_returned_separately_from_wall(self):
         import json
         from unittest import mock
+
         d = Path(tempfile.mkdtemp())
         marker = d / "ran_once"
-        rl = json.dumps({"type": "result", "is_error": True,
-                         "api_error_status": "429", "result": "rate_limit"})
+        rl = json.dumps(
+            {"type": "result", "is_error": True, "api_error_status": "429", "result": "rate_limit"}
+        )
         ok = json.dumps({"type": "result", "is_error": False, "result": "ok"})
         # First attempt: rate-limited result + non-zero exit → one back-off
         # sleep (base 2s, mocked). Second attempt: success.
-        script = (f"if [ -e {marker} ]; then echo '{ok}'; "
-                  f"else touch {marker}; echo '{rl}'; exit 1; fi")
+        script = (
+            f"if [ -e {marker} ]; then echo '{ok}'; else touch {marker}; echo '{rl}'; exit 1; fi"
+        )
         with mock.patch("time.sleep") as slept:
             exit_code, wall, wait = claude_runner.run_with_retry(
                 cmd=["sh", "-c", script],
@@ -638,18 +726,28 @@ class RateLimitWaitAccountingTests(unittest.TestCase):
 class DeadRowSchemaTests(unittest.TestCase):
     def test_error_column_present_and_last_is_run_dir(self):
         from mlpab import results
+
         self.assertIn("error", results.RESULTS_FIELDS)
         self.assertEqual(results.RESULTS_FIELDS[-1], "run_dir")  # invariant preserved
 
     def test_dead_row_round_trips_with_error_and_zeros(self):
-        from mlpab import results
         import csv
+
+        from mlpab import results
+
         out = Path(tempfile.mkdtemp()) / "results.csv"
         row = results.Row(
-            started_at="2026-06-04T00:00:00+00:00", run="9", version="v1",
-            platform="hopsworks", interface="sdk", skills="none",
-            category="t", task="c", sdk_calls=0,
-            error="no valid submission produced", run_dir=str(out.parent),
+            started_at="2026-06-04T00:00:00+00:00",
+            run="9",
+            version="v1",
+            platform="hopsworks",
+            interface="sdk",
+            skills="none",
+            category="t",
+            task="c",
+            sdk_calls=0,
+            error="no valid submission produced",
+            run_dir=str(out.parent),
         )
         results.append(out, row)
         got = list(csv.DictReader(out.open()))[0]

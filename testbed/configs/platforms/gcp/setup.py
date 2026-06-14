@@ -9,6 +9,7 @@ google-cloud-bigquery client installed in the run venv.
 ⚠ LIVE-VALIDATION REQUIRED — dataset location must match GCP_LOCATION's multi-
 region; adjust if the project uses a specific region.
 """
+
 from __future__ import annotations
 
 import os
@@ -34,5 +35,35 @@ def main() -> None:
         print(f"[gcp setup] best-effort skip: {e}")
 
 
+def verify() -> int:
+    """Twofold setup check (`setup.py verify`): (1) BigQuery CONNECTS, then (2)
+    the backing dataset setup guarantees is PRESENT. Connection is the hard gate;
+    the dataset is best-effort. Read-only."""
+    project = os.environ.get("GCP_PROJECT")
+    dataset = os.environ.get("GCP_BQ_DATASET", "mlpab")
+    if not project:
+        print("[gcp verify-setup] missing GCP_PROJECT")
+        return 1
+    try:
+        from google.cloud import bigquery
+
+        bq = bigquery.Client(project=project)
+        list(bq.list_datasets(max_results=1))  # authenticated round-trip
+    except Exception as e:
+        print(f"[gcp verify-setup] NO CONNECTION: {e}")
+        return 1
+    try:
+        bq.get_dataset(f"{project}.{dataset}")
+        print(f"[gcp verify-setup] OK: connected; dataset {project}.{dataset} present")
+    except Exception as e:
+        print(
+            f"[gcp verify-setup] OK: connected; dataset {project}.{dataset} absent "
+            f"(best-effort, not failing): {e}"
+        )
+    return 0
+
+
 if __name__ == "__main__":
-    main()
+    import sys
+
+    sys.exit(verify() if sys.argv[1:2] == ["verify"] else (main() or 0))

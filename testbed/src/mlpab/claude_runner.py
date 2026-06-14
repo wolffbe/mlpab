@@ -5,6 +5,7 @@ denies), runs `claude -p`, and captures the stream-json transcript (cost +
 token totals come from its `result` event). `run_with_retry` handles 429/529
 and 5xx back-off across a 6h budget.
 """
+
 from __future__ import annotations
 
 import json
@@ -18,7 +19,6 @@ from pathlib import Path
 from typing import Any, Callable
 
 from mlpab import streaming
-
 
 TESTBED_ROOT = Path(__file__).resolve().parents[2]
 # Real user home from /etc/passwd, NOT $HOME — the runner redirects $HOME into
@@ -36,16 +36,29 @@ HOOK_SCRIPT = Path(__file__).resolve().parent / "hooks" / "log_tool_call.py"
 COMMON_DENY = [
     # Background scheduling / async — calling these in -p ends the turn.
     "ScheduleWakeup",
-    "CronCreate", "CronDelete", "CronList",
-    "Task", "TaskCreate", "TaskUpdate", "TaskGet", "TaskList", "TaskOutput", "TaskStop",
-    "RemoteTrigger", "Monitor", "PushNotification",
+    "CronCreate",
+    "CronDelete",
+    "CronList",
+    "Task",
+    "TaskCreate",
+    "TaskUpdate",
+    "TaskGet",
+    "TaskList",
+    "TaskOutput",
+    "TaskStop",
+    "RemoteTrigger",
+    "Monitor",
+    "PushNotification",
     # Nested subagents — bloat context, break per-call cost attribution.
     "Agent",
     # Plan / worktree modes unused in treatment runs.
-    "EnterPlanMode", "ExitPlanMode",
-    "EnterWorktree", "ExitWorktree",
+    "EnterPlanMode",
+    "ExitPlanMode",
+    "EnterWorktree",
+    "ExitWorktree",
     # Meta / helper tools not needed for the loop.
-    "ToolSearch", "ShareOnboardingGuide",
+    "ToolSearch",
+    "ShareOnboardingGuide",
 ]
 
 # Agent-only denies. Web access kills reproducibility for the deterministic
@@ -59,8 +72,18 @@ AGENT_ONLY_DENY = ["WebFetch", "WebSearch"]
 # remote results, formatting deliverables) is intentionally NOT here. Overridable
 # per run via `compute_deny`; surfaced to the hook as TESTBED_COMPUTE_DENY.
 DEFAULT_COMPUTE_DENY = [
-    "torch", "torchvision", "tensorflow", "keras", "sklearn", "scikit_learn",
-    "xgboost", "lightgbm", "catboost", "jax", "flax", "transformers",
+    "torch",
+    "torchvision",
+    "tensorflow",
+    "keras",
+    "sklearn",
+    "scikit_learn",
+    "xgboost",
+    "lightgbm",
+    "catboost",
+    "jax",
+    "flax",
+    "transformers",
 ]
 
 # Bootstrapped into the agent's run venv (as `_mlpab_apilog.py` + a `.pth`
@@ -83,7 +106,7 @@ DEFAULT_COMPUTE_DENY = [
 # `sitecustomize.py` — a base interpreter (e.g. Homebrew python) often ships its
 # own stdlib `sitecustomize.py` that precedes the venv on sys.path and would
 # shadow ours, silently disabling the shim.
-_API_LOG_SHIM = r'''
+_API_LOG_SHIM = r"""
 import os as _os
 _mlpab_log = _os.environ.get("MLPAB_API_LOG")
 if _mlpab_log:
@@ -132,7 +155,7 @@ if _mlpab_log:
         _rq.Session.send = _mlpab_send
     except Exception:
         pass
-'''
+"""
 
 
 def _first_party_roots(venv_dir: Path) -> list[str]:
@@ -183,8 +206,10 @@ def deny_patterns_for(boundary: Path) -> list[str]:
     home = str(HOME_DIR)
     return [
         "Bash(cd *..*)",
-        f"Bash(cat {home}/.*)",  f"Bash(cat {home}/.*/**)",
-        f"Bash(ls {home}/.*)",   f"Bash(ls {home}/.*/**)",
+        f"Bash(cat {home}/.*)",
+        f"Bash(cat {home}/.*/**)",
+        f"Bash(ls {home}/.*)",
+        f"Bash(ls {home}/.*/**)",
     ]
 
 
@@ -195,13 +220,20 @@ def oauth_token_from_keychain() -> str | None:
     """
     try:
         out = subprocess.run(
-            ["/usr/bin/security", "find-generic-password",
-             "-s", "Claude Code-credentials", "-w"],
-            check=True, capture_output=True, text=True, timeout=5,
+            ["/usr/bin/security", "find-generic-password", "-s", "Claude Code-credentials", "-w"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
         ).stdout
         return json.loads(out)["claudeAiOauth"]["accessToken"]
-    except (subprocess.CalledProcessError, FileNotFoundError,
-            subprocess.TimeoutExpired, json.JSONDecodeError, KeyError):
+    except (
+        subprocess.CalledProcessError,
+        FileNotFoundError,
+        subprocess.TimeoutExpired,
+        json.JSONDecodeError,
+        KeyError,
+    ):
         return None
 
 
@@ -247,9 +279,11 @@ def resolve_oauth_token() -> str | None:
     snapshot; STALEST source, so last — preferring it over Keychain once froze
     an expired token for ~30 runs). Returns the token string or None.
     """
-    return (os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
-            or oauth_token_from_keychain()
-            or read_token_cache())
+    return (
+        os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
+        or oauth_token_from_keychain()
+        or read_token_cache()
+    )
 
 
 # Rate-limit / transient-error retry budget. On a matching exit-error we exp-
@@ -262,10 +296,19 @@ RATE_LIMIT_MAX_BACKOFF_S = 3600
 # Anthropic rate limits (429/529, "overloaded") + transient 5xx. Without the 5xx
 # tokens, a mid-session 500 burns a whole run on retry.
 _RATE_LIMIT_TOKENS = (
-    "rate_limit", "rate limit", "overloaded",
-    "429", "529",
-    "500", "502", "503", "504",
-    "internal server error", "bad gateway", "service unavailable", "gateway timeout",
+    "rate_limit",
+    "rate limit",
+    "overloaded",
+    "429",
+    "529",
+    "500",
+    "502",
+    "503",
+    "504",
+    "internal server error",
+    "bad gateway",
+    "service unavailable",
+    "gateway timeout",
 )
 
 # Auth failures. The injected CLAUDE_CODE_OAUTH_TOKEN can expire mid-session on a
@@ -273,8 +316,13 @@ _RATE_LIMIT_TOKENS = (
 # fresh token from the Keychain (Claude Code refreshes it there) and retry a
 # bounded number of times — distinct from the rate-limit backoff loop.
 _AUTH_ERROR_TOKENS = (
-    "401", "invalid authentication", "authentication_error",
-    "unauthorized", "invalid x-api-key", "invalid bearer token", "oauth token",
+    "401",
+    "invalid authentication",
+    "authentication_error",
+    "unauthorized",
+    "invalid x-api-key",
+    "invalid bearer token",
+    "oauth token",
 )
 # How many times to refresh-and-retry on an auth error before giving up.
 AUTH_RETRY_MAX_ATTEMPTS = 3
@@ -329,8 +377,7 @@ class ToolTimer:
         etype = event.get("type")
         if etype == "assistant":
             for block in (event.get("message") or {}).get("content") or []:
-                if isinstance(block, dict) and block.get("type") == "tool_use" \
-                        and block.get("id"):
+                if isinstance(block, dict) and block.get("type") == "tool_use" and block.get("id"):
                     self._open[block["id"]] = {
                         "tool_name": block.get("name", ""),
                         "tool_input": block.get("input") or {},
@@ -361,9 +408,12 @@ class ToolTimer:
 # specific hosts come from each `configs/platforms/<platform>/<interface>.yaml`
 # via the `allowed_domains:` key.
 BASE_ALLOWED_DOMAINS = (
-    "127.0.0.1", "localhost",
-    "api.anthropic.com", "*.anthropic.com",
-    "statsig.anthropic.com", "console.anthropic.com",
+    "127.0.0.1",
+    "localhost",
+    "api.anthropic.com",
+    "*.anthropic.com",
+    "statsig.anthropic.com",
+    "console.anthropic.com",
 )
 
 
@@ -415,21 +465,23 @@ def _write_settings(
     excluded = list(sandbox_excluded_commands or [])
     settings = {
         "hooks": {
-            "PreToolUse": [{
-                "matcher": ".*",  # regex over tool names
-                # ABSOLUTE path: claude resolves hook commands from its own cwd
-                # (the run dir), so a relative run_dir (e.g. the CLI single-run
-                # form's default --runs-root) would double the path and block
-                # every tool call.
-                "hooks": [{"type": "command", "command": f"python3 {local_hook.resolve()}"}],
-            }]
+            "PreToolUse": [
+                {
+                    "matcher": ".*",  # regex over tool names
+                    # ABSOLUTE path: claude resolves hook commands from its own cwd
+                    # (the run dir), so a relative run_dir (e.g. the CLI single-run
+                    # form's default --runs-root) would double the path and block
+                    # every tool call.
+                    "hooks": [{"type": "command", "command": f"python3 {local_hook.resolve()}"}],
+                }
+            ]
         },
         "sandbox": {
             "enabled": True,
             "autoAllowBashIfSandboxed": True,
             "excludedCommands": excluded,
             "filesystem": {
-                "allowRead":  ["/"],
+                "allowRead": ["/"],
                 "allowWrite": ["/"],
             },
             "network": {
@@ -464,7 +516,7 @@ def run(
     mcp_servers: dict[str, Any],
     command_log: Path,
     cli_subcommand: str | None = None,
-    timeout_s: int | None = 60 * 60,   # None → NO wall-clock cap
+    timeout_s: int | None = 60 * 60,  # None → NO wall-clock cap
     extra_env: dict[str, str] | None = None,
     allowed_domains: list[str] | None = None,
     interface: str | None = None,
@@ -483,9 +535,12 @@ def run(
     if shutil.which("claude") is None:
         raise RuntimeError("`claude` CLI not found on PATH. Install Claude Code first.")
 
-    _write_settings(run_dir, command_log,
-                    allowed_domains=allowed_domains,
-                    sandbox_excluded_commands=sandbox_excluded_commands)
+    _write_settings(
+        run_dir,
+        command_log,
+        allowed_domains=allowed_domains,
+        sandbox_excluded_commands=sandbox_excluded_commands,
+    )
     mcp_cfg = _write_mcp_config(run_dir, mcp_servers)
 
     transcript_path = run_dir / "transcript.jsonl"
@@ -512,10 +567,12 @@ def run(
     if auth == "login":
         env.pop("ANTHROPIC_API_KEY", None)
     if not env.get("ANTHROPIC_API_KEY") and not env.get("CLAUDE_CODE_OAUTH_TOKEN"):
-        print("[mlpab] WARNING: no auth available (no ANTHROPIC_API_KEY, "
-              "no token in env/cache/Keychain). Agent will fail. Re-run "
-              "mlpab from a shell where `claude /login` has been run.",
-              flush=True)
+        print(
+            "[mlpab] WARNING: no auth available (no ANTHROPIC_API_KEY, "
+            "no token in env/cache/Keychain). Agent will fail. Re-run "
+            "mlpab from a shell where `claude /login` has been run.",
+            flush=True,
+        )
     env["ANTHROPIC_MODEL"] = model
     env["TESTBED_COMMAND_LOG"] = str(command_log)
     # PreToolUse hook reads this to enforce Read/Write/Edit path denies — silently
@@ -564,10 +621,12 @@ def run(
             # attribute calls and tags everything "other", silently zeroing
             # whitelist_hits. Warn rather than fail quietly so a misbuilt venv
             # doesn't look like an agent that simply never used the interface.
-            print(f"[mlpab] WARNING: no first-party interface roots in "
-                  f"{run_dir / 'venv'}; API calls will all be attributed 'other' "
-                  f"and whitelist_hits will be 0 for interface {interface!r}.",
-                  flush=True)
+            print(
+                f"[mlpab] WARNING: no first-party interface roots in "
+                f"{run_dir / 'venv'}; API calls will all be attributed 'other' "
+                f"and whitelist_hits will be 0 for interface {interface!r}.",
+                flush=True,
+            )
         _install_api_log_shim(run_dir / "venv")
 
     # Skip pip cache (per-run venv inherits via .pth; cache dir unwritable).
@@ -608,13 +667,21 @@ def run(
     # Absolute path: `--settings` resolves against cwd (=run_dir).
     settings_file = (run_dir / ".claude" / "settings.json").resolve()
     cmd = [
-        "claude", "-p", prompt,
-        "--output-format", "stream-json", "--verbose",
-        "--model", model,
-        "--permission-mode", "bypassPermissions",
+        "claude",
+        "-p",
+        prompt,
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--model",
+        model,
+        "--permission-mode",
+        "bypassPermissions",
         # `-p` mode skips project settings unless we ask for them explicitly.
-        "--settings", str(settings_file),
-        "--setting-sources", "project,local,user",
+        "--settings",
+        str(settings_file),
+        "--setting-sources",
+        "project,local,user",
     ]
     if mcp_cfg:
         cmd.extend(["--mcp-config", str(mcp_cfg)])
@@ -686,8 +753,8 @@ def run_with_retry(
     start = time.monotonic()
     attempt = 0
     auth_attempts = 0
-    rl_attempts = 0   # rate-limit retries only — drives the backoff exponent
-    rl_wait_s = 0.0   # total back-off sleep — returned so wall − wait = compute
+    rl_attempts = 0  # rate-limit retries only — drives the backoff exponent
+    rl_wait_s = 0.0  # total back-off sleep — returned so wall − wait = compute
     exit_code = 1
     # Buffer stderr to a temp file outside the run dir; moved into place at the
     # END only if it has actual content.
@@ -869,11 +936,70 @@ def _refresh_oauth_token(env: dict[str, str]) -> bool:
 def engine_ready(auth: str = "login") -> tuple[bool, str]:
     """Is the Claude agent engine usable? (CLI on PATH + auth available.)"""
     import shutil
+
     if shutil.which("claude") is None:
         return False, "`claude` CLI not on PATH — install Claude Code"
     if auth == "api-key":
-        return (bool(os.environ.get("ANTHROPIC_API_KEY")),
-                "ANTHROPIC_API_KEY " + ("set" if os.environ.get("ANTHROPIC_API_KEY") else "MISSING"))
+        return (
+            bool(os.environ.get("ANTHROPIC_API_KEY")),
+            "ANTHROPIC_API_KEY " + ("set" if os.environ.get("ANTHROPIC_API_KEY") else "MISSING"),
+        )
     tok = resolve_oauth_token()
-    return (bool(tok), "oauth login present" if tok else
-            "no oauth token (run `claude` to log in, or set CLAUDE_CODE_OAUTH_TOKEN)")
+    return (
+        bool(tok),
+        "oauth login present"
+        if tok
+        else "no oauth token (run `claude` to log in, or set CLAUDE_CODE_OAUTH_TOKEN)",
+    )
+
+
+def engine_live(model: str, auth: str = "api-key", timeout_s: int = 60) -> tuple[bool, str]:
+    """Live responsiveness probe: send a one-word prompt to `model` via the
+    Claude CLI and confirm it answers. Returns (ok, detail). Runs in a throwaway
+    cwd so it touches no testbed state."""
+    import shutil
+    import subprocess
+    import tempfile
+
+    ready, detail = engine_ready(auth)
+    if not ready:
+        return False, detail
+    env = os.environ.copy()
+    env.pop("ANTHROPIC_BASE_URL", None)
+    if auth == "login":
+        env.pop("ANTHROPIC_API_KEY", None)
+        tok = resolve_oauth_token()
+        if tok:
+            env["CLAUDE_CODE_OAUTH_TOKEN"] = tok
+    env["ANTHROPIC_MODEL"] = model
+    tmp = tempfile.mkdtemp(prefix="mlpab-llmprobe-")
+    try:
+        cmd = [
+            "claude",
+            "-p",
+            "Reply with the single word: READY",
+            "--model",
+            model,
+            "--permission-mode",
+            "bypassPermissions",
+            "--max-turns",
+            "1",
+        ]
+        try:
+            proc = subprocess.run(
+                cmd,
+                cwd=tmp,
+                env=env,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=timeout_s,
+            )
+        except subprocess.TimeoutExpired:
+            return False, f"no response within {timeout_s}s"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    if proc.returncode == 0:
+        return True, f"responded ({model})"
+    tail = (proc.stderr or proc.stdout or "").strip().splitlines()[-2:]
+    return False, f"exit {proc.returncode}: {' / '.join(tail)[:200]}"

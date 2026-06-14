@@ -28,6 +28,7 @@ Usage:
     python -m evals.inference.vector_search.grade --instance <dir> --adapter <hopsworks|databricks|sagemaker|none>
 (cwd must be the run dir — the provider runs graders there.)
 """
+
 from __future__ import annotations
 
 import json
@@ -45,8 +46,7 @@ def grade(instance_dir: Path, adapter: str, run_dir: Path) -> dict:
     diagnostic = None
 
     def check(name, ok, detail=""):
-        asserts.append({"name": name, "passed": bool(ok),
-                        **({"detail": detail} if detail else {})})
+        asserts.append({"name": name, "passed": bool(ok), **({"detail": detail} if detail else {})})
         return bool(ok)
 
     answers = load_answers(Path(run_dir) / "submission" / "answers.json")
@@ -55,18 +55,22 @@ def grade(instance_dir: Path, adapter: str, run_dir: Path) -> dict:
     if not a1_ok:
         a1_detail = "answers.json must carry a 'neighbors' object {query_id: [5 item_ids]}"
     elif set(got) != set(want):
-        a1_ok, a1_detail = False, (
-            f"neighbors must cover all {len(want)} query_ids "
-            f"(missing: {sorted(set(want) - set(got))[:5]}, "
-            f"unknown: {sorted(set(got) - set(want))[:5]})")
+        a1_ok, a1_detail = (
+            False,
+            (
+                f"neighbors must cover all {len(want)} query_ids "
+                f"(missing: {sorted(set(want) - set(got))[:5]}, "
+                f"unknown: {sorted(set(got) - set(want))[:5]})"
+            ),
+        )
     else:
         for qid, ids in got.items():
             ids = [str(i) for i in ids] if isinstance(ids, list) else []
-            if len(ids) != truth["k"] or len(set(ids)) != truth["k"] \
-                    or not set(ids) <= valid_ids:
-                a1_ok, a1_detail = False, (
-                    f"{qid}: expected exactly {truth['k']} distinct valid "
-                    f"item_ids, got {ids!r}")
+            if len(ids) != truth["k"] or len(set(ids)) != truth["k"] or not set(ids) <= valid_ids:
+                a1_ok, a1_detail = (
+                    False,
+                    (f"{qid}: expected exactly {truth['k']} distinct valid item_ids, got {ids!r}"),
+                )
                 break
     a1 = check("A1_format", a1_ok, a1_detail)
 
@@ -74,9 +78,14 @@ def grade(instance_dir: Path, adapter: str, run_dir: Path) -> dict:
     if a1:
         norm = {qid: [str(i) for i in ids] for qid, ids in got.items()}
         bad = [qid for qid in want if norm[qid] != want[qid]]
-        a2 = check("A2_neighbors", not bad,
-                   f"{len(bad)}/{len(want)} queries diverge from the exact "
-                   f"L2 top-{truth['k']} ranking (e.g. {bad[:3]})" if bad else "")
+        a2 = check(
+            "A2_neighbors",
+            not bad,
+            f"{len(bad)}/{len(want)} queries diverge from the exact "
+            f"L2 top-{truth['k']} ranking (e.g. {bad[:3]})"
+            if bad
+            else "",
+        )
         if not a2:
             for vname, vmap in truth.get("variant_neighbors", {}).items():
                 if norm == vmap:
@@ -86,20 +95,27 @@ def grade(instance_dir: Path, adapter: str, run_dir: Path) -> dict:
         a2 = check("A2_neighbors", False, "no valid answers to compare")
 
     if adapter == "none":
-        a3 = check("A3_platform_state", True,
-                   "no checker adapter (platform none) — skipped")
+        a3 = check("A3_platform_state", True, "no checker adapter (platform none) — skipped")
     else:
         st = state_checker(adapter).get_vector_store(truth["table_name"])
-        a3 = check("A3_platform_state", st.get("exists"),
-                   "" if st.get("exists") else
-                   f"vector store {truth['table_name']!r} not found on the "
-                   f"platform: {st}")
+        a3 = check(
+            "A3_platform_state",
+            st.get("exists"),
+            ""
+            if st.get("exists")
+            else f"vector store {truth['table_name']!r} not found on the platform: {st}",
+        )
 
     success = a1 and a2 and a3
-    return {"family": "vector_search", "seed": truth["seed"], "success": success,
-            "asserts_passed": sum(a["passed"] for a in asserts),
-            "asserts_total": len(asserts), "asserts": asserts,
-            **({"diagnostic": diagnostic} if diagnostic else {})}
+    return {
+        "family": "vector_search",
+        "seed": truth["seed"],
+        "success": success,
+        "asserts_passed": sum(a["passed"] for a in asserts),
+        "asserts_total": len(asserts),
+        "asserts": asserts,
+        **({"diagnostic": diagnostic} if diagnostic else {}),
+    }
 
 
 def main(argv=None) -> int:

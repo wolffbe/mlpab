@@ -19,6 +19,7 @@ against an independent vectorized `merge_asof` reference. Naive variants
 (current_values) and on the most recent revision within a sloppy T+7d window
 (after_T_allowed).
 """
+
 from __future__ import annotations
 
 import argparse
@@ -47,9 +48,9 @@ SPEC = {
 }
 VARIANT_DIAGNOSIS = {
     "current_values": "scored on each account's LATEST feature revision instead of "
-                      "the revision valid at T (most recent at or before T)",
+    "the revision valid at T (most recent at or before T)",
     "after_T_allowed": "scored on revisions up to 7 days AFTER T — the as-of join "
-                       "must not look past T",
+    "must not look past T",
 }
 
 
@@ -85,14 +86,16 @@ def _merge_asof_ref(hist: pd.DataFrame, cutoff: pd.Timestamp) -> pd.DataFrame:
     return pd.merge_asof(
         accounts.sort_values("event_time"),
         hist.sort_values("event_time"),
-        on="event_time", by="account_id", direction="backward",
+        on="event_time",
+        by="account_id",
+        direction="backward",
     )
 
 
 def generate(seed: int, out: Path) -> dict:
     rng = np.random.default_rng(seed)
     table = TABLE_BASE + instance_suffix(seed)
-    t_day = int(rng.integers(38, 43))                     # AS-OF day T (~40)
+    t_day = int(rng.integers(38, 43))  # AS-OF day T (~40)
     cutoff = ORIGIN + pd.Timedelta(days=t_day, hours=int(rng.integers(8, 18)))
 
     # Revision days per account: guaranteed coverage before T, plus seeded
@@ -101,7 +104,7 @@ def generate(seed: int, out: Path) -> dict:
     for i in range(N_ACCOUNTS):
         acct = f"A{i:04d}"
         days = set(int(d) for d in rng.integers(0, N_DAYS, int(rng.integers(4, 9))))
-        days.add(int(rng.integers(0, 30)))                # at or before T
+        days.add(int(rng.integers(0, 30)))  # at or before T
         if i % 4 == 0:
             days.add(t_day + 1 + int(rng.integers(0, 6)))  # in (T, T+7]
         if i % 4 == 1:
@@ -113,14 +116,14 @@ def generate(seed: int, out: Path) -> dict:
     hist = hist.drop_duplicates(subset=["account_id", "event_time"]).reset_index(drop=True)
 
     model = {
-        "weights": {f: round(float(w), 4) for f, w in
-                    zip(FEATURES, rng.normal(0, 0.8, len(FEATURES)))},
+        "weights": {
+            f: round(float(w), 4) for f, w in zip(FEATURES, rng.normal(0, 0.8, len(FEATURES)))
+        },
         "bias": round(float(rng.normal(0, 0.5)), 4),
     }
 
     def scores_of(asof_df: pd.DataFrame) -> pd.DataFrame:
-        return pd.DataFrame({"account_id": asof_df["account_id"],
-                             "score": _score(asof_df, model)})
+        return pd.DataFrame({"account_id": asof_df["account_id"], "score": _score(asof_df, model)})
 
     truth = canonicalize(scores_of(_scan_asof(hist, cutoff)), SPEC)
 
@@ -132,7 +135,8 @@ def generate(seed: int, out: Path) -> dict:
     variants = {
         "current_values": canonicalize(scores_of(latest), SPEC),
         "after_T_allowed": canonicalize(
-            scores_of(_scan_asof(hist, cutoff + pd.Timedelta(days=7))), SPEC),
+            scores_of(_scan_asof(hist, cutoff + pd.Timedelta(days=7))), SPEC
+        ),
     }
     for name, v in variants.items():
         if digest(v) == digest(truth):
@@ -176,10 +180,14 @@ def generate(seed: int, out: Path) -> dict:
         "(online/real-time access), where the platform distinguishes the two.\n"
     )
     meta = {
-        "family": "batch", "seed": seed,
-        "table_name": table, "table_version": 1,
+        "family": "batch",
+        "seed": seed,
+        "table_name": table,
+        "table_version": 1,
         "as_of": t_iso,
-        "spec": SPEC, "row_count": len(truth), "digest": digest(truth),
+        "spec": SPEC,
+        "row_count": len(truth),
+        "digest": digest(truth),
         "record_ids": truth["account_id"].tolist(),
         "variant_digests": {k: digest(v) for k, v in variants.items()},
         "variant_diagnosis": VARIANT_DIAGNOSIS,

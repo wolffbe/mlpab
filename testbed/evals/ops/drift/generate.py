@@ -16,6 +16,7 @@ committed reference detector recovers (feature, onset±TOLERANCE) from the
 emitted CSV; no other feature triggers it (uniqueness), and every wrong-feature
 answer fails the grader.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -31,9 +32,9 @@ ORIGIN = pd.Timestamp("2026-01-01", tz="UTC")
 N_DAYS = 90
 N_ENTITIES = 150
 FEATURES = [f"f{i}" for i in range(1, 7)]
-ONSET_WINDOW = (45, 70)        # drift starts in this day range
-SHIFT_SIGMAS = 4.0             # step size in units of the feature's sigma
-TOLERANCE_DAYS = 3             # |reported onset - true onset| accepted
+ONSET_WINDOW = (45, 70)  # drift starts in this day range
+SHIFT_SIGMAS = 4.0  # step size in units of the feature's sigma
+TOLERANCE_DAYS = 3  # |reported onset - true onset| accepted
 
 
 def _detect(df: pd.DataFrame) -> tuple[str, pd.Timestamp] | None:
@@ -82,8 +83,7 @@ def generate(seed: int, out: Path) -> dict:
             k = FEATURES.index(drifted)
             vals[:, k] += SHIFT_SIGMAS * sigmas[k]
         for e in range(N_ENTITIES):
-            rows.append([f"E{e:04d}", ts.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                         *np.round(vals[e], 4)])
+            rows.append([f"E{e:04d}", ts.strftime("%Y-%m-%dT%H:%M:%SZ"), *np.round(vals[e], 4)])
     df = pd.DataFrame(rows, columns=["entity_id", "event_time", *FEATURES])
 
     # --- gates ---------------------------------------------------------------
@@ -105,7 +105,8 @@ def generate(seed: int, out: Path) -> dict:
     df.to_csv(out / "data" / "features.csv", index=False)
     (out / "data" / "schema.md").write_text(
         "# Schema\n\n- **features.csv**: entity_id, event_time (daily), "
-        + ", ".join(FEATURES) + " (numeric features)\n"
+        + ", ".join(FEATURES)
+        + " (numeric features)\n"
     )
     (out / "prompt.txt").write_text(
         "The directory data/ contains a daily stream of feature observations "
@@ -119,13 +120,14 @@ def generate(seed: int, out: Path) -> dict:
         '    {"feature": "<name>", "onset": "YYYY-MM-DD"}\n'
     )
     truth = {
-        "family": "drift", "seed": seed,
-        "feature": drifted, "onset": onset.strftime("%Y-%m-%d"),
+        "family": "drift",
+        "seed": seed,
+        "feature": drifted,
+        "onset": onset.strftime("%Y-%m-%d"),
         "tolerance_days": TOLERANCE_DAYS,
     }
     (out / "solution" / "truth.json").write_text(json.dumps(truth, indent=2))
-    (out / "instance.json").write_text(json.dumps(
-        {"family": "drift", "seed": seed}, indent=2))
+    (out / "instance.json").write_text(json.dumps({"family": "drift", "seed": seed}, indent=2))
     return truth
 
 

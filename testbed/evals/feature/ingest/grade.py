@@ -1,5 +1,6 @@
 """Ingest task — grader: the standard table suite (columns/rows/content) over
 the feature table read back through the platform (or --csv locally)."""
+
 from __future__ import annotations
 
 import sys

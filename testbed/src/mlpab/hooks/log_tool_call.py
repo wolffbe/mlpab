@@ -14,6 +14,7 @@ Blocked:
     `bypassPermissions`: `permissions.deny` patterns are silently skipped in
     bypass mode, but PreToolUse hooks fire in every mode.
 """
+
 from __future__ import annotations
 
 import json
@@ -82,12 +83,15 @@ def classify(tool_name: str, tool_input: dict) -> str:
 # (inline `-c`, `.py` files, `-m module`) to distinguish LOCAL execution of a
 # compute library from a script merely written to be shipped to the cluster.
 
+
 def _is_env_assign(tok: str) -> bool:
     if "=" not in tok or tok.startswith("="):
         return False
     head = tok.split("=", 1)[0]
-    return bool(head) and (head[0].isalpha() or head[0] == "_") and all(
-        c.isalnum() or c == "_" for c in head
+    return (
+        bool(head)
+        and (head[0].isalpha() or head[0] == "_")
+        and all(c.isalnum() or c == "_" for c in head)
     )
 
 
@@ -119,7 +123,12 @@ def _seg_exec(tokens: list, depth: int = 0) -> str | None:
         if _is_env_assign(tok):
             i += 1
             continue
-        if depth < 2 and tok in ("bash", "sh", "zsh") and i + 2 < len(tokens) and tokens[i + 1] == "-c":
+        if (
+            depth < 2
+            and tok in ("bash", "sh", "zsh")
+            and i + 2 < len(tokens)
+            and tokens[i + 1] == "-c"
+        ):
             return _seg_exec(_split(tokens[i + 2]), depth + 1)
         # `env [-i|--unset=..] [VAR=VAL]... cmd ...` → real command follows.
         if tok in ("env", "/usr/bin/env") and depth < 3:
@@ -161,12 +170,58 @@ def _is_python_tok(tok: str) -> bool:
 # gated by the allowlist (skipping them keeps compound commands like
 # `for f in *; do cp "$f" out/; done` from tripping it).
 _SHELL_KEYWORDS = {
-    "if", "then", "elif", "else", "fi", "for", "while", "until", "do", "done",
-    "case", "esac", "in", "select", "function", "time", "{", "}", "[[", "]]",
-    "!", ":", ".", "true", "false", "test", "[", "]",
-    "cd", "pwd", "echo", "printf", "export", "set", "unset", "local", "read",
-    "source", "command", "which", "type", "exit", "return", "pushd", "popd",
-    "wait", "shift", "getopts", "let", "declare", "alias", "umask",
+    "if",
+    "then",
+    "elif",
+    "else",
+    "fi",
+    "for",
+    "while",
+    "until",
+    "do",
+    "done",
+    "case",
+    "esac",
+    "in",
+    "select",
+    "function",
+    "time",
+    "{",
+    "}",
+    "[[",
+    "]]",
+    "!",
+    ":",
+    ".",
+    "true",
+    "false",
+    "test",
+    "[",
+    "]",
+    "cd",
+    "pwd",
+    "echo",
+    "printf",
+    "export",
+    "set",
+    "unset",
+    "local",
+    "read",
+    "source",
+    "command",
+    "which",
+    "type",
+    "exit",
+    "return",
+    "pushd",
+    "popd",
+    "wait",
+    "shift",
+    "getopts",
+    "let",
+    "declare",
+    "alias",
+    "umask",
 }
 
 # Basic POSIX file/text utilities permitted in EVERY interface mode: they move
@@ -176,14 +231,70 @@ _SHELL_KEYWORDS = {
 # CLI) is denied by `enforce`. Deliberately EXCLUDES general-purpose interpreters
 # (node/ruby/perl/php/…) and network tools (curl/wget) — the escape hatches.
 _BASIC_SHELL = {
-    "ls", "cat", "head", "tail", "tac", "nl", "wc", "find", "stat", "file",
-    "du", "df", "tree", "realpath", "readlink", "basename", "dirname",
-    "cp", "mv", "mkdir", "rmdir", "rm", "ln", "touch", "chmod",
-    "grep", "egrep", "fgrep", "sed", "awk", "cut", "sort", "uniq", "tr",
-    "diff", "cmp", "comm", "tee", "fold", "column", "rev", "paste", "join",
-    "xxd", "od", "hexdump", "split", "expand", "unexpand", "date",
-    "gzip", "gunzip", "zcat", "bzip2", "bunzip2", "xz", "unxz", "tar",
-    "unzip", "zip", "shasum", "md5sum", "sha256sum", "cksum",
+    "ls",
+    "cat",
+    "head",
+    "tail",
+    "tac",
+    "nl",
+    "wc",
+    "find",
+    "stat",
+    "file",
+    "du",
+    "df",
+    "tree",
+    "realpath",
+    "readlink",
+    "basename",
+    "dirname",
+    "cp",
+    "mv",
+    "mkdir",
+    "rmdir",
+    "rm",
+    "ln",
+    "touch",
+    "chmod",
+    "grep",
+    "egrep",
+    "fgrep",
+    "sed",
+    "awk",
+    "cut",
+    "sort",
+    "uniq",
+    "tr",
+    "diff",
+    "cmp",
+    "comm",
+    "tee",
+    "fold",
+    "column",
+    "rev",
+    "paste",
+    "join",
+    "xxd",
+    "od",
+    "hexdump",
+    "split",
+    "expand",
+    "unexpand",
+    "date",
+    "gzip",
+    "gunzip",
+    "zcat",
+    "bzip2",
+    "bunzip2",
+    "xz",
+    "unxz",
+    "tar",
+    "unzip",
+    "zip",
+    "shasum",
+    "md5sum",
+    "sha256sum",
+    "cksum",
 }
 
 
@@ -195,9 +306,16 @@ def _is_cli_tok(tok: str, cli_binary: str) -> bool:
 # not the option's argument (`aws --debug sagemaker …`). Options outside this
 # set (and not `--opt=value`) are assumed to consume the next token
 # (`aws --region us-east-1 sagemaker …`).
-_NO_VALUE_OPTS = {"--debug", "--version", "--help", "--no-verify-ssl",
-                  "--no-paginate", "--no-sign-request", "--no-cli-pager",
-                  "--no-cli-auto-prompt"}
+_NO_VALUE_OPTS = {
+    "--debug",
+    "--version",
+    "--help",
+    "--no-verify-ssl",
+    "--no-paginate",
+    "--no-sign-request",
+    "--no-cli-pager",
+    "--no-cli-auto-prompt",
+}
 
 
 def _cli_arg_after(tokens: list, cli_binary: str) -> str | None:
@@ -220,9 +338,9 @@ def _cli_arg_after(tokens: list, cli_binary: str) -> str | None:
             if not t.startswith("-"):
                 return t
             if "=" in t or t in _NO_VALUE_OPTS or t.startswith("--no-"):
-                j += 1          # option carries no separate value token
+                j += 1  # option carries no separate value token
             else:
-                j += 2          # `--opt value` — skip both
+                j += 2  # `--opt value` — skip both
         return None
     return None
 
@@ -247,7 +365,9 @@ def _python_payloads(command: str) -> tuple[str, list]:
         ex = _seg_exec(seg)
         if ex == "cd" and len(seg) > 1:
             target = seg[1]
-            curdir = target if os.path.isabs(target) else os.path.normpath(os.path.join(curdir, target))
+            curdir = (
+                target if os.path.isabs(target) else os.path.normpath(os.path.join(curdir, target))
+            )
             continue
         if not (ex and _is_python_tok(ex)):
             continue
@@ -283,14 +403,14 @@ def _imported_modules(text: str) -> set:
     for stmt in re.split(r"[;\n]", text):
         s = stmt.strip()
         if s.startswith("import "):
-            for part in s[len("import "):].split(","):
+            for part in s[len("import ") :].split(","):
                 head = part.strip().split()
                 if head:
                     root = head[0].split(".")[0]
                     if root:
                         mods.add(root)
         elif s.startswith("from "):
-            after = s[len("from "):].split(" import ")[0].strip()
+            after = s[len("from ") :].split(" import ")[0].strip()
             root = after.split(".")[0]
             if root:
                 mods.add(root)
@@ -326,12 +446,14 @@ def _use_only(interface: str) -> str:
         return f"the `{binary}` CLI"
     if interface == "mcp":
         platform = os.environ.get("TESTBED_PLATFORM") or None
-        return (f"the MCP tools (`mcp__{platform}__*`)" if platform
-                else "the platform's MCP tools")
+        return f"the MCP tools (`mcp__{platform}__*`)" if platform else "the platform's MCP tools"
     if interface == "sdk":
         module = os.environ.get("TESTBED_SDK_MODULE") or None
-        return (f"the `{module}` Python SDK (no ML libraries)" if module
-                else "the platform Python SDK (no ML libraries)")
+        return (
+            f"the `{module}` Python SDK (no ML libraries)"
+            if module
+            else "the platform Python SDK (no ML libraries)"
+        )
     return f"the {interface} interface"
 
 
@@ -488,9 +610,7 @@ def enforce_instance_types(tool_name: str, tool_input: dict) -> str | None:
     TESTBED_INSTANCE_ALLOW, else None. Unset/empty allowlist → no-op (platforms
     without instance types never set it)."""
     allow = {
-        t.strip()
-        for t in (os.environ.get("TESTBED_INSTANCE_ALLOW") or "").split(",")
-        if t.strip()
+        t.strip() for t in (os.environ.get("TESTBED_INSTANCE_ALLOW") or "").split(",") if t.strip()
     }
     if not allow:
         return None
@@ -536,7 +656,7 @@ def _pipeline_segments(command: str) -> list:
     a redirect `&` (`2>&1`, `&>file`, `>&2`) as a separator: an `&` glued to a
     `>` on either side is part of a redirect, not an operator.
     """
-    raw: list = []          # (text, sep_after)
+    raw: list = []  # (text, sep_after)
     cur: list = []
     quote: str | None = None
     i, n = 0, len(command)
@@ -549,26 +669,49 @@ def _pipeline_segments(command: str) -> list:
             i += 1
             continue
         if c in ("'", '"'):
-            quote = c; cur.append(c); i += 1; continue
-        if c == "\\":                                          # backslash escape
+            quote = c
+            cur.append(c)
+            i += 1
+            continue
+        if c == "\\":  # backslash escape
             nxt = command[i + 1] if i + 1 < n else ""
-            if nxt == "\n":            # line continuation → fold to whitespace
-                cur.append(" "); i += 2; continue
-            if nxt:                    # escaped char: literal, never a separator
-                cur.append(c); cur.append(nxt); i += 2; continue
-        if c in "&|" and i + 1 < n and command[i + 1] == c:    # && or ||
-            raw.append(("".join(cur), c + c)); cur = []; i += 2; continue
+            if nxt == "\n":  # line continuation → fold to whitespace
+                cur.append(" ")
+                i += 2
+                continue
+            if nxt:  # escaped char: literal, never a separator
+                cur.append(c)
+                cur.append(nxt)
+                i += 2
+                continue
+        if c in "&|" and i + 1 < n and command[i + 1] == c:  # && or ||
+            raw.append(("".join(cur), c + c))
+            cur = []
+            i += 2
+            continue
         if c == "|":
-            raw.append(("".join(cur), "|")); cur = []; i += 1; continue
+            raw.append(("".join(cur), "|"))
+            cur = []
+            i += 1
+            continue
         if c in ";\n":
-            raw.append(("".join(cur), ";")); cur = []; i += 1; continue
+            raw.append(("".join(cur), ";"))
+            cur = []
+            i += 1
+            continue
         if c == "&":
             prev = command[i - 1] if i > 0 else ""
             nxt = command[i + 1] if i + 1 < n else ""
-            if prev == ">" or nxt == ">":      # redirect (2>&1, &>file) — not sep
-                cur.append(c); i += 1; continue
-            raw.append(("".join(cur), "&")); cur = []; i += 1; continue
-        cur.append(c); i += 1
+            if prev == ">" or nxt == ">":  # redirect (2>&1, &>file) — not sep
+                cur.append(c)
+                i += 1
+                continue
+            raw.append(("".join(cur), "&"))
+            cur = []
+            i += 1
+            continue
+        cur.append(c)
+        i += 1
     raw.append(("".join(cur), ""))
     out: list = []
     for text, sep in raw:
@@ -597,7 +740,7 @@ def _mlpab_run_misuse(command: str, segments: list | None = None) -> str | None:
     backgrounded, else None. See the module note above for why. `segments` may
     carry a pre-parsed `_pipeline_segments(command)` to reuse one parse; None →
     parse here."""
-    for toks, sep in (segments if segments is not None else _pipeline_segments(command)):
+    for toks, sep in segments if segments is not None else _pipeline_segments(command):
         if _is_mlpab_run(toks) and sep in ("|", "&"):
             how = "piped into another command" if sep == "|" else "backgrounded with `&`"
             return (
@@ -644,8 +787,10 @@ def _path_violates_boundary(file_path: str) -> str | None:
     points at a sensitive $HOME subdir; None if allowed."""
     if not file_path:
         return None
-    p = os.path.realpath(file_path) if os.path.isabs(file_path) else os.path.realpath(
-        os.path.join(os.getcwd(), file_path)
+    p = (
+        os.path.realpath(file_path)
+        if os.path.isabs(file_path)
+        else os.path.realpath(os.path.join(os.getcwd(), file_path))
     )
     # Boundary check: TESTBED_BOUNDARY is the agent's run dir.
     boundary = os.environ.get("TESTBED_BOUNDARY")
@@ -669,16 +814,14 @@ def _path_violates_boundary(file_path: str) -> str | None:
             #      command. The path embeds the cwd slug, scoping this to THIS
             #      run's own tasks.
             cwd_slug = os.getcwd().replace(os.sep, "-")
-            is_task_output = (
-                "/tasks/" in p and p.endswith(".output") and cwd_slug in p
-            )
+            is_task_output = "/tasks/" in p and p.endswith(".output") and cwd_slug in p
             if not p.startswith(home + "/.claude/") and not is_task_output:
                 return f"path is outside the agent boundary ({b})"
     # Always block dotfiles + dot-dirs at $HOME root (secrets), boundary set or
     # not. Catches ~/.ssh, ~/.aws, ~/.gnupg, .gitconfig, .netrc, .zshrc —
     # every secret-bearing path on macOS.
     home = _real_home()
-    rel = p[len(home) + 1:] if p.startswith(home + "/") else None
+    rel = p[len(home) + 1 :] if p.startswith(home + "/") else None
     if rel and rel.startswith("."):
         # ~/.claude allowed (Claude's config + tokens we already trust).
         if rel == ".claude" or rel.startswith(".claude/"):
@@ -687,8 +830,9 @@ def _path_violates_boundary(file_path: str) -> str | None:
     return None
 
 
-def _log_call(payload: dict, tool_name: str, tool_input: dict,
-              denied_reason: str | None = None) -> None:
+def _log_call(
+    payload: dict, tool_name: str, tool_input: dict, denied_reason: str | None = None
+) -> None:
     """Append one JSONL record to TESTBED_COMMAND_LOG. Denials carry
     `denied: true` + the reason, so results.py can count them structurally
     instead of substring-scanning transcripts for the `DENIED:` marker."""
@@ -774,13 +918,17 @@ def main() -> int:
     # `cat solution/truth.json`) and the search tools.
     if tool_name == "Bash":
         if re.search(r'(?:^|[\s"\'=/(`;|&])solution/', tool_input.get("command") or ""):
-            return deny("DENIED: the solution/ folder is the eval's answer key — "
-                        "off limits to the agent. Solve the task from data/ only.")
+            return deny(
+                "DENIED: the solution/ folder is the eval's answer key — "
+                "off limits to the agent. Solve the task from data/ only."
+            )
     elif tool_name in ("Glob", "Grep"):
         blob = f"{tool_input.get('path') or ''} {tool_input.get('pattern') or ''}"
         if "solution" in blob:
-            return deny("DENIED: the solution/ folder is the eval's answer key — "
-                        "off limits to the agent. Search data/ instead.")
+            return deny(
+                "DENIED: the solution/ folder is the eval's answer key — "
+                "off limits to the agent. Search data/ instead."
+            )
 
     # Log the (allowed) call.
     _log_call(payload, tool_name, tool_input)

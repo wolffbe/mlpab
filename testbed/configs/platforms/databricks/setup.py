@@ -22,6 +22,7 @@ Best-effort by design: invoked via the interface `serve:` step, whose runner
 `main()` — a setup hiccup (e.g. a workspace without Unity Catalog) must never
 fail an engineer run.
 """
+
 from __future__ import annotations
 
 import json
@@ -37,10 +38,15 @@ SCHEMA = "default"
 
 def _api(method: str, path: str, payload: dict | None = None) -> dict:
     data = json.dumps(payload).encode() if payload is not None else None
-    req = urllib.request.Request(HOST + path, data=data, method=method, headers={
-        "Authorization": f"Bearer {TOKEN}",
-        "Content-Type": "application/json",
-    })
+    req = urllib.request.Request(
+        HOST + path,
+        data=data,
+        method=method,
+        headers={
+            "Authorization": f"Bearer {TOKEN}",
+            "Content-Type": "application/json",
+        },
+    )
     with urllib.request.urlopen(req, timeout=20) as resp:
         body = resp.read()
     return json.loads(body) if body else {}
@@ -60,8 +66,7 @@ def main() -> None:
         pass  # missing (or no UC at all) → try to create it
 
     try:
-        _api("POST", "/api/2.1/unity-catalog/schemas",
-             {"name": SCHEMA, "catalog_name": CATALOG})
+        _api("POST", "/api/2.1/unity-catalog/schemas", {"name": SCHEMA, "catalog_name": CATALOG})
         print(f"[databricks setup] created schema {full!r}")
     except Exception as e:
         # Workspace without Unity Catalog, or missing catalog — the agent can
@@ -69,5 +74,38 @@ def main() -> None:
         print(f"[databricks setup] create of schema {full!r} skipped: {e}")
 
 
+def verify() -> int:
+    """Twofold setup check (`setup.py verify`): (1) the workspace CONNECTS with
+    the run's token, then (2) the `workspace.default` schema setup guarantees is
+    PRESENT. Exit 0 iff ready, non-zero with a reason otherwise — the runner
+    fails the run on non-zero, so the agent never works against a platform it
+    can't reach. Read-only.
+
+    Connection is the hard gate; the schema is best-effort (setup.py itself only
+    creates it where Unity Catalog exists), so a non-UC workspace that connects
+    still passes — it's reported, not failed.
+    """
+    if not HOST or not TOKEN:
+        print("[databricks verify-setup] DATABRICKS_HOST/DATABRICKS_TOKEN unset")
+        return 1
+    try:
+        _api("GET", "/api/2.0/preview/scim/v2/Me")
+    except Exception as e:
+        print(f"[databricks verify-setup] NO CONNECTION ({HOST!r}): {e}")
+        return 1
+    full = f"{CATALOG}.{SCHEMA}"
+    try:
+        _api("GET", f"/api/2.1/unity-catalog/schemas/{full}")
+        print(f"[databricks verify-setup] OK: connected; schema {full!r} present")
+    except Exception as e:
+        print(
+            f"[databricks verify-setup] OK: connected; schema {full!r} absent "
+            f"(no Unity Catalog?) — best-effort, not failing: {e}"
+        )
+    return 0
+
+
 if __name__ == "__main__":
-    main()
+    import sys
+
+    sys.exit(verify() if sys.argv[1:2] == ["verify"] else (main() or 0))

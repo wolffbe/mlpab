@@ -18,6 +18,7 @@ wrote and computes the 5 scores. Generation-time gates run the grade function
 (adapter `none`): the reference answers pass; a perturbed response and a
 wrong endpoint name both fail.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -34,9 +35,26 @@ from evals.common import instance_suffix
 
 ENDPOINT_BASE = "scorer"  # per-instance: f"{ENDPOINT_BASE}{instance_suffix(seed)}"
 N_PAYLOADS = 5
-VOCAB = ["feature", "store", "online", "vector", "pipeline", "model", "drift",
-         "lookup", "serving", "batch", "training", "embedding", "latency",
-         "monitor", "schedule", "registry", "inference", "stream"]
+VOCAB = [
+    "feature",
+    "store",
+    "online",
+    "vector",
+    "pipeline",
+    "model",
+    "drift",
+    "lookup",
+    "serving",
+    "batch",
+    "training",
+    "embedding",
+    "latency",
+    "monitor",
+    "schedule",
+    "registry",
+    "inference",
+    "stream",
+]
 
 SCORER_TEMPLATE = '''"""A tiny deterministic pure-python "language model".
 
@@ -99,8 +117,7 @@ def generate(seed: int, out: Path) -> dict:
         c=round(float(rng.uniform(0.5, 3.0)), 6),
         d=round(float(rng.uniform(-2.0, 2.0)), 6),
     )
-    payloads = [" ".join(rng.choice(VOCAB, int(rng.integers(6, 13))))
-                for _ in range(N_PAYLOADS)]
+    payloads = [" ".join(rng.choice(VOCAB, int(rng.integers(6, 13)))) for _ in range(N_PAYLOADS)]
 
     # --- write instance --------------------------------------------------------
     if out.exists():
@@ -128,13 +145,16 @@ def generate(seed: int, out: Path) -> dict:
         "in payload order>]}\n"
     )
     truth = {
-        "family": "llm_serving", "seed": seed,
+        "family": "llm_serving",
+        "seed": seed,
         "endpoint_name": endpoint,
-        "payloads": payloads, "responses": responses,
+        "payloads": payloads,
+        "responses": responses,
     }
     (out / "solution" / "truth.json").write_text(json.dumps(truth, indent=2))
-    (out / "instance.json").write_text(json.dumps(
-        {"family": "llm_serving", "seed": seed}, indent=2))
+    (out / "instance.json").write_text(
+        json.dumps({"family": "llm_serving", "seed": seed}, indent=2)
+    )
 
     # --- gates: the grade function accepts truth, rejects corruptions ----------
     from evals.inference.llm_serving.grade import grade

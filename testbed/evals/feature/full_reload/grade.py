@@ -1,6 +1,7 @@
 """Full-reload task — grader: the standard table suite (columns/rows/content)
 over feature table `customers` VERSION 2 read back through the platform (or
 --csv locally). Stale rows or old column names fail with named diagnoses."""
+
 from __future__ import annotations
 
 import sys

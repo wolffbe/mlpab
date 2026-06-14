@@ -19,6 +19,7 @@ direction diverges). Ground truth by construction: a per-user scan,
 cross-checked against an independent vectorized matmul reference. Naive
 variants (gates assert they differ): include_seen and ties_desc.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -36,7 +37,7 @@ N_USERS = 40
 N_ITEMS = 60
 DIM = 8
 TOP_K = 5
-N_DUP_PAIRS = 8        # item pairs with identical embeddings → exact ties
+N_DUP_PAIRS = 8  # item pairs with identical embeddings → exact ties
 TABLE_BASE = "recs"  # per-instance: f"{TABLE_BASE}{instance_suffix(seed)}"
 
 SPEC = {
@@ -55,8 +56,13 @@ class GateError(RuntimeError):
     pass
 
 
-def _scan_topk(users: pd.DataFrame, items: pd.DataFrame, seen: dict[str, set],
-               exclude_seen: bool = True, ties_ascending: bool = True) -> pd.DataFrame:
+def _scan_topk(
+    users: pd.DataFrame,
+    items: pd.DataFrame,
+    seen: dict[str, set],
+    exclude_seen: bool = True,
+    ties_ascending: bool = True,
+) -> pd.DataFrame:
     """Per-user scan (truth and naive variants share it, parameterized)."""
     ecols = [f"e{i}" for i in range(1, DIM + 1)]
     rows = []
@@ -71,8 +77,8 @@ def _scan_topk(users: pd.DataFrame, items: pd.DataFrame, seen: dict[str, set],
         if ties_ascending:
             cands.sort(key=lambda c: (-c[0], c[1]))
         else:
-            cands.sort(key=lambda c: c[1], reverse=True)   # desc id …
-            cands.sort(key=lambda c: -c[0])                 # … then stable by score
+            cands.sort(key=lambda c: c[1], reverse=True)  # desc id …
+            cands.sort(key=lambda c: -c[0])  # … then stable by score
         for rank, (_, item_id) in enumerate(cands[:TOP_K], start=1):
             rows.append([f"{u['user_id']}#{rank}", u["user_id"], rank, item_id])
     return pd.DataFrame(rows, columns=SPEC["columns"])
@@ -90,7 +96,7 @@ def _matmul_ref(users: pd.DataFrame, items: pd.DataFrame, seen: dict[str, set]) 
         s = scores[ui].copy()
         mask = np.isin(item_ids, list(seen.get(user_id, set())))
         s[mask] = -np.inf
-        order = np.lexsort((item_ids, -s))               # score desc, id asc
+        order = np.lexsort((item_ids, -s))  # score desc, id asc
         for rank, ii in enumerate(order[:TOP_K], start=1):
             rows.append([f"{user_id}#{rank}", user_id, rank, item_ids[ii]])
     return pd.DataFrame(rows, columns=SPEC["columns"])
@@ -117,7 +123,9 @@ def generate(seed: int, out: Path) -> dict:
     for ui, u in users.iterrows():
         s = u[ecols].to_numpy(dtype=float) @ I.T
         best = items["item_id"].iloc[int(np.argmax(s))]
-        picks = {best} | set(items["item_id"].iloc[rng.integers(0, N_ITEMS, int(rng.integers(4, 10)))])
+        picks = {best} | set(
+            items["item_id"].iloc[rng.integers(0, N_ITEMS, int(rng.integers(4, 10)))]
+        )
         seen[u["user_id"]] = picks
         inter_rows += [[u["user_id"], it] for it in sorted(picks)]
     interactions = pd.DataFrame(inter_rows, columns=["user_id", "item_id"])
@@ -162,16 +170,20 @@ def generate(seed: int, out: Path) -> dict:
         "(interactions.csv); rank 1 is the highest-relevance item; break exact "
         "score ties by ASCENDING item_id.\n"
         f"Produce a feature table named `{table}`, version 1, on the platform, "
-        "with record key `rec_id` formatted \"<user_id>#<rank>\" (e.g. "
-        "\"U0003#1\") and exactly these columns: rec_id, user_id, rank "
+        'with record key `rec_id` formatted "<user_id>#<rank>" (e.g. '
+        '"U0003#1") and exactly these columns: rec_id, user_id, rank '
         f"(integer 1..{TOP_K}), item_id. {TOP_K} rows per user.\n"
         "Make the table's features available for low-latency lookup as well "
         "(online/real-time access), where the platform distinguishes the two.\n"
     )
     meta = {
-        "family": "recsys", "seed": seed,
-        "table_name": table, "table_version": 1,
-        "spec": SPEC, "row_count": len(truth), "digest": digest(truth),
+        "family": "recsys",
+        "seed": seed,
+        "table_name": table,
+        "table_version": 1,
+        "spec": SPEC,
+        "row_count": len(truth),
+        "digest": digest(truth),
         "record_ids": truth["rec_id"].tolist(),
         "variant_digests": {k: digest(v) for k, v in variants.items()},
         "variant_diagnosis": VARIANT_DIAGNOSIS,

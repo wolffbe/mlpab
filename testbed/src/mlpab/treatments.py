@@ -39,6 +39,7 @@ Config format (YAML):
     max_seconds: 1200  # OPTIONAL per-agent-run wall-clock cap in SECONDS
                        # (legacy: `max_min`, `timeout_s`). Absent/null → NO cap.
 """
+
 from __future__ import annotations
 
 import os
@@ -49,8 +50,9 @@ from typing import Any
 
 import yaml
 
-from mlpab import claude_runner, interfaces, preflight as preflight_mod, results, runner, skills
-
+from mlpab import claude_runner, interfaces
+from mlpab import preflight as preflight_mod
+from mlpab import results, runner, skills
 
 # ---------------------------------------------------------------------------
 # Config
@@ -59,12 +61,12 @@ from mlpab import claude_runner, interfaces, preflight as preflight_mod, results
 
 @dataclass
 class RunEntry:
-    task: str                       # FTI sub-task (an evals family)
+    task: str  # FTI sub-task (an evals family)
     platform: str
     interface: str
     skills: str = "none"
-    category: str = "no_task"       # FTI category (a folder in the run path)
-    model: str = ""                 # agent model; "" → filled from the config's model list
+    category: str = "no_task"  # FTI category (a folder in the run path)
+    model: str = ""  # agent model; "" → filled from the config's model list
 
 
 @dataclass
@@ -102,7 +104,7 @@ def _parse_runs(data: dict[str, Any]) -> list[RunEntry]:
                     interface=interface,
                     skills=r.get("skills", "none"),
                     category=r.get("category", "no_task"),
-                    model=r.get("model", ""),   # per-run override; else config model list
+                    model=r.get("model", ""),  # per-run override; else config model list
                 )
             )
         return entries
@@ -128,15 +130,13 @@ def _parse_runs(data: dict[str, Any]) -> list[RunEntry]:
     for tk, category in task_category:
         for iface in iface_entries:
             if not isinstance(iface, dict):
-                raise ValueError(
-                    f"treatment `interfaces` entries must be mappings, got {iface!r}"
-                )
+                raise ValueError(f"treatment `interfaces` entries must be mappings, got {iface!r}")
             if iface.get("config"):
                 platform, interface = interfaces.platform_interface_from_config(iface["config"])
             else:
                 platform, interface = iface["platform"], iface.get("interface", "none")
             for sk in skills_list:
-                sk_platform = None   # None → bundle applies to every platform
+                sk_platform = None  # None → bundle applies to every platform
                 if isinstance(sk, str):
                     sk_name = sk
                 elif isinstance(sk, dict) and sk.get("config"):
@@ -215,7 +215,7 @@ def load_config(path: Path) -> TreatmentConfig:
     model_list = model_list or [runner.DEFAULT_MODEL]
     runs, seen = [], set()
     for e in _parse_runs(data):
-        for m in ([e.model] if e.model else model_list):
+        for m in [e.model] if e.model else model_list:
             key = (m, e.task, e.platform, e.interface, e.skills, e.category)
             if key in seen:
                 continue
@@ -225,7 +225,7 @@ def load_config(path: Path) -> TreatmentConfig:
         runs=runs,
         # Auth is a machine/setup concern: defaults to MLPAB_AUTH (what `make
         # setup` chose) unless the config explicitly overrides it.
-        model=model_list[0],   # representative; per-run model lives on the RunEntry
+        model=model_list[0],  # representative; per-run model lives on the RunEntry
         auth=data.get("auth", os.environ.get("MLPAB_AUTH", "api-key")),
         max_seconds=max_seconds,
         repeats=max(1, int(data.get("n", data.get("repeats", 1)) or 1)),
@@ -242,6 +242,7 @@ def check_readiness(config: "TreatmentConfig") -> tuple[bool, list[tuple[str, bo
     (all_ready, [(model, ok, detail), …]). Dispatches per model id to the right
     engine: gpt-*/codex → Codex, mistral-* → Vibe, else Claude."""
     from mlpab import codex_runner, mistral_runner
+
     report: list[tuple[str, bool, str]] = []
     for m in sorted({e.model for e in config.runs}):
         if codex_runner.is_codex_model(m):
@@ -254,18 +255,41 @@ def check_readiness(config: "TreatmentConfig") -> tuple[bool, list[tuple[str, bo
     return all(ok for _, ok, _ in report), report
 
 
-def print_readiness(report: list[tuple[str, bool, str]]) -> None:
-    print("\n[mlpab] agent-engine readiness:")
+def print_readiness(
+    report: list[tuple[str, bool, str]], title: str = "agent-engine readiness"
+) -> None:
+    print(f"\n[mlpab] {title}:")
     for model, ok, detail in report:
         mark = "✓" if ok else "✗"
         print(f"  {mark} {model:20} {detail}")
+
+
+def check_llm_live(
+    config: "TreatmentConfig",
+    timeout_s: int = 60,
+) -> tuple[bool, list[tuple[str, bool, str]]]:
+    """Live LLM responsiveness: send each unique model a one-word prompt through
+    its agent engine and confirm it answers. Returns (all_ok, [(model, ok, detail)]).
+    Dispatches per model id like check_readiness."""
+    from mlpab import codex_runner, mistral_runner
+
+    report: list[tuple[str, bool, str]] = []
+    for m in sorted({e.model for e in config.runs}):
+        if codex_runner.is_codex_model(m):
+            ok, detail = codex_runner.engine_live(m, timeout_s=timeout_s)
+        elif mistral_runner.is_mistral_model(m):
+            ok, detail = mistral_runner.engine_live(m, timeout_s=timeout_s)
+        else:
+            ok, detail = claude_runner.engine_live(m, auth=config.auth, timeout_s=timeout_s)
+        report.append((m, ok, detail))
+    return all(ok for _, ok, _ in report), report
 
 
 def run_treatments(
     config: TreatmentConfig,
     runs_root: Path,
     config_name: str | None = None,
-    assume_yes: bool = False,   # kept for CLI compat; runs ACCUMULATE, never prompt
+    assume_yes: bool = False,  # kept for CLI compat; runs ACCUMULATE, never prompt
 ) -> None:
     total = len(config.runs) * config.repeats
     if total == 0:
@@ -281,6 +305,12 @@ def run_treatments(
         )
         for e in config.runs
     ]
+    # Cheapest gate first: a no-build, no-network availability check that every
+    # platform/interface/skill is even usable (config present, creds set, skill
+    # bundle well-formed). Catches a forgotten credential or a missing bundle in
+    # ~a second, instead of after minutes of building. The live connection +
+    # interface build/test happen in the preflight below.
+    preflight_mod.check_availability(reqs)
     # Fail fast if the agent ENGINE any model needs isn't ready (CLI + auth) —
     # before building platforms or launching a single run.
     ready, report = check_readiness(config)
@@ -288,32 +318,43 @@ def run_treatments(
     if not ready:
         raise preflight_mod.PreflightError(
             "agent engine(s) not ready (see above) — run `mlpab setup`, or fix the "
-            "missing CLI/credential, before running this config.")
+            "missing CLI/credential, before running this config."
+        )
     # Fail fast on unimplemented eval families BEFORE building anything.
     from mlpab import evals_provider
+
     for tk in sorted({e.task for e in config.runs}):
         evals_provider._family(tk)  # raises ValueError with the implemented list
-    # `building()` marks this session's ENTIRE setup phase for PARALLEL
-    # sessions (the per-platform configs): a platform with nothing to
-    # build must still not open its agent while a sibling session is
-    # mid-setup — every run below gates on `agent_slot()`. The barrier is
-    # two-directional: `building()` itself first waits for any ALREADY-OPEN
-    # agent run (a sibling started earlier), so staggered session starts
-    # never build under a sibling's open, timed run.
-    with preflight_mod.building():
-        try:
-            # Build + test the platforms once at session start (login is checked per
-            # run by the runner, in each run's own venv). NOTE: treatment runs
-            # put the agent directly against the built interface dir ($INTERFACE_DIR
-            # = bin_dir; preflight=False per run, so nothing rebuilds per run). The
-            # built artifact MUST persist here for the agent's runtime_install —
-            # so we do NOT cleanup_build.
-            preflight_mod.preflight(
-                reqs, auth=config.auth, model=config.model, check_login=False,
-            )
-        except preflight_mod.PreflightError as e:
-            print(f"\n[mlpab] preflight failed:\n{e}", file=sys.stderr)
-            raise
+    # Live per-model probe: confirm each model actually ANSWERS a one-word prompt.
+    # A model id the account can't reach passes the static readiness check above
+    # but then produces zero-activity runs (see docs/code_review.md §12.1) — catch
+    # it here, before building platforms or launching a single run.
+    live_ok, live_report = check_llm_live(config)
+    print_readiness(live_report, title="agent model liveness (live probe)")
+    if not live_ok:
+        raise preflight_mod.PreflightError(
+            "agent model(s) did not respond to a liveness probe (see above) — a "
+            "model this config names cannot be reached; check the model id / "
+            "account access before running."
+        )
+    # Build + test the platforms once at session start, AND materialize each
+    # interface's PREPARED venv (interfaces.prepare, inside preflight). This is
+    # the whole setup phase: every run below just CLONES its prepared venv
+    # read-only, so no run builds or mutates shared state — parallel sessions
+    # need no build barrier and never wait on one another. (Login is checked per
+    # run by the runner, in each run's own venv.) The build artifacts + prepared
+    # venvs MUST persist here for the runs that clone them, so we do NOT
+    # cleanup_build.
+    try:
+        preflight_mod.preflight(
+            reqs,
+            auth=config.auth,
+            model=config.model,
+            check_login=False,
+        )
+    except preflight_mod.PreflightError as e:
+        print(f"\n[mlpab] preflight failed:\n{e}", file=sys.stderr)
+        raise
 
     parent = runs_root
     parent.mkdir(parents=True, exist_ok=True)
@@ -351,14 +392,17 @@ def run_treatments(
         print(f"[mlpab] legacy leaf-CSV merge skipped: {e}", flush=True)
     global_nb = parent / "results.ipynb"
     if not global_nb.exists():
-        from nbformat.v4 import new_notebook, new_markdown_cell
         import nbformat as _nbf
+        from nbformat.v4 import new_markdown_cell, new_notebook
+
         nb = new_notebook()
-        nb.cells = [new_markdown_cell(
-            "# Results — global analysis\n\n"
-            "_(No results yet — this notebook regenerates at end of every "
-            "treatment run.)_\n"
-        )]
+        nb.cells = [
+            new_markdown_cell(
+                "# Results — global analysis\n\n"
+                "_(No results yet — this notebook regenerates at end of every "
+                "treatment run.)_\n"
+            )
+        ]
         with global_nb.open("w") as f:
             _nbf.write(nb, f)
 
@@ -382,14 +426,19 @@ def run_treatments(
             version_seg = "none"
         else:
             version_seg = interfaces.interface_ref(
-                interfaces.load_manifest(entry.platform, entry.interface))
+                interfaces.load_manifest(entry.platform, entry.interface)
+            )
         skills_seg = entry.skills if entry.skills and entry.skills != "none" else "no-skills"
-        leaf_root = (run_path / entry.model / entry.platform
-                     / entry.interface / version_seg / skills_seg)
+        leaf_root = (
+            run_path / entry.model / entry.platform / entry.interface / version_seg / skills_seg
+        )
         # Repeat counter: next free /<n> attempt folder under this task.
         task_dir = leaf_root / entry.category / entry.task
-        existing = [int(d.name) for d in task_dir.iterdir()
-                    if d.is_dir() and d.name.isdigit()] if task_dir.is_dir() else []
+        existing = (
+            [int(d.name) for d in task_dir.iterdir() if d.is_dir() and d.name.isdigit()]
+            if task_dir.is_dir()
+            else []
+        )
         attempt = max(existing, default=0) + 1
         try:
             spec = runner.RunSpec(
@@ -401,22 +450,16 @@ def run_treatments(
                 auth=config.auth,
                 timeout_s=int(config.max_seconds) if config.max_seconds is not None else None,
                 runs_root=leaf_root,
-                run_id=run_id,        # tagged into the `config` column of the master CSV
+                run_id=run_id,  # tagged into the `config` column of the master CSV
                 category=entry.category,
                 attempt=attempt,
                 preflight=False,  # union already verified upfront
                 results_csv=global_csv,  # the ONE results CSV, appended per run
             )
-            # Never START an agent (claude) run while a parallel session is
-            # still in its setup phase (building, preparing data) — blocks
-            # until the barrier is clear. The slot is then HELD
-            # for the run's duration, so a sibling session started AFTER this
-            # agent opened waits in its `building()` instead of building
-            # under the open run (the staggered-start race).
-            with preflight_mod.agent_slot() as waited:
-                if waited > 1:
-                    print(f"[mlpab] build barrier cleared after {waited:.0f}s", flush=True)
-                row = runner.run(spec)
+            # No build barrier: every interface was prepared up front, so this
+            # run only clones its prepared venv read-only — nothing to wait on,
+            # even with parallel sessions running concurrently.
+            row = runner.run(spec)
             completed.append(row)
             print(
                 f"[mlpab] asserts={row.asserts_passed}/{row.asserts_total}  "
@@ -427,6 +470,18 @@ def run_treatments(
             # the global results.ipynb to match, so both stay current after
             # EVERY run instead of only at end of the session.
             _refresh_notebook(parent)
+        except preflight_mod.PlatformNotReadyError as exc:
+            # Setup verification failed — the platform is unusable, so every
+            # remaining run would fail the same way. Abort the whole config
+            # (print what completed so far, then propagate).
+            print(
+                f"\n[mlpab] ABORTING config {config_name!r} — platform "
+                f"{entry.platform!r} is not ready:\n{exc}",
+                file=sys.stderr,
+            )
+            print(f"[mlpab] results: {global_csv}", flush=True)
+            _print_summary(completed, failed, global_csv)
+            raise
         except Exception as exc:
             label = f"{entry.task}/{entry.platform}/{entry.interface}"
             print(f"[mlpab] FAILED {label}: {exc}", file=sys.stderr)
@@ -444,6 +499,7 @@ def _refresh_notebook(parent: Path) -> None:
     placeholder created at run start. Failures never abort the session."""
     try:
         from mlpab import notebook as notebook_mod
+
         nb_path = notebook_mod.build_results_notebook(parent)
         if nb_path is not None:
             print(f"[mlpab] refreshed analysis notebook: {nb_path}", flush=True)

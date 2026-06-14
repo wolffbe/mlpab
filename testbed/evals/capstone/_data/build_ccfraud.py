@@ -12,6 +12,7 @@ column — so the agent has to actually build a feature pipeline.
     python -m evals.capstone._data.build_ccfraud           # writes ccfraud_raw.csv
     python -m evals.capstone._data.build_ccfraud --rows 30000
 """
+
 from __future__ import annotations
 
 import argparse
@@ -22,8 +23,18 @@ import pandas as pd
 
 OUT = Path(__file__).parent / "ccfraud_raw.csv"
 ORIGIN = pd.Timestamp("2025-09-01", tz="UTC")
-CATEGORIES = ["grocery", "restaurant", "fuel", "electronics", "travel",
-              "entertainment", "health", "clothing", "online", "cash_advance"]
+CATEGORIES = [
+    "grocery",
+    "restaurant",
+    "fuel",
+    "electronics",
+    "travel",
+    "entertainment",
+    "health",
+    "clothing",
+    "online",
+    "cash_advance",
+]
 SEED = 20240917  # fixed: the committed fixture must be stable across rebuilds
 
 
@@ -32,7 +43,7 @@ def build(n_cards: int, days: int, rows: int) -> pd.DataFrame:
     # Each card has a home location and a baseline spend profile.
     home_lat = rng.uniform(25.0, 49.0, n_cards)
     home_lon = rng.uniform(-123.0, -71.0, n_cards)
-    base_amt = rng.uniform(2.0, 4.0, n_cards)              # log-amount mean
+    base_amt = rng.uniform(2.0, 4.0, n_cards)  # log-amount mean
     cards = [f"{rng.integers(4000, 4999)}{i:08d}" for i in range(n_cards)]
 
     secs = days * 24 * 3600
@@ -55,11 +66,34 @@ def build(n_cards: int, days: int, rows: int) -> pd.DataFrame:
             hour = int(rng.choice(range(24), p=_day_hours()))
             category = str(rng.choice(CATEGORIES))
         ts = ts.normalize() + pd.Timedelta(hours=hour, minutes=int(rng.integers(0, 60)))
-        recs.append((c, cards[c], ts, amount, f"m_{rng.integers(0, 800):03d}",
-                     category, lat, lon, int(fraud)))
+        recs.append(
+            (
+                c,
+                cards[c],
+                ts,
+                amount,
+                f"m_{rng.integers(0, 800):03d}",
+                category,
+                lat,
+                lon,
+                int(fraud),
+            )
+        )
 
-    df = pd.DataFrame(recs, columns=["_card_idx", "cc_num", "datetime", "amount",
-                                     "merchant", "category", "lat", "long", "is_fraud"])
+    df = pd.DataFrame(
+        recs,
+        columns=[
+            "_card_idx",
+            "cc_num",
+            "datetime",
+            "amount",
+            "merchant",
+            "category",
+            "lat",
+            "long",
+            "is_fraud",
+        ],
+    )
     df = df.sort_values("datetime").reset_index(drop=True)
     df.insert(0, "transaction_id", [f"T{i:09d}" for i in range(len(df))])
     df["datetime"] = df["datetime"].dt.strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -67,11 +101,15 @@ def build(n_cards: int, days: int, rows: int) -> pd.DataFrame:
 
 
 def _odd_hours() -> np.ndarray:
-    w = np.ones(24); w[0:5] = 5.0; return w / w.sum()      # fraud skews to night
+    w = np.ones(24)
+    w[0:5] = 5.0
+    return w / w.sum()  # fraud skews to night
 
 
 def _day_hours() -> np.ndarray:
-    w = np.ones(24); w[8:21] = 4.0; return w / w.sum()     # legit skews to daytime
+    w = np.ones(24)
+    w[8:21] = 4.0
+    return w / w.sum()  # legit skews to daytime
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -83,8 +121,10 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
     df = build(args.cards, args.days, args.rows)
     df.to_csv(args.out, index=False)
-    print(f"[build_ccfraud] wrote {len(df)} rows ({df['is_fraud'].mean():.3%} fraud) "
-          f"over {df['cc_num'].nunique()} cards -> {args.out}")
+    print(
+        f"[build_ccfraud] wrote {len(df)} rows ({df['is_fraud'].mean():.3%} fraud) "
+        f"over {df['cc_num'].nunique()} cards -> {args.out}"
+    )
     return 0
 
 

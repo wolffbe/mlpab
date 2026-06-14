@@ -8,6 +8,7 @@ bypassPermissions (see `claude_runner.deny_patterns_for` for the why).
 Auto-skips when `claude` isn't on PATH or the Keychain has no token. Not
 picked up by `make test` (file is `live_*.py`); run with `make test-integration`.
 """
+
 import json
 import os
 import shutil
@@ -27,8 +28,10 @@ def _keychain_token_available() -> bool:
     return claude_runner.oauth_token_from_keychain() is not None
 
 
-@unittest.skipUnless(_claude_available() and _keychain_token_available(),
-                     "needs `claude` on PATH and a usable Keychain OAuth token")
+@unittest.skipUnless(
+    _claude_available() and _keychain_token_available(),
+    "needs `claude` on PATH and a usable Keychain OAuth token",
+)
 class FunctionalEscapeBlockingTests(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -59,16 +62,29 @@ class FunctionalEscapeBlockingTests(unittest.TestCase):
         env["CLAUDE_CODE_OAUTH_TOKEN"] = claude_runner.oauth_token_from_keychain()
 
         cmd = [
-            "claude", "-p", prompt,
-            "--output-format", "stream-json", "--verbose",
-            "--model", "claude-sonnet-4-6",
-            "--permission-mode", "bypassPermissions",  # match production
-            "--settings", str(self.run_dir / ".claude" / "settings.json"),
-            "--setting-sources", "project,local,user",
+            "claude",
+            "-p",
+            prompt,
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--model",
+            "claude-sonnet-4-6",
+            "--permission-mode",
+            "bypassPermissions",  # match production
+            "--settings",
+            str(self.run_dir / ".claude" / "settings.json"),
+            "--setting-sources",
+            "project,local,user",
         ]
         proc = subprocess.run(
-            cmd, cwd=str(self.run_dir), env=env, stdin=subprocess.DEVNULL,
-            capture_output=True, text=True, timeout=120,
+            cmd,
+            cwd=str(self.run_dir),
+            env=env,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=120,
         )
         last = next((ln for ln in reversed(proc.stdout.splitlines()) if ln.strip()), "")
         try:
@@ -76,22 +92,33 @@ class FunctionalEscapeBlockingTests(unittest.TestCase):
         except json.JSONDecodeError:
             self.fail(f"no parseable result line.\nstdout tail:\n{proc.stdout[-2000:]}")
 
-        bash_cmds = [d.get("tool_input", {}).get("command", "")
-                     for d in (summary.get("permission_denials") or [])
-                     if d.get("tool_name") == "Bash"]
+        bash_cmds = [
+            d.get("tool_input", {}).get("command", "")
+            for d in (summary.get("permission_denials") or [])
+            if d.get("tool_name") == "Bash"
+        ]
 
-        self.assertTrue(any(c.startswith("cat ") and f"{home}/.zshrc" in c for c in bash_cmds),
-                        f"T1 (cat $HOME/.zshrc) not denied; bash_cmds={bash_cmds}")
-        self.assertTrue(any(c.startswith("cat ") and f"{home}/.ssh" in c for c in bash_cmds),
-                        f"T2 (cat .ssh contents) not denied; bash_cmds={bash_cmds}")
-        self.assertTrue(any("cd .." in c for c in bash_cmds),
-                        f"T3 (cd ..) not denied; bash_cmds={bash_cmds}")
-        self.assertTrue(any(c.startswith("ls ") and f"{home}/.aws" in c for c in bash_cmds),
-                        f"T4 (ls .aws) not denied; bash_cmds={bash_cmds}")
+        self.assertTrue(
+            any(c.startswith("cat ") and f"{home}/.zshrc" in c for c in bash_cmds),
+            f"T1 (cat $HOME/.zshrc) not denied; bash_cmds={bash_cmds}",
+        )
+        self.assertTrue(
+            any(c.startswith("cat ") and f"{home}/.ssh" in c for c in bash_cmds),
+            f"T2 (cat .ssh contents) not denied; bash_cmds={bash_cmds}",
+        )
+        self.assertTrue(
+            any("cd .." in c for c in bash_cmds), f"T3 (cd ..) not denied; bash_cmds={bash_cmds}"
+        )
+        self.assertTrue(
+            any(c.startswith("ls ") and f"{home}/.aws" in c for c in bash_cmds),
+            f"T4 (ls .aws) not denied; bash_cmds={bash_cmds}",
+        )
 
 
-@unittest.skipUnless(_claude_available() and _keychain_token_available(),
-                     "needs `claude` on PATH and a usable Keychain OAuth token")
+@unittest.skipUnless(
+    _claude_available() and _keychain_token_available(),
+    "needs `claude` on PATH and a usable Keychain OAuth token",
+)
 class AgentCanDoItsThingTests(unittest.TestCase):
     """End-to-end: the agent's boundary is its run dir AND every
     capability it needs (python imports, data reads, submission writes) is
@@ -106,16 +133,17 @@ class AgentCanDoItsThingTests(unittest.TestCase):
     def setUp(self):
         # Put the boundary under the testbed's results/ so it sits where
         # production agents actually run from.
-        self.run_dir = (claude_runner.TESTBED_ROOT
-                        / "results" / "_eng_can_do_its_thing")
+        self.run_dir = claude_runner.TESTBED_ROOT / "results" / "_eng_can_do_its_thing"
         if self.run_dir.exists():
             import shutil as _s
+
             _s.rmtree(self.run_dir)
         self.run_dir.mkdir(parents=True)
 
         # Materialize a minimal venv inside the boundary (instant via APFS
         # clone of the base venv).
         from mlpab import runner as runner_mod
+
         runner_mod._make_venv(self.run_dir / "venv")
 
         # Pretend-data: a small CSV the agent is supposed to read.
@@ -127,6 +155,7 @@ class AgentCanDoItsThingTests(unittest.TestCase):
 
     def tearDown(self):
         import shutil as _s
+
         _s.rmtree(self.run_dir, ignore_errors=True)
 
     def test_agent_can_write_inside_boundary(self):
@@ -142,16 +171,29 @@ class AgentCanDoItsThingTests(unittest.TestCase):
         env.pop("ANTHROPIC_API_KEY", None)
         env["CLAUDE_CODE_OAUTH_TOKEN"] = claude_runner.oauth_token_from_keychain()
         cmd = [
-            "claude", "-p", prompt,
-            "--output-format", "stream-json", "--verbose",
-            "--model", "claude-sonnet-4-6",
-            "--permission-mode", "bypassPermissions",
-            "--settings", str(self.run_dir / ".claude" / "settings.json"),
-            "--setting-sources", "project,local,user",
+            "claude",
+            "-p",
+            prompt,
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--model",
+            "claude-sonnet-4-6",
+            "--permission-mode",
+            "bypassPermissions",
+            "--settings",
+            str(self.run_dir / ".claude" / "settings.json"),
+            "--setting-sources",
+            "project,local,user",
         ]
         proc = subprocess.run(
-            cmd, cwd=str(self.run_dir), env=env, stdin=subprocess.DEVNULL,
-            capture_output=True, text=True, timeout=120,
+            cmd,
+            cwd=str(self.run_dir),
+            env=env,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=120,
         )
         target = self.run_dir / "submission.txt"
         self.assertTrue(

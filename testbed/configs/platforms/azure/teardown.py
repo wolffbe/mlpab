@@ -9,6 +9,7 @@ are platform plumbing setup.py guarantees, not agent state).
 resource type leaks billable Azure resources (managed online endpoints in
 particular run a VM continuously).
 """
+
 from __future__ import annotations
 
 import os
@@ -17,6 +18,7 @@ import os
 def _ml(*, workspace: str | None = None, feature_store: str | None = None):
     from azure.ai.ml import MLClient
     from azure.identity import DefaultAzureCredential
+
     cred = DefaultAzureCredential()
     sub = os.environ["AZURE_SUBSCRIPTION_ID"]
     rg = os.environ["AZURE_RESOURCE_GROUP"]
@@ -52,29 +54,56 @@ def main() -> None:
         print(f"[azure teardown] no workspace client: {e}")
         return
     # cost order: serving first (a live endpoint bills continuously)
-    _sweep("online-endpoint", lambda: ws.online_endpoints.list(),
-           lambda n: ws.online_endpoints.begin_delete(n))
-    _sweep("batch-endpoint", lambda: ws.batch_endpoints.list(),
-           lambda n: ws.batch_endpoints.begin_delete(n))
+    _sweep(
+        "online-endpoint",
+        lambda: ws.online_endpoints.list(),
+        lambda n: ws.online_endpoints.begin_delete(n),
+    )
+    _sweep(
+        "batch-endpoint",
+        lambda: ws.batch_endpoints.list(),
+        lambda n: ws.batch_endpoints.begin_delete(n),
+    )
     # Compute clusters/instances bill continuously while provisioned (a training
     # job's compute target the agent created) — delete them right after serving.
-    _sweep("compute", lambda: ws.compute.list(),
-           lambda n: ws.compute.begin_delete(name=n))
-    _sweep("job", lambda: ws.jobs.list(),
-           lambda n: ws.jobs.begin_cancel(n))
-    _sweep("model", lambda: ws.models.list(),
-           lambda n: ws.models.archive(name=n))
-    _sweep("data-asset", lambda: ws.data.list(),
-           lambda n: ws.data.archive(name=n))
+    _sweep("compute", lambda: ws.compute.list(), lambda n: ws.compute.begin_delete(name=n))
+    _sweep("job", lambda: ws.jobs.list(), lambda n: ws.jobs.begin_cancel(n))
+    _sweep("model", lambda: ws.models.list(), lambda n: ws.models.archive(name=n))
+    _sweep("data-asset", lambda: ws.data.list(), lambda n: ws.data.archive(name=n))
     fs = os.environ.get("AZUREML_FEATURE_STORE_NAME")
     if fs:
         try:
             fsc = _ml(feature_store=fs)
-            _sweep("feature-set", lambda: fsc.feature_sets.list(),
-                   lambda n: fsc.feature_sets.archive(name=n))
+            _sweep(
+                "feature-set",
+                lambda: fsc.feature_sets.list(),
+                lambda n: fsc.feature_sets.archive(name=n),
+            )
         except Exception as e:
             print(f"[azure teardown] feature-store sweep skipped: {e}")
 
 
+def verify() -> int:
+    """Twofold teardown check (`teardown.py verify`): (1) Azure ML CONNECTS, then
+    (2) no billed online/batch ENDPOINTS survive (a managed online endpoint runs
+    a VM continuously). Exit non-zero on no-connection or a leak; the runner
+    WARNS on a leak. Read-only, best-effort."""
+    try:
+        ws = _ml(workspace=os.environ.get("AZUREML_WORKSPACE_NAME"))
+        online = [getattr(e, "name", "?") for e in ws.online_endpoints.list()]
+        batch = [getattr(e, "name", "?") for e in ws.batch_endpoints.list()]
+    except Exception as e:
+        print(f"[azure verify-teardown] NO CONNECTION: {e}")
+        return 1
+    leaks = [f"online-endpoint {n!r}" for n in online] + [f"batch-endpoint {n!r}" for n in batch]
+    if leaks:
+        print("[azure verify-teardown] LEAKS remain:\n  - " + "\n  - ".join(leaks))
+        return 1
+    print("[azure verify-teardown] OK: connected; no endpoints remain")
+    return 0
+
+
 if __name__ == "__main__":
-    main()
+    import sys
+
+    sys.exit(verify() if sys.argv[1:2] == ["verify"] else (main() or 0))

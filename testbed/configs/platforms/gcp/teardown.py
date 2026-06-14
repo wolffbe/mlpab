@@ -9,6 +9,7 @@ jobs → registered models → feature groups → the BigQuery dataset's TABLES
 ⚠ LIVE-VALIDATION REQUIRED before any real run — missed the platform endpoints / index
 endpoints bill continuously.
 """
+
 from __future__ import annotations
 
 import importlib
@@ -54,22 +55,29 @@ def main() -> None:
         return
     try:
         from google.cloud import aiplatform
+
         aiplatform.init(project=project, location=location)
     except Exception as e:
         print(f"[gcp teardown] aiplatform init skipped: {e}")
         aiplatform = None
 
     if aiplatform is not None:
+
         def _undeploy_delete(ep):
             try:
                 ep.undeploy_all()
             except Exception:
                 pass
             ep.delete(force=True)
+
         _sweep("endpoint", aiplatform.Endpoint.list, _undeploy_delete)
-        _sweep("index-endpoint", aiplatform.MatchingEngineIndexEndpoint.list,
-               lambda e: _undeploy_delete(e))
+        _sweep(
+            "index-endpoint",
+            aiplatform.MatchingEngineIndexEndpoint.list,
+            lambda e: _undeploy_delete(e),
+        )
         _sweep("vector-index", aiplatform.MatchingEngineIndex.list, lambda i: i.delete())
+
         # Feature Online Stores are Bigtable/Optimized-backed and BILL CONTINUOUSLY;
         # delete them (force removes their feature views) + the feature groups.
         # These classes are NOT top-level aiplatform attributes — they live under
@@ -81,8 +89,11 @@ def main() -> None:
                 r.delete(force=True)
             except Exception:
                 r.delete()
-        for label, attr in (("feature-online-store", "FeatureOnlineStore"),
-                            ("feature-group", "FeatureGroup")):
+
+        for label, attr in (
+            ("feature-online-store", "FeatureOnlineStore"),
+            ("feature-group", "FeatureGroup"),
+        ):
             cls = _resolve(
                 ("vertexai.resources.preview.feature_store", attr),
                 ("vertexai.resources.preview", attr),
@@ -91,21 +102,34 @@ def main() -> None:
             if cls is not None and hasattr(cls, "list"):
                 _sweep(label, cls.list, _force_del)
             else:
-                print(f"[gcp teardown] WARNING: could not resolve {attr}; "
-                      f"{label}s NOT swept and may bill continuously — verify SDK path")
-        for lister in (getattr(aiplatform, "CustomJob", None),
-                       getattr(aiplatform, "PipelineJob", None),
-                       getattr(aiplatform, "BatchPredictionJob", None)):
+                print(
+                    f"[gcp teardown] WARNING: could not resolve {attr}; "
+                    f"{label}s NOT swept and may bill continuously — verify SDK path"
+                )
+        for lister in (
+            getattr(aiplatform, "CustomJob", None),
+            getattr(aiplatform, "PipelineJob", None),
+            getattr(aiplatform, "BatchPredictionJob", None),
+        ):
             if lister is not None:
-                _sweep(lister.__name__, lister.list,
-                       lambda j: j.delete() if str(getattr(j, "state", "")).endswith(
-                           ("SUCCEEDED", "FAILED", "CANCELLED")) else None)
+                _sweep(
+                    lister.__name__,
+                    lister.list,
+                    lambda j: (
+                        j.delete()
+                        if str(getattr(j, "state", "")).endswith(
+                            ("SUCCEEDED", "FAILED", "CANCELLED")
+                        )
+                        else None
+                    ),
+                )
         _sweep("model", aiplatform.Model.list, lambda m: m.delete())
 
     # BigQuery: drop the dataset's TABLES (feature groups + training datasets),
     # keep the dataset (plumbing).
     try:
         from google.cloud import bigquery
+
         bq = bigquery.Client(project=project)
         for t in bq.list_tables(f"{project}.{dataset}"):
             try:
@@ -117,5 +141,35 @@ def main() -> None:
         print(f"[gcp teardown] BigQuery sweep skipped: {e}")
 
 
+def verify() -> int:
+    """Twofold teardown check (`teardown.py verify`): (1) Vertex AI CONNECTS,
+    then (2) no billed Vertex ENDPOINTS survive (a deployed endpoint bills
+    continuously). Exit non-zero on no-connection or a leak; the runner WARNS on
+    a leak. Read-only, best-effort."""
+    project = os.environ.get("GCP_PROJECT")
+    location = os.environ.get("GCP_LOCATION", "us-central1")
+    if not project:
+        print("[gcp verify-teardown] missing GCP_PROJECT")
+        return 1
+    try:
+        from google.cloud import aiplatform
+
+        aiplatform.init(project=project, location=location)
+        eps = [
+            getattr(e, "display_name", None) or getattr(e, "name", "?")
+            for e in aiplatform.Endpoint.list()
+        ]
+    except Exception as e:
+        print(f"[gcp verify-teardown] NO CONNECTION: {e}")
+        return 1
+    if eps:
+        print("[gcp verify-teardown] LEAKS: endpoints " + ", ".join(map(str, eps)))
+        return 1
+    print("[gcp verify-teardown] OK: connected; no endpoints remain")
+    return 0
+
+
 if __name__ == "__main__":
-    main()
+    import sys
+
+    sys.exit(verify() if sys.argv[1:2] == ["verify"] else (main() or 0))

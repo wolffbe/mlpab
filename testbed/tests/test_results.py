@@ -1,4 +1,5 @@
 """Tests for the results table: session ids, legacy rollups, the row schema."""
+
 import csv
 import json
 import multiprocessing
@@ -14,10 +15,18 @@ def _append_bench_row(csv_path: str, i: int) -> None:
     """Module-level worker for the concurrent-append test (spawn-picklable)."""
     row = results.Row(
         started_at=f"2026-06-10T00:00:{i:02d}+00:00",
-        run="", version="", platform="hopsworks", interface="cli", skills="none",
-        category="img", task="c1",
-        asserts_passed=3, asserts_total=4,
-        wall_time_s=1.0, total_tokens=10, cost_usd=0.1,
+        run="",
+        version="",
+        platform="hopsworks",
+        interface="cli",
+        skills="none",
+        category="img",
+        task="c1",
+        asserts_passed=3,
+        asserts_total=4,
+        wall_time_s=1.0,
+        total_tokens=10,
+        cost_usd=0.1,
         run_dir=f"/tmp/run-{i}",
     )
     results.append(Path(csv_path), row, fields=results.RESULTS_FIELDS)
@@ -69,11 +78,11 @@ class NextSessionIdTests(unittest.TestCase):
 
     def test_counts_leading_int_of_combo_folders(self):
         d = Path(tempfile.mkdtemp())
-        (d / "0").mkdir()                                   # pure-int session dir
-        (d / "1_hopsworks_cli_no_skills").mkdir()            # combo folder
-        (d / "1_hopsworks_sdk_no_skills").mkdir()            # same session 1
+        (d / "0").mkdir()  # pure-int session dir
+        (d / "1_hopsworks_cli_no_skills").mkdir()  # combo folder
+        (d / "1_hopsworks_sdk_no_skills").mkdir()  # same session 1
         (d / "notes").mkdir()
-        (d / "results.csv").write_text("hdr\n")             # file, ignored
+        (d / "results.csv").write_text("hdr\n")  # file, ignored
         self.assertEqual(results.next_session_id(d), "2")
 
 
@@ -94,11 +103,18 @@ class RollUpResultsTests(unittest.TestCase):
                 for task in ("a", "b"):
                     row = {k: "" for k in fields}
                     row.update(
-                        task=task, platform="hopsworks",
-                        interface=iface, skills="none", n=1,
-                        asserts_passed=passed, asserts_total=4,
-                        wall_time_s=100, total_tokens=5000, cost_usd=0.5,
-                        interface_calls=calls, python_calls=1,
+                        task=task,
+                        platform="hopsworks",
+                        interface=iface,
+                        skills="none",
+                        n=1,
+                        asserts_passed=passed,
+                        asserts_total=4,
+                        wall_time_s=100,
+                        total_tokens=5000,
+                        cost_usd=0.5,
+                        interface_calls=calls,
+                        python_calls=1,
                     )
                     w.writerow(row)
 
@@ -172,21 +188,31 @@ class RollUpResultsTests(unittest.TestCase):
         # run_dir is missing from the global table.
         root = Path(tempfile.mkdtemp())
         parent = root / "runs"
-        base = dict(task="a", platform="hopsworks",
-                    interface="cli", skills="none", asserts_passed=4,
-                    asserts_total=4)
+        base = dict(
+            task="a",
+            platform="hopsworks",
+            interface="cli",
+            skills="none",
+            asserts_passed=4,
+            asserts_total=4,
+        )
         out = parent / "results.csv"
-        self._write_csv(out, [
-            {**base, "run_dir": "/runs/a/1", "n": 1},   # also in leaf
-            {**base, "run_dir": "/runs/a/2", "n": 2},   # global-only
-        ])
-        self._write_csv(parent / "rq1" / "results.csv", [
-            {**base, "run_dir": "/runs/a/1", "n": 1},   # dup → skipped
-            {**base, "run_dir": "/runs/a/0", "n": 1},   # legacy → added
-        ])
+        self._write_csv(
+            out,
+            [
+                {**base, "run_dir": "/runs/a/1", "n": 1},  # also in leaf
+                {**base, "run_dir": "/runs/a/2", "n": 2},  # global-only
+            ],
+        )
+        self._write_csv(
+            parent / "rq1" / "results.csv",
+            [
+                {**base, "run_dir": "/runs/a/1", "n": 1},  # dup → skipped
+                {**base, "run_dir": "/runs/a/0", "n": 1},  # legacy → added
+            ],
+        )
         rows = results.roll_up_results(parent, out)
-        self.assertEqual([r["run_dir"] for r in rows],
-                         ["/runs/a/1", "/runs/a/2", "/runs/a/0"])
+        self.assertEqual([r["run_dir"] for r in rows], ["/runs/a/1", "/runs/a/2", "/runs/a/0"])
         # `n` re-numbered across the merged whole, same identity counts up.
         self.assertEqual([r["n"] for r in rows], [1, 2, 3])
         with open(out) as f:
@@ -196,11 +222,15 @@ class RollUpResultsTests(unittest.TestCase):
         # Re-running the merge (every session start) must not duplicate rows.
         root = Path(tempfile.mkdtemp())
         parent = root / "runs"
-        base = dict(task="a", platform="hopsworks",
-                    interface="cli", skills="none", asserts_passed=4,
-                    asserts_total=4)
-        self._write_csv(parent / "rq1" / "results.csv",
-                        [{**base, "run_dir": "/runs/a/1", "n": 1}])
+        base = dict(
+            task="a",
+            platform="hopsworks",
+            interface="cli",
+            skills="none",
+            asserts_passed=4,
+            asserts_total=4,
+        )
+        self._write_csv(parent / "rq1" / "results.csv", [{**base, "run_dir": "/runs/a/1", "n": 1}])
         out = parent / "results.csv"
         results.roll_up_results(parent, out)
         rows = results.roll_up_results(parent, out)
@@ -212,13 +242,19 @@ class RollUpResultsTests(unittest.TestCase):
         # rows it added THIS pass, not just against the pre-existing global.
         root = Path(tempfile.mkdtemp())
         parent = root / "runs"
-        base = dict(task="a", platform="hopsworks",
-                    interface="cli", skills="none", asserts_passed=4,
-                    asserts_total=4)
+        base = dict(
+            task="a",
+            platform="hopsworks",
+            interface="cli",
+            skills="none",
+            asserts_passed=4,
+            asserts_total=4,
+        )
         row = {**base, "run_dir": "/runs/a/1", "n": 1}
-        self._write_csv(parent / "rq1" / "results.csv", [row])           # old rollup
-        self._write_csv(parent / "rq1" / "hopsworks" / "cli" / "no-skills"
-                        / "results.csv", [row])                          # old leaf
+        self._write_csv(parent / "rq1" / "results.csv", [row])  # old rollup
+        self._write_csv(
+            parent / "rq1" / "hopsworks" / "cli" / "no-skills" / "results.csv", [row]
+        )  # old leaf
         out = parent / "results.csv"
         rows = results.roll_up_results(parent, out)
         self.assertEqual(len(rows), 1)
@@ -236,11 +272,15 @@ class RollUpResultsTests(unittest.TestCase):
             w = csv.DictWriter(f, fieldnames=["combo", "dir", "avg_score"])
             w.writeheader()
             w.writerow({"combo": "hopsworks_cli", "dir": "rq1", "avg_score": 0.5})
-        base = dict(task="a", platform="hopsworks",
-                    interface="cli", skills="none", asserts_passed=4,
-                    asserts_total=4)
-        self._write_csv(parent / "rq1" / "results.csv",
-                        [{**base, "run_dir": "/runs/a/1", "n": 1}])
+        base = dict(
+            task="a",
+            platform="hopsworks",
+            interface="cli",
+            skills="none",
+            asserts_passed=4,
+            asserts_total=4,
+        )
+        self._write_csv(parent / "rq1" / "results.csv", [{**base, "run_dir": "/runs/a/1", "n": 1}])
         rows = results.roll_up_results(parent, out)
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["run_dir"], "/runs/a/1")
@@ -253,18 +293,39 @@ class RollUpResultsTests(unittest.TestCase):
         parent = root / "runs"
         leaf = parent / "rq1" / "results.csv"
         leaf.parent.mkdir(parents=True)
-        old_fields = ["config", "model", "platform", "interface", "version",
-                      "skills", "task", "legacy_sub_task", "n", "started_at",
-                      "legacy_valid", "legacy_score", "wall_time_s",
-                      "run_dir"]
+        old_fields = [
+            "config",
+            "model",
+            "platform",
+            "interface",
+            "version",
+            "skills",
+            "task",
+            "legacy_sub_task",
+            "n",
+            "started_at",
+            "legacy_valid",
+            "legacy_score",
+            "wall_time_s",
+            "run_dir",
+        ]
         with open(leaf, "w", newline="") as f:
             w = csv.DictWriter(f, fieldnames=old_fields)
             w.writeheader()
-            w.writerow({"platform": "hopsworks", "interface": "cli",
-                        "skills": "none", "task": "feature",
-                        "legacy_sub_task": "drift", "n": 1, "legacy_valid": 1,
-                        "legacy_score": 0.5, "wall_time_s": 10,
-                        "run_dir": "/runs/legacy/1"})
+            w.writerow(
+                {
+                    "platform": "hopsworks",
+                    "interface": "cli",
+                    "skills": "none",
+                    "task": "feature",
+                    "legacy_sub_task": "drift",
+                    "n": 1,
+                    "legacy_valid": 1,
+                    "legacy_score": 0.5,
+                    "wall_time_s": 10,
+                    "run_dir": "/runs/legacy/1",
+                }
+            )
         out = parent / "results.csv"
         rows = results.roll_up_results(parent, out)
         self.assertEqual(len(rows), 1)
@@ -280,10 +341,15 @@ class AppendRepeatNumberTests(unittest.TestCase):
     def _row(self, run_dir, asserts_passed=2):
         return results.Row(
             started_at="2026-06-10T00:00:00+00:00",
-            run="rq1", version="",
-            platform="hopsworks", interface="cli", skills="none",
-            category="t", task="a",
-            asserts_passed=asserts_passed, asserts_total=4,
+            run="rq1",
+            version="",
+            platform="hopsworks",
+            interface="cli",
+            skills="none",
+            category="t",
+            task="a",
+            asserts_passed=asserts_passed,
+            asserts_total=4,
             run_dir=run_dir,
         )
 
@@ -293,10 +359,8 @@ class AppendRepeatNumberTests(unittest.TestCase):
         # n=3 and lose n=1.
         out = Path(tempfile.mkdtemp()) / "results.csv"
         for i in (1, 2, 3):
-            results.append(out, self._row(f"/runs/a/{i}"),
-                           fields=results.RESULTS_FIELDS)
-        results.append(out, self._row("/runs/a/1", asserts_passed=4),
-                       fields=results.RESULTS_FIELDS)
+            results.append(out, self._row(f"/runs/a/{i}"), fields=results.RESULTS_FIELDS)
+        results.append(out, self._row("/runs/a/1", asserts_passed=4), fields=results.RESULTS_FIELDS)
         with open(out) as f:
             rows = list(csv.DictReader(f))
         self.assertEqual(sorted(int(r["n"]) for r in rows), [1, 2, 3])
@@ -314,20 +378,26 @@ class RowSchemaTests(unittest.TestCase):
         # then metrics; `run_dir` last.
         self.assertEqual(
             results.RESULTS_FIELDS[:8],
-            ["config", "model", "platform", "interface", "version", "skills",
-             "category", "task"],
+            ["config", "model", "platform", "interface", "version", "skills", "category", "task"],
         )
         self.assertEqual(results.RESULTS_FIELDS[8:10], ["n", "started_at"])
         # Grading outcome (valid/success) then the assertion-suite tallies.
-        self.assertEqual(results.RESULTS_FIELDS[10:14],
-                         ["valid", "success", "asserts_passed", "asserts_total"])
+        self.assertEqual(
+            results.RESULTS_FIELDS[10:14], ["valid", "success", "asserts_passed", "asserts_total"]
+        )
         self.assertEqual(results.RESULTS_FIELDS[-1], "run_dir")
         # The legacy schema (and its annotation columns) is gone entirely.
         self.assertFalse(hasattr(results, "FIELDS"))
-        for dropped in ("hypothesis", "change", "verdict", "verdict_reason",
-                        "keep", "observations", "proposed_changes"):
-            self.assertNotIn(dropped, results.RESULTS_FIELDS,
-                             f"{dropped!r} should be gone")
+        for dropped in (
+            "hypothesis",
+            "change",
+            "verdict",
+            "verdict_reason",
+            "keep",
+            "observations",
+            "proposed_changes",
+        ):
+            self.assertNotIn(dropped, results.RESULTS_FIELDS, f"{dropped!r} should be gone")
             self.assertFalse(hasattr(results.Row, dropped))
 
     def test_append_round_trip(self):
@@ -337,12 +407,20 @@ class RowSchemaTests(unittest.TestCase):
         out = Path(tempfile.mkdtemp()) / "results.csv"
         row = results.Row(
             started_at="2026-05-28T00:00:00+00:00",
-            run="rq1", version="",
-            platform="hopsworks", interface="cli", skills="none",
-            category="image_classification", task="aerial",
-            interface_ref="v2", model="claude-sonnet-4-6",
-            asserts_passed=3, asserts_total=4,
-            wall_time_s=12.3, total_tokens=100, cost_usd=0.4,
+            run="rq1",
+            version="",
+            platform="hopsworks",
+            interface="cli",
+            skills="none",
+            category="image_classification",
+            task="aerial",
+            interface_ref="v2",
+            model="claude-sonnet-4-6",
+            asserts_passed=3,
+            asserts_total=4,
+            wall_time_s=12.3,
+            total_tokens=100,
+            cost_usd=0.4,
             run_dir=str(out.parent / "a"),
         )
         results.append(out, row)
@@ -369,32 +447,53 @@ class RowSchemaTests(unittest.TestCase):
         # The results CSV uses plain metric names. The cli/mcp/sdk triple
         # collapses into `interface_calls` (off-interface remainder folds into
         # bash_calls); endpoint columns drop (no endpoint policy configured).
-        for dropped in ("run",
-                        "cli_calls", "mcp_calls", "sdk_calls",
-                        "whitelist_hits", "blacklist_hits"):
-            self.assertNotIn(dropped, results.RESULTS_FIELDS,
-                             f"RESULTS_FIELDS should drop {dropped!r}")
-        for kept in ("started_at", "version", "n", "task",
-                     "wall_time_s", "rate_limit_wait_s",
-                     "input_tokens", "output_tokens", "total_tokens", "cost_usd",
-                     "asserts_passed", "asserts_total",
-                     "interface_calls", "python_calls", "bash_calls",
-                     "run_dir"):
-            self.assertIn(kept, results.RESULTS_FIELDS,
-                          f"RESULTS_FIELDS should keep {kept!r}")
+        for dropped in (
+            "run",
+            "cli_calls",
+            "mcp_calls",
+            "sdk_calls",
+            "whitelist_hits",
+            "blacklist_hits",
+        ):
+            self.assertNotIn(
+                dropped, results.RESULTS_FIELDS, f"RESULTS_FIELDS should drop {dropped!r}"
+            )
+        for kept in (
+            "started_at",
+            "version",
+            "n",
+            "task",
+            "wall_time_s",
+            "rate_limit_wait_s",
+            "input_tokens",
+            "output_tokens",
+            "total_tokens",
+            "cost_usd",
+            "asserts_passed",
+            "asserts_total",
+            "interface_calls",
+            "python_calls",
+            "bash_calls",
+            "run_dir",
+        ):
+            self.assertIn(kept, results.RESULTS_FIELDS, f"RESULTS_FIELDS should keep {kept!r}")
 
     def test_results_view_interface_calls_and_bash_fold(self):
         # cli row: interface_calls = its cli_calls; off-interface mcp attempts
         # fold into bash_calls (cli/mcp that is NOT the interface = bash).
-        raw = dict(interface="cli", cli_calls=7, mcp_calls=2, sdk_calls=0,
-                   bash_calls=5, python_calls=3)
+        raw = dict(
+            interface="cli", cli_calls=7, mcp_calls=2, sdk_calls=0, bash_calls=5, python_calls=3
+        )
         view = results._results_view(raw)
         self.assertEqual(view["interface_calls"], "7")
-        self.assertEqual(view["bash_calls"], "7")   # 5 bash + 2 off-interface mcp
+        self.assertEqual(view["bash_calls"], "7")  # 5 bash + 2 off-interface mcp
         self.assertEqual(view["python_calls"], 3)
         # sdk row: interface_calls = sdk_calls.
-        view = results._results_view(dict(interface="sdk", cli_calls=0, mcp_calls=0,
-                                            sdk_calls=9, bash_calls=1, python_calls=2))
+        view = results._results_view(
+            dict(
+                interface="sdk", cli_calls=0, mcp_calls=0, sdk_calls=9, bash_calls=1, python_calls=2
+            )
+        )
         self.assertEqual(view["interface_calls"], "9")
         self.assertEqual(view["bash_calls"], "1")
 
@@ -402,10 +501,18 @@ class RowSchemaTests(unittest.TestCase):
         # Row metric fields and the results CSV columns share plain names.
         row = results.Row(
             started_at="2026-05-28T00:00:00+00:00",
-            run="", version="", platform="i", interface="t", skills="none",
-            category="img", task="c1",
-            asserts_passed=2, asserts_total=4,
-            wall_time_s=10.0, total_tokens=100, cost_usd=0.5,
+            run="",
+            version="",
+            platform="i",
+            interface="t",
+            skills="none",
+            category="img",
+            task="c1",
+            asserts_passed=2,
+            asserts_total=4,
+            wall_time_s=10.0,
+            total_tokens=100,
+            cost_usd=0.5,
             run_dir="/tmp/x",
         )
         out = Path(tempfile.mkdtemp()) / "results.csv"
@@ -427,8 +534,7 @@ class ConcurrentAppendTests(unittest.TestCase):
         out = Path(tempfile.mkdtemp()) / "results.csv"
         n_procs = 8
         ctx = multiprocessing.get_context("spawn")
-        procs = [ctx.Process(target=_append_bench_row, args=(str(out), i))
-                 for i in range(n_procs)]
+        procs = [ctx.Process(target=_append_bench_row, args=(str(out), i)) for i in range(n_procs)]
         for p in procs:
             p.start()
         for p in procs:
@@ -437,15 +543,14 @@ class ConcurrentAppendTests(unittest.TestCase):
         with open(out) as f:
             rows = list(csv.DictReader(f))
         self.assertEqual(len(rows), n_procs)
-        self.assertEqual({r["run_dir"] for r in rows},
-                         {f"/tmp/run-{i}" for i in range(n_procs)})
-        self.assertEqual(sorted(int(r["n"]) for r in rows),
-                         list(range(1, n_procs + 1)))
+        self.assertEqual({r["run_dir"] for r in rows}, {f"/tmp/run-{i}" for i in range(n_procs)})
+        self.assertEqual(sorted(int(r["n"]) for r in rows), list(range(1, n_procs + 1)))
 
 
 class CommandClassificationTests(unittest.TestCase):
     def _transcript(self, *blocks):
         import json
+
         p = Path(tempfile.mkdtemp()) / "transcript.jsonl"
         p.write_text(json.dumps({"type": "assistant", "message": {"content": list(blocks)}}) + "\n")
         return p
@@ -476,7 +581,7 @@ class CommandClassificationTests(unittest.TestCase):
         counts = results.aggregate_commands(tr)
         self.assertEqual(counts["read_calls"], 2)
         self.assertEqual(counts["write_calls"], 1)
-        self.assertEqual(counts["edit_calls"], 2)   # Edit + NotebookEdit
+        self.assertEqual(counts["edit_calls"], 2)  # Edit + NotebookEdit
         self.assertEqual(counts["glob_calls"], 1)
         self.assertEqual(counts["grep_calls"], 1)
         self.assertEqual(counts["todo_calls"], 1)
@@ -489,6 +594,7 @@ class CommandClassificationTests(unittest.TestCase):
             {"type": "tool_use", "name": "Bash", "input": {"command": "hops fg create"}},
         )
         import json
+
         with open(tr, "a") as f:
             for content, is_err in (
                 ("DENIED: local python is off-interface in 'cli' mode.", True),
@@ -496,9 +602,19 @@ class CommandClassificationTests(unittest.TestCase):
                 ("error: unknown flag --primary-key", True),
                 ("ok", False),
             ):
-                f.write(json.dumps({"type": "user", "message": {"content": [
-                    {"type": "tool_result", "is_error": is_err, "content": content}
-                ]}}) + "\n")
+                f.write(
+                    json.dumps(
+                        {
+                            "type": "user",
+                            "message": {
+                                "content": [
+                                    {"type": "tool_result", "is_error": is_err, "content": content}
+                                ]
+                            },
+                        }
+                    )
+                    + "\n"
+                )
         counts = results.aggregate_commands(tr)
         self.assertEqual(counts["denied_calls"], 1)
         self.assertEqual(counts["failed_commands"], 2)
@@ -507,8 +623,11 @@ class CommandClassificationTests(unittest.TestCase):
         # `BASE=/x; python train.py` — first token is the env assignment,
         # second segment runs python. Should count as python_calls.
         tr = self._transcript(
-            {"type": "tool_use", "name": "Bash",
-             "input": {"command": "BASE=/tmp/x\ncd $BASE\npython train.py --epochs 5"}},
+            {
+                "type": "tool_use",
+                "name": "Bash",
+                "input": {"command": "BASE=/tmp/x\ncd $BASE\npython train.py --epochs 5"},
+            },
         )
         counts = results.aggregate_commands(tr)
         self.assertEqual(counts["python_calls"], 1)
@@ -517,8 +636,11 @@ class CommandClassificationTests(unittest.TestCase):
     def test_python_after_env_var_prefix_counts_as_python(self):
         # `FOO=bar python script.py` — env-var prefix style.
         tr = self._transcript(
-            {"type": "tool_use", "name": "Bash",
-             "input": {"command": "PYTHONPATH=/x python -m train"}},
+            {
+                "type": "tool_use",
+                "name": "Bash",
+                "input": {"command": "PYTHONPATH=/x python -m train"},
+            },
         )
         counts = results.aggregate_commands(tr)
         self.assertEqual(counts["python_calls"], 1)
@@ -526,16 +648,18 @@ class CommandClassificationTests(unittest.TestCase):
     def test_python_in_bash_dash_c_counts_as_python(self):
         # `bash -c "python train.py"` — recursion into the inner script.
         tr = self._transcript(
-            {"type": "tool_use", "name": "Bash",
-             "input": {"command": "bash -c 'python train.py'"}},
+            {"type": "tool_use", "name": "Bash", "input": {"command": "bash -c 'python train.py'"}},
         )
         counts = results.aggregate_commands(tr)
         self.assertEqual(counts["python_calls"], 1)
 
     def test_pure_shell_still_counts_as_bash(self):
         tr = self._transcript(
-            {"type": "tool_use", "name": "Bash",
-             "input": {"command": "ls -la /tmp && cat /etc/hostname"}},
+            {
+                "type": "tool_use",
+                "name": "Bash",
+                "input": {"command": "ls -la /tmp && cat /etc/hostname"},
+            },
         )
         counts = results.aggregate_commands(tr)
         self.assertEqual(counts["bash_calls"], 1)
@@ -545,8 +669,7 @@ class CommandClassificationTests(unittest.TestCase):
         # `find . -name '*.py'` shouldn't be counted as a python invocation —
         # *.py here is an argument to find, not an executable.
         tr = self._transcript(
-            {"type": "tool_use", "name": "Bash",
-             "input": {"command": "find . -name '*.py'"}},
+            {"type": "tool_use", "name": "Bash", "input": {"command": "find . -name '*.py'"}},
         )
         counts = results.aggregate_commands(tr)
         self.assertEqual(counts["bash_calls"], 1)
@@ -556,8 +679,11 @@ class CommandClassificationTests(unittest.TestCase):
         # When BOTH cli and python appear, cli takes priority (interface use
         # is the primary intent we're optimising for).
         tr = self._transcript(
-            {"type": "tool_use", "name": "Bash",
-             "input": {"command": "hops fit data && python eval.py"}},
+            {
+                "type": "tool_use",
+                "name": "Bash",
+                "input": {"command": "hops fit data && python eval.py"},
+            },
         )
         counts = results.aggregate_commands(tr, cli_binary="hops")
         self.assertEqual(counts["cli_calls"], 1)
@@ -567,17 +693,33 @@ class CommandClassificationTests(unittest.TestCase):
         # `cli_subcommand` is a comma-joined allowlist: every allowed service of
         # the binary counts as an interface call; others fall through to bash.
         tr = self._transcript(
-            {"type": "tool_use", "name": "Bash",
-             "input": {"command": "aws sagemaker list-training-jobs"}},
-            {"type": "tool_use", "name": "Bash",
-             "input": {"command": "aws s3 cp data s3://bkt/data --recursive"}},
-            {"type": "tool_use", "name": "Bash",
-             "input": {"command": "aws sagemaker-runtime invoke-endpoint --endpoint-name e o.json"}},
-            {"type": "tool_use", "name": "Bash",
-             "input": {"command": "aws ec2 describe-instances"}},
+            {
+                "type": "tool_use",
+                "name": "Bash",
+                "input": {"command": "aws sagemaker list-training-jobs"},
+            },
+            {
+                "type": "tool_use",
+                "name": "Bash",
+                "input": {"command": "aws s3 cp data s3://bkt/data --recursive"},
+            },
+            {
+                "type": "tool_use",
+                "name": "Bash",
+                "input": {
+                    "command": "aws sagemaker-runtime invoke-endpoint --endpoint-name e o.json"
+                },
+            },
+            {
+                "type": "tool_use",
+                "name": "Bash",
+                "input": {"command": "aws ec2 describe-instances"},
+            },
         )
         counts = results.aggregate_commands(
-            tr, cli_binary="aws", cli_subcommand="sagemaker,sagemaker-runtime,s3",
+            tr,
+            cli_binary="aws",
+            cli_subcommand="sagemaker,sagemaker-runtime,s3",
         )
         self.assertEqual(counts["cli_calls"], 3)
         self.assertEqual(counts["bash_calls"], 1)
@@ -587,11 +729,13 @@ class CommandClassificationTests(unittest.TestCase):
         # service match must sit in an EXEC-position segment, mirroring the
         # no-subcommand branch.
         tr = self._transcript(
-            {"type": "tool_use", "name": "Bash",
-             "input": {"command": "echo aws sagemaker create-training-job"}},
+            {
+                "type": "tool_use",
+                "name": "Bash",
+                "input": {"command": "echo aws sagemaker create-training-job"},
+            },
         )
-        counts = results.aggregate_commands(
-            tr, cli_binary="aws", cli_subcommand="sagemaker,s3")
+        counts = results.aggregate_commands(tr, cli_binary="aws", cli_subcommand="sagemaker,s3")
         self.assertEqual(counts["cli_calls"], 0)
         self.assertEqual(counts["bash_calls"], 1)
 
@@ -600,13 +744,18 @@ class CommandClassificationTests(unittest.TestCase):
         # don't hide the entrypoint (`aws --region x sagemaker …` is cli), and
         # an option value equal to an allowed service legitimizes nothing.
         tr = self._transcript(
-            {"type": "tool_use", "name": "Bash",
-             "input": {"command": "aws --region us-east-1 sagemaker list-models"}},
-            {"type": "tool_use", "name": "Bash",
-             "input": {"command": "aws --profile sagemaker ec2 describe-instances"}},
+            {
+                "type": "tool_use",
+                "name": "Bash",
+                "input": {"command": "aws --region us-east-1 sagemaker list-models"},
+            },
+            {
+                "type": "tool_use",
+                "name": "Bash",
+                "input": {"command": "aws --profile sagemaker ec2 describe-instances"},
+            },
         )
-        counts = results.aggregate_commands(
-            tr, cli_binary="aws", cli_subcommand="sagemaker,s3")
+        counts = results.aggregate_commands(tr, cli_binary="aws", cli_subcommand="sagemaker,s3")
         self.assertEqual(counts["cli_calls"], 1)
         self.assertEqual(counts["bash_calls"], 1)
 
@@ -615,6 +764,7 @@ class CommandClassificationTests(unittest.TestCase):
         # are FAILURES, not hook denials; the hook marker sits at line start
         # (optionally bulleted by Claude Code's blocked-by-hook formatting).
         import json
+
         tr = self._transcript(
             {"type": "tool_use", "name": "Bash", "input": {"command": "ls"}},
         )
@@ -623,9 +773,19 @@ class CommandClassificationTests(unittest.TestCase):
                 "grpc error: PERMISSION_DENIED: caller lacks permission",
                 "PreToolUse:Bash blocked by hook:\n- DENIED: local python is off-interface",
             ):
-                f.write(json.dumps({"type": "user", "message": {"content": [
-                    {"type": "tool_result", "is_error": True, "content": content}
-                ]}}) + "\n")
+                f.write(
+                    json.dumps(
+                        {
+                            "type": "user",
+                            "message": {
+                                "content": [
+                                    {"type": "tool_result", "is_error": True, "content": content}
+                                ]
+                            },
+                        }
+                    )
+                    + "\n"
+                )
         counts = results.aggregate_commands(tr)
         self.assertEqual(counts["denied_calls"], 1)
         self.assertEqual(counts["failed_commands"], 1)
@@ -635,6 +795,7 @@ class CommandClassificationTests(unittest.TestCase):
         # records are the source of truth: echoed DENIED text in tool results
         # cannot inflate denied_calls, and the remaining errors are failures.
         import json
+
         tr = self._transcript(
             {"type": "tool_use", "name": "Bash", "input": {"command": "ls"}},
         )
@@ -644,16 +805,33 @@ class CommandClassificationTests(unittest.TestCase):
                 "DENIED: looks like a denial but the hook never logged it",  # echo
                 "Traceback (most recent call last): boom",
             ):
-                f.write(json.dumps({"type": "user", "message": {"content": [
-                    {"type": "tool_result", "is_error": True, "content": content}
-                ]}}) + "\n")
+                f.write(
+                    json.dumps(
+                        {
+                            "type": "user",
+                            "message": {
+                                "content": [
+                                    {"type": "tool_result", "is_error": True, "content": content}
+                                ]
+                            },
+                        }
+                    )
+                    + "\n"
+                )
         log = tr.parent / "commands.jsonl"
         log.write_text(
-            json.dumps({"tool_name": "Bash", "category": "bash",
-                        "tool_input": {"command": "ls"}}) + "\n"
-            + json.dumps({"tool_name": "Bash", "category": "python", "denied": True,
-                          "reason": "DENIED: local python is off-interface",
-                          "tool_input": {"command": "python x.py"}}) + "\n"
+            json.dumps({"tool_name": "Bash", "category": "bash", "tool_input": {"command": "ls"}})
+            + "\n"
+            + json.dumps(
+                {
+                    "tool_name": "Bash",
+                    "category": "python",
+                    "denied": True,
+                    "reason": "DENIED: local python is off-interface",
+                    "tool_input": {"command": "python x.py"},
+                }
+            )
+            + "\n"
         )
         counts = results.aggregate_commands(tr, commands_log=log)
         self.assertEqual(counts["denied_calls"], 1)
@@ -663,14 +841,22 @@ class CommandClassificationTests(unittest.TestCase):
         # The rebuild from the transcript must not erase the hook's structured
         # denial records — they are the denied_calls source of truth.
         import json
+
         tr = self._transcript(
             {"type": "tool_use", "name": "Bash", "input": {"command": "ls"}},
         )
         log = tr.parent / "commands.jsonl"
         log.write_text(
-            json.dumps({"tool_name": "Bash", "category": "python", "denied": True,
-                        "reason": "DENIED: local python is off-interface",
-                        "tool_input": {"command": "python x.py"}}) + "\n"
+            json.dumps(
+                {
+                    "tool_name": "Bash",
+                    "category": "python",
+                    "denied": True,
+                    "reason": "DENIED: local python is off-interface",
+                    "tool_input": {"command": "python x.py"},
+                }
+            )
+            + "\n"
         )
         results.write_commands_log(tr, log)
         recs = [json.loads(l) for l in log.read_text().splitlines() if l.strip()]
@@ -703,16 +889,29 @@ class CollectClientLogsTests(unittest.TestCase):
 
     def test_mcp_startup_crash_is_surfaced(self):
         import json
+
         run_dir = self._run_dir()
         boundary = run_dir  # HOME == run dir
         self._mcp_log(
-            boundary, run_dir, "hopsworks",
-            json.dumps("Server stderr: Traceback (most recent call last):\n  RuntimeError: Login failed"),
-            json.dumps({"timestamp": "T", "debug": "Connection failed after 2749ms: MCP error -32000: Connection closed"}),
+            boundary,
+            run_dir,
+            "hopsworks",
+            json.dumps(
+                "Server stderr: Traceback (most recent call last):\n  RuntimeError: Login failed"
+            ),
+            json.dumps(
+                {
+                    "timestamp": "T",
+                    "debug": "Connection failed after 2749ms: MCP error -32000: Connection closed",
+                }
+            ),
         )
         res = results.collect_client_logs(
-            run_dir=run_dir, boundary=boundary, interface="mcp",
-            platform="hopsworks", mcp_servers={"hopsworks": {}},
+            run_dir=run_dir,
+            boundary=boundary,
+            interface="mcp",
+            platform="hopsworks",
+            mcp_servers={"hopsworks": {}},
             transcript_path=run_dir / "missing.jsonl",
         )
         self.assertTrue(res["crashed"])
@@ -727,14 +926,31 @@ class CollectClientLogsTests(unittest.TestCase):
         run_dir = self._run_dir()
         tr = self._transcript(
             run_dir,
-            {"type": "user", "message": {"content": [
-                {"type": "tool_result", "is_error": True,
-                 "content": [{"type": "text", "text": "Traceback (most recent call last):\n  hsfs.client.exceptions.RestAPIError: boom"}]},
-            ]}},
+            {
+                "type": "user",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "is_error": True,
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": "Traceback (most recent call last):\n  hsfs.client.exceptions.RestAPIError: boom",
+                                }
+                            ],
+                        },
+                    ]
+                },
+            },
         )
         res = results.collect_client_logs(
-            run_dir=run_dir, boundary=run_dir, interface="sdk",
-            platform="hopsworks", mcp_servers=None, transcript_path=tr,
+            run_dir=run_dir,
+            boundary=run_dir,
+            interface="sdk",
+            platform="hopsworks",
+            mcp_servers=None,
+            transcript_path=tr,
         )
         self.assertTrue(res["crashed"])
         text = Path(res["path"]).read_text()
@@ -745,13 +961,25 @@ class CollectClientLogsTests(unittest.TestCase):
         run_dir = self._run_dir()
         tr = self._transcript(
             run_dir,
-            {"type": "user", "message": {"content": [
-                {"type": "tool_result", "content": [{"type": "text", "text": "ok, project created"}]},
-            ]}},
+            {
+                "type": "user",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "content": [{"type": "text", "text": "ok, project created"}],
+                        },
+                    ]
+                },
+            },
         )
         res = results.collect_client_logs(
-            run_dir=run_dir, boundary=run_dir, interface="mcp",
-            platform="hopsworks", mcp_servers={"hopsworks": {}}, transcript_path=tr,
+            run_dir=run_dir,
+            boundary=run_dir,
+            interface="mcp",
+            platform="hopsworks",
+            mcp_servers={"hopsworks": {}},
+            transcript_path=tr,
         )
         self.assertFalse(res["crashed"])
         self.assertTrue(Path(res["path"]).exists())
@@ -760,8 +988,12 @@ class CollectClientLogsTests(unittest.TestCase):
     def test_none_interface_skips_collection(self):
         run_dir = self._run_dir()
         res = results.collect_client_logs(
-            run_dir=run_dir, boundary=run_dir, interface="none",
-            platform="none", mcp_servers=None, transcript_path=None,
+            run_dir=run_dir,
+            boundary=run_dir,
+            interface="none",
+            platform="none",
+            mcp_servers=None,
+            transcript_path=None,
         )
         self.assertFalse(res["crashed"])
         self.assertFalse(Path(res["path"]).exists())
@@ -773,25 +1005,33 @@ class ToolTimerTests(unittest.TestCase):
 
     def _timer(self, ticks):
         from mlpab import claude_runner
+
         it = iter(ticks)
         return claude_runner.ToolTimer(clock=lambda: next(it))
 
     @staticmethod
     def _use(tid, name, **inp):
-        return json.dumps({"type": "assistant", "message": {"content": [
-            {"type": "tool_use", "id": tid, "name": name, "input": inp}]}})
+        return json.dumps(
+            {
+                "type": "assistant",
+                "message": {
+                    "content": [{"type": "tool_use", "id": tid, "name": name, "input": inp}]
+                },
+            }
+        )
 
     @staticmethod
     def _result(tid):
-        return json.dumps({"type": "user", "message": {"content": [
-            {"type": "tool_result", "tool_use_id": tid}]}})
+        return json.dumps(
+            {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": tid}]}}
+        )
 
     def test_spans_measure_tool_use_to_tool_result(self):
         t = self._timer([0.0, 5.0, 6.0, 8.5])
-        t.observe(self._use("a", "Bash", command="hops fg list"))   # t=0
-        t.observe(self._result("a"))                                 # t=5
-        t.observe(self._use("b", "Read", file_path="x.csv"))         # t=6
-        t.observe(self._result("b"))                                 # t=8.5
+        t.observe(self._use("a", "Bash", command="hops fg list"))  # t=0
+        t.observe(self._result("a"))  # t=5
+        t.observe(self._use("b", "Read", file_path="x.csv"))  # t=6
+        t.observe(self._result("b"))  # t=8.5
         spans = t.finalize()
         self.assertEqual([s["seconds"] for s in spans], [5.0, 2.5])
         self.assertEqual(spans[0]["tool_name"], "Bash")
@@ -800,8 +1040,8 @@ class ToolTimerTests(unittest.TestCase):
         # A `result` event ends one attempt; the rate-limit sleep that follows
         # must not inflate a span left open by a kill/error.
         t = self._timer([0.0, 3.0])
-        t.observe(self._use("a", "Bash", command="sleep 999"))       # t=0
-        t.observe(json.dumps({"type": "result"}))                    # t=3
+        t.observe(self._use("a", "Bash", command="sleep 999"))  # t=0
+        t.observe(json.dumps({"type": "result"}))  # t=3
         spans = t.finalize()
         self.assertEqual(len(spans), 1)
         self.assertEqual(spans[0]["seconds"], 3.0)
@@ -809,7 +1049,7 @@ class ToolTimerTests(unittest.TestCase):
     def test_finalize_closes_span_open_at_process_death(self):
         t = self._timer([0.0, 7.0])
         t.observe(self._use("a", "Bash", command="aws sagemaker wait"))
-        spans = t.finalize()                                          # t=7
+        spans = t.finalize()  # t=7
         self.assertEqual(spans[0]["seconds"], 7.0)
 
     def test_platform_tool_time_counts_only_the_interface_under_test(self):
@@ -825,14 +1065,18 @@ class ToolTimerTests(unittest.TestCase):
 
     def test_platform_tool_time_sdk_python(self):
         spans = [
-            {"tool_name": "Bash",
-             "tool_input": {"command": "python -c 'import hopsworks; hopsworks.login()'"},
-             "seconds": 4.0},
-            {"tool_name": "Bash",
-             "tool_input": {"command": "python -c 'print(1)'"}, "seconds": 3.0},
+            {
+                "tool_name": "Bash",
+                "tool_input": {"command": "python -c 'import hopsworks; hopsworks.login()'"},
+                "seconds": 4.0,
+            },
+            {
+                "tool_name": "Bash",
+                "tool_input": {"command": "python -c 'print(1)'"},
+                "seconds": 3.0,
+            },
         ]
-        self.assertEqual(
-            results.platform_tool_time(spans, sdk_module="hopsworks"), 4.0)
+        self.assertEqual(results.platform_tool_time(spans, sdk_module="hopsworks"), 4.0)
 
 
 if __name__ == "__main__":

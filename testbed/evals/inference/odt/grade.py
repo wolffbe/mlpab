@@ -1,6 +1,7 @@
 """On-demand transformation task — grader: the standard table suite over the
 scored-requests table (truth.json `table_name`) read back through the
 platform (or --csv locally)."""
+
 from __future__ import annotations
 
 import sys

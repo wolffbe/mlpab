@@ -19,6 +19,7 @@ SDKs imported lazily so this module imports without azure-ai-ml installed.
 CLI (for live probing):
     python -m evals.adapters.azure describe-fg --name transactions --version 1
 """
+
 from __future__ import annotations
 
 import argparse
@@ -51,15 +52,17 @@ class AzureMLChecker:
         except Exception:
             return None
         feats = getattr(fset, "features", None) or []
-        schema = {f.name: str(getattr(f, "type", getattr(f, "data_type", "")))
-                  for f in feats}
+        schema = {f.name: str(getattr(f, "type", getattr(f, "data_type", ""))) for f in feats}
         spec = getattr(fset, "specification", None)
-        pk = list(getattr(fset, "index_columns", None)
-                  or getattr(spec, "index_columns", None) or [])
-        event = getattr(spec, "source_timestamp_column", None) \
-            or getattr(fset, "timestamp_column", None)
-        return TableInfo(name=name, version=int(version or 1),
-                         primary_key=pk, event_time=event, schema=schema)
+        pk = list(
+            getattr(fset, "index_columns", None) or getattr(spec, "index_columns", None) or []
+        )
+        event = getattr(spec, "source_timestamp_column", None) or getattr(
+            fset, "timestamp_column", None
+        )
+        return TableInfo(
+            name=name, version=int(version or 1), primary_key=pk, event_time=event, schema=schema
+        )
 
     def read_rows(self, name: str, version: int | None = None) -> pd.DataFrame:
         """Best-effort, NO-SPARK: resolve the backing parquet of the registered
@@ -71,7 +74,8 @@ class AzureMLChecker:
         except Exception as e:
             raise LookupError(
                 f"could not read feature data {name!r} v{version} on Azure ML "
-                f"(no-Spark offline read is convention-based — see adapter doc): {e}")
+                f"(no-Spark offline read is convention-based — see adapter doc): {e}"
+            )
 
     def read_training_dataset(self, name: str, version: int = 1) -> pd.DataFrame:
         for n, v in ((f"{name}_v{version}", "1"), (name, str(version)), (name, "1")):
@@ -81,16 +85,19 @@ class AzureMLChecker:
             except Exception:
                 continue
         raise LookupError(
-            f"training dataset {name!r} v{version} not found as an Azure ML Data asset")
+            f"training dataset {name!r} v{version} not found as an Azure ML Data asset"
+        )
 
 
 def _read_uri(uri: str, cred) -> pd.DataFrame:
     """Read CSV/Parquet behind an abfss:// or https:// ADLS data-asset path."""
     import pyarrow.dataset as ds
+
     storage_options = {"anon": False}
     # adlfs understands abfss:// with a DefaultAzureCredential-derived token.
     if uri.startswith(("abfss://", "az://", "azureml://")):
         import adlfs  # noqa: F401 — registers the fsspec handler
+
         storage_options = {"credential": cred}
     # Don't guess from a substring: a registered data-asset folder URI carries
     # no extension (azureml://.../paths/<guid>) yet is almost always parquet, so
@@ -123,7 +130,7 @@ def _state_reads(cls):
         try:
             m = self._ws.models.get(name=name, version=str(version))
         except Exception:
-            try:                                   # latest if the version differs
+            try:  # latest if the version differs
                 ms = list(self._ws.models.list(name=name))
                 if not ms:
                     return {"exists": False}
@@ -132,10 +139,12 @@ def _state_reads(cls):
                 return {"exists": False, "error": str(e)}
         props = dict(getattr(m, "properties", None) or {})
         tags = dict(getattr(m, "tags", None) or {})
-        metrics = {k: v for k, v in {**props, **tags}.items()
-                   if any(t in k.lower() for t in ("metric", "auc", "rmse", "acc", "loss"))}
-        return {"exists": True, "version": getattr(m, "version", None),
-                "metrics": metrics or None}
+        metrics = {
+            k: v
+            for k, v in {**props, **tags}.items()
+            if any(t in k.lower() for t in ("metric", "auc", "rmse", "acc", "loss"))
+        }
+        return {"exists": True, "version": getattr(m, "version", None), "metrics": metrics or None}
 
     def get_job(self, name: str) -> dict:
         try:
@@ -147,16 +156,22 @@ def _state_reads(cls):
             scheduled = any(name in (s.name or "") for s in self._ws.schedules.list())
         except Exception:
             pass
-        return {"exists": True, "last_run_state": str(getattr(j, "status", "")),
-                "scheduled": scheduled, "kind": getattr(j, "type", None)}
+        return {
+            "exists": True,
+            "last_run_state": str(getattr(j, "status", "")),
+            "scheduled": scheduled,
+            "kind": getattr(j, "type", None),
+        }
 
     def get_endpoint(self, name: str) -> dict:
         for getter in ("online_endpoints", "batch_endpoints"):
             try:
                 e = getattr(self._ws, getter).get(name)
-                return {"exists": True,
-                        "status": str(getattr(e, "provisioning_state", "") or ""),
-                        "kind": getter}
+                return {
+                    "exists": True,
+                    "status": str(getattr(e, "provisioning_state", "") or ""),
+                    "kind": getter,
+                }
             except Exception:
                 continue
         return {"exists": False}
@@ -166,11 +181,15 @@ def _state_reads(cls):
         whose name matches; best-effort (needs the mgmt SDK + Monitoring Reader)."""
         try:
             from azure.mgmt.monitor import MonitorManagementClient
+
             sub = os.environ["AZURE_SUBSCRIPTION_ID"]
             rg = os.environ["AZURE_RESOURCE_GROUP"]
             mon = MonitorManagementClient(self._cred, sub)
-            hits = [r.name for r in mon.metric_alerts.list_by_resource_group(rg)
-                    if name_or_hint in (r.name or "")]
+            hits = [
+                r.name
+                for r in mon.metric_alerts.list_by_resource_group(rg)
+                if name_or_hint in (r.name or "")
+            ]
             return {"exists": bool(hits), "count": len(hits), "matches": hits}
         except Exception as e:
             return {"exists": False, "error": str(e)}
@@ -178,8 +197,11 @@ def _state_reads(cls):
     def get_vector_store(self, name: str) -> dict:
         """Azure ML has no native vector store; Azure AI Search is a SEPARATE
         service off the Azure ML interface (asymmetry documented like SageMaker)."""
-        return {"exists": False, "native_ann": False,
-                "note": "Azure AI Search is off the Azure ML interface"}
+        return {
+            "exists": False,
+            "native_ann": False,
+            "note": "Azure AI Search is off the Azure ML interface",
+        }
 
     cls.get_model = get_model
     cls.get_job = get_job
@@ -196,17 +218,23 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("describe-fg")
-    p.add_argument("--name", required=True); p.add_argument("--version", type=int, default=1)
+    p.add_argument("--name", required=True)
+    p.add_argument("--version", type=int, default=1)
     p = sub.add_parser("read-fg")
-    p.add_argument("--name", required=True); p.add_argument("--version", type=int, default=1)
+    p.add_argument("--name", required=True)
+    p.add_argument("--version", type=int, default=1)
     p.add_argument("--out", type=Path, required=True)
     args = ap.parse_args(argv)
     ck = AzureMLChecker()
     if args.cmd == "describe-fg":
         info = ck.get_feature_table(args.name, args.version)
-        print(json.dumps({"exists": info is not None,
-                          **(info.__dict__ if info else {"name": args.name})},
-                         default=str, indent=2))
+        print(
+            json.dumps(
+                {"exists": info is not None, **(info.__dict__ if info else {"name": args.name})},
+                default=str,
+                indent=2,
+            )
+        )
         return 0 if info else 1
     ck.read_rows(args.name, args.version).to_csv(args.out, index=False)
     print(f"wrote {args.out}")

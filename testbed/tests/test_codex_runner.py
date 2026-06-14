@@ -1,6 +1,7 @@
 """Tests for the Codex agent engine: model routing, raw-event normalization
 into the Claude-style transcript (so the existing accounting pipeline works
 unchanged), and the per-run config.toml writer."""
+
 import json
 import tempfile
 import unittest
@@ -36,16 +37,20 @@ class NormalizeTests(unittest.TestCase):
         return [
             {"type": "thread.started", "thread_id": "t-1"},
             {"type": "turn.started"},
-            {"type": "item.completed",
-             "item": {"item_type": "command_execution", "command": "hops fg create --name x"}},
-            {"type": "item.completed",
-             "item": {"item_type": "command_execution", "command": "python train.py"}},
-            {"type": "item.completed",
-             "item": {"item_type": "mcp_tool_call", "server": "hopsworks", "tool": "create_fg"}},
-            {"type": "item.completed",
-             "item": {"item_type": "file_change"}},
-            {"type": "item.completed",
-             "item": {"item_type": "agent_message", "text": "done"}},
+            {
+                "type": "item.completed",
+                "item": {"item_type": "command_execution", "command": "hops fg create --name x"},
+            },
+            {
+                "type": "item.completed",
+                "item": {"item_type": "command_execution", "command": "python train.py"},
+            },
+            {
+                "type": "item.completed",
+                "item": {"item_type": "mcp_tool_call", "server": "hopsworks", "tool": "create_fg"},
+            },
+            {"type": "item.completed", "item": {"item_type": "file_change"}},
+            {"type": "item.completed", "item": {"item_type": "agent_message", "text": "done"}},
             {"type": "turn.completed", "usage": {"input_tokens": 100, "output_tokens": 40}},
             {"type": "turn.completed", "usage": {"input_tokens": 250, "output_tokens": 60}},
         ]
@@ -63,12 +68,14 @@ class NormalizeTests(unittest.TestCase):
         _write_events(self.raw, self._events())
         codex_runner.normalize_events(self.raw, self.transcript)
         counts = results.aggregate_commands(
-            self.transcript, cli_binary="hops", run_dir=self.dir,
+            self.transcript,
+            cli_binary="hops",
+            run_dir=self.dir,
         )
-        self.assertEqual(counts["cli_calls"], 1)      # hops fg create
-        self.assertEqual(counts["python_calls"], 1)   # python train.py
-        self.assertEqual(counts["mcp_calls"], 1)      # mcp__hopsworks__create_fg
-        self.assertEqual(counts["edit_calls"], 1)        # file_change → Edit
+        self.assertEqual(counts["cli_calls"], 1)  # hops fg create
+        self.assertEqual(counts["python_calls"], 1)  # python train.py
+        self.assertEqual(counts["mcp_calls"], 1)  # mcp__hopsworks__create_fg
+        self.assertEqual(counts["edit_calls"], 1)  # file_change → Edit
 
     def test_agent_message_not_a_tool_call(self):
         _write_events(self.raw, self._events())
@@ -87,31 +94,59 @@ class NormalizeTests(unittest.TestCase):
         # Non-zero exit_code on a command_execution → an errored tool_result in
         # the normalized transcript → failed_commands. Codex has no hook, so
         # denied_calls stays 0.
-        _write_events(self.raw, [
-            {"type": "item.completed",
-             "item": {"item_type": "command_execution", "command": "hops bad", "exit_code": 1}},
-            {"type": "item.completed",
-             "item": {"item_type": "command_execution", "command": "hops ok", "exit_code": 0}},
-            {"type": "turn.completed", "usage": {"input_tokens": 1, "output_tokens": 1}},
-        ])
+        _write_events(
+            self.raw,
+            [
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "item_type": "command_execution",
+                        "command": "hops bad",
+                        "exit_code": 1,
+                    },
+                },
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "item_type": "command_execution",
+                        "command": "hops ok",
+                        "exit_code": 0,
+                    },
+                },
+                {"type": "turn.completed", "usage": {"input_tokens": 1, "output_tokens": 1}},
+            ],
+        )
         codex_runner.normalize_events(self.raw, self.transcript)
         counts = results.aggregate_commands(self.transcript, cli_binary="hops", run_dir=self.dir)
         self.assertEqual(counts["failed_commands"], 1)
         self.assertEqual(counts["denied_calls"], 0)
-        self.assertEqual(counts["cli_calls"], 2)   # attempts still counted
+        self.assertEqual(counts["cli_calls"], 2)  # attempts still counted
 
     def test_subcommand_entrypoint_accounting(self):
         # `aws sagemaker …` counts as cli; `aws s3 …` does not.
-        _write_events(self.raw, [
-            {"type": "item.completed",
-             "item": {"item_type": "command_execution", "command": "aws sagemaker list-models"}},
-            {"type": "item.completed",
-             "item": {"item_type": "command_execution", "command": "aws s3 ls"}},
-            {"type": "turn.completed", "usage": {"input_tokens": 1, "output_tokens": 1}},
-        ])
+        _write_events(
+            self.raw,
+            [
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "item_type": "command_execution",
+                        "command": "aws sagemaker list-models",
+                    },
+                },
+                {
+                    "type": "item.completed",
+                    "item": {"item_type": "command_execution", "command": "aws s3 ls"},
+                },
+                {"type": "turn.completed", "usage": {"input_tokens": 1, "output_tokens": 1}},
+            ],
+        )
         codex_runner.normalize_events(self.raw, self.transcript)
         counts = results.aggregate_commands(
-            self.transcript, cli_binary="aws", cli_subcommand="sagemaker", run_dir=self.dir,
+            self.transcript,
+            cli_binary="aws",
+            cli_subcommand="sagemaker",
+            run_dir=self.dir,
         )
         self.assertEqual(counts["cli_calls"], 1)
         self.assertEqual(counts["bash_calls"], 1)
@@ -122,8 +157,13 @@ class ConfigTomlTests(unittest.TestCase):
         d = Path(tempfile.mkdtemp())
         cfg = codex_runner._write_codex_config(
             d / ".codex",
-            {"hopsworks": {"command": "hopsworks-mcp",
-                           "args": ["--transport", "stdio"], "env": {}}},
+            {
+                "hopsworks": {
+                    "command": "hopsworks-mcp",
+                    "args": ["--transport", "stdio"],
+                    "env": {},
+                }
+            },
             run_dir=d,
         )
         text = cfg.read_text()

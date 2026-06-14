@@ -10,6 +10,7 @@ as a failure, since not every registry can return metrics). Adapter `none`
 Usage:
     python -m evals.training.register.grade --instance <dir> --adapter <name|none>
 """
+
 from __future__ import annotations
 
 import json
@@ -29,8 +30,7 @@ def grade_answers(instance_dir: Path, adapter: str, answers: dict | None) -> dic
     asserts: list[dict] = []
 
     def check(name, ok, detail=""):
-        asserts.append({"name": name, "passed": bool(ok),
-                        **({"detail": detail} if detail else {})})
+        asserts.append({"name": name, "passed": bool(ok), **({"detail": detail} if detail else {})})
         return bool(ok)
 
     # --- A1: answers present with matching name/version ------------------------
@@ -41,10 +41,14 @@ def grade_answers(instance_dir: Path, adapter: str, answers: dict | None) -> dic
     else:
         name_ok = str(answers.get("model_name", "")).strip() == truth["model_name"]
         ver_ok = answers.get("version") == truth["version"]
-        check("A1_answers", name_ok and ver_ok,
-              "" if name_ok and ver_ok
-              else f"expected model_name={truth['model_name']!r} version={truth['version']}, "
-                   f"got model_name={answers.get('model_name')!r} version={answers.get('version')!r}")
+        check(
+            "A1_answers",
+            name_ok and ver_ok,
+            ""
+            if name_ok and ver_ok
+            else f"expected model_name={truth['model_name']!r} version={truth['version']}, "
+            f"got model_name={answers.get('model_name')!r} version={answers.get('version')!r}",
+        )
 
     # --- A2: answers metrics == the provided metrics exactly --------------------
     a2 = False
@@ -56,17 +60,21 @@ def grade_answers(instance_dir: Path, adapter: str, answers: dict | None) -> dic
         else:
             same_keys = set(got) == set(want)
             a2 = same_keys and all(
-                isinstance(got[k], (int, float)) and float(got[k]) == float(want[k])
-                for k in want)
-            check("A2_metrics", a2,
-                  "" if a2 else "metrics differ from data/metrics.json")
+                isinstance(got[k], (int, float)) and float(got[k]) == float(want[k]) for k in want
+            )
+            check("A2_metrics", a2, "" if a2 else "metrics differ from data/metrics.json")
     else:
         check("A2_metrics", False, "no answers to compare metrics from")
 
     # --- A3: registry entry exists on the platform -------------------------------
     if adapter == "none":
-        asserts.append({"name": "A3_registry_entry", "passed": True,
-                        "detail": "no platform — registry assert skipped"})
+        asserts.append(
+            {
+                "name": "A3_registry_entry",
+                "passed": True,
+                "detail": "no platform — registry assert skipped",
+            }
+        )
     else:
         m = state_checker(adapter).get_model(truth["model_name"], truth["version"])
         ok = bool(m.get("exists"))
@@ -76,13 +84,18 @@ def grade_answers(instance_dir: Path, adapter: str, answers: dict | None) -> dic
             if isinstance(platform_metrics, dict) and platform_metrics:
                 overlap = set(platform_metrics) & set(truth["metrics"])
                 if overlap:
-                    diffs = [k for k in overlap
-                             if abs(float(platform_metrics[k]) - float(truth["metrics"][k]))
-                             > METRIC_TOL]
-                    detail = ("platform metrics match on " + ", ".join(sorted(overlap))
-                              if not diffs else
-                              "platform metrics DIFFER on " + ", ".join(sorted(diffs))
-                              + " (informative — not a failure)")
+                    diffs = [
+                        k
+                        for k in overlap
+                        if abs(float(platform_metrics[k]) - float(truth["metrics"][k])) > METRIC_TOL
+                    ]
+                    detail = (
+                        "platform metrics match on " + ", ".join(sorted(overlap))
+                        if not diffs
+                        else "platform metrics DIFFER on "
+                        + ", ".join(sorted(diffs))
+                        + " (informative — not a failure)"
+                    )
                 else:
                     detail = "platform returned metrics but none overlap the provided keys"
             else:
@@ -92,9 +105,14 @@ def grade_answers(instance_dir: Path, adapter: str, answers: dict | None) -> dic
         asserts.append({"name": "A3_registry_entry", "passed": ok, "detail": detail})
 
     success = all(a["passed"] for a in asserts)
-    return {"family": FAMILY, "seed": truth["seed"], "success": success,
-            "asserts_passed": sum(a["passed"] for a in asserts),
-            "asserts_total": len(asserts), "asserts": asserts}
+    return {
+        "family": FAMILY,
+        "seed": truth["seed"],
+        "success": success,
+        "asserts_passed": sum(a["passed"] for a in asserts),
+        "asserts_total": len(asserts),
+        "asserts": asserts,
+    }
 
 
 def grade(instance_dir: Path, adapter: str, run_dir: Path) -> dict:

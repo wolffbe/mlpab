@@ -17,6 +17,7 @@ committed reference detector recovers the onset within tolerance from the
 emitted CSV, and a wrong onset fails the grade function. Detection logic is
 self-contained (no imports from evals.ops.drift).
 """
+
 from __future__ import annotations
 
 import argparse
@@ -30,10 +31,10 @@ import pandas as pd
 
 ORIGIN = pd.Timestamp("2026-01-01", tz="UTC")
 N_DAYS = 90
-PER_DAY = 150                  # ~150 predictions/day (±20 jitter)
-ONSET_WINDOW = (45, 70)        # the shift starts in this day range
-SHIFT_SIGMAS = 4.0             # step size in units of the prediction sigma
-TOLERANCE_DAYS = 3             # |reported onset - true onset| accepted
+PER_DAY = 150  # ~150 predictions/day (±20 jitter)
+ONSET_WINDOW = (45, 70)  # the shift starts in this day range
+SHIFT_SIGMAS = 4.0  # step size in units of the prediction sigma
+TOLERANCE_DAYS = 3  # |reported onset - true onset| accepted
 
 
 def _detect(df: pd.DataFrame) -> pd.Timestamp | None:
@@ -50,7 +51,7 @@ def _detect(df: pd.DataFrame) -> pd.Timestamp | None:
     if not dev.any():
         return None
     first = dev.idxmax()
-    if dev.loc[first:].mean() <= 0.8:      # require persistence, not a fluke
+    if dev.loc[first:].mean() <= 0.8:  # require persistence, not a fluke
         return None
     return first
 
@@ -70,12 +71,15 @@ def generate(seed: int, out: Path) -> dict:
     for d in range(N_DAYS):
         day = ORIGIN + pd.Timedelta(days=d)
         n = PER_DAY + int(rng.integers(-20, 21))
-        vals = rng.normal(mu + (SHIFT_SIGMAS * sigma if d >= onset_day else 0.0),
-                          sigma, n)
+        vals = rng.normal(mu + (SHIFT_SIGMAS * sigma if d >= onset_day else 0.0), sigma, n)
         secs = np.sort(rng.integers(0, 86400, n))
         for sec, v in zip(secs, vals):
-            rows.append([(day + pd.Timedelta(seconds=int(sec))).strftime(
-                "%Y-%m-%dT%H:%M:%SZ"), round(float(v), 4)])
+            rows.append(
+                [
+                    (day + pd.Timedelta(seconds=int(sec))).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    round(float(v), 4),
+                ]
+            )
     df = pd.DataFrame(rows, columns=["ts", "prediction"])
 
     # --- gates ---------------------------------------------------------------
@@ -83,8 +87,10 @@ def generate(seed: int, out: Path) -> dict:
     if got is None:
         raise GateError(f"reference detector found no shift (seed={seed})")
     if abs((got - onset).days) > TOLERANCE_DAYS:
-        raise GateError(f"reference detector disagrees with seeded onset "
-                        f"({got.date()} vs {onset.date()}, seed={seed})")
+        raise GateError(
+            f"reference detector disagrees with seeded onset "
+            f"({got.date()} vs {onset.date()}, seed={seed})"
+        )
 
     # --- write instance --------------------------------------------------------
     if out.exists():
@@ -107,16 +113,19 @@ def generate(seed: int, out: Path) -> dict:
         '    {"onset": "YYYY-MM-DD"}\n'
     )
     truth = {
-        "family": "prediction_monitoring", "seed": seed,
+        "family": "prediction_monitoring",
+        "seed": seed,
         "onset": onset.strftime("%Y-%m-%d"),
         "tolerance_days": TOLERANCE_DAYS,
     }
     (out / "solution" / "truth.json").write_text(json.dumps(truth, indent=2))
-    (out / "instance.json").write_text(json.dumps(
-        {"family": "prediction_monitoring", "seed": seed}, indent=2))
+    (out / "instance.json").write_text(
+        json.dumps({"family": "prediction_monitoring", "seed": seed}, indent=2)
+    )
 
     # gate the grade function: detected onset passes, a far-off onset fails
     from evals.ops.prediction_monitoring.grade import grade
+
     if not grade(out, {"onset": got.strftime("%Y-%m-%d")})["success"]:
         raise GateError("reference answers fail the grade function")
     bad = (onset + pd.Timedelta(days=TOLERANCE_DAYS + 5)).strftime("%Y-%m-%d")

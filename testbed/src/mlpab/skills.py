@@ -28,6 +28,7 @@ project skills. Bundle name "none" is the without-skills control.
 
 The bundle's hash is the recursive sha256 of the resolved bundle folder.
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -38,7 +39,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import yaml
-
 
 _TESTBED_ROOT = Path(__file__).resolve().parents[2]
 CONFIGS_DIR = _TESTBED_ROOT / "configs" / "platforms"
@@ -131,14 +131,14 @@ def _fetch_repo_bundle(project: str, name: str, entry: dict) -> Path:
     try:
         subprocess.run(["git", "-C", str(src), "init", "-q"], check=True)
         subprocess.run(["git", "-C", str(src), "remote", "add", "origin", repo], check=True)
-        subprocess.run(["git", "-C", str(src), "fetch", "-q", "--depth", "1", "origin", ref],
-                       check=True)
+        subprocess.run(
+            ["git", "-C", str(src), "fetch", "-q", "--depth", "1", "origin", ref], check=True
+        )
         subprocess.run(["git", "-C", str(src), "checkout", "-q", "FETCH_HEAD"], check=True)
     except subprocess.CalledProcessError as e:
         shutil.rmtree(home, ignore_errors=True)
         raise RuntimeError(
-            f"fetch of skill bundle {name!r} for {project!r} failed "
-            f"({repo} @ {ref}): {e}"
+            f"fetch of skill bundle {name!r} for {project!r} failed ({repo} @ {ref}): {e}"
         ) from e
 
     sub = src / entry["path"] if entry.get("path") else src
@@ -199,21 +199,15 @@ def verify_installed(project: str, name: str) -> tuple[str, Path]:
     when name == 'none'."""
     variant = _bundle_dir(project, name)
     if not variant.is_dir():
-        raise ValueError(
-            f"Skill bundle {name!r} not found at {variant} "
-            f"(project {project!r})."
-        )
+        raise ValueError(f"Skill bundle {name!r} not found at {variant} (project {project!r}).")
     skill_dirs = [p for p in variant.iterdir() if p.is_dir()]
     missing_md = [p.name for p in skill_dirs if not (p / "SKILL.md").is_file()]
     if not skill_dirs:
         raise ValueError(
-            f"Skill bundle {name!r} has no skill subfolders "
-            f"({variant}/<skill-name>/SKILL.md)."
+            f"Skill bundle {name!r} has no skill subfolders ({variant}/<skill-name>/SKILL.md)."
         )
     if missing_md:
-        raise ValueError(
-            f"Skill bundle {name!r}: missing SKILL.md in: {', '.join(missing_md)}."
-        )
+        raise ValueError(f"Skill bundle {name!r}: missing SKILL.md in: {', '.join(missing_md)}.")
     return _compute_hash(variant), variant
 
 
@@ -239,6 +233,7 @@ def apply(project: str, name: str, run_dir: Path) -> SkillsSetup:
 def skill_names(project: str, name: str) -> list[str]:
     """The names Claude sees (SKILL.md `name:` frontmatter, else folder)."""
     import re
+
     _, variant = verify_installed(project, name)
     out: list[str] = []
     for d in sorted(p for p in variant.iterdir() if p.is_dir()):

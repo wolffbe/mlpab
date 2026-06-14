@@ -22,6 +22,7 @@ interface package is installed from the committed pinned wheel, so the client
 is trusted. Platform `none` (local baseline) grades the local file the prompt
 names instead.
 """
+
 from __future__ import annotations
 
 import json
@@ -47,37 +48,40 @@ from typing import Any
 #             state reads); it always receives `--adapter <platform|none>`
 FAMILIES: dict[str, tuple[str, str]] = {
     # F — feature pipelines (evals/feature/)
-    "ingest": ("feature.ingest", "table"),          # full load w/ overlap + mixed ts
-    "backfill": ("feature.backfill", "table"),      # out-of-order corrections
-    "mit": ("feature.mit", "table"),                # model-independent transforms
-    "validate": ("feature.validate", "table"),      # data contract + quarantine report
+    "ingest": ("feature.ingest", "table"),  # full load w/ overlap + mixed ts
+    "backfill": ("feature.backfill", "table"),  # out-of-order corrections
+    "mit": ("feature.mit", "table"),  # model-independent transforms
+    "validate": ("feature.validate", "table"),  # data contract + quarantine report
     "incremental_load": ("feature.incremental_load", "platform"),  # increments + recurring job
     "full_reload": ("feature.full_reload", "table"),  # schema-breaking re-create (v2)
-    "training_data": ("feature.pit", "dataset"),    # PIT-correct training dataset
-    "leakage": ("feature.leakage", "answers"),      # leaky-feature detection
+    "training_data": ("feature.pit", "dataset"),  # PIT-correct training dataset
+    "leakage": ("feature.leakage", "answers"),  # leaky-feature detection
     # T — training pipelines (evals/training/)
-    "train": ("training.train", "platform"),        # provided script as a platform job
-    "mdt": ("training.mdt", "table"),               # model-dependent transforms (train-split stats)
+    "train": ("training.train", "platform"),  # provided script as a platform job
+    "mdt": ("training.mdt", "table"),  # model-dependent transforms (train-split stats)
     "register": ("training.register", "platform"),  # model registry entry + metrics
-    "llm_finetuning": ("training.llm_finetuning", "platform"),  # LLM fine-tune as a platform job + registry entry
+    "llm_finetuning": (
+        "training.llm_finetuning",
+        "platform",
+    ),  # LLM fine-tune as a platform job + registry entry
     # I — inference pipelines (evals/inference/)
-    "batch": ("inference.batch", "table"),          # batch scoring as-of T
-    "online": ("inference.online", "platform"),     # online lookups recorded + verified
-    "odt": ("inference.odt", "table"),              # on-demand request-time feature
-    "skew": ("inference.skew", "answers"),          # training/serving skew detection
+    "batch": ("inference.batch", "table"),  # batch scoring as-of T
+    "online": ("inference.online", "platform"),  # online lookups recorded + verified
+    "odt": ("inference.odt", "table"),  # on-demand request-time feature
+    "skew": ("inference.skew", "answers"),  # training/serving skew detection
     "llm_serving": ("inference.llm_serving", "platform"),  # deploy + invoke a real-time scorer
-    "recsys": ("inference.recsys", "table"),        # top-k retrieval excl. seen
+    "recsys": ("inference.recsys", "table"),  # top-k retrieval excl. seen
     "vector_search": ("inference.vector_search", "platform"),  # native ANN/KNN top-k by L2
     # Ops — observability & operations (evals/ops/)
-    "drift": ("ops.drift", "answers"),              # data drift detection
+    "drift": ("ops.drift", "answers"),  # data drift detection
     "prediction_monitoring": ("ops.prediction_monitoring", "answers"),  # prediction drift onset
     "scheduled_jobs": ("ops.scheduled_jobs", "platform"),  # recurring heartbeat job
-    "alerting": ("ops.alerting", "platform"),       # failure alert on a failing job
-    "lineage": ("ops.lineage", "platform"),         # derivation chain + lineage answer
+    "alerting": ("ops.alerting", "platform"),  # failure alert on a failing job
+    "lineage": ("ops.lineage", "platform"),  # derivation chain + lineage answer
     # Capstone — end-to-end FTI modelling tasks (evals/capstone/); hybrid grade:
     # held-out predictive metric + on-platform FTI artifacts (feature group,
     # training dataset, registered model) read back through the adapter.
-    "ccfraud": ("capstone.ccfraud", "platform"),    # classification (fraud) — ROC AUC
+    "ccfraud": ("capstone.ccfraud", "platform"),  # classification (fraud) — ROC AUC
     "airquality": ("capstone.airquality", "platform"),  # regression (PM2.5) — RMSE
 }
 
@@ -156,8 +160,7 @@ def grade(task: str, run_dir: Path, platform: str, venv_python: Path) -> dict[st
     # sibling holds the answer key the graders read.
     run_dir = Path(run_dir).absolute()
     inst = run_dir.parent
-    cmd = [str(Path(venv_python).absolute()), "-m", f"evals.{fam}.grade",
-           "--instance", str(inst)]
+    cmd = [str(Path(venv_python).absolute()), "-m", f"evals.{fam}.grade", "--instance", str(inst)]
 
     if kind == "answers":
         cmd += ["--answers", str(Path(run_dir) / "submission" / "answers.json")]
@@ -170,31 +173,57 @@ def grade(task: str, run_dir: Path, platform: str, venv_python: Path) -> dict[st
         deliverable = meta.get("dataset_name") or meta.get("table_name")
         local = Path(run_dir) / "submission" / f"{deliverable}.csv"
         if not local.exists():
-            return {"success": False, "asserts_passed": 0, "asserts_total": 1,
-                    "asserts": [{"name": "A0_deliverable_exists", "passed": False,
-                                 "detail": f"no local deliverable at {local}"}],
-                    "error": "no deliverable produced"}
+            return {
+                "success": False,
+                "asserts_passed": 0,
+                "asserts_total": 1,
+                "asserts": [
+                    {
+                        "name": "A0_deliverable_exists",
+                        "passed": False,
+                        "detail": f"no local deliverable at {local}",
+                    }
+                ],
+                "error": "no deliverable produced",
+            }
         cmd += ["--csv", str(local)]
     else:
-        return {"success": False, "asserts_passed": 0, "asserts_total": 0,
-                "asserts": [],
-                "error": f"no checker adapter for platform {platform!r} — "
-                         f"available: {', '.join(ADAPTERS)} (+ `none` for local)"}
+        return {
+            "success": False,
+            "asserts_passed": 0,
+            "asserts_total": 0,
+            "asserts": [],
+            "error": f"no checker adapter for platform {platform!r} — "
+            f"available: {', '.join(ADAPTERS)} (+ `none` for local)",
+        }
 
     try:
         proc = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=600, cwd=str(run_dir),
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=600,
+            cwd=str(run_dir),
         )
     except Exception as e:
-        return {"success": False, "asserts_passed": 0, "asserts_total": 0,
-                "asserts": [], "error": f"grader failed to run: {e}"}
+        return {
+            "success": False,
+            "asserts_passed": 0,
+            "asserts_total": 0,
+            "asserts": [],
+            "error": f"grader failed to run: {e}",
+        }
     report = _extract_report(proc.stdout)
     if report is not None:
         return report
-    return {"success": False, "asserts_passed": 0, "asserts_total": 0,
-            "asserts": [],
-            "error": f"grader produced no report (exit {proc.returncode}): "
-                     f"{(proc.stderr or proc.stdout)[-500:]}"}
+    return {
+        "success": False,
+        "asserts_passed": 0,
+        "asserts_total": 0,
+        "asserts": [],
+        "error": f"grader produced no report (exit {proc.returncode}): "
+        f"{(proc.stderr or proc.stdout)[-500:]}",
+    }
 
 
 def _extract_report(stdout: str) -> dict[str, Any] | None:

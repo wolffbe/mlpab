@@ -6,6 +6,7 @@ columns come from the stream-json transcript's `result` event (Claude Code's
 `tool_use` block in the same transcript; asserts_passed/asserts_total from the
 assertion-suite grading report.
 """
+
 from __future__ import annotations
 
 import contextlib
@@ -175,7 +176,7 @@ _RESULTS_VIEW = {
     # The meaningful task id — the FTI sub-task (Row.task, e.g.
     # training_data/skew/drift). Row.category (the parent FTI stage) stays an
     # internal field only.
-    "category": "category",   # FTI stage: feature / training / inference / ops
+    "category": "category",  # FTI stage: feature / training / inference / ops
     "task": "task",
     # Repeat counter (derived; src None): 1 for the first execution of a given
     # (platform, interface, skills, category, task) config, 2 for its second
@@ -276,9 +277,7 @@ def confirm_overwrite(path: Path, assume_yes: bool = False) -> bool:
                 flush=True,
             )
             return False
-        resp = input(
-            f"Results dir already exists:\n  {path}\nOverwrite it? [y/N] "
-        ).strip().lower()
+        resp = input(f"Results dir already exists:\n  {path}\nOverwrite it? [y/N] ").strip().lower()
         if resp not in ("y", "yes"):
             return False
     shutil.rmtree(path)
@@ -299,9 +298,19 @@ RESULTS_SUMMARY_FIELDS = list(RESULTS_FIELDS)
 
 def _bench_identity(row: dict[str, Any]) -> tuple:
     """The config identity that `n` counts repeats of."""
-    return tuple(str(row.get(k, "")) for k in
-                 ("config", "model", "platform", "interface", "version",
-                  "skills", "task", "category"))
+    return tuple(
+        str(row.get(k, ""))
+        for k in (
+            "config",
+            "model",
+            "platform",
+            "interface",
+            "version",
+            "skills",
+            "task",
+            "category",
+        )
+    )
 
 
 def roll_up_results(parent: Path, out_csv: Path) -> list[dict[str, Any]]:
@@ -384,15 +393,15 @@ class Row:
     # UTC ISO-8601 recorded when the agent's `claude -p` started.
     started_at: str
     # Identity.
-    run: str                # the treatment config name (the `config` column
-                            # of the results CSV)
-    version: str            # raw Row field, always ""; the CSV `version`
-                            # column is sourced from `interface_ref`
-    platform: str           # platform NAME, e.g. "hopsworks" or "none"
-    interface: str          # interface: cli/mcp/sdk/none
-    skills: str             # skill bundle name or "none"
-    category: str           # FTI stage (feature/inference/ops) this task belongs to
-    task: str               # FTI sub-task (an evals_provider family)
+    run: str  # the treatment config name (the `config` column
+    # of the results CSV)
+    version: str  # raw Row field, always ""; the CSV `version`
+    # column is sourced from `interface_ref`
+    platform: str  # platform NAME, e.g. "hopsworks" or "none"
+    interface: str  # interface: cli/mcp/sdk/none
+    skills: str  # skill bundle name or "none"
+    category: str  # FTI stage (feature/inference/ops) this task belongs to
+    task: str  # FTI sub-task (an evals_provider family)
     # Interface build identity (pinned ref / version pin) — surfaced as the
     # results `version` column.
     interface_ref: str = ""
@@ -469,6 +478,7 @@ def usd_cost(model: str | None, input_tokens: int, output_tokens: int) -> float 
         cands.append("mistral/" + model)
     try:
         import litellm
+
         litellm.suppress_debug_info = True
     except Exception:
         return None
@@ -477,7 +487,8 @@ def usd_cost(model: str | None, input_tokens: int, output_tokens: int) -> float 
             continue
         try:
             pin, pout = litellm.cost_per_token(
-                model=cand, prompt_tokens=int(input_tokens), completion_tokens=int(output_tokens))
+                model=cand, prompt_tokens=int(input_tokens), completion_tokens=int(output_tokens)
+            )
             cost = round(float(pin) + float(pout), 6)
         except Exception:
             continue
@@ -498,7 +509,13 @@ def parse_transcript_usage(transcript_path: Path, model: str | None = None) -> d
     only if litellm can't price the model do we fall back to the transcript's
     own `total_cost_usd` (Claude Code reports it; codex/mistral report 0).
     """
-    totals = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "cost_usd": 0.0, "llm_calls": 0}
+    totals = {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "cost_usd": 0.0,
+        "llm_calls": 0,
+    }
     if not transcript_path.exists():
         return totals
 
@@ -563,7 +580,9 @@ def _sdk_import_pattern(module: str) -> re.Pattern[str]:
     return re.compile(rf"\b(?:import|from)\s+{m}\b|-m\s+{m}\b")
 
 
-def _command_uses_sdk(tokens: list[str], command: str, sdk_module: str, run_dir: Path | None) -> bool:
+def _command_uses_sdk(
+    tokens: list[str], command: str, sdk_module: str, run_dir: Path | None
+) -> bool:
     pattern = _sdk_import_pattern(sdk_module)
     if pattern.search(command):
         return True
@@ -621,7 +640,12 @@ def _exec_segments(tokens: list[str], depth: int = 0) -> list[list[str]]:
             i += 1
             continue  # still expecting the executable
         # bash/sh -c "..." → recurse into the quoted script body.
-        if depth < 2 and tok in ("bash", "sh", "zsh") and i + 2 < len(tokens) and tokens[i + 1] == "-c":
+        if (
+            depth < 2
+            and tok in ("bash", "sh", "zsh")
+            and i + 2 < len(tokens)
+            and tokens[i + 1] == "-c"
+        ):
             inner = tokens[i + 2]
             try:
                 inner_tokens = shlex.split(inner)
@@ -645,7 +669,9 @@ def _executable_tokens(tokens: list[str], depth: int = 0) -> list[str]:
 _TOOL_BUCKETS = {
     "Read": "read",
     "Write": "write",
-    "Edit": "edit", "MultiEdit": "edit", "NotebookEdit": "edit",
+    "Edit": "edit",
+    "MultiEdit": "edit",
+    "NotebookEdit": "edit",
     "Glob": "glob",
     "Grep": "grep",
     "TodoWrite": "todo",
@@ -692,10 +718,12 @@ def _classify_tool_use(
         return "bash"
     if not exec_tokens:
         return "bash"
+
     # Priority: cli (interface usage) > python (counts even when nested in bash) >
     # bash (pure shell utilities).
     def _is_cli(tok: str) -> bool:
         return bool(cli_binary) and (tok == cli_binary or tok.endswith(f"/{cli_binary}"))
+
     def _cli_present() -> bool:
         if not cli_binary:
             return False
@@ -709,9 +737,9 @@ def _classify_tool_use(
         # skipping global options (`aws --region us-east-1 sagemaker …`) via
         # the hook's shared parser — one rule for enforcement and counting.
         return any(
-            _is_cli(seg[0]) and _hook_cli_arg_after(seg, cli_binary) in subs
-            for seg in exec_segs
+            _is_cli(seg[0]) and _hook_cli_arg_after(seg, cli_binary) in subs for seg in exec_segs
         )
+
     if _cli_present():
         return "cli"
     if any(_is_python_first(t) for t in exec_tokens):
@@ -721,7 +749,9 @@ def _classify_tool_use(
     return "bash"
 
 
-def _parse_endpoint_patterns(patterns: list[str] | None) -> list[tuple[str, str, "re.Pattern[str]"]]:
+def _parse_endpoint_patterns(
+    patterns: list[str] | None,
+) -> list[tuple[str, str, "re.Pattern[str]"]]:
     """Parse `"<METHOD> <path-regex>"` strings into (source, method, compiled
     regex). `source` is the original string (kept for the covered/missed report);
     missing method = "any method"; unparseable entries skipped.
@@ -766,11 +796,13 @@ def _read_api_log(api_log: Path | str) -> list[tuple[str, str, str]]:
             e = json.loads(line)
         except json.JSONDecodeError:
             continue
-        rows.append((
-            str(e.get("method", "")).upper(),
-            str(e.get("path", "")),
-            str(e.get("src", "")),
-        ))
+        rows.append(
+            (
+                str(e.get("method", "")).upper(),
+                str(e.get("path", "")),
+                str(e.get("src", "")),
+            )
+        )
     return rows
 
 
@@ -803,9 +835,7 @@ def endpoint_coverage(
     rows = _read_api_log(api_log)
     # Whitelist coverage scores only calls through the interface under test (the
     # shim's `src` tag); blacklist sees every call.
-    wl_rows = [
-        (m, p) for m, p, so in rows if interface is None or so == interface
-    ]
+    wl_rows = [(m, p) for m, p, so in rows if interface is None or so == interface]
 
     def hit(method: str, rx: "re.Pattern[str]", m: str, path: str) -> bool:
         return (not method or method == m) and bool(rx.search(path))
@@ -1100,9 +1130,7 @@ def _flatten_text(content: Any) -> str:
     if isinstance(content, str):
         return content
     if isinstance(content, list):
-        return "".join(
-            b.get("text", "") for b in content if isinstance(b, dict)
-        )
+        return "".join(b.get("text", "") for b in content if isinstance(b, dict))
     return ""
 
 
@@ -1118,9 +1146,7 @@ def _mcp_server_log(caches_dir: Path, run_dir: Path, server: str) -> list[str]:
     # Cache dir is keyed on the agent's cwd (the run dir); fall back to a
     # glob so a layout change doesn't silently drop the logs.
     candidates = [caches_dir / _slug_for(run_dir) / f"mcp-logs-{server}"]
-    candidates += [
-        p for p in caches_dir.glob(f"*/mcp-logs-{server}") if p not in candidates
-    ]
+    candidates += [p for p in caches_dir.glob(f"*/mcp-logs-{server}") if p not in candidates]
     for logdir in candidates:
         if not logdir.is_dir():
             continue
@@ -1225,10 +1251,7 @@ def collect_client_logs(
 
     crashes = _transcript_crashes(transcript_path) if transcript_path else []
     if crashes:
-        sections.append(
-            "===== client errors (agent transcript) =====\n"
-            + "\n---\n".join(crashes)
-        )
+        sections.append("===== client errors (agent transcript) =====\n" + "\n---\n".join(crashes))
         body_for_scan.extend(crashes)
 
     blob = "\n".join(body_for_scan)
@@ -1237,11 +1260,11 @@ def collect_client_logs(
 
     head = (
         f"# {platform} client log ({interface} interface)\n"
-        f"# crashed={crashed}"
-        + (f"  markers={markers}" if markers else "")
-        + "\n\n"
+        f"# crashed={crashed}" + (f"  markers={markers}" if markers else "") + "\n\n"
     )
-    out_path.write_text(head + ("\n\n".join(sections) if sections else "(no client output captured)\n"))
+    out_path.write_text(
+        head + ("\n\n".join(sections) if sections else "(no client output captured)\n")
+    )
     return {"path": str(out_path), "crashed": crashed, "markers": markers}
 
 
@@ -1279,10 +1302,13 @@ def append(results_csv: Path, row: Row, fields: list[str] | None = None) -> None
             # kept rows instead would collide with a later repeat's n whenever
             # the replaced row wasn't the latest one.
             ident = _bench_identity(new_row)
-            old_n = (replaced or {}).get("n") if replaced is not None and _bench_identity(replaced) == ident else None
+            old_n = (
+                (replaced or {}).get("n")
+                if replaced is not None and _bench_identity(replaced) == ident
+                else None
+            )
             if old_n and str(old_n).isdigit():
                 new_row["n"] = int(old_n)
             else:
                 new_row["n"] = 1 + sum(1 for r in kept if _bench_identity(r) == ident)
         _write_csv_atomic(results_csv, cols, kept + [new_row])
-

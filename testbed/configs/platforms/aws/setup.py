@@ -38,6 +38,7 @@ Best-effort by design: invoked via the interface `serve:` step, whose runner
 (`_run_aux`) ignores failures and discards output. Nothing here may raise out of
 `main()` — a setup hiccup must never fail an engineer run.
 """
+
 from __future__ import annotations
 
 import json
@@ -50,11 +51,13 @@ DEFAULT_ROLE_NAME = "mlpab-sagemaker-execution-role"
 
 TRUST_POLICY = {
     "Version": "2012-10-17",
-    "Statement": [{
-        "Effect": "Allow",
-        "Principal": {"Service": "sagemaker.amazonaws.com"},
-        "Action": "sts:AssumeRole",
-    }],
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Principal": {"Service": "sagemaker.amazonaws.com"},
+            "Action": "sts:AssumeRole",
+        }
+    ],
 }
 EXECUTION_POLICY_ARN = "arn:aws:iam::aws:policy/AmazonSageMakerFullAccess"
 
@@ -149,5 +152,35 @@ def main() -> None:
         _export_for_engineer("SAGEMAKER_ROLE_ARN", role_arn)
 
 
+def verify() -> int:
+    """Twofold setup check (`setup.py verify`): (1) AWS CONNECTS (sts), then (2)
+    the default SageMaker bucket setup guarantees is PRESENT. Connection is the
+    hard gate (non-zero fails the run); the bucket is best-effort. Read-only."""
+    try:
+        import botocore.session
+    except Exception as e:
+        print(f"[sagemaker verify-setup] botocore unavailable: {e}")
+        return 1
+    session = botocore.session.get_session()
+    region = os.environ.get("AWS_REGION") or session.get_config_variable("region")
+    try:
+        account = session.create_client("sts", region_name=region).get_caller_identity()["Account"]
+    except Exception as e:
+        print(f"[sagemaker verify-setup] NO CONNECTION: {e}")
+        return 1
+    bucket = f"sagemaker-{region}-{account}"
+    try:
+        session.create_client("s3", region_name=region).head_bucket(Bucket=bucket)
+        print(f"[sagemaker verify-setup] OK: connected (acct {account}); bucket {bucket!r} present")
+    except Exception as e:
+        print(
+            f"[sagemaker verify-setup] OK: connected; bucket {bucket!r} absent "
+            f"(best-effort, not failing): {e}"
+        )
+    return 0
+
+
 if __name__ == "__main__":
-    main()
+    import sys
+
+    sys.exit(verify() if sys.argv[1:2] == ["verify"] else (main() or 0))

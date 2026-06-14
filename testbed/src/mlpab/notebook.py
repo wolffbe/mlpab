@@ -19,7 +19,9 @@ notebook transform; no AI involved.
 Notebook execution is best-effort: if execution fails we still write the
 unexecuted notebook so the user can run the cells by hand.
 """
+
 from __future__ import annotations
+
 import json
 from pathlib import Path
 from typing import Any
@@ -111,14 +113,17 @@ def build_results_notebook(
 
     # Make sure there are rows beyond the header.
     import csv as _csv
+
     with open(results_csv, newline="") as f:
         rows = list(_csv.DictReader(f))
     if not rows:
         return None
 
     import os
+
     csv_rel = os.path.relpath(results_csv, results_root)
     from mlpab import results as results_mod
+
     tracked = results_mod.RESULTS_TRACKED_METRICS
 
     # Section structure mirrors the data: config → model → metric charts.
@@ -139,14 +144,11 @@ def build_results_notebook(
             "tracked metric: one bar per `(platform, interface, version, "
             "skills)`, averaged across tasks and repeats (`n`); "
             "the dashed line is that config/model's overall average.\n\n"
-            "## Tracked metrics\n"
-            + "\n".join(f"- `{m}`" for m in tracked)
+            "## Tracked metrics\n" + "\n".join(f"- `{m}`" for m in tracked)
         ),
         new_markdown_cell("## Raw executions"),
         _setup_cell(csv_rel),
-        new_markdown_cell(
-            "## Averages per (config, model, platform, interface, version, skills)"
-        ),
+        new_markdown_cell("## Averages per (config, model, platform, interface, version, skills)"),
         _aggregate_cell(list(tracked)),
     ]
     for config in sorted(sections):
@@ -159,22 +161,32 @@ def build_results_notebook(
 
     if execute:
         import sys
-        from nbclient import NotebookClient
+
         from jupyter_client.manager import KernelManager
+        from nbclient import NotebookClient
+
         km = KernelManager()
         km.kernel_cmd = [
-            sys.executable, "-m", "ipykernel_launcher",
-            "-f", "{connection_file}",
+            sys.executable,
+            "-m",
+            "ipykernel_launcher",
+            "-f",
+            "{connection_file}",
         ]
         client = NotebookClient(
-            nb, km=km, timeout=120,
+            nb,
+            km=km,
+            timeout=120,
             resources={"metadata": {"path": str(results_root)}},
         )
         try:
             client.execute()
         except Exception as e:
-            print(f"[mlpab] pre-execution failed ({type(e).__name__}: {e}); "
-                  f"writing unexecuted notebook.", flush=True)
+            print(
+                f"[mlpab] pre-execution failed ({type(e).__name__}: {e}); "
+                f"writing unexecuted notebook.",
+                flush=True,
+            )
         finally:
             try:
                 if km.is_alive():
@@ -186,10 +198,9 @@ def build_results_notebook(
     # every run; an in-place write could leave torn JSON for a concurrent reader.
     import os
     import tempfile
+
     out_path = results_root / "results.ipynb"
-    fd, tmp_name = tempfile.mkstemp(
-        dir=str(results_root), prefix=".results.ipynb.", suffix=".tmp"
-    )
+    fd, tmp_name = tempfile.mkstemp(dir=str(results_root), prefix=".results.ipynb.", suffix=".tmp")
     try:
         with os.fdopen(fd, "w") as f:
             nbformat.write(nb, f)

@@ -1,6 +1,7 @@
 """Unit tests for the capstone FTI evals (ccfraud classification, airquality
 regression): metrics, bar calibration, generators (gates + instance shape), and
 the hybrid grader's metric/coverage asserts on the `none` platform."""
+
 import json
 import shutil
 import tempfile
@@ -22,29 +23,36 @@ class MetricTests(unittest.TestCase):
 
     def test_roc_auc_separation(self):
         y = np.array([0, 0, 1, 1])
-        self.assertEqual(common.roc_auc(y, [0.1, 0.2, 0.8, 0.9]), 1.0)   # perfect
-        self.assertEqual(common.roc_auc(y, [0.9, 0.8, 0.2, 0.1]), 0.0)   # reversed
-        self.assertEqual(common.roc_auc(y, [0.5, 0.5, 0.5, 0.5]), 0.5)   # no signal
-        self.assertTrue(np.isnan(common.roc_auc([1, 1], [0.3, 0.7])))    # single class
+        self.assertEqual(common.roc_auc(y, [0.1, 0.2, 0.8, 0.9]), 1.0)  # perfect
+        self.assertEqual(common.roc_auc(y, [0.9, 0.8, 0.2, 0.1]), 0.0)  # reversed
+        self.assertEqual(common.roc_auc(y, [0.5, 0.5, 0.5, 0.5]), 0.5)  # no signal
+        self.assertTrue(np.isnan(common.roc_auc([1, 1], [0.3, 0.7])))  # single class
 
     def test_calibrate_bar_direction(self):
         y = np.array([0, 0, 1, 1])
         # AUC: higher better -> bar between naive(0.5) and reference(1.0)
-        cau = common.calibrate_bar("auc", y, [0.5, 0.5, 0.5, 0.5],
-                                   [0.1, 0.2, 0.8, 0.9], floor=0.7, margin=0.5)
+        cau = common.calibrate_bar(
+            "auc", y, [0.5, 0.5, 0.5, 0.5], [0.1, 0.2, 0.8, 0.9], floor=0.7, margin=0.5
+        )
         self.assertTrue(cau["naive"] <= cau["bar"] <= cau["reference"])
         # RMSE: lower better -> bar between reference and naive
         yv = np.array([10.0, 20.0, 30.0, 40.0])
-        crm = common.calibrate_bar("rmse", yv, np.full(4, yv.mean()),
-                                   yv + 1.0, floor=common.rmse(yv, np.full(4, yv.mean())),
-                                   margin=0.5)
+        crm = common.calibrate_bar(
+            "rmse",
+            yv,
+            np.full(4, yv.mean()),
+            yv + 1.0,
+            floor=common.rmse(yv, np.full(4, yv.mean())),
+            margin=0.5,
+        )
         self.assertTrue(crm["reference"] <= crm["bar"] <= crm["naive"])
 
 
 class _GenMixin:
     """Shared structural checks over a generated instance."""
-    gen = None          # the generator module
-    score_file = None   # the agent-visible scoring CSV
+
+    gen = None  # the generator module
+    score_file = None  # the agent-visible scoring CSV
     label_col = None
 
     def _generate(self, seed):
@@ -72,8 +80,10 @@ class _GenMixin:
         self.assertEqual(len(labels), meta["n_test"])
 
     def test_deterministic(self):
-        a, ma = self._generate(3); self.addCleanup(shutil.rmtree, a, True)
-        b, mb = self._generate(3); self.addCleanup(shutil.rmtree, b, True)
+        a, ma = self._generate(3)
+        self.addCleanup(shutil.rmtree, a, True)
+        b, mb = self._generate(3)
+        self.addCleanup(shutil.rmtree, b, True)
         self.assertEqual(ma["bar"], mb["bar"])
         self.assertEqual(ma["record_ids"], mb["record_ids"])
 
@@ -97,9 +107,11 @@ class GradeNoneTests(unittest.TestCase):
     def _instance(self, gen):
         root = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, root, True)
-        attempt = root / "attempt"; task = attempt / "task"
+        attempt = root / "attempt"
+        task = attempt / "task"
         (task / "submission").mkdir(parents=True)
-        staging = root / "staging"; gen.generate(7, staging)
+        staging = root / "staging"
+        gen.generate(7, staging)
         shutil.move(str(staging / "data"), str(task / "data"))
         shutil.move(str(staging / "solution"), str(attempt / "solution"))
         truth = json.loads((attempt / "solution" / "truth.json").read_text())
@@ -119,11 +131,12 @@ class GradeNoneTests(unittest.TestCase):
         self._write(task, truth, good)
         rep = self._grade(attempt, task)
         self.assertTrue(rep["success"])
-        self.assertEqual(rep["asserts_total"], 3)   # A1 table, A1 coverage, A2 metric
+        self.assertEqual(rep["asserts_total"], 3)  # A1 table, A1 coverage, A2 metric
 
     def test_constant_prediction_fails_metric(self):
         attempt, task, truth, labels = self._instance(cc)
-        bad = labels[["transaction_id"]].copy(); bad["fraud_probability"] = 0.5
+        bad = labels[["transaction_id"]].copy()
+        bad["fraud_probability"] = 0.5
         self._write(task, truth, bad)
         rep = self._grade(attempt, task)
         self.assertFalse(rep["success"])
@@ -140,7 +153,7 @@ class GradeNoneTests(unittest.TestCase):
     def test_airquality_good_regression_passes(self):
         attempt, task, truth, labels = self._instance(aq)
         good = labels.rename(columns={"pm25": "pm25_pred"})
-        good["pm25_pred"] = good["pm25_pred"] + 0.5    # tiny error, well under bar
+        good["pm25_pred"] = good["pm25_pred"] + 0.5  # tiny error, well under bar
         self._write(task, truth, good)
         rep = self._grade(attempt, task)
         self.assertTrue(rep["success"])

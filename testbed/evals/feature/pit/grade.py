@@ -13,6 +13,7 @@ compares against the generator's known-wrong variants to NAME the failure:
 Usage:
     python -m evals.feature.pit.grade --instance /tmp/pit-m7 --csv produced.csv
 """
+
 from __future__ import annotations
 
 import argparse
@@ -26,10 +27,10 @@ from evals.feature.pit.generate import canonicalize, digest
 
 VARIANT_DIAGNOSIS = {
     "latest_join": "joined each account's overall-latest feature rows — values from "
-                   "AFTER label_time leaked into the training data",
+    "AFTER label_time leaked into the training data",
     "ignore_late": "the late-arriving export (transactions_late.csv) was not ingested",
     "leak_future": "PIT-correct except the leak-tempting table, whose post-label row "
-                   "was used — future information leaked into the training data",
+    "was used — future information leaked into the training data",
 }
 
 
@@ -40,7 +41,9 @@ def grade(instance_dir: Path, produced: pd.DataFrame) -> dict:
     diagnostic = None
 
     def check(name: str, ok: bool, detail: str = "") -> bool:
-        asserts.append({"name": name, "passed": bool(ok), **({"detail": detail} if detail and not ok else {})})
+        asserts.append(
+            {"name": name, "passed": bool(ok), **({"detail": detail} if detail and not ok else {})}
+        )
         return bool(ok)
 
     # A1 — column set (canonicalize would throw on missing columns; check first)
@@ -52,14 +55,20 @@ def grade(instance_dir: Path, produced: pd.DataFrame) -> dict:
     if a1:
         norm = canonicalize(produced, columns)
         # A2 — one row per label row
-        a2 = check("A2_row_count", len(norm) == truth_meta["row_count"],
-                   f"got {len(norm)}, expected {truth_meta['row_count']}")
+        a2 = check(
+            "A2_row_count",
+            len(norm) == truth_meta["row_count"],
+            f"got {len(norm)}, expected {truth_meta['row_count']}",
+        )
         # A3 — label passthrough (account_id + churned must match exactly)
         truth = pd.read_csv(instance_dir / "solution" / "truth.csv")
         truth = canonicalize(truth, columns)
         if a2:
-            a3 = check("A3_labels", norm[["account_id", "churned"]].equals(
-                truth[["account_id", "churned"]]), "account_id/churned do not match labels.csv")
+            a3 = check(
+                "A3_labels",
+                norm[["account_id", "churned"]].equals(truth[["account_id", "churned"]]),
+                "account_id/churned do not match labels.csv",
+            )
         # A4 — content
         d = digest(norm)
         a4 = check("A4_content", d == truth_meta["digest"], "content digest mismatch")
@@ -70,21 +79,26 @@ def grade(instance_dir: Path, produced: pd.DataFrame) -> dict:
                     break
             if diagnostic is None and a1 and a2:
                 # first few differing cells, for a readable report
-                neq = (norm != truth)
+                neq = norm != truth
                 bad = neq.any(axis=1)
                 examples = []
                 for idx in norm.index[bad][:3]:
                     cols_bad = [c for c in columns if neq.at[idx, c]]
-                    examples.append({
-                        "account_id": norm.at[idx, "account_id"],
-                        "columns": {c: {"got": norm.at[idx, c], "expected": truth.at[idx, c]}
-                                    for c in cols_bad},
-                    })
+                    examples.append(
+                        {
+                            "account_id": norm.at[idx, "account_id"],
+                            "columns": {
+                                c: {"got": norm.at[idx, c], "expected": truth.at[idx, c]}
+                                for c in cols_bad
+                            },
+                        }
+                    )
                 diagnostic = f"content differs on {int(bad.sum())} rows; examples: {examples}"
 
     success = a1 and a2 and a3 and a4
     return {
-        "family": "pit", "seed": truth_meta["seed"],
+        "family": "pit",
+        "seed": truth_meta["seed"],
         "success": success,
         "asserts_passed": sum(a["passed"] for a in asserts),
         "asserts_total": len(asserts),
@@ -98,9 +112,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--instance", type=Path, required=True)
     src = ap.add_mutually_exclusive_group(required=True)
     src.add_argument("--csv", type=Path, help="grade a local file (no platform)")
-    src.add_argument("--adapter", choices=["hopsworks", "databricks", "sagemaker"],
-                     help="read the deliverable back THROUGH the platform "
-                          "(name/version from the instance's truth.json)")
+    src.add_argument(
+        "--adapter",
+        choices=["hopsworks", "databricks", "sagemaker"],
+        help="read the deliverable back THROUGH the platform "
+        "(name/version from the instance's truth.json)",
+    )
     args = ap.parse_args(argv)
 
     if args.csv:
@@ -109,21 +126,27 @@ def main(argv: list[str] | None = None) -> int:
         meta = json.loads((args.instance / "solution" / "truth.json").read_text())
         if args.adapter == "hopsworks":
             from evals.adapters.hopsworks import HopsworksChecker
+
             checker = HopsworksChecker()
         elif args.adapter == "databricks":
             from evals.adapters.databricks import DatabricksChecker
+
             checker = DatabricksChecker()
         elif args.adapter == "sagemaker":
             from evals.adapters.sagemaker import SageMakerChecker
+
             checker = SageMakerChecker()
         try:
-            produced = checker.read_training_dataset(
-                meta["dataset_name"], meta["dataset_version"])
+            produced = checker.read_training_dataset(meta["dataset_name"], meta["dataset_version"])
         except LookupError as e:
-            report = {"family": meta["family"], "seed": meta["seed"],
-                      "success": False, "asserts_passed": 0, "asserts_total": 1,
-                      "asserts": [{"name": "A0_deliverable_exists", "passed": False,
-                                   "detail": str(e)}]}
+            report = {
+                "family": meta["family"],
+                "seed": meta["seed"],
+                "success": False,
+                "asserts_passed": 0,
+                "asserts_total": 1,
+                "asserts": [{"name": "A0_deliverable_exists", "passed": False, "detail": str(e)}],
+            }
             print(json.dumps(report, indent=2, default=str))
             return 1
 

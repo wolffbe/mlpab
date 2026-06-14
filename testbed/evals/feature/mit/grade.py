@@ -1,5 +1,6 @@
 """MIT (model-independent transformations) task — grader: the standard table
 suite over the derived feature table read back through the platform."""
+
 from __future__ import annotations
 
 import sys

@@ -40,6 +40,7 @@ Best-effort by design: invoked via the interface `teardown:` step, whose runner
 state-transition (e.g. an endpoint still Creating) refuse deletion; the next
 run's start-of-run sweep catches them.
 """
+
 from __future__ import annotations
 
 import os
@@ -62,8 +63,16 @@ def _list(client, op: str, result_key: str, **kwargs) -> list[dict]:
     return items
 
 
-def _sweep(client, label: str, list_op: str, result_key: str, name_key: str,
-           delete_op: str, delete_param: str, **list_kwargs) -> None:
+def _sweep(
+    client,
+    label: str,
+    list_op: str,
+    result_key: str,
+    name_key: str,
+    delete_op: str,
+    delete_param: str,
+    **list_kwargs,
+) -> None:
     """List every <name_key> and call <delete_op> on each, best-effort."""
     for item in _list(client, list_op, result_key, **list_kwargs):
         name = item.get(name_key)
@@ -162,58 +171,147 @@ def main() -> None:
         return
 
     # 1) Billed-per-hour resources first.
-    _sweep(sm, "endpoint", "list_endpoints", "Endpoints", "EndpointName",
-           "delete_endpoint", "EndpointName")
-    _sweep(sm, "mlflow server", "list_mlflow_tracking_servers", "TrackingServerSummaries",
-           "TrackingServerName", "delete_mlflow_tracking_server", "TrackingServerName")
+    _sweep(
+        sm,
+        "endpoint",
+        "list_endpoints",
+        "Endpoints",
+        "EndpointName",
+        "delete_endpoint",
+        "EndpointName",
+    )
+    _sweep(
+        sm,
+        "mlflow server",
+        "list_mlflow_tracking_servers",
+        "TrackingServerSummaries",
+        "TrackingServerName",
+        "delete_mlflow_tracking_server",
+        "TrackingServerName",
+    )
     # Notebook instances also bill per hour while InService: stop running ones,
     # delete stopped ones. Delete requires Stopped, so a just-stopped instance
     # (Stopping) is picked up by the NEXT sweep — same convergence story as an
     # endpoint mid-Creating (this runs at start AND end of every run).
-    _sweep(sm, "notebook instance", "list_notebook_instances", "NotebookInstances",
-           "NotebookInstanceName", "stop_notebook_instance", "NotebookInstanceName",
-           StatusEquals="InService")
-    _sweep(sm, "notebook instance", "list_notebook_instances", "NotebookInstances",
-           "NotebookInstanceName", "delete_notebook_instance", "NotebookInstanceName",
-           StatusEquals="Stopped")
+    _sweep(
+        sm,
+        "notebook instance",
+        "list_notebook_instances",
+        "NotebookInstances",
+        "NotebookInstanceName",
+        "stop_notebook_instance",
+        "NotebookInstanceName",
+        StatusEquals="InService",
+    )
+    _sweep(
+        sm,
+        "notebook instance",
+        "list_notebook_instances",
+        "NotebookInstances",
+        "NotebookInstanceName",
+        "delete_notebook_instance",
+        "NotebookInstanceName",
+        StatusEquals="Stopped",
+    )
 
     # 2) Stop billed-per-second jobs still running (jobs cannot be deleted —
     #    finished ones are inert history).
-    _sweep(sm, "training job", "list_training_jobs", "TrainingJobSummaries",
-           "TrainingJobName", "stop_training_job", "TrainingJobName",
-           StatusEquals="InProgress")
-    _sweep(sm, "processing job", "list_processing_jobs", "ProcessingJobSummaries",
-           "ProcessingJobName", "stop_processing_job", "ProcessingJobName",
-           StatusEquals="InProgress")
-    _sweep(sm, "transform job", "list_transform_jobs", "TransformJobSummaries",
-           "TransformJobName", "stop_transform_job", "TransformJobName",
-           StatusEquals="InProgress")
-    _sweep(sm, "tuning job", "list_hyper_parameter_tuning_jobs",
-           "HyperParameterTuningJobSummaries", "HyperParameterTuningJobName",
-           "stop_hyper_parameter_tuning_job", "HyperParameterTuningJobName",
-           StatusEquals="InProgress")
-    _sweep(sm, "automl job", "list_auto_ml_jobs", "AutoMLJobSummaries",
-           "AutoMLJobName", "stop_auto_ml_job", "AutoMLJobName",
-           StatusEquals="InProgress")
+    _sweep(
+        sm,
+        "training job",
+        "list_training_jobs",
+        "TrainingJobSummaries",
+        "TrainingJobName",
+        "stop_training_job",
+        "TrainingJobName",
+        StatusEquals="InProgress",
+    )
+    _sweep(
+        sm,
+        "processing job",
+        "list_processing_jobs",
+        "ProcessingJobSummaries",
+        "ProcessingJobName",
+        "stop_processing_job",
+        "ProcessingJobName",
+        StatusEquals="InProgress",
+    )
+    _sweep(
+        sm,
+        "transform job",
+        "list_transform_jobs",
+        "TransformJobSummaries",
+        "TransformJobName",
+        "stop_transform_job",
+        "TransformJobName",
+        StatusEquals="InProgress",
+    )
+    _sweep(
+        sm,
+        "tuning job",
+        "list_hyper_parameter_tuning_jobs",
+        "HyperParameterTuningJobSummaries",
+        "HyperParameterTuningJobName",
+        "stop_hyper_parameter_tuning_job",
+        "HyperParameterTuningJobName",
+        StatusEquals="InProgress",
+    )
+    _sweep(
+        sm,
+        "automl job",
+        "list_auto_ml_jobs",
+        "AutoMLJobSummaries",
+        "AutoMLJobName",
+        "stop_auto_ml_job",
+        "AutoMLJobName",
+        StatusEquals="InProgress",
+    )
 
     # 3) Free metadata.
-    _sweep(sm, "endpoint config", "list_endpoint_configs", "EndpointConfigs",
-           "EndpointConfigName", "delete_endpoint_config", "EndpointConfigName")
-    _sweep(sm, "model", "list_models", "Models", "ModelName",
-           "delete_model", "ModelName")
-    _sweep(sm, "feature group", "list_feature_groups", "FeatureGroupSummaries",
-           "FeatureGroupName", "delete_feature_group", "FeatureGroupName")
-    _sweep(sm, "pipeline", "list_pipelines", "PipelineSummaries", "PipelineName",
-           "delete_pipeline", "PipelineName")
+    _sweep(
+        sm,
+        "endpoint config",
+        "list_endpoint_configs",
+        "EndpointConfigs",
+        "EndpointConfigName",
+        "delete_endpoint_config",
+        "EndpointConfigName",
+    )
+    _sweep(sm, "model", "list_models", "Models", "ModelName", "delete_model", "ModelName")
+    _sweep(
+        sm,
+        "feature group",
+        "list_feature_groups",
+        "FeatureGroupSummaries",
+        "FeatureGroupName",
+        "delete_feature_group",
+        "FeatureGroupName",
+    )
+    _sweep(
+        sm,
+        "pipeline",
+        "list_pipelines",
+        "PipelineSummaries",
+        "PipelineName",
+        "delete_pipeline",
+        "PipelineName",
+    )
 
     # Model packages nest under groups: delete packages, then their group.
     for group in _list(sm, "list_model_package_groups", "ModelPackageGroupSummaryList"):
         gname = group.get("ModelPackageGroupName")
         if not gname:
             continue
-        _sweep(sm, "model package", "list_model_packages", "ModelPackageSummaryList",
-               "ModelPackageArn", "delete_model_package", "ModelPackageName",
-               ModelPackageGroupName=gname)
+        _sweep(
+            sm,
+            "model package",
+            "list_model_packages",
+            "ModelPackageSummaryList",
+            "ModelPackageArn",
+            "delete_model_package",
+            "ModelPackageName",
+            ModelPackageGroupName=gname,
+        )
         try:
             sm.delete_model_package_group(ModelPackageGroupName=gname)
             print(f"[sagemaker teardown] deleted model package group {gname!r}")
@@ -229,8 +327,9 @@ def main() -> None:
             tname = trial.get("TrialName")
             if not tname:
                 continue
-            for comp in _list(sm, "list_trial_components", "TrialComponentSummaries",
-                              TrialName=tname):
+            for comp in _list(
+                sm, "list_trial_components", "TrialComponentSummaries", TrialName=tname
+            ):
                 cname = comp.get("TrialComponentName")
                 if not cname:
                     continue
@@ -265,8 +364,16 @@ def main() -> None:
                 continue
             # delete_index needs (vectorBucketName, indexName) or the ARN;
             # _sweep passes a single delete param, so sweep by indexArn.
-            _sweep(s3v, "vector index", "list_indexes", "indexes", "indexArn",
-                   "delete_index", "indexArn", vectorBucketName=bname)
+            _sweep(
+                s3v,
+                "vector index",
+                "list_indexes",
+                "indexes",
+                "indexArn",
+                "delete_index",
+                "indexArn",
+                vectorBucketName=bname,
+            )
             try:
                 s3v.delete_vector_bucket(vectorBucketName=bname)
                 print(f"[sagemaker teardown] deleted vector bucket {bname!r}")
@@ -282,5 +389,38 @@ def main() -> None:
     print("[sagemaker teardown] done")
 
 
+def verify() -> int:
+    """Twofold teardown check (`teardown.py verify`): (1) AWS CONNECTS, then (2)
+    no billed SageMaker ENDPOINTS survive the sweep (the per-hour cost the
+    teardown targets first). Exit non-zero on no-connection or a leak; the runner
+    WARNS on a leak (the run already happened). Read-only, best-effort."""
+    try:
+        import botocore.session
+    except Exception as e:
+        print(f"[sagemaker verify-teardown] botocore unavailable: {e}")
+        return 1
+    session = botocore.session.get_session()
+    region = os.environ.get("AWS_REGION") or session.get_config_variable("region")
+    try:
+        eps = (
+            session.create_client("sagemaker", region_name=region)
+            .list_endpoints()
+            .get("Endpoints", [])
+        )
+    except Exception as e:
+        print(f"[sagemaker verify-teardown] NO CONNECTION: {e}")
+        return 1
+    if eps:
+        print(
+            "[sagemaker verify-teardown] LEAKS: endpoints "
+            + ", ".join(e.get("EndpointName", "?") for e in eps)
+        )
+        return 1
+    print("[sagemaker verify-teardown] OK: connected; no endpoints remain")
+    return 0
+
+
 if __name__ == "__main__":
-    main()
+    import sys
+
+    sys.exit(verify() if sys.argv[1:2] == ["verify"] else (main() or 0))

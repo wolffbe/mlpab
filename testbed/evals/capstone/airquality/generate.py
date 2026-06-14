@@ -17,6 +17,7 @@ calibrated between a train-mean baseline and a deterministic reference model.
     python -m evals.capstone.airquality.generate --seed 7 --out /tmp/aq-7
     python -m evals.capstone.airquality.generate --selftest
 """
+
 from __future__ import annotations
 
 import argparse
@@ -33,7 +34,7 @@ from evals.common import instance_suffix
 
 METRIC = "rmse"
 N_TEST = 90
-REGION = 0.70        # test days are sampled from the last 30% of history
+REGION = 0.70  # test days are sampled from the last 30% of history
 FEATURES = ["pm25_lag1", "temperature", "humidity", "wind_speed", "pressure", "precipitation"]
 RAW = common.RAW_DIR / "airquality_raw.csv"
 
@@ -52,7 +53,8 @@ def _sample_test_idx(rng, lo: int, hi: int, n: int) -> list[int]:
     for i in cand:
         if (i - 1) in used or (i + 1) in used:
             continue
-        chosen.append(i); used.add(i)
+        chosen.append(i)
+        used.add(i)
         if len(chosen) >= n:
             break
     return sorted(chosen)
@@ -60,8 +62,10 @@ def _sample_test_idx(rng, lo: int, hi: int, n: int) -> list[int]:
 
 def generate(seed: int, out: Path) -> dict:
     if not RAW.exists():
-        raise GateError(f"missing fixture {RAW}; run `python -m evals.capstone."
-                        f"_data.build_airquality` once to build it")
+        raise GateError(
+            f"missing fixture {RAW}; run `python -m evals.capstone."
+            f"_data.build_airquality` once to build it"
+        )
     rng = np.random.default_rng(seed)
     sfx = instance_suffix(seed)
     df = pd.read_csv(RAW).sort_values("date").reset_index(drop=True)
@@ -73,7 +77,7 @@ def generate(seed: int, out: Path) -> dict:
     test_idx = _sample_test_idx(rng, region_start, n, N_TEST)
     if len(test_idx) < N_TEST // 2:
         raise GateError(f"not enough non-adjacent test days (seed={seed})")
-    train = df.iloc[:region_start].reset_index(drop=True)        # strictly earlier
+    train = df.iloc[:region_start].reset_index(drop=True)  # strictly earlier
     score = df.iloc[test_idx].reset_index(drop=True)
 
     # --- reference bar ---------------------------------------------------------
@@ -81,31 +85,52 @@ def generate(seed: int, out: Path) -> dict:
     Xte, yte = score[FEATURES], score["pm25"].to_numpy()
     reg = GradientBoostingRegressor(random_state=0).fit(Xtr, ytr)
     ref_pred = reg.predict(Xte)
-    naive_pred = np.full(len(yte), ytr.mean())                  # train-mean predictor
-    cal = common.calibrate_bar(METRIC, yte, naive_pred, ref_pred,
-                               floor=common.rmse(yte, naive_pred), margin=0.5)
+    naive_pred = np.full(len(yte), ytr.mean())  # train-mean predictor
+    cal = common.calibrate_bar(
+        METRIC, yte, naive_pred, ref_pred, floor=common.rmse(yte, naive_pred), margin=0.5
+    )
     if cal["reference"] >= 0.95 * cal["naive"]:
         raise GateError(f"reference model barely beats the mean (seed={seed}): {cal}")
 
     # --- resource names + frames ----------------------------------------------
-    names = {"feature_group": f"airq{sfx}", "training_dataset": f"airqtd{sfx}",
-             "model_name": f"airqmodel{sfx}", "predictions_table": f"airqpred{sfx}"}
+    names = {
+        "feature_group": f"airq{sfx}",
+        "training_dataset": f"airqtd{sfx}",
+        "model_name": f"airqmodel{sfx}",
+        "predictions_table": f"airqpred{sfx}",
+    }
     train_csv = train[["date", "pm25_lag1", *FEATURES[1:], "pm25"]]
     score_csv = score[["date", *FEATURES]]
     labels = score[["date", "pm25"]].copy()
 
-    meta = {"family": "airquality", "seed": seed, "kind": "regression",
-            "metric": METRIC, "id_col": "date", "pred_col": "pm25_pred",
-            "label_col": "pm25", **cal, **names,
-            "feature_group_version": 1, "training_dataset_version": 1,
-            "predictions_version": 1,
-            "record_ids": labels["date"].tolist(),
-            "n_train": len(train), "n_test": len(score)}
+    meta = {
+        "family": "airquality",
+        "seed": seed,
+        "kind": "regression",
+        "metric": METRIC,
+        "id_col": "date",
+        "pred_col": "pm25_pred",
+        "label_col": "pm25",
+        **cal,
+        **names,
+        "feature_group_version": 1,
+        "training_dataset_version": 1,
+        "predictions_version": 1,
+        "record_ids": labels["date"].tolist(),
+        "n_train": len(train),
+        "n_test": len(score),
+    }
 
     return common.write_instance(
-        out, train=train_csv, score=score_csv, labels=labels,
-        task_md=_task_md(names, cal), prompt=_prompt(names, cal), meta=meta,
-        data_files={"airquality_history.csv": train_csv, "forecast_days.csv": score_csv})
+        out,
+        train=train_csv,
+        score=score_csv,
+        labels=labels,
+        task_md=_task_md(names, cal),
+        prompt=_prompt(names, cal),
+        meta=meta,
+        data_files={"airquality_history.csv": train_csv, "forecast_days.csv": score_csv},
+    )
 
 
 def _task_md(n: dict, cal: dict) -> str:
@@ -155,8 +180,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.selftest:
         for seed in (1, 2, 3):
             m = generate(seed, Path(f"/tmp/mlpab-airquality-selftest/{seed}"))
-            print(f"[airquality] seed={seed} n_test={m['n_test']} bar={m['bar']} "
-                  f"naive={m['naive']} ref={m['reference']} gates=OK")
+            print(
+                f"[airquality] seed={seed} n_test={m['n_test']} bar={m['bar']} "
+                f"naive={m['naive']} ref={m['reference']} gates=OK"
+            )
         return 0
     if not args.out:
         ap.error("--out is required (or use --selftest)")

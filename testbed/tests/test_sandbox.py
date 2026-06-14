@@ -4,6 +4,7 @@ Covers: settings.json shape (sandbox + denies), OAuth token Keychain helper,
 agent env construction (HOME redirect + auth fallback). Live-claude
 integration lives in tests/integration/live_sandbox.py.
 """
+
 import json
 import os
 import subprocess
@@ -15,10 +16,10 @@ from unittest import mock
 from mlpab import claude_runner
 from mlpab.hooks import log_tool_call as hook
 
-
 # ---------------------------------------------------------------------------
 # 1) Static settings shape
 # ---------------------------------------------------------------------------
+
 
 class DenyPatternsTests(unittest.TestCase):
     """Patterns that DO fire in bypassPermissions: Bash escapes only.
@@ -89,8 +90,9 @@ class WriteSettingsTests(unittest.TestCase):
     def test_sandbox_merges_interface_allowed_domains(self):
         # `allowed_domains=[...]` passed in (from interface config) is appended
         # to the baseline allowlist.
-        claude_runner._write_settings(self.run_dir, self.command_log,
-                                      allowed_domains=["api.openai.com", "*.openai.com"])
+        claude_runner._write_settings(
+            self.run_dir, self.command_log, allowed_domains=["api.openai.com", "*.openai.com"]
+        )
         net = self._load()["sandbox"]["network"]
         self.assertIn("api.openai.com", net["allowedDomains"])
         self.assertIn("*.openai.com", net["allowedDomains"])
@@ -102,8 +104,9 @@ class WriteSettingsTests(unittest.TestCase):
         # (trustd unreachable → OSStatus -26276); the manifest's
         # `sandbox_excluded_commands` must land in sandbox.excludedCommands
         # so they run outside the sandbox.
-        claude_runner._write_settings(self.run_dir, self.command_log,
-                                      sandbox_excluded_commands=["databricks", "databricks *"])
+        claude_runner._write_settings(
+            self.run_dir, self.command_log, sandbox_excluded_commands=["databricks", "databricks *"]
+        )
         sb = self._load()["sandbox"]
         self.assertEqual(sb["excludedCommands"], ["databricks", "databricks *"])
 
@@ -117,8 +120,10 @@ class WriteSettingsTests(unittest.TestCase):
         # not the testbed source path (would require an allowRead exception).
         claude_runner._write_settings(self.run_dir, self.command_log)
         hook_cmd = self._load()["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
-        self.assertTrue(hook_cmd.endswith("/.claude/hooks/log_tool_call.py"),
-                        f"hook command should point inside boundary; got {hook_cmd!r}")
+        self.assertTrue(
+            hook_cmd.endswith("/.claude/hooks/log_tool_call.py"),
+            f"hook command should point inside boundary; got {hook_cmd!r}",
+        )
         self.assertNotIn(str(claude_runner.TESTBED_ROOT), hook_cmd)
         # And the copied script actually exists + is executable.
         local = self.run_dir / ".claude" / "hooks" / "log_tool_call.py"
@@ -132,6 +137,7 @@ class WriteSettingsTests(unittest.TestCase):
         # HOME_DIR would emit denyRead rooted at <run>/, which then blocks
         # parent-dir lookups for writes inside the agent's own cwd.
         import pwd as _pwd
+
         real_home = Path(_pwd.getpwuid(os.getuid()).pw_dir).resolve()
         self.assertEqual(claude_runner.HOME_DIR, real_home)
 
@@ -161,22 +167,29 @@ class WriteSettingsTests(unittest.TestCase):
 # 2) OAuth / env construction
 # ---------------------------------------------------------------------------
 
+
 class OAuthTokenFromKeychainTests(unittest.TestCase):
     def test_parses_access_token_from_security_output(self):
-        payload = json.dumps({"claudeAiOauth": {
-            "accessToken": "sk-ant-oat01-EXAMPLE-TOKEN",
-            "refreshToken": "sk-ant-ort01-EXAMPLE-REFRESH",
-        }})
+        payload = json.dumps(
+            {
+                "claudeAiOauth": {
+                    "accessToken": "sk-ant-oat01-EXAMPLE-TOKEN",
+                    "refreshToken": "sk-ant-ort01-EXAMPLE-REFRESH",
+                }
+            }
+        )
         with mock.patch("subprocess.run", return_value=mock.Mock(stdout=payload)) as p:
-            self.assertEqual(claude_runner.oauth_token_from_keychain(),
-                             "sk-ant-oat01-EXAMPLE-TOKEN")
+            self.assertEqual(
+                claude_runner.oauth_token_from_keychain(), "sk-ant-oat01-EXAMPLE-TOKEN"
+            )
             args = p.call_args.args[0]
             self.assertEqual(args[:3], ["/usr/bin/security", "find-generic-password", "-s"])
             self.assertIn("Claude Code-credentials", args)
 
     def test_missing_entry_returns_none(self):
-        with mock.patch("subprocess.run",
-                        side_effect=subprocess.CalledProcessError(44, "security")):
+        with mock.patch(
+            "subprocess.run", side_effect=subprocess.CalledProcessError(44, "security")
+        ):
             self.assertIsNone(claude_runner.oauth_token_from_keychain())
 
     def test_security_binary_missing_returns_none(self):
@@ -208,9 +221,7 @@ class TokenCacheTests(unittest.TestCase):
         self.assertEqual(cache, self.run_path / claude_runner.TOKEN_CACHE_FILENAME)
         self.assertEqual(cache.stat().st_mode & 0o777, 0o600)
         # Readable via MLPAB_TOKEN_CACHE pointing at the file.
-        with mock.patch.dict(os.environ,
-                             {claude_runner.TOKEN_CACHE_ENV: str(cache)},
-                             clear=False):
+        with mock.patch.dict(os.environ, {claude_runner.TOKEN_CACHE_ENV: str(cache)}, clear=False):
             self.assertEqual(claude_runner.read_token_cache(), "sk-ant-oat01-CACHED")
 
     def test_read_missing_env_returns_none(self):
@@ -218,9 +229,9 @@ class TokenCacheTests(unittest.TestCase):
             self.assertIsNone(claude_runner.read_token_cache())
 
     def test_read_missing_file_returns_none(self):
-        with mock.patch.dict(os.environ,
-                             {claude_runner.TOKEN_CACHE_ENV: "/nonexistent/path"},
-                             clear=True):
+        with mock.patch.dict(
+            os.environ, {claude_runner.TOKEN_CACHE_ENV: "/nonexistent/path"}, clear=True
+        ):
             self.assertIsNone(claude_runner.read_token_cache())
 
     def test_resolve_order_env_beats_keychain_beats_cache(self):
@@ -229,29 +240,27 @@ class TokenCacheTests(unittest.TestCase):
         # so it must win over the cache — preferring the stale cache once froze
         # an expired token for ~30 runs.
         cache = claude_runner.write_token_cache("CACHED", self.run_path)
-        with mock.patch.dict(os.environ,
-                             {"CLAUDE_CODE_OAUTH_TOKEN": "ENV",
-                              claude_runner.TOKEN_CACHE_ENV: str(cache)},
-                             clear=True):
+        with mock.patch.dict(
+            os.environ,
+            {"CLAUDE_CODE_OAUTH_TOKEN": "ENV", claude_runner.TOKEN_CACHE_ENV: str(cache)},
+            clear=True,
+        ):
             self.assertEqual(claude_runner.resolve_oauth_token(), "ENV")
-        with mock.patch.dict(os.environ,
-                             {claude_runner.TOKEN_CACHE_ENV: str(cache)},
-                             clear=True), \
-             mock.patch.object(claude_runner, "oauth_token_from_keychain",
-                               return_value="KEYCHAIN"):
+        with (
+            mock.patch.dict(os.environ, {claude_runner.TOKEN_CACHE_ENV: str(cache)}, clear=True),
+            mock.patch.object(claude_runner, "oauth_token_from_keychain", return_value="KEYCHAIN"),
+        ):
             self.assertEqual(claude_runner.resolve_oauth_token(), "KEYCHAIN")
-        with mock.patch.dict(os.environ,
-                             {claude_runner.TOKEN_CACHE_ENV: str(cache)},
-                             clear=True), \
-             mock.patch.object(claude_runner, "oauth_token_from_keychain",
-                               return_value=None):
+        with (
+            mock.patch.dict(os.environ, {claude_runner.TOKEN_CACHE_ENV: str(cache)}, clear=True),
+            mock.patch.object(claude_runner, "oauth_token_from_keychain", return_value=None),
+        ):
             self.assertEqual(claude_runner.resolve_oauth_token(), "CACHED")
         cache.unlink()
-        with mock.patch.dict(os.environ,
-                             {claude_runner.TOKEN_CACHE_ENV: str(cache)},
-                             clear=True), \
-             mock.patch.object(claude_runner, "oauth_token_from_keychain",
-                               return_value="KEYCHAIN"):
+        with (
+            mock.patch.dict(os.environ, {claude_runner.TOKEN_CACHE_ENV: str(cache)}, clear=True),
+            mock.patch.object(claude_runner, "oauth_token_from_keychain", return_value="KEYCHAIN"),
+        ):
             self.assertEqual(claude_runner.resolve_oauth_token(), "KEYCHAIN")
 
 
@@ -266,8 +275,7 @@ class AgentEnvConstructionTests(unittest.TestCase):
     def tearDown(self):
         self._tmp.cleanup()
 
-    def _invoke(self, auth: str = "login",
-                token: str | None = "sk-ant-oat01-FAKE"):
+    def _invoke(self, auth: str = "login", token: str | None = "sk-ant-oat01-FAKE"):
         captured = {}
 
         def fake_run_with_retry(*, cmd, cwd, env, **kw):
@@ -276,21 +284,26 @@ class AgentEnvConstructionTests(unittest.TestCase):
 
         # Force keychain + token cache to the mocked value so a real on-disk
         # cache file from a previous run doesn't leak into tests.
-        with mock.patch("shutil.which", return_value="/usr/bin/claude"), \
-             mock.patch.object(claude_runner, "run_with_retry", side_effect=fake_run_with_retry), \
-             mock.patch.object(claude_runner, "oauth_token_from_keychain", return_value=token), \
-             mock.patch.object(claude_runner, "read_token_cache", return_value=None):
+        with (
+            mock.patch("shutil.which", return_value="/usr/bin/claude"),
+            mock.patch.object(claude_runner, "run_with_retry", side_effect=fake_run_with_retry),
+            mock.patch.object(claude_runner, "oauth_token_from_keychain", return_value=token),
+            mock.patch.object(claude_runner, "read_token_cache", return_value=None),
+        ):
             claude_runner.run(
-                prompt="hi", run_dir=self.run_dir,
-                auth=auth, model="claude-sonnet-4-6",
-                cli_binary=None, sdk_module=None, mcp_servers={},
+                prompt="hi",
+                run_dir=self.run_dir,
+                auth=auth,
+                model="claude-sonnet-4-6",
+                cli_binary=None,
+                sdk_module=None,
+                mcp_servers={},
                 command_log=self.run_dir / "commands.jsonl",
             )
         return captured
 
     def test_home_redirected_to_run_dir(self):
-        self.assertEqual(self._invoke()["env"]["HOME"],
-                         str(self.run_dir.resolve()))
+        self.assertEqual(self._invoke()["env"]["HOME"], str(self.run_dir.resolve()))
 
     def test_keychain_token_injected_when_auth_login(self):
         # Redirected HOME → claude cannot reach the Keychain itself; the
@@ -321,8 +334,11 @@ class AgentEnvConstructionTests(unittest.TestCase):
         # No API key, no Keychain token, no token cache → warn (don't raise).
         import io
         from contextlib import redirect_stdout
-        with mock.patch.dict(os.environ, {}, clear=True), \
-             mock.patch.object(claude_runner, "read_token_cache", return_value=None):
+
+        with (
+            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch.object(claude_runner, "read_token_cache", return_value=None),
+        ):
             buf = io.StringIO()
             with redirect_stdout(buf):
                 self._invoke(auth="login", token=None)
@@ -338,9 +354,9 @@ class AgentEnvConstructionTests(unittest.TestCase):
     def test_inherited_env_token_used_when_no_keychain(self):
         # No Keychain credential → an inherited CLAUDE_CODE_OAUTH_TOKEN from
         # the parent env is re-injected via resolve_oauth_token().
-        with mock.patch.dict(os.environ,
-                             {"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat01-INHERITED"},
-                             clear=True):
+        with mock.patch.dict(
+            os.environ, {"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat01-INHERITED"}, clear=True
+        ):
             captured = self._invoke(auth="login", token=None)
         self.assertEqual(captured["env"]["CLAUDE_CODE_OAUTH_TOKEN"], "sk-ant-oat01-INHERITED")
 
@@ -364,6 +380,7 @@ class AgentEnvConstructionTests(unittest.TestCase):
 # 3) PreToolUse hook — boundary path checks
 # ---------------------------------------------------------------------------
 
+
 class HookTaskOutputAllowanceTests(unittest.TestCase):
     """The boundary hook denies reads outside the agent's cwd, EXCEPT for
     Claude Code's own background-task output files for THIS run — otherwise an
@@ -373,8 +390,10 @@ class HookTaskOutputAllowanceTests(unittest.TestCase):
     """
 
     def _check(self, path: str, boundary: str, cwd: str) -> str | None:
-        with mock.patch.dict(os.environ, {"TESTBED_BOUNDARY": boundary}, clear=False), \
-             mock.patch("os.getcwd", return_value=cwd):
+        with (
+            mock.patch.dict(os.environ, {"TESTBED_BOUNDARY": boundary}, clear=False),
+            mock.patch("os.getcwd", return_value=cwd),
+        ):
             return hook._path_violates_boundary(path)
 
     def test_allows_own_background_task_output(self):
@@ -399,8 +418,7 @@ class HookTaskOutputAllowanceTests(unittest.TestCase):
 
     def test_in_boundary_path_still_allowed(self):
         cwd = "/runs/v0/image_classification/aerial-cactus"
-        self.assertIsNone(self._check(f"{cwd}/submission/submission.csv",
-                                      boundary=cwd, cwd=cwd))
+        self.assertIsNone(self._check(f"{cwd}/submission/submission.csv", boundary=cwd, cwd=cwd))
 
 
 if __name__ == "__main__":

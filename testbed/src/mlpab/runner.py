@@ -19,6 +19,7 @@ The generated instance (incl. the private answer key) lives in a SIBLING
 `.<task>.private/` dir — outside the agent's sandbox boundary.
 Login (`auth_command`) is verified per run.
 """
+
 from __future__ import annotations
 
 import json
@@ -34,15 +35,19 @@ from pathlib import Path
 from mlpab import (
     claude_runner,
     codex_runner,
-    mistral_runner,
     evals_provider,
     interfaces,
-    preflight as preflight_mod,
+    mistral_runner,
+)
+from mlpab import preflight as preflight_mod
+from mlpab import (
+    redact,
     results,
-    skills as skills_mod,
+)
+from mlpab import skills as skills_mod
+from mlpab import (
     streaming,
 )
-
 
 DEFAULT_MODEL = "claude-sonnet-4-6"
 AUTH_MODES = ("api-key", "login")
@@ -56,14 +61,14 @@ BASE_VENV = TESTBED_ROOT / ".venv"
 
 @dataclass
 class RunSpec:
-    task: str                       # FTI sub-task (an evals_provider family)
-    platform: str                   # e.g. "hopsworks", "none"
-    interface: str                  # interface: cli/mcp/sdk/none
-    skills: str = "none"            # platform skill bundle name or "none"
-    category: str = "no_task"       # FTI category (stage) this task belongs to
+    task: str  # FTI sub-task (an evals_provider family)
+    platform: str  # e.g. "hopsworks", "none"
+    interface: str  # interface: cli/mcp/sdk/none
+    skills: str = "none"  # platform skill bundle name or "none"
+    category: str = "no_task"  # FTI category (stage) this task belongs to
     model: str = DEFAULT_MODEL
     auth: str = "api-key"
-    timeout_s: int | None = 60 * 60   # None → NO per-run wall-clock cap
+    timeout_s: int | None = 60 * 60  # None → NO per-run wall-clock cap
     runs_root: Path = Path("results")
     # Session tag: the treatment config's name, stored as the `run` column.
     run_id: str | None = None
@@ -90,20 +95,29 @@ def _results_root_from(runs_root: Path) -> Path:
     return runs_root
 
 
-def _make_venv(target: Path) -> Path:
+def _make_venv(target: Path, prepared: Path | None = None) -> Path:
     """Create the agent's per-run venv FULLY MATERIALIZED inside the run dir.
 
-    The base venv's (testbed/.venv) site-packages are copied entirely INSIDE
-    the agent's run dir — no `.pth` indirection to an outside path — so
-    the agent's sandbox is truly bounded to its run folder.
+    When `prepared` is given (an interface's prepared venv — see
+    interfaces.prepare), the run venv is a CLONE of it: base libs AND the
+    interface are already installed, so the run does no pip work and mutates no
+    shared state. Otherwise (no prepared venv) the venv is built from the base
+    venv and the interface is installed per run by interfaces.setup (legacy path).
+
+    Either way the site-packages are copied entirely INSIDE the agent's run dir —
+    no `.pth` indirection to an outside path — so the agent's sandbox is truly
+    bounded to its run folder.
 
     On APFS (macOS default) `cp -Rc` does copy-on-write clones, so the 2-3 GB
-    shared site-packages costs near-zero disk until the agent modifies a page
-    (pip install of the interface). Falls back to a recursive copy where APFS
-    clones aren't available (Linux, non-APFS volumes).
+    shared tree costs near-zero disk until the agent modifies a page. Falls back
+    to a recursive copy where APFS clones aren't available (Linux, non-APFS).
     """
     py = target / "bin" / "python"
     if py.exists():
+        return py
+
+    if prepared is not None and (prepared / "bin" / "python").exists():
+        _clone_prepared_venv(prepared, target)
         return py
 
     base_venv_py = BASE_VENV / "bin" / "python"
@@ -111,16 +125,61 @@ def _make_venv(target: Path) -> Path:
     subprocess.run(
         [str(base_py), "-m", "venv", "--system-site-packages", str(target)],
         check=True,
+        timeout=300,
     )
     # Materialize the base venv's site-packages into the agent venv: its
     # sandbox confines reads to the run dir, so any outside `.pth` reference
     # would resolve to a path Seatbelt denies.
     if base_venv_py.exists():
-        eng_sp = next((target / "lib").glob("python*/site-packages"), None)
-        base_sp = next((BASE_VENV / "lib").glob("python*/site-packages"), None)
+        eng_sp = interfaces.venv_site_packages(target)
+        base_sp = interfaces.venv_site_packages(BASE_VENV)
         if eng_sp and base_sp:
             _clone_tree(base_sp, eng_sp)
     return py
+
+
+def _clone_prepared_venv(src: Path, dst: Path) -> None:
+    """Clone a prepared venv into the run dir (APFS CoW where available) and
+    RELOCATE it: a venv hardcodes its own absolute path into bin/ scripts
+    (shebangs, `activate`) and `pyvenv.cfg`, so the copy would still point at the
+    prepared venv (outside the sandbox). Rewrite those paths to the run dir."""
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        subprocess.run(["cp", "-Rc", str(src), str(dst)], check=True, timeout=600)
+    except subprocess.CalledProcessError:
+        subprocess.run(["cp", "-R", str(src), str(dst)], check=True, timeout=600)
+    _relocate_venv(src, dst)
+
+
+def _relocate_venv(old: Path, new: Path) -> None:
+    """Rewrite a venv's self-referential absolute path (`old` → `new`) in its
+    bin/ text scripts and pyvenv.cfg. Console-script shebangs (`#!<venv>/bin/
+    python`) and the `activate` family carry the venv path; bin/python itself is
+    a symlink to the base interpreter (left as-is, like a freshly-created venv).
+    """
+    old_s, new_s = str(old), str(new)
+    bin_dir = new / "bin"
+    if bin_dir.is_dir():
+        for entry in bin_dir.iterdir():
+            if entry.is_symlink() or not entry.is_file():
+                continue
+            try:
+                data = entry.read_bytes()
+            except OSError:
+                continue
+            if b"\0" in data[:2048]:  # a real binary, not a text script
+                continue
+            try:
+                text = data.decode("utf-8")
+            except UnicodeDecodeError:
+                continue
+            if old_s in text:
+                entry.write_text(text.replace(old_s, new_s))
+    cfg = new / "pyvenv.cfg"
+    if cfg.is_file():
+        text = cfg.read_text()
+        if old_s in text:
+            cfg.write_text(text.replace(old_s, new_s))
 
 
 def _clone_tree(src: Path, dst: Path) -> None:
@@ -135,9 +194,9 @@ def _clone_tree(src: Path, dst: Path) -> None:
         if target.exists():
             continue
         try:
-            subprocess.run(["cp", "-Rc", str(child), str(target)], check=True)
+            subprocess.run(["cp", "-Rc", str(child), str(target)], check=True, timeout=600)
         except subprocess.CalledProcessError:
-            subprocess.run(["cp", "-R", str(child), str(target)], check=True)
+            subprocess.run(["cp", "-R", str(child), str(target)], check=True, timeout=600)
 
 
 def _run_aux(steps: list[str], run_dir: Path, env: dict[str, str], timeout: int = 60) -> None:
@@ -151,16 +210,63 @@ def _run_aux(steps: list[str], run_dir: Path, env: dict[str, str], timeout: int 
     agent's wall_time_s never sees these phases either (it is timed around the
     claude subprocess only).
     """
-    aux_env = {k: v for k, v in env.items()
-               if k not in ("MLPAB_API_LOG", "MLPAB_IFACE_SDK")}
+    aux_env = {k: v for k, v in env.items() if k not in ("MLPAB_API_LOG", "MLPAB_IFACE_SDK")}
     for cmd in steps:
         try:
             subprocess.run(
-                cmd, shell=True, cwd=str(run_dir), env=aux_env,
-                timeout=timeout, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                cmd,
+                shell=True,
+                cwd=str(run_dir),
+                env=aux_env,
+                timeout=timeout,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
             )
         except Exception:
             pass
+
+
+def _verify_platform(
+    phase: str,
+    platform: str,
+    run_dir: Path,
+    env: dict[str, str],
+    timeout: int = 120,
+) -> tuple[bool, str]:
+    """Run a platform's `<phase>.py verify` (phase: 'setup' | 'teardown') if the
+    script exists, capturing its output. Returns (ok, output); (True, "") when
+    there's no such script — nothing to verify.
+
+    The twofold check (per the platform's setup.py/teardown.py `verify` mode):
+    confirm CONNECTION, then that the resources setup creates are PRESENT (setup)
+    / that the agent's resources are GONE (teardown). Read-only — it mutates
+    nothing. Runs with the per-run venv python (so an SDK-based verify imports
+    fine), with the api-logging shim stripped (its reads are plumbing, not the
+    agent's endpoint coverage)."""
+    script = interfaces.CONFIGS_DIR / platform / f"{phase}.py"
+    if not script.exists():
+        return True, ""
+    venv_py = run_dir / "venv" / "bin" / "python"
+    py = str(venv_py) if venv_py.exists() else sys.executable
+    verify_env = {k: v for k, v in env.items() if k not in ("MLPAB_API_LOG", "MLPAB_IFACE_SDK")}
+    try:
+        proc = subprocess.run(
+            [py, str(script), "verify"],
+            cwd=str(run_dir),
+            env=verify_env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=timeout,
+        )
+    except Exception as e:
+        return False, f"{phase} verify did not run: {e}"
+    # Scrub credentials before this output reaches an exception message / the log.
+    # Scan THIS verify env (not just os.environ) so a manifest-inlined key value
+    # that isn't in the process environment is still redacted.
+    return proc.returncode == 0, redact.redact(
+        proc.stdout.decode("utf-8", "replace"), env=verify_env
+    )
 
 
 def _platform_env(run_dir: Path) -> dict[str, str]:
@@ -231,7 +337,7 @@ def _total_ram_gb() -> float | None:
     Uses POSIX sysconf (macOS and Linux); no third-party deps.
     """
     try:
-        return os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE") / (1024 ** 3)
+        return os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE") / (1024**3)
     except (ValueError, OSError, AttributeError):
         return None
 
@@ -249,8 +355,8 @@ def detect_environment() -> str:
     import platform
     import shutil
 
-    system = platform.system()                  # Darwin / Linux / Windows
-    machine = platform.machine() or "?"         # arm64 / x86_64 / ...
+    system = platform.system()  # Darwin / Linux / Windows
+    machine = platform.machine() or "?"  # arm64 / x86_64 / ...
     cpus = os.cpu_count() or 1
     ram = _total_ram_gb()
     ram_str = f", ~{ram:.0f} GB RAM" if ram else ""
@@ -273,7 +379,7 @@ def detect_environment() -> str:
     if spawn:
         lines.append(
             "- Because the start method is 'spawn', a `DataLoader` with `num_workers>0` "
-            "(or any multiprocessing) whose script lacks an `if __name__ == \"__main__\":` "
+            '(or any multiprocessing) whose script lacks an `if __name__ == "__main__":` '
             "guard will DEADLOCK and hang forever — it never errors, it just stalls. "
             "Default to `num_workers=0`; only use workers if all top-level code is under "
             "that guard."
@@ -284,15 +390,11 @@ def detect_environment() -> str:
 # The "platform is under test" rule (agent default), baked into agent.md
 # between these markers. Applies only when a platform is present; for none/none
 # (agent builds its own model freely) the whole section is stripped.
-_UNDER_TEST_RE = re.compile(
-    r"<!--UNDER_TEST_START-->\n(.*?)\n<!--UNDER_TEST_END-->", re.DOTALL
-)
+_UNDER_TEST_RE = re.compile(r"<!--UNDER_TEST_START-->\n(.*?)\n<!--UNDER_TEST_END-->", re.DOTALL)
 # Inverse: content kept ONLY when NO interface is under test (none/none, agent
 # trains its own model locally). Stripped when an interface is under test
 # (everything must run remotely on the platform).
-_LOCAL_ONLY_RE = re.compile(
-    r"<!--LOCAL_ONLY_START-->\n(.*?)\n<!--LOCAL_ONLY_END-->", re.DOTALL
-)
+_LOCAL_ONLY_RE = re.compile(r"<!--LOCAL_ONLY_START-->\n(.*?)\n<!--LOCAL_ONLY_END-->", re.DOTALL)
 
 
 def _build_prompt(
@@ -369,11 +471,15 @@ def run(spec: RunSpec) -> results.Row:
     # nested.
     passthrough = not streaming.nested() and not streaming.quiet()
     with streaming.tee_to(run_dir / "agent.log", passthrough=passthrough):
-        # The per-run venv clones the base .venv. Ensure the base holds no copy of
-        # the interface package before cloning, so this run installs the interface
-        # wheel fresh + complete (console scripts, extras).
-        interfaces.ensure_base_clean(spec.platform, spec.interface)
-        venv_python = _make_venv(run_dir / "venv")
+        # Prefer cloning the interface's PREPARED venv (base libs + interface,
+        # built once at preflight): the run does no pip work and mutates no shared
+        # state. Only when none exists do we fall back to the legacy path — clone
+        # the base .venv (kept free of the interface) and install per run below.
+        prepared = interfaces.prepared_venv_dir(spec.platform, spec.interface)
+        use_prepared = (prepared / "bin" / "python").exists()
+        if not use_prepared:
+            interfaces.ensure_base_clean(spec.platform, spec.interface)
+        venv_python = _make_venv(run_dir / "venv", prepared if use_prepared else None)
         (run_dir / "submission").mkdir(exist_ok=True)
 
         # Generate a FRESH eval instance (validity gates run inside the
@@ -381,17 +487,23 @@ def run(spec: RunSpec) -> results.Row:
         # Claude. The seed is deterministic per (session, category, task,
         # attempt): reproducible rows, fresh instance every repeat.
         seed = evals_provider.seed_for(
-            spec.run_id or "", spec.category, spec.task, spec.attempt or 1)
+            spec.run_id or "", spec.category, spec.task, spec.attempt or 1
+        )
         task_body = evals_provider.prepare(spec.task, run_dir, seed)
 
         interface_setup = interfaces.setup(
-            spec.platform, spec.interface, run_dir, venv_python,
+            spec.platform,
+            spec.interface,
+            run_dir,
+            venv_python,
+            # A prepared-venv clone already has the interface installed — skip the
+            # per-run install (it would re-pip into the run venv for nothing).
+            run_install=not use_prepared,
         )
         skills_setup = skills_mod.apply(spec.platform, spec.skills, run_dir)
         if skills_setup.installed:
             print(
-                f"[mlpab] skills ({skills_setup.hash}): "
-                f"{','.join(skills_setup.installed)}",
+                f"[mlpab] skills ({skills_setup.hash}): {','.join(skills_setup.installed)}",
                 file=sys.stderr,
             )
         # The agent never receives platform docs. Its sole guide is the
@@ -421,6 +533,21 @@ def run(spec: RunSpec) -> results.Row:
             # up to ~3 min while the backend finishes deleting the previous
             # run's namespace (teardown is async server-side).
             _run_aux(interface_setup.serve, run_dir, serve_env, timeout=300)
+        # Twofold check: confirm the platform connects AND that setup actually
+        # established what the agent needs, BEFORE spending a (timed, billed)
+        # agent run against it. A failure here means the run could not be valid
+        # — fail it now with a clear reason instead of letting the agent flail
+        # against a half-set-up platform (and the grader later report a missing
+        # deliverable it never had a chance to create).
+        ok, detail = _verify_platform("setup", spec.platform, run_dir, base_keys_env)
+        if not ok:
+            # PlatformNotReadyError aborts the whole config (the treatment loop
+            # re-raises it) — every later run would hit the same broken platform.
+            raise preflight_mod.PlatformNotReadyError(
+                f"platform setup verification failed for {spec.platform!r} — the "
+                f"platform is not ready, so this run would not be valid:\n"
+                f"{detail.strip()[-1000:]}"
+            )
         # Env the setup step exported for the agent (e.g. a role ARN it just
         # created) — declared keys (.env) win on conflict, so an explicit .env
         # value always overrides what setup derived.
@@ -430,13 +557,19 @@ def run(spec: RunSpec) -> results.Row:
         # once at treatment preflight; login is re-checked every run (catches
         # expired creds mid-session; each run authenticates in its own venv).
         login = interfaces.login_status(
-            spec.platform, spec.interface, venv_python=venv_python, keys=agent_keys,
+            spec.platform,
+            spec.interface,
+            venv_python=venv_python,
+            keys=agent_keys,
         )
         if not login.ok:
             raise preflight_mod.PreflightError(login.message)
 
-        prompt = _build_prompt(task_body, interface_setup.prompt_fragment,
-                               interface_under_test=interface_setup.interface != "none")
+        prompt = _build_prompt(
+            task_body,
+            interface_setup.prompt_fragment,
+            interface_under_test=interface_setup.interface != "none",
+        )
         (run_dir / "prompt.txt").write_text(prompt)
 
         # The agent is confined to its own run dir (the generated
@@ -452,6 +585,15 @@ def run(spec: RunSpec) -> results.Row:
             engine = mistral_runner
         else:
             engine = claude_runner
+        # No agent may touch the testbed git repo during a run (it must not
+        # commit/push its run artifacts — see the stray agent commits this
+        # guards against). Point git's repo search ceiling at the run dir so a
+        # `git` invocation cannot ascend to discover the repo's .git: every
+        # command then reports "not a git repository". Engine-agnostic — all
+        # engines merge extra_env into the agent subprocess (claude additionally
+        # denies the `git` binary via its PreToolUse allowlist).
+        agent_env = _localize_file_credentials(agent_keys, run_dir)
+        agent_env["GIT_CEILING_DIRECTORIES"] = str(run_dir)
         cr = engine.run(
             prompt=prompt,
             run_dir=run_dir,
@@ -464,7 +606,7 @@ def run(spec: RunSpec) -> results.Row:
             command_log=run_dir / "commands.jsonl",
             timeout_s=spec.timeout_s,
             # sandboxed agent reads cert/ADC from inside its run dir
-            extra_env=_localize_file_credentials(agent_keys, run_dir),
+            extra_env=agent_env,
             allowed_domains=interface_setup.allowed_domains,
             interface=interface_setup.interface,
             instance_allowlist=interface_setup.instance_allowlist,
@@ -480,11 +622,15 @@ def run(spec: RunSpec) -> results.Row:
         # Runs BEFORE venv teardown: the grader uses the run venv's python,
         # whose platform client was installed from the committed pinned wheel.
         try:
-            grading = evals_provider.grade(
-                spec.task, run_dir, spec.platform, venv_python)
+            grading = evals_provider.grade(spec.task, run_dir, spec.platform, venv_python)
         except Exception as e:
-            grading = {"success": False, "asserts_passed": 0, "asserts_total": 0,
-                       "asserts": [], "error": str(e)}
+            grading = {
+                "success": False,
+                "asserts_passed": 0,
+                "asserts_total": 0,
+                "asserts": [],
+                "error": str(e),
+            }
         # grading.json lives grader-side, next to the answer key.
         (attempt_dir / "solution" / "grading.json").write_text(json.dumps(grading, indent=2))
 
@@ -495,7 +641,9 @@ def run(spec: RunSpec) -> results.Row:
         # feed the cross-interface enforcement HOOK, but counting must not relabel
         # an off-interface call as on-interface.)
         count_cli = interface_setup.cli_binary if interface_setup.interface == "cli" else None
-        count_cli_sub = interface_setup.cli_subcommand if interface_setup.interface == "cli" else None
+        count_cli_sub = (
+            interface_setup.cli_subcommand if interface_setup.interface == "cli" else None
+        )
         count_sdk = interface_setup.sdk_module if interface_setup.interface == "sdk" else None
         counts = results.aggregate_commands(
             cr.transcript_path,
@@ -546,8 +694,14 @@ def run(spec: RunSpec) -> results.Row:
         # THROUGH cli/mcp/sdk count — not hand-rolled `requests`, not server-side
         # Job calls (which never reach the venv shim). A none/none baseline has no
         # interface (and no endpoints), so it stays unattributed.
-        _iface = interface_setup.interface if interface_setup.interface in ("cli", "mcp", "sdk") else None
-        endpoint_cov = results.endpoint_coverage(run_dir / "api_calls.jsonl", _wl, _bl, interface=_iface)
+        _iface = (
+            interface_setup.interface
+            if interface_setup.interface in ("cli", "mcp", "sdk")
+            else None
+        )
+        endpoint_cov = results.endpoint_coverage(
+            run_dir / "api_calls.jsonl", _wl, _bl, interface=_iface
+        )
         endpoint_counts = {
             "whitelist_hits": endpoint_cov["whitelist_hits"],
             "blacklist_hits": endpoint_cov["blacklist_hits"],
@@ -575,10 +729,12 @@ def run(spec: RunSpec) -> results.Row:
             "asserts_total": grading.get("asserts_total", 0),
         }
         if grading.get("asserts_total"):
-            print(f"[mlpab] graded: {grading.get('asserts_passed', 0)}/"
-                  f"{grading['asserts_total']} asserts"
-                  + (f" — {grading['diagnostic']}" if grading.get("diagnostic") else ""),
-                  flush=True)
+            print(
+                f"[mlpab] graded: {grading.get('asserts_passed', 0)}/"
+                f"{grading['asserts_total']} asserts"
+                + (f" — {grading['diagnostic']}" if grading.get("diagnostic") else ""),
+                flush=True,
+            )
         # Map the agent's `claude -p` usage into the Row's metric columns.
         # Wall metrics count COMPUTE time only: rate-limit back-off sleeps are
         # excluded (waiting != computing) and recorded separately in
@@ -586,8 +742,7 @@ def run(spec: RunSpec) -> results.Row:
         rl_wait = round(cr.rate_limit_wait_s, 2)
         wall = round(cr.wall_time_s - cr.rate_limit_wait_s, 2)
         if rl_wait:
-            print(f"[mlpab] rate-limit waits excluded from wall time: "
-                  f"{rl_wait:.0f}s", flush=True)
+            print(f"[mlpab] rate-limit waits excluded from wall time: {rl_wait:.0f}s", flush=True)
         # Exact execution split of wall: platform = seconds inside interface
         # (cli/mcp/sdk) tool calls — remote execution against the platform;
         # local = the rest (local tools + LLM generation). Clamped so the
@@ -612,7 +767,7 @@ def run(spec: RunSpec) -> results.Row:
         row = results.Row(
             started_at=started.isoformat(),
             run=spec.run_id or "",
-            version="",   # raw Row field; the CSV `version` column carries interface_ref
+            version="",  # raw Row field; the CSV `version` column carries interface_ref
             platform=spec.platform,
             interface=spec.interface,
             skills=spec.skills,
@@ -638,19 +793,54 @@ def run(spec: RunSpec) -> results.Row:
         # process itself died (crash/timeout), where partial counts would
         # mislead.
         if not deliverable_exists:
-            row.error = str(grading.get("error")
-                            or grading.get("diagnostic")
-                            or "deliverable not found on the platform")[:1000]
+            row.error = str(
+                grading.get("error")
+                or grading.get("diagnostic")
+                or "deliverable not found on the platform"
+            )[:1000]
             if cr.exit_code != 0:
-                for _f in ("wall_time_s", "rate_limit_wait_s",
-                           "platform_time_s", "local_time_s",
-                           "input_tokens", "output_tokens",
-                           "total_tokens", "cost_usd", "llm_calls", "cli_calls",
-                           "mcp_calls", "sdk_calls", "python_calls", "bash_calls",
-                           "skill_calls", "read_calls", "write_calls", "edit_calls",
-                           "glob_calls", "grep_calls", "todo_calls",
-                           "failed_commands", "denied_calls",
-                           "whitelist_hits", "blacklist_hits"):
+                # The agent itself DIED — that's the root cause; "no deliverable"
+                # (and any grader read error it triggers) is just a symptom.
+                # Report the agent failure, with its stderr tail, INSTEAD of the
+                # downstream grader message — otherwise a dead engine (e.g. a
+                # model the runner can't reach) masquerades as a grading bug.
+                tail = ""
+                try:
+                    if cr.stderr_path and Path(cr.stderr_path).exists():
+                        tail = Path(cr.stderr_path).read_text(errors="replace").strip()[-400:]
+                except Exception:
+                    pass
+                row.error = (
+                    f"agent exited {cr.exit_code} (no deliverable produced)"
+                    + (f": …{tail}" if tail else "")
+                )[:1000]
+                for _f in (
+                    "wall_time_s",
+                    "rate_limit_wait_s",
+                    "platform_time_s",
+                    "local_time_s",
+                    "input_tokens",
+                    "output_tokens",
+                    "total_tokens",
+                    "cost_usd",
+                    "llm_calls",
+                    "cli_calls",
+                    "mcp_calls",
+                    "sdk_calls",
+                    "python_calls",
+                    "bash_calls",
+                    "skill_calls",
+                    "read_calls",
+                    "write_calls",
+                    "edit_calls",
+                    "glob_calls",
+                    "grep_calls",
+                    "todo_calls",
+                    "failed_commands",
+                    "denied_calls",
+                    "whitelist_hits",
+                    "blacklist_hits",
+                ):
                     setattr(row, _f, 0)
                 print(
                     f"[mlpab] DEAD run (agent exited {cr.exit_code}, no "
@@ -659,11 +849,16 @@ def run(spec: RunSpec) -> results.Row:
                     file=sys.stderr,
                 )
 
+        # Scrub any credential value that leaked into the error text (e.g. an
+        # agent stderr tail or a platform error echoing a token) before it's
+        # persisted to the CSV. extra = this interface's declared key values,
+        # which may be manifest-embedded and not in the environment.
+        row.error = redact.redact(row.error, extra=interface_setup.keys.values())
+
         # ONE global CSV for all configs, appended right here
         # after every run so the table is always fresh. `append` numbers the
         # row's repeat counter `n` against the rows already in the global table.
-        global_csv = spec.results_csv or (
-            _results_root_from(spec.runs_root) / "results.csv")
+        global_csv = spec.results_csv or (_results_root_from(spec.runs_root) / "results.csv")
         results.append(global_csv, row, fields=results.RESULTS_FIELDS)
 
         # Teardown: run done — stop the platform's background servers, then remove
@@ -671,11 +866,25 @@ def run(spec: RunSpec) -> results.Row:
         # pip-installed) and the copied skill bundle, so nothing persists into
         # other runs. Results/artifacts (agent.log, submission, grading,
         # commands.jsonl, endpoint_coverage.json) stay.
-        _run_aux(interface_setup.teardown, run_dir, {
+        teardown_env = {
             **os.environ,
             **interface_setup.keys,
             "MLPAB_PLATFORM_DIR": str(interfaces.CONFIGS_DIR / spec.platform),
-        })
+        }
+        _run_aux(interface_setup.teardown, run_dir, teardown_env)
+        # Twofold check (other half): confirm teardown actually swept the agent's
+        # resources. A leak is a cost + cross-run-contamination risk, but the run
+        # already happened — so WARN (don't fail), and the next run's start
+        # teardown sweeps again. Runs before the venv is removed (an SDK-based
+        # verify needs it).
+        ok, detail = _verify_platform("teardown", spec.platform, run_dir, teardown_env)
+        if not ok:
+            print(
+                f"[mlpab] WARNING: teardown verification for {spec.platform!r} found "
+                f"un-swept resources (possible leak / cost):\n{detail.strip()[-1000:]}",
+                file=sys.stderr,
+                flush=True,
+            )
         shutil.rmtree(run_dir / "venv", ignore_errors=True)
         shutil.rmtree(run_dir / ".claude" / "skills", ignore_errors=True)
         # Transient processing inputs, not kept per run: the raw stream-json

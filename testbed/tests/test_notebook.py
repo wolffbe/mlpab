@@ -4,6 +4,7 @@ Covers cell construction (deterministic, no kernel needed) and the optional
 execution path. Execution-path tests skip if matplotlib + ipykernel aren't both
 installed.
 """
+
 import csv
 import shutil
 import tempfile
@@ -18,9 +19,10 @@ from mlpab import results as results_mod
 
 def _has_exec_deps() -> bool:
     try:
-        import matplotlib  # noqa: F401
         import ipykernel  # noqa: F401
+        import matplotlib  # noqa: F401
         from jupyter_client.manager import KernelManager  # noqa: F401
+
         return True
     except ImportError:
         return False
@@ -36,14 +38,30 @@ def _write_results_csv(parent: Path, rows: list[dict]) -> Path:
     return path
 
 
-def _bm_row(config, task, asserts_passed, n=1, interface="cli",
-            asserts_total=4, wall_time_s=10, total_tokens=100, cost_usd=0.1):
+def _bm_row(
+    config,
+    task,
+    asserts_passed,
+    n=1,
+    interface="cli",
+    asserts_total=4,
+    wall_time_s=10,
+    total_tokens=100,
+    cost_usd=0.1,
+):
     return {
-        "config": config, "model": "claude-opus-4-8", "platform": "hopsworks",
-        "interface": interface, "version": "v1", "skills": "none",
-        "task": task, "n": str(n),
-        "asserts_passed": str(asserts_passed), "asserts_total": str(asserts_total),
-        "wall_time_s": str(wall_time_s), "total_tokens": str(total_tokens),
+        "config": config,
+        "model": "claude-opus-4-8",
+        "platform": "hopsworks",
+        "interface": interface,
+        "version": "v1",
+        "skills": "none",
+        "task": task,
+        "n": str(n),
+        "asserts_passed": str(asserts_passed),
+        "asserts_total": str(asserts_total),
+        "wall_time_s": str(wall_time_s),
+        "total_tokens": str(total_tokens),
         "cost_usd": str(cost_usd),
     }
 
@@ -65,11 +83,14 @@ class BuildResultsNotebookTests(unittest.TestCase):
         self.assertIsNone(notebook_mod.build_results_notebook(self.results_root))
 
     def test_sections_per_config_and_chart_per_tracked_metric(self):
-        _write_results_csv(self.results_root, [
-            _bm_row("rq1-a", "drift", 2, n=1),
-            _bm_row("rq1-a", "drift", 3, n=2),
-            _bm_row("rq1-b", "skew", 4, interface="sdk"),
-        ])
+        _write_results_csv(
+            self.results_root,
+            [
+                _bm_row("rq1-a", "drift", 2, n=1),
+                _bm_row("rq1-a", "drift", 3, n=2),
+                _bm_row("rq1-b", "skew", 4, interface="sdk"),
+            ],
+        )
         nb_path = notebook_mod.build_results_notebook(self.results_root, execute=False)
         self.assertIsNotNone(nb_path)
         self.assertEqual(nb_path.name, "results.ipynb")
@@ -93,10 +114,13 @@ class BuildResultsNotebookTests(unittest.TestCase):
 
     @unittest.skipUnless(_has_exec_deps(), "needs matplotlib + ipykernel")
     def test_executed_notebook_embeds_outputs(self):
-        _write_results_csv(self.results_root, [
-            _bm_row("rq1-a", "drift", 2, n=1),
-            _bm_row("rq1-a", "drift", 3, n=2),
-        ])
+        _write_results_csv(
+            self.results_root,
+            [
+                _bm_row("rq1-a", "drift", 2, n=1),
+                _bm_row("rq1-a", "drift", 3, n=2),
+            ],
+        )
         nb_path = notebook_mod.build_results_notebook(self.results_root, execute=True)
         nb = nbformat.read(nb_path, as_version=4)
         self.assertTrue(any(c.cell_type == "code" and c.get("outputs") for c in nb.cells))

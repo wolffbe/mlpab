@@ -19,6 +19,7 @@ on adapter `none` those asserts are skipped-pass, so the generation-time
 gates exercise the answers-shape asserts directly: the reference answers pass
 the grade function; a missing/empty `alert` key and a wrong job name fail.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -62,8 +63,7 @@ def generate(seed: int, out: Path) -> dict:
         shutil.rmtree(out)
     (out / "data").mkdir(parents=True)
     (out / "solution").mkdir()
-    (out / "data" / "failing_job.py").write_text(
-        FAILING_TEMPLATE.format(code=code, job=job))
+    (out / "data" / "failing_job.py").write_text(FAILING_TEMPLATE.format(code=code, job=job))
     (out / "data" / "instructions.md").write_text(
         "# Flaky job + failure alert\n\n"
         f"`failing_job.py` ALWAYS exits 1 (it raises a seeded error, {code}). "
@@ -86,11 +86,9 @@ def generate(seed: int, out: Path) -> dict:
         f'    {{"job_name": "{job}", "alert": "<name or short description '
         'of the alert you configured>"}\n'
     )
-    truth = {"family": "alerting", "seed": seed,
-             "job_name": job, "error_code": code}
+    truth = {"family": "alerting", "seed": seed, "job_name": job, "error_code": code}
     (out / "solution" / "truth.json").write_text(json.dumps(truth, indent=2))
-    (out / "instance.json").write_text(json.dumps(
-        {"family": "alerting", "seed": seed}, indent=2))
+    (out / "instance.json").write_text(json.dumps({"family": "alerting", "seed": seed}, indent=2))
 
     # --- gates: answers-shape asserts via the grade function (adapter none) ----
     from evals.ops.alerting.grade import grade

@@ -19,6 +19,7 @@ CLI (for live probing):
     python -m evals.adapters.databricks describe-fg --name transactions
     python -m evals.adapters.databricks read-td --name churn_training --version 1 --out /tmp/td.csv
 """
+
 from __future__ import annotations
 
 import argparse
@@ -52,7 +53,9 @@ class DatabricksChecker:
 
     def _sql(self, statement: str) -> pd.DataFrame:
         r = self._w.statement_execution.execute_statement(
-            statement=statement, warehouse_id=self._warehouse, wait_timeout="50s",
+            statement=statement,
+            warehouse_id=self._warehouse,
+            wait_timeout="50s",
         )
         state = r.status.state.value if r.status and r.status.state else "?"
         if state != "SUCCEEDED":
@@ -71,7 +74,7 @@ class DatabricksChecker:
         except Exception:
             return None
         pk: list[str] = []
-        for c in (getattr(t, "table_constraints", None) or []):
+        for c in getattr(t, "table_constraints", None) or []:
             pkc = getattr(c, "primary_key_constraint", None)
             if pkc is not None:
                 pk = list(pkc.child_columns or [])
@@ -79,13 +82,25 @@ class DatabricksChecker:
             name=name,
             version=None,
             primary_key=pk,
-            event_time=None,   # Unity Catalog has no event-time concept → capability note
-            schema={c.name: str(c.type_name.value if c.type_name else c.type_text)
-                    for c in (t.columns or [])},
+            event_time=None,  # Unity Catalog has no event-time concept → capability note
+            schema={
+                c.name: str(c.type_name.value if c.type_name else c.type_text)
+                for c in (t.columns or [])
+            },
         )
 
     def read_rows(self, name: str, version: int | None = None) -> pd.DataFrame:
-        return self._sql(f"SELECT * FROM {SCHEMA}.{name}")
+        try:
+            return self._sql(f"SELECT * FROM {SCHEMA}.{name}")
+        except RuntimeError as e:
+            # A missing deliverable is a graceful "not produced" (failed
+            # A0_deliverable_exists assert), NOT a grader crash: translate it to
+            # LookupError, which grade_table_main catches. Anything else is a
+            # genuine read failure and must keep propagating.
+            msg = str(e)
+            if "TABLE_OR_VIEW_NOT_FOUND" in msg or "cannot be found" in msg:
+                raise LookupError(f"table {SCHEMA}.{name} not found") from e
+            raise
 
     # -- training datasets ---------------------------------------------------
 
@@ -116,9 +131,13 @@ def main(argv: list[str] | None = None) -> int:
     checker = DatabricksChecker()
     if args.cmd == "describe-fg":
         info = checker.get_feature_table(args.name)
-        print(json.dumps({"exists": info is not None,
-                          **(info.__dict__ if info else {"name": args.name})},
-                         default=str, indent=2))
+        print(
+            json.dumps(
+                {"exists": info is not None, **(info.__dict__ if info else {"name": args.name})},
+                default=str,
+                indent=2,
+            )
+        )
         return 0 if info else 1
     if args.cmd == "read-fg":
         checker.read_rows(args.name).to_csv(args.out, index=False)
@@ -137,23 +156,26 @@ if __name__ == "__main__":
 # graders assert on `exists` plus whichever detail keys the API provides).
 # --------------------------------------------------------------------------
 
+
 def _state_reads(cls):
     def get_model(self, name: str, version: int = 1) -> dict:
         """Registered model: UC registry (workspace.default.<name>) first,
         then the legacy workspace (MLflow) registry."""
         try:
             m = self._w.registered_models.get(f"{SCHEMA}.{name}")
-            return {"exists": True, "registry": "unity-catalog",
-                    "full_name": m.full_name}
+            return {"exists": True, "registry": "unity-catalog", "full_name": m.full_name}
         except Exception:
             pass
         try:
             r = self._w.api_client.do(
-                "GET", "/api/2.0/mlflow/registered-models/get",
-                query={"name": name})
+                "GET", "/api/2.0/mlflow/registered-models/get", query={"name": name}
+            )
             versions = (r.get("registered_model") or {}).get("latest_versions") or []
-            return {"exists": True, "registry": "workspace-mlflow",
-                    "version": max((int(v.get("version", 0)) for v in versions), default=None)}
+            return {
+                "exists": True,
+                "registry": "workspace-mlflow",
+                "version": max((int(v.get("version", 0)) for v in versions), default=None),
+            }
         except Exception as e:
             return {"exists": False, "error": str(e)}
 
@@ -165,17 +187,24 @@ def _state_reads(cls):
                 return {"exists": False}
             j = self._w.jobs.get(jobs[0].job_id)
             s = j.settings
-            out = {"exists": True,
-                   "scheduled": bool(getattr(s, "schedule", None)
-                                     or getattr(s, "trigger", None)
-                                     or getattr(s, "continuous", None)),
-                   "notifications": bool(getattr(s, "email_notifications", None)
-                                         or getattr(s, "webhook_notifications", None))}
+            out = {
+                "exists": True,
+                "scheduled": bool(
+                    getattr(s, "schedule", None)
+                    or getattr(s, "trigger", None)
+                    or getattr(s, "continuous", None)
+                ),
+                "notifications": bool(
+                    getattr(s, "email_notifications", None)
+                    or getattr(s, "webhook_notifications", None)
+                ),
+            }
             try:
                 runs = list(self._w.jobs.list_runs(job_id=jobs[0].job_id, limit=1))
                 if runs and runs[0].state:
                     out["last_run_state"] = str(
-                        runs[0].state.result_state or runs[0].state.life_cycle_state)
+                        runs[0].state.result_state or runs[0].state.life_cycle_state
+                    )
             except Exception:
                 pass
             return out
@@ -187,8 +216,7 @@ def _state_reads(cls):
         try:
             e = self._w.serving_endpoints.get(name)
             state = getattr(e, "state", None)
-            return {"exists": True,
-                    "status": str(getattr(state, "ready", "") or "")}
+            return {"exists": True, "status": str(getattr(state, "ready", "") or "")}
         except Exception as e:
             return {"exists": False, "error": str(e)}
 
@@ -196,8 +224,10 @@ def _state_reads(cls):
         """Alerting realization on Databricks = job notification settings;
         report whether the named JOB carries any (see get_job)."""
         job = get_job(self, name_or_hint)
-        return {"exists": bool(job.get("exists") and job.get("notifications")),
-                **({"error": job["error"]} if job.get("error") else {})}
+        return {
+            "exists": bool(job.get("exists") and job.get("notifications")),
+            **({"error": job["error"]} if job.get("error") else {}),
+        }
 
     def get_vector_store(self, name: str) -> dict:
         """Vector store realization on Databricks: a Vector Search index (an
@@ -213,16 +243,25 @@ def _state_reads(cls):
             hits = []
             for ep in ep_names:
                 try:
-                    r = self._w.api_client.do(
-                        "GET", "/api/2.0/vector-search/indexes",
-                        query={"endpoint_name": ep}) or {}
+                    r = (
+                        self._w.api_client.do(
+                            "GET", "/api/2.0/vector-search/indexes", query={"endpoint_name": ep}
+                        )
+                        or {}
+                    )
                 except Exception:
                     continue
-                hits += [{"index": idx.get("name"), "endpoint": ep}
-                         for idx in (r.get("vector_indexes") or [])
-                         if name in (idx.get("name") or "")]
-            return {"exists": bool(hits), "kind": "vector-search-index",
-                    "matches": hits, "endpoints": ep_names}
+                hits += [
+                    {"index": idx.get("name"), "endpoint": ep}
+                    for idx in (r.get("vector_indexes") or [])
+                    if name in (idx.get("name") or "")
+                ]
+            return {
+                "exists": bool(hits),
+                "kind": "vector-search-index",
+                "matches": hits,
+                "endpoints": ep_names,
+            }
         except Exception as e:
             return {"exists": False, "error": str(e)}
 
