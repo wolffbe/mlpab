@@ -2,10 +2,12 @@
 into the Claude-style transcript (so the existing accounting pipeline works
 unchanged), and the per-run config.toml writer."""
 
+import io
 import json
 import os
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import mock
 
@@ -273,6 +275,85 @@ class RateLimitDetectionTests(unittest.TestCase):
             [json.dumps({"type": "item.completed", "item": {"command": "head -n 500 f"}})]
         )
         self.assertFalse(codex_runner._rate_limited(raw, err))
+
+
+class PrintEventTests(unittest.TestCase):
+    """`_print_event` renders codex `exec --json` events as Claude-style
+    `[agent:…]` lines (parity with claude_runner's live pane / agent.log)."""
+
+    def setUp(self):
+        os.environ.pop("MLPAB_QUIET", None)
+
+    def _capture(self, event):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            codex_runner._print_event(json.dumps(event))
+        return buf.getvalue()
+
+    def test_command_renders_bash_then_result(self):
+        out = self._capture(
+            {
+                "type": "item.completed",
+                "item": {
+                    "item_type": "command_execution",
+                    "command": "aws s3 ls",
+                    "aggregated_output": "bucket-a\nbucket-b",
+                    "exit_code": 0,
+                },
+            }
+        )
+        self.assertEqual(
+            out,
+            "[agent:bash] aws s3 ls\n[agent:result] bucket-a\n[agent:result] bucket-b\n",
+        )
+
+    def test_failed_command_tags_exit_code(self):
+        out = self._capture(
+            {
+                "type": "item.completed",
+                "item": {"item_type": "command_execution", "command": "aws boom", "exit_code": 2},
+            }
+        )
+        self.assertEqual(out, "[agent:bash] aws boom\n[agent:result-err] exit 2\n")
+
+    def test_agent_message_rendered(self):
+        out = self._capture(
+            {"type": "item.completed", "item": {"item_type": "agent_message", "text": "hi\nthere"}}
+        )
+        self.assertEqual(out, "[agent] hi\n[agent] there\n")
+
+    def test_mcp_tool_rendered(self):
+        out = self._capture(
+            {
+                "type": "item.completed",
+                "item": {"item_type": "mcp_tool_call", "server": "hops", "tool": "list"},
+            }
+        )
+        self.assertEqual(out, "[agent:mcp] mcp__hops__list\n")
+
+    def test_error_event_tagged(self):
+        out = self._capture({"type": "error", "message": "429 slow down"})
+        self.assertEqual(out, "[agent:result-err] 429 slow down\n")
+
+    def test_is_failed_exit_coerces_string_and_int(self):
+        f = codex_runner._is_failed_exit
+        self.assertFalse(f(None))
+        self.assertFalse(f(0))
+        self.assertFalse(f("0"))   # codex may emit exit_code as a string
+        self.assertTrue(f(1))
+        self.assertTrue(f("2"))
+        self.assertFalse(f(""))    # missing/empty → not a failure
+
+    def test_turn_completed_is_silent(self):
+        # claude prints only on the final `result` event, not per turn.
+        out = self._capture({"type": "turn.completed", "usage": {"input_tokens": 5}})
+        self.assertEqual(out, "")
+
+    def test_malformed_json_ignored(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            codex_runner._print_event("{not json")
+        self.assertEqual(buf.getvalue(), "")
 
 
 if __name__ == "__main__":

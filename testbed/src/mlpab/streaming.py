@@ -38,6 +38,27 @@ def nested() -> bool:
     return os.environ.get("MLPAB_NESTED", "").strip().lower() not in ("", "0", "false", "no")
 
 
+# Bound a tool RESULT body before LIVE echo so a chatty command (a big codex
+# `aggregated_output` / `cat bigfile` / job-log tail) can't flood the pane and
+# agent.log. The full body still exists in the engine's own event log
+# (vibe_events.jsonl / codex_events.jsonl). The Claude path is unaffected — it
+# already surfaces only what the model chose to return.
+LIVE_RESULT_MAX_LINES = 200
+LIVE_RESULT_MAX_CHARS = 20000
+
+
+def cap_for_live(text: str) -> str:
+    """Truncate a result body to LIVE_RESULT_MAX_CHARS / _LINES with a marker."""
+    text = text or ""
+    if len(text) > LIVE_RESULT_MAX_CHARS:
+        text = text[:LIVE_RESULT_MAX_CHARS] + "\n… (truncated; see the engine event log)"
+    lines = text.splitlines()
+    if len(lines) > LIVE_RESULT_MAX_LINES:
+        extra = len(lines) - LIVE_RESULT_MAX_LINES
+        lines = lines[:LIVE_RESULT_MAX_LINES] + [f"… ({extra} more lines, see the event log)"]
+    return "\n".join(lines)
+
+
 def _wrap_block(text: str, prefix: str) -> list[str]:
     """Tag every line of `text` with `prefix`. No truncation — the live log is
     the durable record (raw transcript.jsonl is discarded at teardown)."""

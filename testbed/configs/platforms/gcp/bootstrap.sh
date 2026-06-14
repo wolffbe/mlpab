@@ -22,14 +22,26 @@ ADC_DST="$TESTBED/.gcp/adc.json"
 SA="${SA:-mlpab-sa}"
 DATASET="${DATASET:-mlpab}"
 LOCATION="${LOCATION:-***REDACTED***}"   # EU by default; Vertex + Vector Search supported
-ROLES=(roles/aiplatform.user roles/bigquery.dataEditor roles/bigquery.jobUser \
-       roles/monitoring.viewer roles/storage.objectAdmin)
+# The interface boundary is enforced by the agent HOOK (the on-interface
+# `gcloud`/SDK surface), NOT by IAM — so scoping the service account's roles
+# adds no experimental value and only manufactures fake-negative runs when a
+# task needs a resource outside the curated set (the GCP analog of the AWS
+# execution-role ECR gap seen live 2026-06-14). So grant the basic `roles/editor`
+# (GCP's "unrestricted except IAM": modify essentially every resource, but
+# cannot set IAM policy, manage roles, or touch billing/org). The keyless-ADC
+# fallback below still adds only the impersonation grant the user needs.
+ROLES=(roles/editor)
 
 say() { printf '\n>> %s\n' "$*"; }
 die() { printf '\nERROR: %s\n' "$*" >&2; exit 1; }
 set_env() { local key="$1"; shift; local val="$*" tmp; tmp="$(mktemp)"; touch "$ENV_FILE"
-  grep -v "^${key}=" "$ENV_FILE" > "$tmp" 2>/dev/null || true
+  val="${val//$'\r'/}"; val="${val//$'\n'/}"   # never split a value across lines
+  grep -v "^${key}=" "$ENV_FILE" 2>/dev/null | cat -s > "$tmp" || true
   printf '%s=%s\n' "$key" "$val" >> "$tmp"; mv "$tmp" "$ENV_FILE"; }
+env_sep() {  # one blank-line separator before this bootstrap's block (idempotent)
+  touch "$ENV_FILE"
+  [ -s "$ENV_FILE" ] && [ -n "$(tail -c1 "$ENV_FILE")" ] && printf '\n' >> "$ENV_FILE"
+  [ -s "$ENV_FILE" ] && [ -n "$(tail -n1 "$ENV_FILE")" ] && printf '\n' >> "$ENV_FILE"; }
 
 # --- 1. CLI -----------------------------------------------------------------
 if ! command -v gcloud >/dev/null 2>&1; then
@@ -71,6 +83,7 @@ else
 fi
 
 # --- 6. credentials: SA key, else keyless ADC (org may block keys) ----------
+env_sep   # keep this run's GCP_* / GOOGLE_* keys as their own separated block
 mkdir -p "$TESTBED/.gcp"; chmod 700 "$TESTBED/.gcp"
 grep -qxF '.gcp/' "$TESTBED/.gitignore" 2>/dev/null || echo '.gcp/' >> "$TESTBED/.gitignore"
 ERR="$(mktemp)"

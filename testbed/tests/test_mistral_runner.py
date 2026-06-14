@@ -1,10 +1,12 @@
 """Unit tests for the Mistral Vibe agent engine: model routing (mutually
 exclusive with codex/claude) and the streaming-event → transcript normalizer."""
 
+import io
 import json
 import os
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import mock
 
@@ -189,6 +191,54 @@ class RateLimitDetectionTests(unittest.TestCase):
     def test_ordinary_error_is_not_rate_limited(self):
         raw, err = self._files([json.dumps({"type": "error", "message": "invalid api key"})])
         self.assertFalse(mistral_runner._rate_limited(raw, err))
+
+
+class PrintEventTests(unittest.TestCase):
+    """`_print_event` renders vibe streaming events as Claude-style `[agent:…]`
+    lines (parity with claude_runner's live pane / agent.log)."""
+
+    def setUp(self):
+        os.environ.pop("MLPAB_QUIET", None)
+
+    def _capture(self, event):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            mistral_runner._print_event(json.dumps(event))
+        return buf.getvalue()
+
+    def test_assistant_tool_call_renders_bash_line(self):
+        out = self._capture(
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"function": {"name": "bash", "arguments": '{"command": "aws s3 ls"}'}}
+                ],
+            }
+        )
+        self.assertEqual(out, "[agent:bash] aws s3 ls\n")
+
+    def test_assistant_free_text_rendered(self):
+        out = self._capture({"role": "assistant", "content": "planning the ingest\nstep two"})
+        self.assertEqual(out, "[agent] planning the ingest\n[agent] step two\n")
+
+    def test_tool_result_rendered_full(self):
+        out = self._capture({"role": "tool", "content": "line1\nline2"})
+        self.assertEqual(out, "[agent:result] line1\n[agent:result] line2\n")
+
+    def test_tool_error_tagged(self):
+        out = self._capture({"role": "tool", "content": "boom", "status": "error"})
+        self.assertEqual(out, "[agent:result-err] boom\n")
+
+    def test_error_event_tagged(self):
+        out = self._capture({"type": "error", "message": "429 slow down"})
+        self.assertEqual(out, "[agent:result-err] 429 slow down\n")
+
+    def test_malformed_json_ignored(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            mistral_runner._print_event("{not json")
+        self.assertEqual(buf.getvalue(), "")
 
 
 if __name__ == "__main__":

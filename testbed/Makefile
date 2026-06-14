@@ -182,6 +182,13 @@ clean-runs: venv
 
 # One-time cloud bootstrap: install CLI, login, create resources, write .env.
 # Idempotent. GCP needs a project:  PROJECT=my-proj make bootstrap-gcp
+#
+# bootstrap-aws prompts for an ADMIN access-key pair (used once, never stored):
+# it provisions the SageMaker execution role, the supplement policy, and a
+# PowerUser `mlpab-agent` user whose freshly minted key is written to .env. The
+# admin identity needs IAM rights to create users/keys/policies/roles — simplest
+# is an admin with the AWS-managed AdministratorAccess (or IAMFullAccess). The
+# minted agent itself is PowerUser ("everything except IAM").
 bootstrap-aws:
 	bash configs/platforms/aws/bootstrap.sh
 bootstrap-azure:

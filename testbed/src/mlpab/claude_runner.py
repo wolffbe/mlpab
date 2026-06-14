@@ -89,6 +89,90 @@ DEFAULT_COMPUTE_DENY = [
     "transformers",
 ]
 
+# Gate script ships beside the hook (src/mlpab/hooks/).
+GATE_SCRIPT = Path(__file__).resolve().parent / "hooks" / "exec_gate.py"
+
+
+def set_enforcement_env(
+    env: dict,
+    *,
+    run_dir: Path,
+    command_log: Path,
+    interface: str | None,
+    cli_binary: str | None,
+    cli_subcommand: str | None,
+    sdk_module: str | None,
+    compute_deny: list[str] | None,
+    instance_allowlist: list[str] | None,
+    platform: str | None,
+) -> None:
+    """Populate the TESTBED_* env the enforcement logic (`hooks.log_tool_call`)
+    reads — used by the Claude PreToolUse hook AND the exec gate for vibe/codex,
+    so the single-interface contract is defined in ONE place and applied
+    identically across all three engines.
+
+    AUTHORITATIVE: every TESTBED_* var is SET or explicitly CLEARED, so a stray
+    value inherited from the parent environment (`os.environ.copy()` at the top
+    of each runner) can never leak in and wrongly trip enforcement on a run it
+    shouldn't apply to."""
+
+    def _put(key: str, value: str | None) -> None:
+        if value:
+            env[key] = value
+        else:
+            env.pop(key, None)
+
+    _put("TESTBED_COMMAND_LOG", str(command_log))
+    _put("TESTBED_BOUNDARY", str(Path(run_dir).resolve()))
+    _put("TESTBED_CLI_BINARY", cli_binary)
+    _put("TESTBED_CLI_SUBCOMMAND", cli_subcommand)
+    _put("TESTBED_SDK_MODULE", sdk_module)
+    _put("TESTBED_PLATFORM", platform if platform and platform != "none" else None)
+    # Enforce ONLY for real delegation interfaces; a none/none baseline trains
+    # locally by design and the logic no-ops on it.
+    delegating = interface in ("cli", "mcp", "sdk")
+    _put("TESTBED_INTERFACE", interface if delegating else None)
+    _put("TESTBED_COMPUTE_DENY", ",".join(compute_deny or DEFAULT_COMPUTE_DENY) if delegating else None)
+    _put("TESTBED_INSTANCE_ALLOW", ",".join(instance_allowlist) if instance_allowlist else None)
+
+
+def install_exec_gate(run_dir: Path, env: dict) -> None:
+    """Route the hookless engines' (vibe/codex) shell commands through the exec
+    gate so the interface allowlist is enforced IN-FLIGHT, matching Claude's hook.
+
+    Both engines run commands through a configurable shell — vibe via
+    `create_subprocess_shell(cmd, executable=$SHELL)`, codex via its `user_shell`
+    (derived from $SHELL). Pointing SHELL (and a bash/sh on PATH, for engines
+    that resolve the shell by name) at the gate makes every `<shell> -c <cmd>`
+    pass through `enforce()` first. The gate hands allowed commands to the REAL
+    shell (MLPAB_REAL_SHELL, absolute → no recursion). Requires the TESTBED_*
+    env from `set_enforcement_env` to already be set. No-op for none/none (no
+    TESTBED_INTERFACE → the gate's enforce() returns None anyway, but we skip the
+    wiring to leave those runs pristine)."""
+    if not env.get("TESTBED_INTERFACE"):
+        return
+    gate_dir = Path(run_dir).resolve() / ".mlpab_gate"
+    gate_dir.mkdir(parents=True, exist_ok=True)
+    # The gate plus the enforcement module it imports, copied into the boundary.
+    gate = gate_dir / GATE_SCRIPT.name
+    shutil.copy(GATE_SCRIPT, gate)
+    shutil.copy(HOOK_SCRIPT, gate_dir / HOOK_SCRIPT.name)
+    gate.chmod(0o755)
+    # Resolve a REAL shell now so the gate's execv target is stable & absolute.
+    real = "/bin/bash" if os.path.exists("/bin/bash") else "/bin/sh"
+    env["MLPAB_REAL_SHELL"] = real
+    env["SHELL"] = str(gate)
+    # For an engine that runs the shell by NAME (`bash -lc …`) rather than via
+    # $SHELL: shim bash/sh to the gate, first on PATH.
+    for name in ("bash", "sh"):
+        link = gate_dir / name
+        # Always (re)point at the gate — unlink first so a stale/real file left
+        # by a prior run can't shadow it.
+        if link.is_symlink() or link.exists():
+            link.unlink()
+        link.symlink_to(gate)
+    env["PATH"] = f"{gate_dir}{os.pathsep}{env.get('PATH', '')}"
+
 # Bootstrapped into the agent's run venv (as `_mlpab_apilog.py` + a `.pth`
 # that imports it): wraps `requests.Session.send` to append every outbound
 # request's {method, path, src} to MLPAB_API_LOG. The Hopsworks SDK, `hops` CLI,
@@ -600,32 +684,23 @@ def run(
             flush=True,
         )
     env["ANTHROPIC_MODEL"] = model
-    env["TESTBED_COMMAND_LOG"] = str(command_log)
-    # PreToolUse hook reads this to enforce Read/Write/Edit path denies — silently
-    # skipped under bypassPermissions, but the hook fires regardless and rejects
-    # calls outside the boundary.
-    env["TESTBED_BOUNDARY"] = str(boundary)
-    if cli_binary:
-        env["TESTBED_CLI_BINARY"] = cli_binary
-    if cli_subcommand:
-        env["TESTBED_CLI_SUBCOMMAND"] = cli_subcommand
-    if sdk_module:
-        env["TESTBED_SDK_MODULE"] = sdk_module
-    # Platform name for the hook's denial messages ("Training must run on
-    # <platform>") — the hook is platform-agnostic and must not hardcode one.
-    if platform and platform != "none":
-        env["TESTBED_PLATFORM"] = platform
-    # Remote-only enforcement, only for the real delegation interfaces. The hook
-    # needs the active interface (so a non-active interface's use is an escape) plus
-    # the compute libraries whose LOCAL execution is forbidden (training must run
-    # remotely). A none/none baseline trains locally by design, so the hook no-ops.
-    if interface in ("cli", "mcp", "sdk"):
-        env["TESTBED_INTERFACE"] = interface
-        env["TESTBED_COMPUTE_DENY"] = ",".join(compute_deny or DEFAULT_COMPUTE_DENY)
-    # Cost control (manifest `instance_allowlist`, e.g. the AWS Free Tier set):
-    # the hook denies any other `ml.<family>.<size>` token in a tool call.
-    if instance_allowlist:
-        env["TESTBED_INSTANCE_ALLOW"] = ",".join(instance_allowlist)
+    # TESTBED_* enforcement env — the SAME set the exec gate (vibe/codex) reads,
+    # so the single-interface contract is defined once and applied identically.
+    # The PreToolUse hook reads TESTBED_BOUNDARY for Read/Write/Edit path denies
+    # (fires regardless of permission mode); TESTBED_INTERFACE/CLI_*/COMPUTE_DENY
+    # for the remote-only allowlist; TESTBED_INSTANCE_ALLOW for the free-tier guard.
+    set_enforcement_env(
+        env,
+        run_dir=run_dir,
+        command_log=command_log,
+        interface=interface,
+        cli_binary=cli_binary,
+        cli_subcommand=cli_subcommand,
+        sdk_module=sdk_module,
+        compute_deny=compute_deny,
+        instance_allowlist=instance_allowlist,
+        platform=platform,
+    )
 
     # Activate per-run venv so claude's python/pip find ML deps via .pth.
     activate_run_venv(env, run_dir)

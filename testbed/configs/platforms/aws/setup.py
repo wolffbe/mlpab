@@ -61,10 +61,79 @@ TRUST_POLICY = {
 }
 EXECUTION_POLICY_ARN = "arn:aws:iam::aws:policy/AmazonSageMakerFullAccess"
 
+# SageMaker jobs (training, processing, …) pull their container image — the
+# built-in algorithm and sklearn/pytorch/xgboost framework images — from
+# AWS-owned ECR registries (e.g. 895741380848 / 811284229777, per region), and
+# the EXECUTION ROLE must be allowed to pull. AmazonSageMakerFullAccess is meant
+# to cover this, but two things bite: (a) a role created BEFORE that policy was
+# attached keeps its old grants — the `get_role` "already exists" path below
+# returns without ensuring ANY policy, so an under-permissioned role is never
+# repaired; (b) the managed policy's ECR scope has narrowed over time. So attach
+# an EXPLICIT inline pull policy idempotently on EVERY setup run, independent of
+# the managed policy's state. (Verified live 2026-06-14: a processing-job ingest
+# floored 0/1 with FailureReason "Access denied for repository:
+# sagemaker-scikit-learn … role … [needs] ecr:BatchCheckLayerAvailability,
+# ecr:BatchGetImage, ecr:GetDownloadUrlForLayer".) Pull actions are read-only;
+# GetAuthorizationToken requires Resource "*".
+ECR_PULL_POLICY_NAME = "mlpab-ecr-pull"
+ECR_PULL_POLICY = {
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Sid": "EcrAuthToken",
+            "Effect": "Allow",
+            "Action": "ecr:GetAuthorizationToken",
+            "Resource": "*",
+        },
+        {
+            "Sid": "EcrPullJobImages",
+            "Effect": "Allow",
+            "Action": [
+                "ecr:BatchCheckLayerAvailability",
+                "ecr:GetDownloadUrlForLayer",
+                "ecr:BatchGetImage",
+            ],
+            # The prebuilt images live in AWS-owned accounts, not ours, so the
+            # repo ARNs span many accounts/regions/names (sagemaker-scikit-learn,
+            # xgboost, pytorch-inference, …) — match all repositories. Read-only.
+            "Resource": "arn:aws:ecr:*:*:repository/*",
+        },
+    ],
+}
+
+
+def _ensure_policies(iam, role_name: str) -> None:
+    """Idempotently give the execution role the permissions a SageMaker job
+    needs: the broad managed policy (AmazonSageMakerFullAccess — full SageMaker
+    + sagemaker-named ECR/S3) PLUS an explicit inline ECR-pull policy that also
+    covers non-`*sagemaker*` framework image repos (xgboost, pytorch, …) the
+    managed policy's repo scope misses. Both calls overwrite, so this is safe on
+    EVERY run and on both the create and already-exists paths — which is the
+    point: the execution role is plumbing, not the measured interface, so it
+    should simply work, and an under-permissioned role must be repaired rather
+    than left to fail jobs (a job that can't pull its image floors the run at
+    0/1, which reads as a model failure but isn't)."""
+    try:
+        iam.attach_role_policy(RoleName=role_name, PolicyArn=EXECUTION_POLICY_ARN)
+        print(f"[sagemaker setup] ensured {EXECUTION_POLICY_ARN.rsplit('/', 1)[-1]} on {role_name!r}")
+    except Exception as e:
+        print(f"[sagemaker setup] managed policy on {role_name!r} skipped: {e}")
+    try:
+        iam.put_role_policy(
+            RoleName=role_name,
+            PolicyName=ECR_PULL_POLICY_NAME,
+            PolicyDocument=json.dumps(ECR_PULL_POLICY),
+        )
+        print(f"[sagemaker setup] ensured inline ECR-pull policy on {role_name!r}")
+    except Exception as e:
+        print(f"[sagemaker setup] ECR-pull policy on {role_name!r} skipped: {e}")
+
 
 def _ensure_execution_role(session, region: str) -> str | None:
     """Make sure the execution role SAGEMAKER_ROLE_ARN names exists (create if
-    the credentials allow IAM) and return its CONFIRMED ARN, else None."""
+    the credentials allow IAM) and return its CONFIRMED ARN, else None. Its
+    permissions are ensured idempotently whether it was just created or already
+    existed (jobs can't pull their image / write artifacts otherwise)."""
     arn = os.environ.get("SAGEMAKER_ROLE_ARN") or ""
     role_name = arn.rsplit("/", 1)[-1] if arn else DEFAULT_ROLE_NAME
     try:
@@ -76,6 +145,7 @@ def _ensure_execution_role(session, region: str) -> str | None:
     try:
         resp = iam.get_role(RoleName=role_name)
         print(f"[sagemaker setup] execution role {role_name!r} already exists")
+        _ensure_policies(iam, role_name)  # repair an under-permissioned existing role
         return (resp.get("Role") or {}).get("Arn")
     except Exception:
         pass  # missing (or no iam:GetRole) → try to create it
@@ -86,7 +156,7 @@ def _ensure_execution_role(session, region: str) -> str | None:
             AssumeRolePolicyDocument=json.dumps(TRUST_POLICY),
             Description="mlpab testbed: execution role assumed by SageMaker jobs",
         )
-        iam.attach_role_policy(RoleName=role_name, PolicyArn=EXECUTION_POLICY_ARN)
+        _ensure_policies(iam, role_name)
         created_arn = (resp.get("Role") or {}).get("Arn")
         print(f"[sagemaker setup] created execution role {role_name!r} ({created_arn})")
         return created_arn

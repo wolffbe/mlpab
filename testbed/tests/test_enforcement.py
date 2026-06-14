@@ -98,6 +98,45 @@ class EnforceHookTests(unittest.TestCase):
             )
         )
 
+    def test_cli_command_substitution_escape_blocked(self):
+        # `echo $(node …)` ran an off-interface interpreter through the (allowed)
+        # echo — the command-substitution body must face the same allowlist.
+        self.assertIsNotNone(self._enforce("cli", "Bash", 'echo $(node -e "1")'))
+        self.assertIsNotNone(self._enforce("cli", "Bash", "echo `node -e 1`"))
+
+    def test_cli_find_exec_escape_blocked(self):
+        self.assertIsNotNone(self._enforce("cli", "Bash", "find . -name '*.py' -exec node {} ;"))
+
+    def test_cli_command_substitution_with_allowed_cmd_ok(self):
+        # A substitution whose inner exec is basic shell / the CLI is fine.
+        self.assertIsNone(self._enforce("cli", "Bash", "hops jobs list $(cat manifest.txt)"))
+        self.assertIsNone(self._enforce("cli", "Bash", 'echo "$(date)"'))
+
+    def test_single_quoted_dollar_paren_is_literal_not_escape(self):
+        # `$(…)` inside SINGLE quotes is literal (bash doesn't expand it) → must
+        # not be treated as a sub-command (no false denial).
+        self.assertIsNone(self._enforce("cli", "Bash", "hops fs cp 'weird$(node).csv' /dst"))
+
+    def test_cli_solution_answer_key_blocked(self):
+        for cmd in ("cat solution/truth.json", "cat ../solution/truth.json",
+                    "head /abs/run/solution/grading.json"):
+            self.assertIsNotNone(
+                __import__("mlpab.hooks.log_tool_call", fromlist=["x"]).gate_check(cmd), cmd
+            )
+
+    def test_gate_check_matches_enforce_for_offinterface(self):
+        import os as _os
+        from mlpab.hooks import log_tool_call as h
+        _os.environ.update({"TESTBED_INTERFACE": "cli", "TESTBED_CLI_BINARY": "aws"})
+        self.assertIsNotNone(h.gate_check('python -c "import torch"'))
+        self.assertIsNone(h.gate_check("aws sagemaker list-training-jobs"))
+
+    def test_cli_sleep_then_poll_allowed(self):
+        # A bounded foreground sleep before a single status poll (so the agent
+        # waits on a remote job instead of busy-polling every LLM turn) — sleep
+        # is basic shell; the interface command on the other side stays allowed.
+        self.assertIsNone(self._enforce("cli", "Bash", "sleep 30 && hops jobs get x"))
+
     def test_cli_mcp_tool_blocked(self):
         self.assertIsNotNone(self._enforce("cli", "mcp__hopsworks__create_job"))
 
@@ -166,12 +205,15 @@ class EnforceHookTests(unittest.TestCase):
     def test_unknown_binary_blocked(self):
         self.assertIsNotNone(self._enforce("mcp", "Bash", "./some_custom_tool --go"))
 
-    def test_sleep_blocked_in_every_mode(self):
-        # `sleep` only stalls / burns compute budget; it does no interface work,
-        # so it is off the allowlist and denied (incl. inside compound commands).
+    def test_sleep_allowed_in_every_mode(self):
+        # `sleep` is allowed so an agent can pause between remote-job status
+        # polls instead of busy-polling every LLM turn (which inflated llm_calls
+        # / tokens, seen live 2026-06-14). It does no interface work; the budget
+        # (max_seconds = wall − rate_limit_wait) still bounds total idle time, so
+        # an agent that over-sleeps just exhausts its own budget.
         for iface in ("cli", "mcp", "sdk"):
-            self.assertIsNotNone(self._enforce(iface, "Bash", "sleep 30"), iface)
-            self.assertIsNotNone(self._enforce(iface, "Bash", "sleep 5 && ls"), iface)
+            self.assertIsNone(self._enforce(iface, "Bash", "sleep 30"), iface)
+            self.assertIsNone(self._enforce(iface, "Bash", "sleep 5 && ls"), iface)
 
     def test_bash_c_node_blocked(self):
         # `bash -c "node …"` — the wrapper is unwrapped and the real exec gated.

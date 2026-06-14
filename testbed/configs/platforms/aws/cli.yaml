@@ -22,26 +22,36 @@
 #   - `service-quotas` — discover which instance types are launchable up front
 #     (seen live 2026-06-10: ml.m5.xlarge training quota 0 + ml.m4 absent from
 #     eu-north-1 were discovered by trial-and-error create-training-job
-#     failures). Read-only. NOTE: needs servicequotas:Get*/List* granted to the
-#     testbed's IAM user — AmazonSageMakerFullAccess does NOT include it; the
-#     consolidated supplement (also role bootstrap for setup.py/auth_command +
-#     logs:DeleteLogGroup for teardown.py's log sweep) is committed as
-#     mlpab-policy.json in this directory — attach it inline to the IAM user.
-#   - `sts` — get-caller-identity sanity checks (account/ARN); needs no IAM.
+#     failures). Read-only.
+#   - `sts` — get-caller-identity sanity checks (account/ARN).
 #   - `s3vectors` — Amazon S3 Vectors, the serverless vector store (vector
 #     buckets + indexes; put-vectors/query-vectors). The ONLY managed vector
 #     similarity search reachable from this interface: SageMaker itself has
 #     none, and AWS's other path (OpenSearch) is both off-interface and
 #     CLI-unreachable (SigV4 HTTP data plane). Verified live in eu-north-1
-#     (2026-06-12). NOTE: needs s3vectors:* granted to the testbed's IAM
-#     user — AmazonSageMakerFullAccess does NOT include it; covered by the
-#     mlpab-policy.json supplement in this directory.
+#     (2026-06-12).
 # Other services (`aws ec2`, `aws iam`, `aws ecr`, …) stay off-interface. This
 # mirrors the other platform CLIs, whose data path ships in the same binary
 # (`hops files`, `databricks fs`).
 # `cli_command: aws` + the `cli_subcommand` list tell mlpab that only those
 # services are on-interface; others (`aws ec2 …`, `aws iam …`) are off-interface
 # escapes (denied by the agent hook, not counted as interface calls).
+#
+# --- IAM grant model (testbed user credentials in `keys:`) ---
+# The interface boundary is enforced by the agent HOOK (the `cli_subcommand`
+# allowlist), NOT by IAM — so scoping the user's IAM policy adds no experimental
+# value and only manufactures fake-negative runs when a job can't reach some
+# service it legitimately needs (seen live 2026-06-14: a processing-job ingest
+# floored 0/1 because the execution role couldn't pull its ECR image). So the
+# testbed user gets the AWS-managed `PowerUserAccess` (full access to every
+# service EXCEPT IAM / Organizations / Account management) plus ONE inline
+# supplement, mlpab-policy.json in this directory, carrying only the IAM actions
+# PowerUser omits but setup.py needs: bootstrap + PassRole of the SageMaker
+# execution role. Attach BOTH to the user: the managed PowerUserAccess and the
+# inline mlpab-policy.json. The execution role itself (assumed by jobs, not the
+# user) is granted by setup.py: AmazonSageMakerFullAccess + a broad ECR-pull.
+# IAM stays denied to the agent both ways — PowerUser excludes it, and `aws iam`
+# is off-interface (hook-denied) regardless.
 #
 # Installed from PyPI (awscli v1 ships the `aws` console script — pip-installable,
 # fits the run-venv model; v2 is a platform-specific installer). The `aws sagemaker`
@@ -125,7 +135,7 @@ instance_allowlist:
 #     a known bucket keeps teardown's sweep simple) and the IAM execution role
 #     (jobs need a RoleArn, and IAM is off-interface), whose ARN setup.py exports
 #     into the agent's env as SAGEMAKER_ROLE_ARN via $MLPAB_PLATFORM_ENV.
-#     The logic is the committed configs/platforms/sagemaker/setup.py —
+#     The logic is the committed configs/platforms/aws/setup.py —
 #     $MLPAB_PLATFORM_DIR points there (fixed infra); `./venv` is the agent's
 #     run venv (botocore is installed there). ---
 serve:
@@ -137,7 +147,7 @@ serve:
 #     MLflow tracking servers, stop in-flight jobs, then endpoint configs /
 #     models / feature groups / pipelines / model packages / experiments, then
 #     the default bucket's contents. The cleanup logic is the committed
-#     configs/platforms/sagemaker/teardown.py — $MLPAB_PLATFORM_DIR points there
+#     configs/platforms/aws/teardown.py — $MLPAB_PLATFORM_DIR points there
 #     (fixed infra); `./venv` is the agent's run venv. ---
 teardown:
   - './venv/bin/python "$MLPAB_PLATFORM_DIR/teardown.py"'

@@ -11,11 +11,14 @@ Parity with the Claude agent (and the deliberate gaps):
   dir; codex's own OS sandbox (`workspace-write`) confines writes to the run
   dir, with network enabled for platform calls.
 - MCP: the interface's `mcp_servers` are written to CODEX_HOME/config.toml.
-- ENFORCEMENT GAP: codex has no PreToolUse-hook equivalent, so the remote-only /
-  single-interface allowlist is NOT enforced in-flight for codex agents.
-  Off-interface and local-python use remains fully VISIBLE post-hoc (the
-  accounting below), it just isn't blocked. Compare codex-agent rows with
-  that in mind.
+- Enforcement: codex has no PreToolUse-hook equivalent, but it runs commands
+  through its `user_shell` (derived from $SHELL), so claude_runner's
+  `install_exec_gate` points $SHELL (and a bash/sh on PATH) at the exec gate
+  that runs the SAME `enforce()` as the Claude hook before each command.
+  PROVISIONAL pending a live codex probe (auth-blocked): if codex ignores both
+  $SHELL and the PATH shim, the gate is bypassed and enforcement falls back to
+  post-hoc VISIBILITY only. codex also exposes a first-class `hooks` config that
+  could replace the gate once verified live.
 - Accounting: raw `codex exec --json` events land in `codex_events.jsonl` and
   are NORMALIZED into a Claude-style stream-json `transcript.jsonl` (assistant
   `tool_use` blocks + a final `result` event with usage/num_turns), so
@@ -32,10 +35,13 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+from mlpab import streaming
 from mlpab.claude_runner import (
     ClaudeResult,
     activate_run_venv,
+    install_exec_gate,
     run_streaming_with_backoff,
+    set_enforcement_env,
     streaming_is_rate_limited,
 )
 
@@ -88,6 +94,19 @@ def _write_codex_config(
     cfg = codex_home / "config.toml"
     cfg.write_text("\n".join(lines) + "\n")
     return cfg
+
+
+def _is_failed_exit(exit_code: Any) -> bool:
+    """A command-execution failed. codex's `exit_code` type is part of the
+    PROVISIONAL schema (auth-blocked, untested) — it may arrive as int OR string,
+    so coerce: None → not failed; "0"/0 → not failed; anything else → failed.
+    Used by BOTH the live echo and normalize_events so display and accounting agree."""
+    if exit_code is None:
+        return False
+    try:
+        return int(exit_code) != 0
+    except (TypeError, ValueError):
+        return str(exit_code).strip() not in ("", "0")
 
 
 # codex --json item types → Claude-style tool_use blocks. Unknown types fall
@@ -157,10 +176,9 @@ def normalize_events(raw_path: Path, transcript_path: Path) -> None:
                         )
                     )
                     # A failed command surfaces as an errored tool_result, so
-                    # `failed_commands` counts codex rows too. (No hook for
-                    # codex → denied_calls stays 0 by construction.)
-                    exit_code = item.get("exit_code")
-                    if block["name"] == "Bash" and exit_code not in (None, 0):
+                    # `failed_commands` counts codex rows too. denied_calls comes
+                    # from the exec gate's structured commands.jsonl records.
+                    if block["name"] == "Bash" and _is_failed_exit(item.get("exit_code")):
                         out_lines.append(
                             json.dumps(
                                 {
@@ -171,7 +189,7 @@ def normalize_events(raw_path: Path, transcript_path: Path) -> None:
                                             {
                                                 "type": "tool_result",
                                                 "is_error": True,
-                                                "content": f"exit {exit_code}",
+                                                "content": f"exit {item.get('exit_code')}",
                                             }
                                         ]
                                     },
@@ -194,32 +212,63 @@ def normalize_events(raw_path: Path, transcript_path: Path) -> None:
 
 
 def _print_event(line: str) -> None:
-    """Compact per-event progress line (lands in agent.log via the tee)."""
+    """Render a `codex exec --json` event as Claude-style `[agent:…]` lines (the
+    SAME formatter as claude_runner — streaming.assistant_lines /
+    tool_result_lines), so the codex run's live pane and agent.log match the
+    Claude runner's. codex emits `item.completed` items (command_execution /
+    mcp_tool_call / agent_message / …), `turn.completed` usage, and `error`
+    events. NOTE: the command-OUTPUT field (`aggregated_output`) is PROVISIONAL
+    pending a live codex probe (see module docstring) — it's printed only when
+    present, so a schema mismatch loses the result body, never crashes."""
     try:
         event = json.loads(line)
     except json.JSONDecodeError:
         return
     etype = event.get("type")
-    if etype == "item.completed":
-        item = event.get("item") or {}
-        itype = item.get("item_type") or item.get("type")
-        if itype == "command_execution":
-            print(f"[agent:codex] $ {(item.get('command') or '')[:200]}", flush=True)
-        elif itype == "mcp_tool_call":
-            print(f"[agent:codex] mcp {item.get('server')}.{item.get('tool')}", flush=True)
-        elif itype == "agent_message":
-            text = (item.get("text") or "").strip().replace("\n", " ")
-            if text:
-                print(f"[agent:codex] {text[:300]}", flush=True)
-    elif etype == "turn.completed":
-        usage = event.get("usage") or {}
-        print(
-            f"[agent:codex] turn done (in={usage.get('input_tokens')}, "
-            f"out={usage.get('output_tokens')})",
-            flush=True,
-        )
-    elif etype == "error":
-        print(f"[agent:codex] ERROR: {event.get('message')}", flush=True)
+    if etype == "error":
+        msg = str(event.get("message") or "") or json.dumps(event)[:200]
+        for ln in msg.splitlines() or [""]:
+            print(f"[agent:result-err] {ln}", flush=True)
+        return
+    if etype != "item.completed":
+        return  # turn.completed usage etc. — claude prints only on `result`
+    item = event.get("item") or {}
+    itype = item.get("item_type") or item.get("type")
+    if itype == "agent_message":
+        for ln in (item.get("text") or "").splitlines():
+            if ln.strip():
+                print(f"[agent] {ln}", flush=True)
+        return
+    block = _item_to_tool_use(item)
+    if not block:
+        return
+    for ln in streaming.assistant_lines(
+        {"type": "assistant", "message": {"content": [block]}}, "agent"
+    ):
+        print(ln, flush=True)
+    # Surface the command result the way claude does: PROVISIONAL output field,
+    # plus the exit code as an explicit error tag on failure. Output is capped so
+    # a chatty command can't flood the pane (full body stays in codex_events.jsonl).
+    if block["name"] == "Bash":
+        output = item.get("aggregated_output") or item.get("output") or ""
+        is_err = _is_failed_exit(item.get("exit_code"))
+        if output or is_err:
+            ev = {
+                "type": "user",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "is_error": is_err,
+                            "content": streaming.cap_for_live(
+                                output or f"exit {item.get('exit_code')}"
+                            ),
+                        }
+                    ]
+                },
+            }
+            for ln in streaming.tool_result_lines(ev, "agent"):
+                print(ln, flush=True)
 
 
 def _rate_limited(raw_path: Path, stderr_path: Path) -> bool:
@@ -288,6 +337,26 @@ def run(
     # interface + ML deps. codex inherits this env, so without it every CLI-mode
     # call dies with `command not found` (rc 127).
     activate_run_venv(env, run_dir)
+
+    # In-flight single-interface enforcement (parity with the Claude hook). codex
+    # runs commands through its `user_shell` (derived from $SHELL); install_exec_gate
+    # points $SHELL (and a bash/sh on PATH) at the gate that runs `enforce()` before
+    # each command. PROVISIONAL pending a live codex probe (auth-blocked) — if codex
+    # ignores $SHELL and the PATH shim, the gate is bypassed; codex also exposes a
+    # first-class `hooks` config that could replace this once verified.
+    set_enforcement_env(
+        env,
+        run_dir=run_dir,
+        command_log=command_log,
+        interface=interface,
+        cli_binary=cli_binary,
+        cli_subcommand=cli_subcommand,
+        sdk_module=sdk_module,
+        compute_deny=compute_deny,
+        instance_allowlist=instance_allowlist,
+        platform=platform,
+    )
+    install_exec_gate(run_dir, env)
 
     raw_path = run_dir / "codex_events.jsonl"
     transcript_path = run_dir / "transcript.jsonl"

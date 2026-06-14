@@ -32,10 +32,17 @@ die() { printf '\nERROR: %s\n' "$*" >&2; exit 1; }
 
 set_env() {  # set_env KEY VALUE — replace existing line or append; value-safe
   local key="$1"; shift; local val="$*" tmp
+  val="${val//$'\r'/}"; val="${val//$'\n'/}"   # never split a value across lines
   tmp="$(mktemp)"; touch "$ENV_FILE"
-  grep -v "^${key}=" "$ENV_FILE" > "$tmp" 2>/dev/null || true
+  grep -v "^${key}=" "$ENV_FILE" 2>/dev/null | cat -s > "$tmp" || true
   printf '%s=%s\n' "$key" "$val" >> "$tmp"
   mv "$tmp" "$ENV_FILE"
+}
+
+env_sep() {  # one blank-line separator before this bootstrap's block (idempotent)
+  touch "$ENV_FILE"
+  [ -s "$ENV_FILE" ] && [ -n "$(tail -c1 "$ENV_FILE")" ] && printf '\n' >> "$ENV_FILE"
+  [ -s "$ENV_FILE" ] && [ -n "$(tail -n1 "$ENV_FILE")" ] && printf '\n' >> "$ENV_FILE"
 }
 
 # --- 1. CLI -----------------------------------------------------------------
@@ -84,6 +91,15 @@ else
 fi
 
 # --- 5. service principal (secret, else certificate) ------------------------
+env_sep   # keep this run's AZURE_* keys as their own blank-line-separated block
+# The SP gets `Contributor` — Azure's "everything EXCEPT IAM": it can create,
+# modify and delete every resource in scope but CANNOT assign roles or manage
+# access (Microsoft.Authorization/*/write is excluded). That mirrors AWS
+# PowerUserAccess and GCP roles/editor — the interface boundary is enforced by
+# the agent's exec gate, not RBAC, so scoping the SP's services only manufactures
+# fake-negative runs. Scoped to the testbed resource group (`$SCOPE`), not the
+# whole subscription, to bound blast radius. Contributor is control-plane only,
+# so section 6 adds the data-plane role(s) it does not cover.
 say "creating service principal $SP"
 ERR="$(mktemp)"
 SP_JSON="$(az ad sp create-for-rbac --name "$SP" --role Contributor --scopes "$SCOPE" -o json 2>"$ERR")"
@@ -112,6 +128,11 @@ fi
 grep -qxF '.azure/' "$TESTBED/.gitignore" 2>/dev/null || echo '.azure/' >> "$TESTBED/.gitignore"
 
 # --- 6. data-plane + monitoring roles (Contributor is control-plane only) ---
+# Azure has no single "all data planes" role, so grant the data-plane roles the
+# ML workloads actually touch: blob (datasets/artifacts/AML datastore) read+write
+# and metrics. If a task floors on a different data plane (Key Vault secrets,
+# Cosmos data, …), add that role here — same "avoid fake-negatives" spirit as
+# Contributor; worth a live re-probe (cf. the GCP Vertex note).
 for role in "Storage Blob Data Contributor" "Monitoring Reader"; do
   for attempt in 1 2 3 4 5; do
     if az role assignment create --assignee "$APPID" --role "$role" --scope "$SCOPE" -o none 2>/dev/null; then

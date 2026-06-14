@@ -17,9 +17,11 @@ Parity with the Claude agent (and the deliberate gaps):
 - Isolation: VIBE_HOME → `<run>/.vibe` so vibe's config.toml and session logs
   land inside the run dir (vibe reads its config from VIBE_HOME, not XDG);
   `--workdir <run_dir>` + `--trust` confine it to the run.
-- ENFORCEMENT GAP: like codex, vibe has no PreToolUse-hook equivalent, so the
-  single-interface allowlist is NOT enforced in-flight — only VISIBLE post-hoc
-  via the accounting below. Compare mistral-agent rows with that in mind.
+- Enforcement: vibe has no PreToolUse-hook equivalent, but it runs every command
+  via `create_subprocess_shell(cmd, executable=$SHELL)`, so claude_runner's
+  `install_exec_gate` points $SHELL at the exec gate (hooks/exec_gate.py) that
+  runs the SAME `enforce()` as the Claude hook before each command. The
+  single-interface allowlist is thus enforced IN-FLIGHT, at parity with Claude.
 - Accounting: raw `--output streaming` events land in `vibe_events.jsonl` and
   are NORMALIZED into a Claude-style `transcript.jsonl` so
   `results.parse_transcript_usage` / `aggregate_commands` work unchanged.
@@ -39,10 +41,13 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+from mlpab import streaming
 from mlpab.claude_runner import (
     ClaudeResult,
     activate_run_venv,
+    install_exec_gate,
     run_streaming_with_backoff,
+    set_enforcement_env,
     streaming_is_rate_limited,
 )
 
@@ -211,16 +216,63 @@ def normalize_events(raw_path: Path, transcript_path: Path) -> None:
 
 
 def _print_event(line: str) -> None:
+    """Render a vibe `--output streaming` event as Claude-style `[agent:…]` lines
+    (the SAME formatter as claude_runner — streaming.assistant_lines /
+    tool_result_lines), so the mistral run's live pane and agent.log match the
+    Claude runner's. vibe's schema (NOT claude stream-json): role=="assistant"
+    carries free-text `content` and/or `tool_calls` (function.arguments is a
+    JSON STRING); role=="tool" carries a `content` string result; errors arrive
+    as type/role=="error"."""
     try:
         event = json.loads(line)
     except json.JSONDecodeError:
         return
-    if "command" in event:
-        print(f"[agent:mistral] $ {str(event.get('command'))[:200]}", flush=True)
-    elif event.get("text"):
-        print(f"[agent:mistral] {str(event['text']).strip()[:300]}", flush=True)
-    elif (event.get("type") or "").lower() == "error":
-        print(f"[agent:mistral] ERROR: {event.get('message')}", flush=True)
+    role = (event.get("role") or "").lower()
+    if (event.get("type") or "").lower() == "error" or role == "error":
+        msg = str(event.get("message") or event.get("content") or "") or json.dumps(event)[:200]
+        for ln in msg.splitlines() or [""]:
+            print(f"[agent:result-err] {ln}", flush=True)
+        return
+    if role == "assistant":
+        text = event.get("content")
+        if isinstance(text, str):
+            for ln in text.splitlines():
+                if ln.strip():
+                    print(f"[agent] {ln}", flush=True)
+        reasoning = event.get("reasoning_content")
+        if isinstance(reasoning, str) and reasoning.strip():
+            for ln in reasoning.splitlines():
+                if ln.strip():
+                    print(f"[agent:thinking] {ln}", flush=True)
+        for tc in event.get("tool_calls") or []:
+            fn = tc.get("function") or tc
+            name = fn.get("name") or tc.get("name") or "tool"
+            raw_args = fn.get("arguments")
+            try:
+                args = json.loads(raw_args) if isinstance(raw_args, str) else (raw_args or {})
+            except (json.JSONDecodeError, TypeError):
+                args = {}
+            ev = {"type": "assistant", "message": {"content": [_tool_use_block(name, args)]}}
+            for ln in streaming.assistant_lines(ev, "agent"):
+                print(ln, flush=True)
+    elif role == "tool":
+        is_err = bool(event.get("is_error")) or str(event.get("status") or "").lower() == "error"
+        ev = {
+            "type": "user",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "is_error": is_err,
+                        # Cap so a chatty command can't flood the pane/agent.log;
+                        # full body stays in vibe_events.jsonl.
+                        "content": streaming.cap_for_live(str(event.get("content") or "")),
+                    }
+                ]
+            },
+        }
+        for ln in streaming.tool_result_lines(ev, "agent"):
+            print(ln, flush=True)
 
 
 def _rate_limited(raw_path: Path, stderr_path: Path) -> bool:
@@ -284,6 +336,24 @@ def run(
     # interface + ML deps. vibe inherits this env, so without it every CLI-mode
     # call dies with `command not found` (rc 127).
     activate_run_venv(env, run_dir)
+
+    # In-flight single-interface enforcement (parity with the Claude hook). vibe
+    # runs every command via `create_subprocess_shell(cmd, executable=$SHELL)`,
+    # so set_enforcement_env populates the TESTBED_* allowlist and install_exec_gate
+    # points $SHELL at the gate that runs `enforce()` before each command.
+    set_enforcement_env(
+        env,
+        run_dir=run_dir,
+        command_log=command_log,
+        interface=interface,
+        cli_binary=cli_binary,
+        cli_subcommand=cli_subcommand,
+        sdk_module=sdk_module,
+        compute_deny=compute_deny,
+        instance_allowlist=instance_allowlist,
+        platform=platform,
+    )
+    install_exec_gate(run_dir, env)
 
     raw_path = run_dir / "vibe_events.jsonl"
     transcript_path = run_dir / "transcript.jsonl"

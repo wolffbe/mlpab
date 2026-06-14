@@ -148,6 +148,45 @@ def _seg_exec(tokens: list, depth: int = 0) -> str | None:
     return None
 
 
+# Command substitutions / find-exec targets EXECUTE code too, but the
+# single-segment exec check never descends into them — the classic escape
+# `echo $(node …)` / `find . -exec node {} \;`. `_nested_commands` surfaces those
+# inner commands so `enforce` can run the SAME allowlist over them.
+_CMDSUB_RE = re.compile(r"\$\(([^()]*(?:\([^()]*\)[^()]*)*)\)")  # $( … ), one nesting level
+_BACKTICK_RE = re.compile(r"`([^`]+)`")
+_FIND_EXEC_FLAGS = {"-exec", "-execdir", "-ok", "-okdir"}
+
+
+def _strip_single_quoted(s: str) -> str:
+    """Drop '...'-quoted spans: `$()`/backticks inside single quotes are literal
+    (bash does not expand them), so they must NOT be treated as sub-commands."""
+    return re.sub(r"'[^']*'", "", s)
+
+
+def _nested_commands(command: str) -> list[str]:
+    """Inner commands that also run and must pass the same allowlist: `$(...)` /
+    backtick substitutions (outside single quotes) and `find … -exec CMD …`
+    targets. Best-effort (one `$()` nesting level)."""
+    subs: list[str] = []
+    unquoted = _strip_single_quoted(command)
+    for rx in (_CMDSUB_RE, _BACKTICK_RE):
+        subs += [m.group(1).strip() for m in rx.finditer(unquoted) if m.group(1).strip()]
+    toks = _split(command)
+    i = 0
+    while i < len(toks):
+        if toks[i] in _FIND_EXEC_FLAGS:
+            j, ex = i + 1, []
+            while j < len(toks) and toks[j] not in (";", "+", "\\;"):
+                ex.append(toks[j])
+                j += 1
+            if ex:
+                subs.append(" ".join(ex))
+            i = j
+        else:
+            i += 1
+    return subs
+
+
 def _interp_basename(tok: str) -> str:
     return tok.rsplit("/", 1)[-1]
 
@@ -230,6 +269,10 @@ _SHELL_KEYWORDS = {
 # shell keyword, and NOT the mode's own interface (python in SDK / CLI binary in
 # CLI) is denied by `enforce`. Deliberately EXCLUDES general-purpose interpreters
 # (node/ruby/perl/php/…) and network tools (curl/wget) — the escape hatches.
+# `sleep` is included so an agent waiting on a remote job can pause BETWEEN polls
+# (`sleep 30 && <cli> jobs get-run …`) instead of busy-polling every LLM turn —
+# a bounded FOREGROUND sleep, not backgrounding (that flag is hard-blocked) and
+# not a wait-loop; it does no platform work.
 _BASIC_SHELL = {
     "ls",
     "cat",
@@ -281,6 +324,7 @@ _BASIC_SHELL = {
     "expand",
     "unexpand",
     "date",
+    "sleep",
     "gzip",
     "gunzip",
     "zcat",
@@ -543,51 +587,62 @@ def enforce(tool_name: str, tool_input: dict, segments: list | None = None) -> s
     #    Else — node/ruby/curl/stray binary, python in cli/mcp, or CLI outside cli
     #    — is off-interface and denied. Redirect-aware segmentation
     #    (`_pipeline_segments`) so `… 2>&1` / `> out` don't misparse.
+    def _seg_violation(segs: list) -> str | None:
+        for seg, _sep in segs:
+            ex = _seg_exec(seg)
+            if not ex:
+                continue
+            base = _interp_basename(ex)
+            if base in _SHELL_KEYWORDS or base in _BASIC_SHELL:
+                continue
+            if _is_python_tok(ex):
+                if interface == "sdk":
+                    continue
+                return (
+                    f"DENIED: local python is off-interface in {interface!r} mode. "
+                    f"Use only {use_only} to run work on {platform}. Basic shell "
+                    f"(cp/mkdir/cat) is fine for writing the floor submission."
+                )
+            if cli_binary and _is_cli_tok(ex, cli_binary):
+                if interface == "cli":
+                    # Subcommand entrypoint: only `<cli_binary> <allowed service> …`
+                    # is on-interface; another service of the same binary is an escape.
+                    if cli_subcommands:
+                        sub = _cli_arg_after(seg, cli_binary)
+                        if sub not in cli_subcommands:
+                            seen = f"{cli_binary} {sub}" if sub else cli_binary
+                            allowed = "/".join(cli_subcommands)
+                            return (
+                                f"DENIED: only `{cli_binary} {{{allowed}}}` is the "
+                                f"interface under test; `{seen}` is off-interface. Use "
+                                f"only {use_only} — other {cli_binary!r} services are "
+                                f"blocked."
+                            )
+                    continue
+                return (
+                    f"DENIED: the {cli_binary!r} CLI is off-interface in "
+                    f"{interface!r} mode. Use only {use_only}."
+                )
+            return (
+                f"DENIED: {base!r} is off-interface in {interface!r} mode — only "
+                f"{use_only} may do work on {platform}; local interpreters, network "
+                f"tools, and stray binaries are blocked. Basic shell "
+                f"(cp/mkdir/cat/head/grep) is allowed for the floor submission and "
+                f"data inspection. If you can't do the work through {use_only}, STOP "
+                f"and report the missing capability — do NOT work around it locally."
+            )
+        return None
+
     if segments is None:
         segments = _pipeline_segments(command)
-    for seg, _sep in segments:
-        ex = _seg_exec(seg)
-        if not ex:
-            continue
-        base = _interp_basename(ex)
-        if base in _SHELL_KEYWORDS or base in _BASIC_SHELL:
-            continue
-        if _is_python_tok(ex):
-            if interface == "sdk":
-                continue
-            return (
-                f"DENIED: local python is off-interface in {interface!r} mode. "
-                f"Use only {use_only} to run work on {platform}. Basic shell "
-                f"(cp/mkdir/cat) is fine for writing the floor submission."
-            )
-        if cli_binary and _is_cli_tok(ex, cli_binary):
-            if interface == "cli":
-                # Subcommand entrypoint: only `<cli_binary> <allowed service> …`
-                # is on-interface; another service of the same binary is an escape.
-                if cli_subcommands:
-                    sub = _cli_arg_after(seg, cli_binary)
-                    if sub not in cli_subcommands:
-                        seen = f"{cli_binary} {sub}" if sub else cli_binary
-                        allowed = "/".join(cli_subcommands)
-                        return (
-                            f"DENIED: only `{cli_binary} {{{allowed}}}` is the "
-                            f"interface under test; `{seen}` is off-interface. Use "
-                            f"only {use_only} — other {cli_binary!r} services are "
-                            f"blocked."
-                        )
-                continue
-            return (
-                f"DENIED: the {cli_binary!r} CLI is off-interface in "
-                f"{interface!r} mode. Use only {use_only}."
-            )
-        return (
-            f"DENIED: {base!r} is off-interface in {interface!r} mode — only "
-            f"{use_only} may do work on {platform}; local interpreters, network "
-            f"tools, and stray binaries are blocked. Basic shell "
-            f"(cp/mkdir/cat/head/grep) is allowed for the floor submission and "
-            f"data inspection. If you can't do the work through {use_only}, STOP "
-            f"and report the missing capability — do NOT work around it locally."
-        )
+    violation = _seg_violation(segments)
+    if violation:
+        return violation
+    # Command substitutions / find -exec targets execute too — same allowlist.
+    for sub in _nested_commands(command):
+        violation = _seg_violation(_pipeline_segments(sub))
+        if violation:
+            return violation
     return None
 
 
@@ -633,6 +688,40 @@ def enforce_instance_types(tool_name: str, tool_input: dict) -> str | None:
             f"Free Tier. Do not retry with a bigger or different instance type."
         )
     return None
+
+
+# The run's solution/ folder is the eval's ANSWER KEY: off limits to the agent.
+# `solution/` preceded by start-of-string or a separator (incl. `/`, so both
+# `solution/` and `../solution/` / an absolute `…/solution/` match).
+_SOLUTION_RE = re.compile(r'(?:^|[\s"\'=/(`;|&])solution/')
+
+
+def _bash_solution_violation(command: str) -> str | None:
+    if _SOLUTION_RE.search(command or ""):
+        return (
+            "DENIED: the solution/ folder is the eval's answer key — "
+            "off limits to the agent. Solve the task from data/ only."
+        )
+    return None
+
+
+def gate_check(command: str) -> str | None:
+    """Full in-flight check for a Bash command, used by the vibe/codex exec gate
+    (hooks/exec_gate.py). The Bash subset of what the PreToolUse hook's main()
+    enforces for Claude: the single-interface allowlist + the instance-type
+    guard + the solution/ answer-key deny. One source of truth for all engines."""
+    return (
+        enforce("Bash", {"command": command})
+        or enforce_instance_types("Bash", {"command": command})
+        or _bash_solution_violation(command)
+    )
+
+
+def gate_log_denial(command: str, reason: str) -> None:
+    """Record an exec-gate denial as a structured commands.jsonl line (denied:
+    true), so `results.denied_calls` counts vibe/codex denials the same way it
+    counts the Claude hook's — instead of substring-scanning transcripts."""
+    _log_call({}, "Bash", {"command": command}, denied_reason=reason)
 
 
 # --- `mlpab run` must be FOREGROUND, never piped or backgrounded ---------------
@@ -917,11 +1006,9 @@ def main() -> int:
     # the surfaces the file-tool check above doesn't: bash (allowed shell like
     # `cat solution/truth.json`) and the search tools.
     if tool_name == "Bash":
-        if re.search(r'(?:^|[\s"\'=/(`;|&])solution/', tool_input.get("command") or ""):
-            return deny(
-                "DENIED: the solution/ folder is the eval's answer key — "
-                "off limits to the agent. Solve the task from data/ only."
-            )
+        sol = _bash_solution_violation(tool_input.get("command") or "")
+        if sol:
+            return deny(sol)
     elif tool_name in ("Glob", "Grep"):
         blob = f"{tool_input.get('path') or ''} {tool_input.get('pattern') or ''}"
         if "solution" in blob:

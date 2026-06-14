@@ -260,6 +260,23 @@ class PrinterTests(unittest.TestCase):
         self.assertEqual(self._capture("{not json"), "")
 
 
+class CapForLiveTests(unittest.TestCase):
+    def test_short_text_unchanged(self):
+        self.assertEqual(streaming.cap_for_live("a\nb"), "a\nb")
+        self.assertEqual(streaming.cap_for_live(""), "")
+
+    def test_caps_excess_lines(self):
+        out = streaming.cap_for_live("\n".join(str(i) for i in range(500)))
+        lines = out.splitlines()
+        self.assertEqual(len(lines), streaming.LIVE_RESULT_MAX_LINES + 1)
+        self.assertIn("more lines", lines[-1])
+
+    def test_caps_excess_chars(self):
+        out = streaming.cap_for_live("x" * (streaming.LIVE_RESULT_MAX_CHARS + 5000))
+        self.assertLessEqual(len(out), streaming.LIVE_RESULT_MAX_CHARS + 80)
+        self.assertIn("truncated", out)
+
+
 class TeeToTests(unittest.TestCase):
     def test_captures_python_and_subprocess_output(self):
         import subprocess
