@@ -27,9 +27,11 @@ Parity with the Claude agent (and the deliberate gaps):
   `results.parse_transcript_usage` / `aggregate_commands` work unchanged.
 
 ⚠ LIVE-PROBE REQUIRED: vibe's streaming-event schema (the per-message `type`
-names and where token usage / cost live) is PROVISIONAL here — run
-`vibe --prompt … --output streaming` once and refine `_event_to_tool_use` /
-`normalize_events` against the real events (same as codex_runner needed).
+names) is PROVISIONAL here — run `vibe --prompt … --output streaming` once and
+refine `_event_to_tool_use` / `normalize_events` against the real events (same
+as codex_runner needed). Token usage was confirmed from a live run: it lives in
+`meta.json` under `stats.session_{prompt,completion}_tokens` (see
+`_session_tokens`); cost is left 0 and filled by `results.usd_cost` (litellm).
 """
 
 from __future__ import annotations
@@ -132,8 +134,11 @@ def _session_tokens(run_dir: Path) -> tuple[int, int]:
         return 0, 0
     try:
         m = json.loads(metas[-1].read_text())
-        return int(m.get("session_prompt_tokens") or 0), int(
-            m.get("session_completion_tokens") or 0
+        # vibe writes usage under a `stats` object; fall back to the top level
+        # in case the schema flattens it in a future version.
+        stats = m.get("stats") if isinstance(m.get("stats"), dict) else m
+        return int(stats.get("session_prompt_tokens") or 0), int(
+            stats.get("session_completion_tokens") or 0
         )
     except Exception:
         return 0, 0
