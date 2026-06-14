@@ -240,18 +240,28 @@ def _verify_platform(
     The twofold check (per the platform's setup.py/teardown.py `verify` mode):
     confirm CONNECTION, then that the resources setup creates are PRESENT (setup)
     / that the agent's resources are GONE (teardown). Read-only — it mutates
-    nothing. Runs with the per-run venv python (so an SDK-based verify imports
-    fine), with the api-logging shim stripped (its reads are plumbing, not the
-    agent's endpoint coverage)."""
+    nothing. Runs with the platform's PLUMBING venv python when one exists (it
+    holds the platform's python client regardless of the interface under test —
+    a CLI run venv may lack it), else the per-run venv python. The api-logging
+    shim is stripped (its reads are plumbing, not the agent's endpoint
+    coverage)."""
     script = interfaces.CONFIGS_DIR / platform / f"{phase}.py"
     if not script.exists():
         return True, ""
-    # Absolute paths: the subprocess runs with cwd=run_dir, so a venv-python path
-    # relative to the CURRENT cwd would resolve against run_dir and miss (the
-    # single-task form passes a relative run_dir). .absolute() does NOT follow the
-    # bin/python symlink out of the venv (unlike .resolve()).
+    # Prefer the plumbing venv (has the python client on every interface); fall
+    # back to the run venv. Absolute paths: the subprocess runs with cwd=run_dir,
+    # so a venv-python path relative to the CURRENT cwd would resolve against
+    # run_dir and miss (the single-task form passes a relative run_dir).
+    # .absolute() does NOT follow the bin/python symlink out of the venv (unlike
+    # .resolve()).
+    plumbing_py = interfaces.plumbing_python(platform)
     venv_py = (run_dir / "venv" / "bin" / "python").absolute()
-    py = str(venv_py) if venv_py.exists() else sys.executable
+    if plumbing_py is not None:
+        py = str(plumbing_py.absolute())
+    elif venv_py.exists():
+        py = str(venv_py)
+    else:
+        py = sys.executable
     verify_env = {k: v for k, v in env.items() if k not in ("MLPAB_API_LOG", "MLPAB_IFACE_SDK")}
     try:
         proc = subprocess.run(
@@ -522,10 +532,22 @@ def run(spec: RunSpec) -> results.Row:
         # `MLPAB_PLATFORM_DIR` points teardown/serve steps at the COMMITTED
         # configs/platforms/<platform>/ dir (e.g. a teardown.py cleanup script)
         # — cleanup logic is fixed infrastructure, immune to run-dir state.
+        # `MLPAB_PLUMBING_PY` is the interpreter those setup/teardown scripts run
+        # under: the platform's plumbing venv (has the python client on EVERY
+        # interface — a CLI run venv may lack it), falling back to the run venv
+        # python when the platform needs none. Built once (idempotent) — cheap
+        # per run; covers the single-task form too (no preflight there).
+        try:
+            plumbing_py = interfaces.prepare_plumbing(spec.platform)
+        except Exception as e:
+            print(f"[mlpab] plumbing venv prep failed for {spec.platform}: {e}", file=sys.stderr)
+            plumbing_py = interfaces.plumbing_python(spec.platform)
+        plumbing_py = plumbing_py or (run_dir / "venv" / "bin" / "python")
         base_keys_env = {
             **os.environ,
             **interface_setup.keys,
             "MLPAB_PLATFORM_DIR": str(interfaces.CONFIGS_DIR / spec.platform),
+            "MLPAB_PLUMBING_PY": str(Path(plumbing_py).absolute()),
         }
         _run_aux(interface_setup.teardown, run_dir, base_keys_env)
         if interface_setup.serve:
@@ -887,6 +909,7 @@ def run(spec: RunSpec) -> results.Row:
             **os.environ,
             **interface_setup.keys,
             "MLPAB_PLATFORM_DIR": str(interfaces.CONFIGS_DIR / spec.platform),
+            "MLPAB_PLUMBING_PY": str(Path(plumbing_py).absolute()),
         }
         _run_aux(interface_setup.teardown, run_dir, teardown_env)
         # Twofold check (other half): confirm teardown actually swept the agent's

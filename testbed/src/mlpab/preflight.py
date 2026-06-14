@@ -20,6 +20,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -168,6 +169,17 @@ def preflight(
         )
         if not status.ok:
             raise PreflightError(status.message)
+
+    # Per-platform PLUMBING venv (setup/verify/teardown run under it — it holds
+    # the platform's python client on EVERY interface, where a CLI run venv may
+    # not). Built once here in the serial setup phase so no timed run pays for
+    # it; idempotent, and a no-op for platforms that need none. Best-effort —
+    # the runner rebuilds it (and falls back to the run venv python) if missing.
+    for plat in sorted({r.platform for r in requirements if r.platform != "none"}):
+        try:
+            interfaces.prepare_plumbing(plat)
+        except Exception as e:
+            print(f"[mlpab] plumbing venv prep for {plat!r} skipped: {e}", file=sys.stderr)
 
     # Phase 2 — skills (agent invokes the skill directly).
     seen_skills: set[tuple] = set()

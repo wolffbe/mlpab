@@ -106,6 +106,98 @@ class GraderInstallTests(InterfaceTestBase):
         self.assertFalse(ri.called)
 
 
+class PlumbingVenvTests(InterfaceTestBase):
+    """The per-platform plumbing venv (build/<p>/_plumbing) holds the platform's
+    python client for setup/verify/teardown, regardless of the interface under
+    test — so a CLI run venv that lacks the client (gcp ships gcloud as a tarball,
+    not pip) doesn't break verify."""
+
+    def test_steps_prefer_grader_then_runtime_install(self):
+        self.write_manifest(
+            "svc",
+            "sdk",
+            "runtime_install:\n  - pip install bigsdk\n"
+            "grader_install:\n  - pip install thinclient\nprompt: hi\n",
+        )
+        self.assertEqual(interfaces._plumbing_steps("svc"), ["pip install thinclient"])
+
+    def test_steps_fall_back_to_runtime_install(self):
+        self.write_manifest("svc", "sdk", "runtime_install:\n  - pip install bigsdk\nprompt: hi\n")
+        self.assertEqual(interfaces._plumbing_steps("svc"), ["pip install bigsdk"])
+
+    def test_steps_empty_without_sdk_interface(self):
+        # Only a CLI manifest exists — no SDK client source, so no plumbing venv.
+        self.write_manifest("svc", "cli", "binary: x\nprompt: hi\n")
+        self.assertEqual(interfaces._plumbing_steps("svc"), [])
+
+    def test_prepare_plumbing_none_when_no_steps(self):
+        self.write_manifest("svc", "cli", "binary: x\nprompt: hi\n")
+        self.assertIsNone(interfaces.prepare_plumbing("svc"))
+        self.assertIsNone(interfaces.prepare_plumbing("none"))
+
+    def test_prepare_plumbing_builds_with_sdk_steps_and_is_idempotent(self):
+        self.write_manifest("svc", "sdk", "runtime_install:\n  - pip install bigsdk\nprompt: hi\n")
+        venv_dir = interfaces.plumbing_venv_dir("svc")
+
+        def _fake_materialize(target: Path) -> Path:
+            (target / "bin").mkdir(parents=True, exist_ok=True)
+            (target / "bin" / "python").write_text("")  # stand-in interpreter
+            return target / "bin" / "python"
+
+        with (
+            mock.patch.object(interfaces, "_materialize_venv", side_effect=_fake_materialize),
+            mock.patch.object(interfaces, "_run_install") as ri,
+        ):
+            py = interfaces.prepare_plumbing("svc")
+            self.assertEqual(py, venv_dir / "bin" / "python")
+            self.assertEqual(list(ri.call_args[0][0]), ["pip install bigsdk"])
+            self.assertTrue((venv_dir.parent / interfaces._PLUMBING_STAMP).exists())
+            # Second call: stamp matches → no rebuild, no reinstall.
+            ri.reset_mock()
+            py2 = interfaces.prepare_plumbing("svc")
+            self.assertEqual(py2, venv_dir / "bin" / "python")
+            self.assertFalse(ri.called)
+
+    def test_plumbing_python_none_until_built(self):
+        self.write_manifest("svc", "sdk", "runtime_install:\n  - pip install bigsdk\nprompt: hi\n")
+        self.assertIsNone(interfaces.plumbing_python("svc"))
+        (interfaces.plumbing_venv_dir("svc") / "bin").mkdir(parents=True)
+        (interfaces.plumbing_venv_dir("svc") / "bin" / "python").write_text("")
+        self.assertEqual(
+            interfaces.plumbing_python("svc"),
+            interfaces.plumbing_venv_dir("svc") / "bin" / "python",
+        )
+
+
+class LoginEnvInjectionTests(InterfaceTestBase):
+    """login_status runs the auth_command in the same credential env the agent
+    gets — including platform-exported values that aren't declared keys (e.g. a
+    runtime-minted CLOUDSDK_AUTH_ACCESS_TOKEN)."""
+
+    def test_undeclared_caller_key_reaches_auth_command(self):
+        # auth_command echoes the runtime token into a file; the check passes
+        # only if the value was injected into the subprocess env.
+        out = self.root / "tok.out"
+        self.write_manifest(
+            "svc",
+            "cli",
+            "keys:\n  - GCP_PROJECT\n"
+            f"auth_command: |\n  sh -c 'test -n \"$CLOUDSDK_AUTH_ACCESS_TOKEN\" && "
+            f'echo "$CLOUDSDK_AUTH_ACCESS_TOKEN" > {out}\'\n'
+            "prompt: hi\n",
+        )
+        venv_python = self.root / "venv" / "bin" / "python"
+        venv_python.parent.mkdir(parents=True)
+        status = interfaces.login_status(
+            "svc",
+            "cli",
+            venv_python=venv_python,
+            keys={"GCP_PROJECT": "p", "CLOUDSDK_AUTH_ACCESS_TOKEN": "ya29.SECRET"},
+        )
+        self.assertTrue(status.ok, status.reason)
+        self.assertEqual(out.read_text().strip(), "ya29.SECRET")
+
+
 class AccountingFieldsTests(InterfaceTestBase):
     """cli_command / sdk_module drive cli_calls / sdk_calls accounting."""
 

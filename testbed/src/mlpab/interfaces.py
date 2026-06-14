@@ -965,6 +965,14 @@ def login_status(
     setup_fix = "make setup  (or: mlpab setup " + f"configs/platforms/{platform}/{interface}.yaml)"
     declared = keys_for(platform, interface)
     env = dict(os.environ)
+    # Inject EVERY caller-provided value so the login check runs in the same
+    # credential env the agent will get — including platform-exported runtime
+    # values that aren't declared keys (e.g. a CLOUDSDK_AUTH_ACCESS_TOKEN that
+    # setup.py minted from ADC for gcloud). Declared keys are still resolved +
+    # missing-checked below.
+    for k, v in (keys or {}).items():
+        if v:
+            env[k] = v
     missing = []
     for k, dv in declared.items():
         val = (keys or {}).get(k) or dv or env.get(k, "")
@@ -1246,3 +1254,87 @@ def prepare(platform: str, interface: str, *, force: bool = False) -> Path | Non
         )
     stamp.write_text(want + "\n")
     return venv_dir
+
+
+# ---------------------------------------------------------------------------
+# Plumbing venv
+# ---------------------------------------------------------------------------
+# A platform's setup/verify/teardown scripts (configs/platforms/<p>/setup.py,
+# teardown.py) talk to the platform through its PYTHON client (e.g. `from
+# google.cloud import bigquery`) — this is fixed mlpab plumbing, NOT the agent's
+# work. On an SDK-interface run the run venv already has that client, but a
+# CLI/MCP run venv does NOT (and gcp's CLI ships as a prebuilt tarball, so its
+# run venv has no python client AT ALL → `setup.py verify` died with "No module
+# named 'google'", aborting the whole config). Installing the client into the
+# run venv would defeat the interface-purity measurement (the agent could then
+# import it and bypass the CLI). So plumbing gets its OWN venv, built once at
+# build/<platform>/_plumbing/venv, holding exactly the SDK interface's pinned
+# client (the SAME deps `install_for_grader` uses to read deliverables back) —
+# no new or changed dependency versions. Used by serve/teardown/verify
+# REGARDLESS of the interface under test; the agent's run venv stays pure.
+_PLUMBING_STAMP = ".plumbing.hash"
+
+
+def plumbing_venv_dir(platform: str) -> Path:
+    """The platform's PLUMBING venv ($BUILD/<platform>/_plumbing/venv) — see
+    `prepare_plumbing`."""
+    return BUILD_DIR / platform / "_plumbing" / _PREPARED_VENV_NAME
+
+
+def _plumbing_steps(platform: str) -> list[str]:
+    """The install steps that put the platform's python client in the plumbing
+    venv: the SDK interface's `grader_install` (a thin read client) or its
+    `runtime_install` — identical to `install_for_grader`'s source, since both
+    need the same client. Empty when the platform has no SDK interface (then
+    there is no plumbing venv and plumbing falls back to the run venv python)."""
+    sdk_path = manifest_path(platform, "sdk")
+    if not sdk_path.exists():
+        return []
+    sdk_cfg = _resolved_config(platform, "sdk")
+    return list(sdk_cfg.get("grader_install") or sdk_cfg.get("runtime_install") or [])
+
+
+def prepare_plumbing(platform: str, *, force: bool = False) -> Path | None:
+    """Materialize the platform's plumbing venv ONCE (idempotent via a stamp) and
+    return its python, or None when the platform needs none (no SDK interface /
+    no install steps). Cheap to call per run: an up-to-date venv is reused.
+
+    Built like a prepared venv — a self-contained clone of the base .venv (so it
+    stands alone) plus the SDK client. The stamp is the steps + base fingerprint,
+    so a base-venv change or an edit to the SDK client pins rebuilds it."""
+    if platform == "none":
+        return None
+    steps = _plumbing_steps(platform)
+    if not steps:
+        return None
+    venv_dir = plumbing_venv_dir(platform)
+    stamp = venv_dir.parent / _PLUMBING_STAMP
+    h = hashlib.sha256()
+    h.update("\0".join(steps).encode())
+    h.update(_base_venv_fingerprint().encode())
+    want = h.hexdigest()[:16]
+    if (
+        not force
+        and (venv_dir / "bin" / "python").exists()
+        and stamp.exists()
+        and stamp.read_text().strip() == want
+    ):
+        return venv_dir / "bin" / "python"
+    # Rebuild from scratch — a stale/partial venv must not linger; stamp is
+    # written last so a crash mid-build re-detects as "not prepared".
+    _force_rmtree(venv_dir)
+    stamp.unlink(missing_ok=True)
+    venv_python = _materialize_venv(venv_dir)
+    _run_install(
+        steps, cwd=venv_dir.parent, venv_python=venv_python, interface_dir=bin_dir(platform, "sdk")
+    )
+    stamp.write_text(want + "\n")
+    return venv_python
+
+
+def plumbing_python(platform: str) -> Path | None:
+    """The platform's plumbing-venv python if already built, else None (caller
+    falls back to the run venv python). Does NOT build — use `prepare_plumbing`
+    for that."""
+    py = plumbing_venv_dir(platform) / "bin" / "python"
+    return py if py.exists() else None
