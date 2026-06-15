@@ -158,6 +158,62 @@ class PlumbingVenvTests(InterfaceTestBase):
             self.assertEqual(py2, venv_dir / "bin" / "python")
             self.assertFalse(ri.called)
 
+    def test_build_lock_is_mutually_exclusive(self):
+        # The inter-process lock must serialize entries even between fds in the
+        # same process (flock is per open-file-description), so threads model the
+        # parallel-session race cheaply. No two critical sections may overlap.
+        import threading
+        import time
+
+        lock_dir = self.builds / "svc" / "_plumbing"
+        overlaps: list[bool] = []
+        active = {"n": 0}
+
+        def crit() -> None:
+            with interfaces._build_lock(lock_dir):
+                active["n"] += 1
+                if active["n"] > 1:
+                    overlaps.append(True)
+                time.sleep(0.02)
+                active["n"] -= 1
+
+        threads = [threading.Thread(target=crit) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(overlaps, [])
+
+    def test_concurrent_prepare_plumbing_builds_once(self):
+        # Several runs starting at once (separate processes/threads) share one
+        # plumbing venv; the double-checked lock means exactly ONE rebuild, and
+        # the rest reuse it — never wiping it mid-build (the cause of the
+        # "No module named '<client>'" verify failure).
+        import threading
+        import time
+
+        self.write_manifest("svc", "sdk", "runtime_install:\n  - pip install bigsdk\nprompt: hi\n")
+
+        def _slow_materialize(target: Path) -> Path:
+            (target / "bin").mkdir(parents=True, exist_ok=True)
+            time.sleep(0.03)
+            (target / "bin" / "python").write_text("")
+            return target / "bin" / "python"
+
+        with (
+            mock.patch.object(interfaces, "_materialize_venv", side_effect=_slow_materialize),
+            mock.patch.object(interfaces, "_run_install") as ri,
+        ):
+            threads = [
+                threading.Thread(target=interfaces.prepare_plumbing, args=("svc",))
+                for _ in range(6)
+            ]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+            self.assertEqual(ri.call_count, 1)
+
     def test_plumbing_python_none_until_built(self):
         self.write_manifest("svc", "sdk", "runtime_install:\n  - pip install bigsdk\nprompt: hi\n")
         self.assertIsNone(interfaces.plumbing_python("svc"))

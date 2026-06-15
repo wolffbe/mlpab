@@ -30,19 +30,44 @@ from __future__ import annotations
 import os
 
 
+def _connect():
+    """Connect to the cluster WITHOUT selecting a project.
+
+    Like `setup.py`, we avoid `hopsworks.login()`: it tries to SELECT a project
+    and, with none selectable, drops to an interactive "Multiple projects
+    found …" prompt whenever >1 project exists — which raises EOFError in this
+    non-interactive subprocess. That broke both teardown paths: the scoped
+    start-of-run sweep (the run's project does not exist yet → login() raised →
+    nothing listed) and the whole-key hard-reset sweep (HOPSWORKS_PROJECT unset
+    → multi-project prompt). `hopsworks.connection()` connects from the same env
+    vars without ever prompting, so we can always list and delete.
+    """
+    import hopsworks
+
+    hostname_verification = os.getenv(
+        "HOPSWORKS_HOSTNAME_VERIFICATION", "False"
+    ).lower() in ("true", "1", "y", "yes")
+    return hopsworks.connection(
+        host=os.environ.get("HOPSWORKS_HOST"),
+        port=int(os.environ.get("HOPSWORKS_PORT", "443")),
+        api_key_value=os.environ.get("HOPSWORKS_API_KEY"),
+        hostname_verification=hostname_verification,
+    )
+
+
 def main() -> None:
     try:
-        import hopsworks
+        import hopsworks  # noqa: F401
         from hopsworks_common import client
     except Exception as e:  # SDK not importable in this venv → nothing to do
         print(f"[hopsworks teardown] SDK unavailable: {e}")
         return
 
     try:
-        hopsworks.login()  # reads HOPSWORKS_API_KEY / HOPSWORKS_HOST from env
+        _connect()
     except Exception as e:
-        # No reachable cluster / no project to connect to → nothing to clean.
-        print(f"[hopsworks teardown] login skipped: {e}")
+        # No reachable cluster → nothing to clean.
+        print(f"[hopsworks teardown] connect skipped: {e}")
         return
 
     try:
@@ -97,13 +122,13 @@ def verify() -> int:
     (return 0); the next run's start-teardown re-sweeps regardless, and the
     runner only WARNS on this check."""
     try:
-        import hopsworks
+        import hopsworks  # noqa: F401
         from hopsworks_common import client
     except Exception as e:
         print(f"[hopsworks verify-teardown] SDK unavailable (assuming clean): {e}")
         return 0
     try:
-        hopsworks.login()
+        _connect()
         teams = client.get_instance()._send_request("GET", ["project"]) or []
     except Exception as e:
         print(f"[hopsworks verify-teardown] could not confirm (assuming clean): {e}")

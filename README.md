@@ -6,7 +6,7 @@
 
 MLPlatformAgentBench is a benchmark for evaluating large language model coding
 agents on machine learning platform tasks. It measures how the interface given
-to the agent, a command-line interface (CLI), a Python SDK, or an MCP server,
+to the agent, a command-line interface (CLI) or a Python SDK,
 affects how well the agent completes those tasks.
 
 ## What it measures
@@ -15,7 +15,7 @@ Each task is run across a grid of conditions so the conditions can be compared
 directly.
 
 - **Platform.** Hopsworks, Databricks, AWS SageMaker, Azure ML, GCP Vertex, and a `local` baseline (`none`).
-- **Interface.** The platform CLI, the Python SDK, or an MCP server for that platform (or `none`).
+- **Interface.** The platform CLI or the Python SDK (or `none`).
 - **Skills.** With or without a bundle of platform skills (Claude Code slash-commands and docs).
 - **Agent engine and model.** `claude-*` (Claude Code), `gpt-*` (Codex), `mistral-*` (Mistral Vibe).
 
@@ -104,7 +104,7 @@ the table.
 ## Adding a platform interface
 
 A platform lives in `configs/platforms/<platform>/`. It has one flat manifest per
-interface (`cli.yaml`, `sdk.yaml`, `mcp.yaml`) describing how to build, install,
+interface (`cli.yaml`, `sdk.yaml`) describing how to build, install,
 authenticate, and test that interface. It also has `setup.py` and `teardown.py`
 (each supporting a `verify` mode) and a `skills/` bundle. A matching grader
 adapter goes in `evals/adapters/<platform>.py` and implements the read-back

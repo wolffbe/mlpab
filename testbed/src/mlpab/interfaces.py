@@ -15,6 +15,7 @@ when missing, and installs the interface fresh into each run's own venv.
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import os
 import re
@@ -22,6 +23,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -663,6 +665,33 @@ def _force_rmtree(path: Path) -> None:
     shutil.rmtree(path, ignore_errors=True)
 
 
+@contextmanager
+def _build_lock(lock_dir: Path):
+    """Hold an EXCLUSIVE inter-process lock for the duration of a shared-venv
+    rebuild. The same venv path (a platform's plumbing venv, or an interface's
+    prepared venv) is shared by every run of that platform/interface, so when
+    several runs start as separate processes (e.g. five `mlpab start` tmux
+    sessions launched at once) their preflights would otherwise all `_force_rmtree`
+    + reinstall the SAME directory concurrently — wiping each other mid-build, so
+    a `setup.py verify` in one process imports a half-installed client and dies
+    with "No module named '<client>'". The lock serializes the rebuild: the first
+    process builds while the rest wait, then everyone re-checks the stamp under
+    the lock (double-checked) and reuses the finished venv. The lockfile lives
+    NEXT TO the venv (never inside it) so `_force_rmtree(venv_dir)` can't remove
+    the fd out from under a waiter."""
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = lock_dir / ".build.lock"
+    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
 def _clean_build_artifacts(platform: str, interface: str) -> None:
     """Remove build artifacts from the interface's build home (build/<p>/<i>) —
     used by `mlpab test` to leave no state behind. A wheel, build|dist|src dir,
@@ -1238,28 +1267,38 @@ def prepare(platform: str, interface: str, *, force: bool = False) -> Path | Non
     venv_dir = prepared_venv_dir(platform, interface)
     stamp = iface_dir / _PREPARED_STAMP
     want = _prepared_stamp_value(platform, interface)
-    if (
-        not force
-        and (venv_dir / "bin" / "python").exists()
-        and stamp.exists()
-        and stamp.read_text().strip() == want
-    ):
+
+    def _ready() -> bool:
+        return (
+            not force
+            and (venv_dir / "bin" / "python").exists()
+            and stamp.exists()
+            and stamp.read_text().strip() == want
+        )
+
+    if _ready():
         return venv_dir
 
-    # (Re)build the prepared venv from scratch — a stale or partial one must not
-    # linger. The stamp is written last, so a crash mid-build is re-detected as
-    # "not prepared" (missing/mismatched stamp) and rebuilt next time.
-    _force_rmtree(venv_dir)
-    stamp.unlink(missing_ok=True)
-    venv_python = _materialize_venv(venv_dir)
-    if runtime_install:
-        # cwd = iface_dir so a step's `./venv` IS this prepared venv (the
-        # databricks/gcp CLIs copy a binary/SDK tree into `./venv`), and
-        # $INTERFACE_DIR = iface_dir (pinned wheels/binaries live there).
-        _run_install(
-            runtime_install, cwd=iface_dir, venv_python=venv_python, interface_dir=iface_dir
-        )
-    stamp.write_text(want + "\n")
+    # Serialize the rebuild across processes (parallel `mlpab start` sessions
+    # share this prepared venv) and re-check under the lock so a process that
+    # already finished the build isn't wiped out from under a concurrent run.
+    with _build_lock(iface_dir):
+        if _ready():
+            return venv_dir
+        # (Re)build the prepared venv from scratch — a stale or partial one must
+        # not linger. The stamp is written last, so a crash mid-build is
+        # re-detected as "not prepared" (missing/mismatched stamp) next time.
+        _force_rmtree(venv_dir)
+        stamp.unlink(missing_ok=True)
+        venv_python = _materialize_venv(venv_dir)
+        if runtime_install:
+            # cwd = iface_dir so a step's `./venv` IS this prepared venv (the
+            # databricks/gcp CLIs copy a binary/SDK tree into `./venv`), and
+            # $INTERFACE_DIR = iface_dir (pinned wheels/binaries live there).
+            _run_install(
+                runtime_install, cwd=iface_dir, venv_python=venv_python, interface_dir=iface_dir
+            )
+        stamp.write_text(want + "\n")
     return venv_dir
 
 
@@ -1320,22 +1359,34 @@ def prepare_plumbing(platform: str, *, force: bool = False) -> Path | None:
     h.update("\0".join(steps).encode())
     h.update(_base_venv_fingerprint().encode())
     want = h.hexdigest()[:16]
-    if (
-        not force
-        and (venv_dir / "bin" / "python").exists()
-        and stamp.exists()
-        and stamp.read_text().strip() == want
-    ):
+    def _ready() -> bool:
+        return (
+            not force
+            and (venv_dir / "bin" / "python").exists()
+            and stamp.exists()
+            and stamp.read_text().strip() == want
+        )
+
+    if _ready():
         return venv_dir / "bin" / "python"
-    # Rebuild from scratch — a stale/partial venv must not linger; stamp is
-    # written last so a crash mid-build re-detects as "not prepared".
-    _force_rmtree(venv_dir)
-    stamp.unlink(missing_ok=True)
-    venv_python = _materialize_venv(venv_dir)
-    _run_install(
-        steps, cwd=venv_dir.parent, venv_python=venv_python, interface_dir=bin_dir(platform, "sdk")
-    )
-    stamp.write_text(want + "\n")
+    # Serialize the rebuild across processes (parallel `mlpab start` sessions all
+    # share this venv) and re-check under the lock: if another process finished
+    # the build while we waited, reuse it instead of wiping it out from under it.
+    with _build_lock(venv_dir.parent):
+        if _ready():
+            return venv_dir / "bin" / "python"
+        # Rebuild from scratch — a stale/partial venv must not linger; stamp is
+        # written last so a crash mid-build re-detects as "not prepared".
+        _force_rmtree(venv_dir)
+        stamp.unlink(missing_ok=True)
+        venv_python = _materialize_venv(venv_dir)
+        _run_install(
+            steps,
+            cwd=venv_dir.parent,
+            venv_python=venv_python,
+            interface_dir=bin_dir(platform, "sdk"),
+        )
+        stamp.write_text(want + "\n")
     return venv_python
 
 

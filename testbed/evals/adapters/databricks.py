@@ -102,6 +102,103 @@ class DatabricksChecker:
                 raise LookupError(f"table {SCHEMA}.{name} not found") from e
             raise
 
+    # -- online reads --------------------------------------------------------
+
+    def _online_pk(self, name: str) -> str:
+        """Primary-key column for the feature table (falls back to account_id,
+        the online task's key)."""
+        info = self.get_feature_table(name)
+        if info is not None and info.primary_key:
+            return info.primary_key[0]
+        return "account_id"
+
+    def _feature_serving_candidates(self, name: str) -> list[str]:
+        """Endpoint names that might serve feature table `name` online.
+
+        Combines conventional names with a scan of the workspace: a feature
+        serving endpoint serves a FeatureSpec (a custom served entity), so we
+        keep only endpoints whose served entities are NOT foundation/external
+        models (that excludes the workspace's hosted LLM/embedding endpoints)
+        and whose endpoint or entity name references the table.
+        """
+        cands: list[str] = [
+            name,
+            f"{name}_serving",
+            f"{name}-serving",
+            f"{name}_endpoint",
+            f"fs_{name}",
+            f"feature_{name}",
+        ]
+        try:
+            for e in self._w.serving_endpoints.list():
+                try:
+                    d = self._w.serving_endpoints.get(e.name)
+                    ents = (getattr(d, "config", None) and d.config.served_entities) or []
+                    is_model = any(
+                        getattr(x, "foundation_model", None) or getattr(x, "external_model", None)
+                        for x in ents
+                    )
+                    if is_model:
+                        continue  # hosted LLM/embedding endpoint — never a feature store
+                    refs = [e.name] + [str(getattr(x, "entity_name", "") or "") for x in ents]
+                    if any(name in r for r in refs):
+                        cands.append(e.name)
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        # de-dup, preserve order
+        seen: set = set()
+        return [c for c in cands if not (c in seen or seen.add(c))]
+
+    def _parse_predictions(self, resp, pk: str, record_ids: list[str]) -> pd.DataFrame:
+        """Normalize a feature-serving query response into rows keyed by pk."""
+        preds = (
+            getattr(resp, "predictions", None)
+            or getattr(resp, "outputs", None)
+            or getattr(resp, "data", None)
+            or []
+        )
+        if isinstance(preds, dict):
+            preds = [preds]
+        df = pd.DataFrame(list(preds))
+        if df.empty:
+            return df
+        if pk not in df.columns and len(df) == len(record_ids):
+            df.insert(0, pk, [str(r) for r in record_ids])  # endpoint returned no key col
+        if pk in df.columns and pk != "account_id":
+            df = df.rename(columns={pk: "account_id"})
+        return df
+
+    def get_records(
+        self, name: str, record_ids: list[str], version: int | None = 1
+    ) -> pd.DataFrame:
+        """Independent ONLINE read for known keys via a Databricks feature
+        serving endpoint (`serving_endpoints.query` — no extra dependency).
+
+        Mirrors the SageMaker/Hopsworks `get_records` contract: a DataFrame with
+        the primary-key column (`account_id`) plus the feature columns, one row
+        per found key. We do NOT read the offline Unity Catalog table here — A3
+        must prove ONLINE materialization, and the UC table is what A1/read_rows
+        already cover. If no feature serving endpoint serves the table, the
+        result is empty and the suite reports the keys as a mismatch.
+
+        NOTE: the Lakebase/synced-table (PostgreSQL) read path is intentionally
+        not used — it would add a Postgres driver dependency. Feature serving is
+        the dependency-free online read.
+        """
+        pk = self._online_pk(name)
+        records = [{pk: str(r)} for r in record_ids]
+        for ep in self._feature_serving_candidates(name):
+            try:
+                resp = self._w.serving_endpoints.query(name=ep, dataframe_records=records)
+            except Exception:
+                continue  # wrong endpoint / not servable this way → try the next
+            df = self._parse_predictions(resp, pk, record_ids)
+            if not df.empty:
+                return df
+        return pd.DataFrame()
+
     # -- training datasets ---------------------------------------------------
 
     def read_training_dataset(self, name: str, version: int = 1) -> pd.DataFrame:
@@ -161,9 +258,19 @@ def _state_reads(cls):
     def get_model(self, name: str, version: int = 1) -> dict:
         """Registered model: UC registry (workspace.default.<name>) first,
         then the legacy workspace (MLflow) registry."""
+        # `version`/`metrics` are included for cross-adapter parity with the
+        # {exists, version, metrics} contract; Databricks' registry surface
+        # doesn't expose training metrics here, so `metrics` is {}.
         try:
             m = self._w.registered_models.get(f"{SCHEMA}.{name}")
-            return {"exists": True, "registry": "unity-catalog", "full_name": m.full_name}
+            aliases = getattr(m, "aliases", None) or []
+            return {
+                "exists": True,
+                "registry": "unity-catalog",
+                "full_name": m.full_name,
+                "version": max((int(getattr(a, "version_num", 0) or 0) for a in aliases), default=None),
+                "metrics": {},
+            }
         except Exception:
             pass
         try:
@@ -175,6 +282,7 @@ def _state_reads(cls):
                 "exists": True,
                 "registry": "workspace-mlflow",
                 "version": max((int(v.get("version", 0)) for v in versions), default=None),
+                "metrics": {},
             }
         except Exception as e:
             return {"exists": False, "error": str(e)}
@@ -224,8 +332,10 @@ def _state_reads(cls):
         """Alerting realization on Databricks = job notification settings;
         report whether the named JOB carries any (see get_job)."""
         job = get_job(self, name_or_hint)
+        exists = bool(job.get("exists") and job.get("notifications"))
         return {
-            "exists": bool(job.get("exists") and job.get("notifications")),
+            "exists": exists,
+            "count": 1 if exists else 0,  # parity with the {exists, count} contract
             **({"error": job["error"]} if job.get("error") else {}),
         }
 

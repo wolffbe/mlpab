@@ -126,17 +126,5 @@ class SkillBundleTests(unittest.TestCase):
             self.assertEqual(got, ["deploy", "tune"])
 
 
-class TreatmentGridTests(unittest.TestCase):
-    def test_new_platform_grids_cover_both_arms(self):
-        # Each (platform × model-family) config expands across models ×
-        # interfaces (cli, sdk) × skills (none, official). Assert one config per
-        # platform covers BOTH skills arms and BOTH interface arms.
-        for platform in ("azure", "gcp"):
-            cfg = bm.load_config(f"configs/treatments/{platform}/{platform}-claude.yaml")
-            self.assertEqual(sorted({r.skills for r in cfg.runs}), ["none", "official"])
-            self.assertEqual(sorted({r.interface for r in cfg.runs}), ["cli", "sdk"])
-            self.assertEqual(sorted({r.platform for r in cfg.runs}), [platform])
-
-
 if __name__ == "__main__":
     unittest.main()

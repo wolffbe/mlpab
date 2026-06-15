@@ -63,7 +63,16 @@ class VertexChecker:
         )
 
     def read_rows(self, name: str, version: int | None = None) -> pd.DataFrame:
-        return self._bq().query(f"SELECT * FROM `{self._table_ref(name)}`").to_dataframe()
+        # Translate a missing table into LookupError (graceful A0 fail), matching
+        # hopsworks/databricks/azure — otherwise BigQuery's NotFound propagates
+        # and crashes the grader instead of failing the deliverable check.
+        ref = self._table_ref(name)
+        try:
+            return self._bq().query(f"SELECT * FROM `{ref}`").to_dataframe()
+        except Exception as e:
+            if "Not found" in str(e) or "notFound" in str(e) or "does not exist" in str(e):
+                raise LookupError(f"table {ref} not found") from e
+            raise
 
     def read_training_dataset(self, name: str, version: int = 1) -> pd.DataFrame:
         for table in (f"{name}_v{version}", name):

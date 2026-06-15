@@ -112,7 +112,7 @@ def main(argv: list[str] | None = None) -> int:
     src.add_argument("--csv", type=Path, help="grade a local file (no platform)")
     src.add_argument(
         "--adapter",
-        choices=["hopsworks", "databricks", "sagemaker"],
+        choices=["hopsworks", "databricks", "aws", "azure", "gcp"],
         help="read the deliverable back THROUGH the platform "
         "(name/version from the instance's truth.json)",
     )
@@ -127,18 +127,11 @@ def main(argv: list[str] | None = None) -> int:
             produced = read_csv_or_empty(args.csv)
     else:
         meta = json.loads((args.instance / "solution" / "truth.json").read_text())
-        if args.adapter == "hopsworks":
-            from evals.adapters.hopsworks import HopsworksChecker
+        # state_checker dispatches to the right adapter for all five platforms
+        # (hopsworks/databricks/aws/azure/gcp) — uniform, no per-platform branch.
+        from evals.common import state_checker
 
-            checker = HopsworksChecker()
-        elif args.adapter == "databricks":
-            from evals.adapters.databricks import DatabricksChecker
-
-            checker = DatabricksChecker()
-        elif args.adapter == "sagemaker":
-            from evals.adapters.sagemaker import SageMakerChecker
-
-            checker = SageMakerChecker()
+        checker = state_checker(args.adapter)
         try:
             produced = checker.read_training_dataset(meta["dataset_name"], meta["dataset_version"])
         except LookupError as e:

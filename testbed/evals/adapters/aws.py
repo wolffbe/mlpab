@@ -77,8 +77,15 @@ class SageMakerChecker:
             "read_training_dataset (S3 deliverable) instead."
         )
 
-    def get_records(self, name: str, record_ids: list[str]) -> pd.DataFrame:
-        """Online-store reads for known keys (content asserts on SageMaker)."""
+    def get_records(
+        self, name: str, record_ids: list[str], version: int | None = 1
+    ) -> pd.DataFrame:
+        """Online-store reads for known keys (content asserts on SageMaker).
+
+        `version` is accepted for signature parity with the other adapters'
+        get_records; SageMaker feature groups are addressed by name, so it is
+        unused here.
+        """
         out = []
         for chunk in (record_ids[i : i + 100] for i in range(0, len(record_ids), 100)):
             resp = self._fsr.batch_get_record(
@@ -174,9 +181,12 @@ def _state_reads(cls):
             pkgs = self._sm.list_model_packages(ModelPackageGroupName=name)[
                 "ModelPackageSummaryList"
             ]
-            return {"exists": True, "version": len(pkgs)}
+            # `version` mirrors the cross-adapter {exists, version, metrics}
+            # contract; for SageMaker it's the package-version count. SageMaker
+            # model packages don't carry training metrics, so `metrics` is {}.
+            return {"exists": True, "version": len(pkgs), "metrics": {}}
         except Exception:
-            return {"exists": True}
+            return {"exists": True, "version": None, "metrics": {}}
 
     def get_job(self, name: str) -> dict:
         """Job realization (checked in order): SageMaker Pipeline (scheduled

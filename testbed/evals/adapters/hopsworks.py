@@ -72,6 +72,51 @@ class HopsworksChecker:
             raise LookupError(f"feature table {name!r} not found")
         return fg.read()
 
+    def get_records(
+        self, name: str, record_ids: list[str], version: int | None = 1
+    ) -> pd.DataFrame:
+        """Independent ONLINE read for known keys — the grader-side proof that
+        rows were materialized to the ONLINE store, not just the offline store.
+
+        Mirrors the SageMaker checker's `get_records` contract (DataFrame with
+        the primary-key column plus the feature columns, one row per found key).
+        Reads through the DEFAULT SQL serving path (`force_sql_client=True` →
+        the online MySQL store at `mysqld-external:3306`), which is the only
+        online read path available to an EXTERNAL client: the RDRS REST client
+        fails certificate hostname verification from outside the cluster. A
+        transient grader-owned feature view is created over the FG to serve the
+        lookups; the run's project is torn down afterwards, so it is not
+        cleaned up explicitly. A key that was never materialized online is
+        simply absent from the result, which the suite reports as a mismatch.
+        """
+        fg = self._get_fg(name, version)
+        if fg is None:
+            raise LookupError(f"feature table {name!r} not found")
+        pk_list = list(getattr(fg, "primary_key", []) or [])
+        pk = pk_list[0] if pk_list else "account_id"
+
+        fv_name = f"grader_online_{name}"
+        try:
+            fv = self._fs.get_feature_view(fv_name, version=1)
+        except Exception:
+            fv = None
+        if fv is None:
+            fv = self._fs.create_feature_view(
+                name=fv_name, version=1, query=fg.select_all()
+            )
+
+        rows = []
+        for rid in record_ids:
+            try:
+                vec = fv.get_feature_vector(
+                    {pk: rid}, return_type="pandas", force_sql_client=True
+                )
+            except Exception:
+                continue  # unmaterialized / missing key → absent row → mismatch
+            if vec is not None and len(vec):
+                rows.append(vec)
+        return pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
+
     # -- training datasets ---------------------------------------------------
 
     def read_training_dataset(self, name: str, version: int = 1) -> pd.DataFrame:

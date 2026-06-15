@@ -111,9 +111,11 @@ def _read_predictions(
     adapter: str | None, table: str, version: int, record_ids: list[str] | None, run_dir: Path
 ) -> pd.DataFrame:
     """Predictions read back THROUGH the platform (or local CSV for `none`)."""
-    if adapter in ("hopsworks", "databricks", "sagemaker"):
+    if adapter not in (None, "none"):
         from evals.common import fetch_table
 
+        # fetch_table supports every real adapter (hopsworks/databricks/aws/
+        # azure/gcp); never read the engineer's local CSV on a real platform.
         return fetch_table(adapter, table, version, record_ids)
     local = run_dir / "submission" / f"{table}.csv"
     if not local.exists():
@@ -262,7 +264,7 @@ def grade_main(family: str, argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--instance", type=Path, required=True)
     ap.add_argument(
-        "--adapter", required=True, choices=["hopsworks", "databricks", "sagemaker", "none"]
+        "--adapter", required=True, choices=["hopsworks", "databricks", "aws", "azure", "gcp", "none"]
     )
     args = ap.parse_args(argv)
     report = grade_capstone(args.instance, args.adapter, Path.cwd())
