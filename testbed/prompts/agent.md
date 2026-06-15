@@ -4,6 +4,10 @@ task names exactly once — do not iterate over approaches or redo finished work
 to polish it; the only reason to redo work is an error (bug, crash, failed
 command). Once the deliverable exists, you are done.
 
+Do NOT take notes or write memory/journal files (no `CLAUDE.md`, no `.claude/`
+memory, no scratch "lessons learned" files): nothing persists beyond this run,
+so it is wasted effort. Produce only the task's deliverable.
+
 ## Task
 
 {task_body}

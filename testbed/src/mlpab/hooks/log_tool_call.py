@@ -166,6 +166,11 @@ def _seg_exec(tokens: list, depth: int = 0) -> str | None:
 _CMDSUB_RE = re.compile(r"\$\(([^()]*(?:\([^()]*\)[^()]*)*)\)")  # $( … ), one nesting level
 _BACKTICK_RE = re.compile(r"`([^`]+)`")
 _FIND_EXEC_FLAGS = {"-exec", "-execdir", "-ok", "-okdir"}
+# Inert placeholder a command substitution / backtick span collapses to during
+# OUTER segmentation: its body is allowlist-checked separately via
+# `_nested_commands`, so the outer parse must not see the body's separators or
+# tokens at all (see `_pipeline_segments`).
+_CMDSUB_MASK = "__cmdsub__"
 
 
 def _strip_single_quoted(s: str) -> str:
@@ -781,6 +786,42 @@ def _pipeline_segments(command: str) -> list:
             quote = c
             cur.append(c)
             i += 1
+            continue
+        # Command substitution `$( … )` and backticks EXECUTE inner code, but
+        # `_nested_commands` already runs the allowlist over their bodies. Mask
+        # each span to one inert token so the OUTER scan never sees the body's
+        # separators (`|`/`;` inside `$(tail … | wc -l)`) as segment breaks, nor
+        # its flags (`-n`, `-d,`) as the segment's executable.
+        if c == "$" and i + 1 < n and command[i + 1] == "(":
+            j, depth, q = i + 2, 1, None
+            while j < n and depth > 0:
+                cj = command[j]
+                if q:
+                    if cj == q:
+                        q = None
+                elif cj in ("'", '"'):
+                    q = cj
+                elif cj == "(":
+                    depth += 1
+                elif cj == ")":
+                    depth -= 1
+                j += 1
+            cur.append(_CMDSUB_MASK)
+            i = j
+            continue
+        if c == "`":
+            j = i + 1
+            while j < n and command[j] != "`":
+                j += 2 if command[j] == "\\" and j + 1 < n else 1
+            cur.append(_CMDSUB_MASK)
+            i = j + 1 if j < n else j
+            continue
+        # A `#` at a word boundary opens a comment to end of line — drop it so a
+        # comment line in a multi-line command isn't parsed as a stray segment
+        # whose first word (e.g. `#`) gets denied as an off-interface binary.
+        if c == "#" and (not cur or cur[-1].isspace()):
+            while i < n and command[i] != "\n":
+                i += 1
             continue
         if c == "\\":  # backslash escape
             nxt = command[i + 1] if i + 1 < n else ""

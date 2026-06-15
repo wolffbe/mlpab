@@ -42,12 +42,12 @@ help:
 	@echo "  make uninstall — remove the venv + build artifacts (install state)"
 	@echo ""
 	@echo "Run a treatment session in tmux (detached from any terminal/Claude):"
-	@echo "  mlpab start configs/treatments/hopsworks/hopsworks-haiku-4-5-no-skills.yaml"
+	@echo "  mlpab start configs/treatments/hopsworks-cli-sdk-no-skills-opus.yaml"
 	@echo "  mlpab status          — list running treatment sessions"
 	@echo "  mlpab attach <yaml>   — watch it live (detach: Ctrl-b d)"
 	@echo "  mlpab stop   <yaml>   — kill it (the session also dies on its own when the run finishes)"
 	@echo ""
-	@echo "Run a config inline: mlpab run configs/treatments/<platform>/<name>.yaml"
+	@echo "Run a config inline: mlpab run configs/treatments/<name>.yaml"
 	@echo "Clear results:       mlpab clean"
 
 check-git:

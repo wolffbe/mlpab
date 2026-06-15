@@ -117,6 +117,32 @@ class EnforceHookTests(unittest.TestCase):
         # not be treated as a sub-command (no false denial).
         self.assertIsNone(self._enforce("cli", "Bash", "hops fs cp 'weird$(node).csv' /dst"))
 
+    def test_separators_inside_cmdsub_dont_split_outer_segment(self):
+        # Regression: a `|`/flag INSIDE `$( … )` must not split the outer segment
+        # and surface the body's flags (`-n`, `-d,`) as a bogus exec. These are
+        # allowed basic-shell data-inspection one-liners; they were false-denied.
+        for cmd in (
+            'tot=$(tail -n +2 data/batch_1.csv | wc -l); echo "$tot"',
+            "uniq=$(cut -d, -f1 data/batch_1.csv | sort -u | wc -l); echo $uniq",
+            "for i in 1 2 3; do n=$(tail -n +2 data/batch_$i.csv | wc -l); echo $n; done",
+        ):
+            self.assertIsNone(self._enforce("sdk", "Bash", cmd), cmd)
+            self.assertIsNone(self._enforce("cli", "Bash", cmd), cmd)
+
+    def test_cmdsub_body_still_allowlist_checked(self):
+        # Masking the span for OUTER segmentation must not stop `_nested_commands`
+        # from enforcing the body: an off-interface interpreter inside `$( … )`
+        # with a pipe is still denied.
+        self.assertIsNotNone(self._enforce("cli", "Bash", "x=$(node -e 1 | cat); echo $x"))
+
+    def test_leading_comment_line_not_treated_as_command(self):
+        # Regression: a `#` comment line in a multi-line command was tokenized to
+        # a `#` segment and denied as an off-interface binary.
+        cmd = "# max updated_at per row_id\ntail -q -n +2 data/*.csv | awk -F, '{print $1}' | sort"
+        self.assertIsNone(self._enforce("cli", "Bash", cmd), cmd)
+        # A `#` mid-token (not a word boundary) stays literal, not a comment.
+        self.assertIsNone(self._enforce("cli", "Bash", "cut -d# -f1 data/x.csv"))
+
     def test_cli_solution_answer_key_blocked(self):
         for cmd in ("cat solution/truth.json", "cat ../solution/truth.json",
                     "head /abs/run/solution/grading.json"):

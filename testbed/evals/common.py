@@ -21,9 +21,32 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 from pathlib import Path
 
 import pandas as pd
+
+# Read-back can flake on the client even when the server returns data: hsfs
+# collapses the real Arrow Flight error into a generic FeatureStoreException
+# (see arrow_flight_client.afs_error_handler_wrapper). The server serves the
+# rows reliably on repeat, so retry transient read failures before giving up.
+# LookupError/NotImplementedError are deterministic adapter limits — not retried.
+FETCH_RETRIES = 3
+FETCH_BACKOFF_S = 5
+
+
+def _fetch_table_with_retry(adapter, table, version, record_ids):
+    last = None
+    for attempt in range(1, FETCH_RETRIES + 1):
+        try:
+            return fetch_table(adapter, table, version, record_ids)
+        except (LookupError, NotImplementedError):
+            raise  # deterministic — retrying cannot change the outcome
+        except Exception as e:  # noqa: BLE001 — client read flake; retry
+            last = e
+            if attempt < FETCH_RETRIES:
+                time.sleep(FETCH_BACKOFF_S)
+    raise last
 
 
 def instance_suffix(seed: int) -> str:
@@ -225,7 +248,7 @@ def grade_table_main(family: str, grade_fn, argv: list[str] | None = None) -> in
     else:
         truth = json.loads((args.instance / "solution" / "truth.json").read_text())
         try:
-            produced = fetch_table(
+            produced = _fetch_table_with_retry(
                 args.adapter,
                 truth["table_name"],
                 truth.get("table_version", 1),
@@ -237,6 +260,12 @@ def grade_table_main(family: str, grade_fn, argv: list[str] | None = None) -> in
             # but keep the real reason for the report.
             produced = pd.DataFrame()
             deliverable_err = str(e)
+        except Exception as e:  # noqa: BLE001
+            # A client-side read-back flake (e.g. hsfs' masked FeatureStoreException)
+            # must NOT crash the grader — that produces no report at all. Degrade to
+            # an empty frame and surface the real reason on the report instead.
+            produced = pd.DataFrame()
+            deliverable_err = f"read-back failed after {FETCH_RETRIES} attempts: {e}"
     report = grade_fn(args.instance, produced, args.adapter)
     if deliverable_err:
         report.setdefault("error", deliverable_err)

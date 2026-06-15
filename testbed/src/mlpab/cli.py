@@ -9,7 +9,7 @@ Everything else — building interface binaries, logging in, testing they run �
 happens automatically at preflight when you run a config, with no AI involved.
 
 Examples:
-    mlpab start configs/treatments/hopsworks/hopsworks-haiku-4-5-no-skills.yaml
+    mlpab start configs/treatments/hopsworks-cli-sdk-no-skills-opus.yaml
     mlpab test configs/platforms/hopsworks/sdk.yaml
     make setup
 """
@@ -17,6 +17,7 @@ Examples:
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -50,6 +51,33 @@ def _load_dotenv() -> None:
         os.environ[key.strip()] = value.strip().strip('"').strip("'")
 
 
+# `.env` is grouped by platform/concern so it stays readable as more platforms
+# are configured: related keys cluster under a header, and groups are separated
+# by a blank line (e.g. the hopsworks block is visibly apart from the gcp block).
+# `_load_dotenv` ignores comments/blank lines, so the grouping is cosmetic only.
+# A key is matched to the first group whose prefixes it starts with; unmatched
+# keys fall into "Other" at the end. (Match on bare prefixes so AZURE also
+# catches AZUREML_*.)
+_DOTENV_GROUPS: list[tuple[str, tuple[str, ...]]] = [
+    ("Agent — Claude", ("ANTHROPIC", "CLAUDE")),
+    ("Agent — Codex", ("CODEX", "OPENAI")),
+    ("Agent — Mistral", ("MISTRAL",)),
+    ("Hopsworks", ("HOPSWORKS",)),
+    ("Databricks", ("DATABRICKS",)),
+    ("AWS", ("AWS",)),
+    ("Azure", ("AZURE",)),
+    ("GCP", ("GCP", "GOOGLE", "CLOUDSDK")),
+    ("Testbed", ("MLPAB",)),
+]
+
+
+def _dotenv_group_for(key: str) -> int:
+    for i, (_, prefixes) in enumerate(_DOTENV_GROUPS):
+        if key.startswith(prefixes):
+            return i
+    return len(_DOTENV_GROUPS)  # "Other" bucket, emitted last
+
+
 def _write_dotenv(updates: dict[str, str]) -> None:
     existing: dict[str, str] = {}
     if DOTENV_PATH.exists():
@@ -60,7 +88,18 @@ def _write_dotenv(updates: dict[str, str]) -> None:
             key, value = stripped.split("=", 1)
             existing[key.strip()] = value.strip()
     existing.update({k: v for k, v in updates.items() if v is not None})
-    DOTENV_PATH.write_text("\n".join(f"{k}={v}" for k, v in existing.items()) + "\n")
+
+    # Bucket keys by group (stable: preserves first-seen order within a group).
+    buckets: dict[int, list[str]] = {}
+    for key in existing:
+        buckets.setdefault(_dotenv_group_for(key), []).append(key)
+
+    names = [name for name, _ in _DOTENV_GROUPS] + ["Other"]
+    sections = [
+        "\n".join([f"# {names[gi]}", *(f"{k}={existing[k]}" for k in buckets[gi])])
+        for gi in sorted(buckets)
+    ]
+    DOTENV_PATH.write_text("\n\n".join(sections) + "\n")
     DOTENV_PATH.chmod(0o600)
 
 
@@ -240,9 +279,14 @@ def start(config: Path, no_attach: bool) -> None:
     session = _tmux_session(config)
     if subprocess.run(["tmux", "has-session", "-t", session], capture_output=True).returncode == 0:
         raise click.ClickException(f"{session} already running (mlpab stop {config} first)")
+    import shlex
     import sys
 
     mlpab_bin = Path(sys.argv[0]).resolve()
+    # Explicit `run` subcommand (not the `mlpab <config>` shorthand) and shell-
+    # quoted args, so ANY config path starts cleanly regardless of its name or
+    # spaces/quotes — the detached session has no shell of ours to lean on.
+    inner = f"{shlex.quote(str(mlpab_bin))} run {shlex.quote(str(config.resolve()))}"
     subprocess.run(
         [
             "tmux",
@@ -252,7 +296,7 @@ def start(config: Path, no_attach: bool) -> None:
             session,
             "-c",
             str(TESTBED_ROOT),
-            f'"{mlpab_bin}" "{config.resolve()}"',
+            inner,
         ],
         check=True,
     )
@@ -587,10 +631,10 @@ def _setup_claude_auth() -> None:
     click.secho("\n[1/1] Claude Code auth (the agent)", bold=True)
     click.echo("  Auth modes:")
     click.echo("    api-key  — claude-code calls Anthropic with ANTHROPIC_API_KEY.")
-    click.echo("    login    — claude-code uses your Claude subscription via `claude auth login`.")
-    click.echo("  This step only provisions the credential. The mode itself is")
-    click.echo("  set per run by the config's `auth:` field (e.g. `auth: login`),")
-    click.echo("  so nothing is written to .env to pin it globally.")
+    click.echo("    login    — claude-code uses your Claude subscription via a long-lived")
+    click.echo("               `claude setup-token` token (survives overnight headless runs).")
+    click.echo("  This step provisions the credential into .env. The mode itself is")
+    click.echo("  still set per run by the config's `auth:` field (e.g. `auth: login`).")
     choice = click.prompt(
         "  Auth mode", type=click.Choice(list(runner.AUTH_MODES)), default="api-key"
     )
@@ -603,12 +647,56 @@ def _setup_claude_auth() -> None:
         if shutil.which("claude") is None:
             click.secho("  `claude` CLI not on PATH — install Claude Code first.", fg="yellow")
             return
-        # `claude auth login` runs the sign-in flow and exits (no REPL to quit).
-        if click.confirm("  Run `claude auth login` now?", default=True):
-            subprocess.run(["claude", "auth", "login"], check=False)
+        # `claude setup-token` mints a LONG-LIVED OAuth token (~1yr) for headless
+        # runs. We pin it in .env as CLAUDE_CODE_OAUTH_TOKEN — resolve_oauth_token()
+        # checks env first, so it wins over the short-lived Keychain token, which
+        # only refreshes during interactive sessions and otherwise expires
+        # mid-run overnight (silently zeroing every subsequent task).
+        if click.confirm("  Run `claude setup-token` to mint a long-lived token now?", default=True):
+            token = _mint_setup_token()
+            if token:
+                _write_dotenv({"CLAUDE_CODE_OAUTH_TOKEN": token})
+                click.secho(f"  Wrote CLAUDE_CODE_OAUTH_TOKEN to {DOTENV_PATH}", fg="green")
+            else:
+                click.secho(
+                    "  Could not capture a token from `claude setup-token`. "
+                    "Run it manually and paste the sk-ant-oat01-… value into .env "
+                    "as CLAUDE_CODE_OAUTH_TOKEN.",
+                    fg="yellow",
+                )
         click.echo(
             "  Configs that should use it need `auth: login` (already the default in shipped configs)."
         )
+
+
+# Long-lived OAuth tokens from `claude setup-token` carry this prefix.
+_OAUTH_TOKEN_RE = re.compile(r"sk-ant-oat01-[A-Za-z0-9_-]+")
+
+
+def _mint_setup_token() -> str | None:
+    """Run `claude setup-token` and return the minted long-lived token, or None.
+
+    The sign-in flow (browser + prompts) streams to stderr/the terminal; the
+    token is printed to stdout, which we capture and scan. If capture fails
+    (e.g. a future CLI prints elsewhere), we fall back to prompting for a paste.
+    """
+    proc = subprocess.run(
+        ["claude", "setup-token"],
+        check=False,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    match = _OAUTH_TOKEN_RE.search(proc.stdout or "")
+    if match:
+        return match.group(0)
+    pasted = click.prompt(
+        "  Paste the sk-ant-oat01-… token from above (blank to skip)",
+        default="",
+        hide_input=True,
+        show_default=False,
+    ).strip()
+    match = _OAUTH_TOKEN_RE.search(pasted)
+    return match.group(0) if match else (pasted or None)
 
 
 def _setup_interface_keys(manifest_path: Path) -> None:
