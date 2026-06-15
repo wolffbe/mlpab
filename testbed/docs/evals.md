@@ -17,10 +17,11 @@ naive solution provably fails an assert.
 
 Configs: `configs/treatments/<platform>/<model>-{skills,no-skills}.yaml`
 (+ `configs/treatments/local/<model>.yaml` — the no-platform baseline).
-Different-platform configs are parallel-safe; same-platform configs and the
-per-model multi-platform baselines run sequentially (per-run teardown sweeps
-the platform). Every config covers all implemented tasks; `n` repeats give
-fresh seeded instances per repeat.
+All configs are parallel-safe — including same-platform ones: every run mints
+a unique per-run platform scope (e.g. a fresh `HOPSWORKS_PROJECT`) and
+setup/teardown touch only that scope, so concurrent runs on one cluster never
+sweep each other's work. Every config covers all implemented tasks; `n`
+repeats give fresh seeded instances per repeat.
 
 ## Design principles
 

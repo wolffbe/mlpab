@@ -148,27 +148,28 @@ def generate(seed: int, out: Path) -> dict:
     (out / "data").mkdir(parents=True)
     (out / "solution").mkdir()
     emit = hist.copy()
-    emit["event_time"] = emit["event_time"].dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    emit["event_time"] = emit["event_time"].dt.as_unit("ns").astype("int64") // 10**6
     emit.to_csv(out / "data" / "feature_history.csv", index=False)
     (out / "data" / "model.json").write_text(json.dumps(model, indent=2))
     t_iso = cutoff.strftime("%Y-%m-%dT%H:%M:%SZ")
+    t_ms = cutoff.value // 10**6  # as-of T in epoch milliseconds (matches event_time)
     (out / "data" / "scoring_request.md").write_text(
         "# Batch scoring request\n\n"
-        f"Score EVERY account AS OF **T = {t_iso}**.\n\n"
+        f"Score EVERY account AS OF **T = {t_ms}** (epoch milliseconds; {t_iso}).\n\n"
         "For each account, use the feature values that were VALID AT time T — "
         "the most recent revision in data/feature_history.csv with "
-        "`event_time` at or before T. Revisions after T must not influence "
-        "any score.\n\n"
+        "`event_time` (epoch milliseconds) at or before T. Revisions after T "
+        "must not influence any score.\n\n"
         "The model (data/model.json) is a logistic scorer:\n"
         "    score = sigmoid(w_f1*f1 + w_f2*f2 + w_f3*f3 + bias)\n"
         "rounded to 6 decimal places.\n"
     )
     (out / "prompt.txt").write_text(
         "The directory data/ contains a feature-history export "
-        "(data/feature_history.csv: account_id, event_time, f1, f2, f3 — "
-        "multiple revisions per account), a model (data/model.json: per-feature "
-        "weights and a bias), and a scoring request (data/scoring_request.md) "
-        "naming the as-of timestamp T.\n"
+        "(data/feature_history.csv: account_id, event_time [epoch milliseconds], "
+        "f1, f2, f3 — multiple revisions per account), a model (data/model.json: "
+        "per-feature weights and a bias), and a scoring request "
+        "(data/scoring_request.md) naming the as-of timestamp T.\n"
         "Batch-score EVERY account using the feature values that were VALID AT "
         "time T (the most recent revision at or before T; later revisions must "
         "not be used), with score = sigmoid(w_f1*f1 + w_f2*f2 + w_f3*f3 + bias) "
@@ -185,6 +186,7 @@ def generate(seed: int, out: Path) -> dict:
         "table_name": table,
         "table_version": 1,
         "as_of": t_iso,
+        "as_of_ms": int(t_ms),
         "spec": SPEC,
         "row_count": len(truth),
         "digest": digest(truth),

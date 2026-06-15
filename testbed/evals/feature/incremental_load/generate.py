@@ -36,8 +36,8 @@ CATEGORIES = ["grocery", "travel", "salary", "rent", "other"]
 
 SPEC = {
     "columns": ["row_id", "account_id", "event_time", "amount", "category"],
-    "ts_cols": ["event_time"],
-    "int_cols": [],
+    "ts_cols": [],
+    "int_cols": ["event_time"],  # epoch-milliseconds (bigint)
     "sort_cols": ["row_id"],
 }
 VARIANT_DIAGNOSIS = {
@@ -64,10 +64,10 @@ def generate(seed: int, out: Path) -> dict:
             {
                 "row_id": [f"R{i:05d}" for i in range(next_id, next_id + n)],
                 "account_id": [f"A{int(a):04d}" for a in rng.integers(0, 150, n)],
+                # epoch-milliseconds (bigint) — the unit Hopsworks ingests
+                # directly as an event-time column; no client-side parsing needed.
                 "event_time": [
-                    (day_origin + pd.Timedelta(minutes=int(m)))
-                    .floor("s")
-                    .strftime("%Y-%m-%dT%H:%M:%SZ")
+                    (day_origin + pd.Timedelta(minutes=int(m))).floor("s").value // 10**6
                     for m in np.sort(rng.integers(0, 24 * 60, n))
                 ],
                 "amount": np.round(rng.lognormal(3.0, 1.0, n), 2),
@@ -107,7 +107,8 @@ def generate(seed: int, out: Path) -> dict:
         "# Schema\n\nDaily increment files of one events table; each file holds one "
         "day's new rows (no overlaps between files). `row_id` uniquely identifies a "
         "row.\n\n- **row_id** (string): unique record key\n- **account_id** (string)\n"
-        "- **event_time** (ISO-8601 UTC): when the row became valid\n"
+        "- **event_time** (bigint): when the row became valid, as epoch "
+        "MILLISECONDS — register it as the event-time column\n"
         "- **amount** (double)\n- **category** (string)\n"
     )
     (out / "prompt.txt").write_text(
@@ -116,8 +117,8 @@ def generate(seed: int, out: Path) -> dict:
         "data/schema.md documenting the columns. New increments with the same schema "
         "will keep arriving daily.\n"
         f"Register a feature table named `{table}`, version 1, on the platform, with "
-        "record key `row_id` and event-timestamp column `event_time`, and load ALL "
-        "provided increments into it.\n"
+        "record key `row_id` and event-time column `event_time` (epoch "
+        "milliseconds), and load ALL provided increments into it.\n"
         "Make the table's features available for low-latency lookup as well "
         "(online/real-time access), where the platform distinguishes the two.\n"
         "Also set up a RECURRING job/pipeline on the platform, named "

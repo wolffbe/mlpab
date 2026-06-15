@@ -1,26 +1,30 @@
 """Hopsworks platform setup — create one empty project for the engineer to work in.
 
 Run automatically by `mlpab run` (the interface `serve:` step) at the START of
-every challenge, right AFTER `teardown.py` has wiped the cluster clean — so each
-run (and therefore each autoresearch version) begins with exactly ONE fresh,
-empty project and nothing leaked from an earlier run. The matching removal is
-`teardown.py`, which deletes every project the API key owns at both the start and
-the end of every run; the empty project this script creates is cleaned up there
-(no separate delete needed here).
+every challenge, right AFTER `teardown.py` has swept the run's own project — so
+each run (and therefore each autoresearch version) begins with one fresh, empty
+project named HOPSWORKS_PROJECT and nothing leaked from an earlier run of the
+same name. The matching removal is `teardown.py`, which deletes exactly the
+HOPSWORKS_PROJECT project at both the start and the end of every run; the empty
+project this script creates is cleaned up there (no separate delete needed here).
 
 Why pre-create it instead of letting the agent do it? Creating a project is
 platform plumbing, not part of the FTI lifecycle we measure (the whitelist starts
-at feature-group create). Pre-creating exactly one project means the engineer's
-`hopsworks.login()` lands in it automatically (a single project is selected
-without prompting), so the agent spends its effort on features/models — and a
-flaky project-create never confounds a run. Created for EVERY interface (cli /
+at feature-group create). Pre-creating the run's named project means the
+engineer's `hopsworks.login()` lands in it automatically (HOPSWORKS_PROJECT
+selects it without prompting, even when other parallel runs' projects coexist on
+the cluster), so the agent spends its effort on features/models — and a flaky
+project-create never confounds a run. Created for EVERY interface (cli /
 sdk / mcp), since each interface is its own run.
 
 We reuse the SDK's authenticated client the same way `teardown.py` does: auth
 (ApiKey / JWT from HOPSWORKS_API_KEY + HOPSWORKS_HOST) and the create call are
-handled by `hopsworks.create_project`. `hopsworks.login()` does NOT require an
-existing project on a self-hosted cluster — it returns no active project and
-leaves the connection live, which is all we need to create one.
+handled by `hopsworks.create_project`. The login here must connect WITHOUT
+selecting a project: the runner exports HOPSWORKS_PROJECT (the per-run name)
+before this step, and `hopsworks.login()` reads that env var and tries to SELECT
+the named project — which does not exist yet, since creating it is this script's
+job. So `main()` pops HOPSWORKS_PROJECT before login (the name is already
+captured in PROJECT_NAME) and recreates the project by name.
 
 Best-effort by design: invoked via the interface `serve:` step, whose runner
 (`_run_aux`) ignores failures and discards output. Nothing here may raise out of
@@ -33,21 +37,27 @@ immediate same-name re-create either fails outright (HTTP 500 / errorCode
 with the old namesake's still-being-cleaned Kafka state, and every feature
 group insert dies server-side with KafkaError TOPIC_AUTHORIZATION_FAILED
 (observed live 2026-06-12). A fresh name sidesteps both races. Uniqueness is
-safe: `teardown.py` deletes every project the key owns regardless of name, and
-the agent's `hopsworks.login()` auto-selects the single existing project. The
-create still RETRIES briefly for transient backend hiccups; the runner's serve
-timeout (runner.py `_run_aux`) must stay comfortably above
-CREATE_RETRY_SECONDS.
+safe: the runner mints HOPSWORKS_PROJECT fresh per run, `teardown.py` deletes
+exactly that project, and the agent's `hopsworks.login()` selects it by name via
+the same env var. The create still RETRIES briefly for transient backend
+hiccups; the runner's serve timeout (runner.py `_run_aux`) must stay comfortably
+above CREATE_RETRY_SECONDS.
 """
 
 from __future__ import annotations
 
+import os
 import secrets
 import time
 
-# Unique-per-run, alphanumeric project name (see module docstring). A single
-# existing project means the agent's login selects it with no prompt.
-PROJECT_NAME = f"mlpab{secrets.token_hex(3)}"
+# Unique-per-run, alphanumeric project name (see module docstring). The runner
+# generates it once per run and exports it as HOPSWORKS_PROJECT so setup
+# (creates it), the agent (login() auto-selects it), the grader's adapter (reads
+# back through it), and teardown (deletes only it) all agree on the SAME name —
+# which is what lets two hopsworks runs share a cluster. We honor that env value
+# and only mint our own when invoked standalone (no runner), so the agent's
+# bare login() and the per-run teardown still line up on the name we create.
+PROJECT_NAME = os.environ.get("HOPSWORKS_PROJECT") or f"mlpab{secrets.token_hex(3)}"
 
 # How long to keep retrying the create while the backend finishes tearing down
 # the previous run's namespace. A clean create takes ~20s; namespace finalizers
@@ -63,6 +73,15 @@ def main() -> None:
         print(f"[hopsworks setup] SDK unavailable: {e}")
         return
 
+    # Connect WITHOUT selecting a project. The runner exports HOPSWORKS_PROJECT
+    # (the per-run name) before this step, and `hopsworks.login()` reads that env
+    # var and tries to SELECT it — but the project does not exist yet, that is
+    # exactly what this script creates. Selecting it would raise ("Could not find
+    # project …") and abort the create. PROJECT_NAME has already captured the
+    # name at module load, so dropping the env var here is safe; we recreate it
+    # below by name. (verify() deliberately keeps the env var set — by then the
+    # project exists and the check mirrors the agent's later bare login().)
+    os.environ.pop("HOPSWORKS_PROJECT", None)
     try:
         hopsworks.login()  # reads HOPSWORKS_API_KEY / HOPSWORKS_HOST from env
     except Exception as e:

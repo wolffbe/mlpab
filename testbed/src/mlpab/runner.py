@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -556,6 +557,20 @@ def run(spec: RunSpec) -> results.Row:
             print(f"[mlpab] plumbing venv prep failed for {spec.platform}: {e}", file=sys.stderr)
             plumbing_py = interfaces.plumbing_python(spec.platform)
         plumbing_py = plumbing_py or (run_dir / "venv" / "bin" / "python")
+        # Per-run Hopsworks project name, the single source of truth shared by
+        # every phase of this run: setup creates it, the agent's bare
+        # `hopsworks.login()` auto-selects it via HOPSWORKS_PROJECT, the grader's
+        # adapter reads back through it, and teardown deletes ONLY it. Scoping the
+        # name per run is what lets two hopsworks runs coexist on one cluster
+        # without deleting each other's projects or cross-attaching at login.
+        # Set on os.environ (not just a local dict) because every downstream
+        # consumer derives from it — base_keys_env below, each engine's
+        # os.environ.copy(), and the grader subprocess which inherits the
+        # environment unchanged. A fresh name every run (matching the old
+        # setup.py behavior) also sidesteps the backend's async namespace/Kafka
+        # delete race documented in setup.py.
+        if spec.platform == "hopsworks":
+            os.environ["HOPSWORKS_PROJECT"] = f"mlpab{secrets.token_hex(3)}"
         base_keys_env = {
             **os.environ,
             **interface_setup.keys,

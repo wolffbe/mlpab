@@ -71,14 +71,14 @@ LAST = [
 
 SPEC = {  # schema B — the graded version-2 table
     "columns": ["row_id", "full_name", "balance", "currency", "updated_at"],
-    "ts_cols": ["updated_at"],
-    "int_cols": [],
+    "ts_cols": [],
+    "int_cols": ["updated_at"],  # epoch-milliseconds (bigint)
     "sort_cols": ["row_id"],
 }
 SPEC_OLD_NAME = {  # schema B but the balance column kept its old name
     "columns": ["row_id", "full_name", "balance_eur", "currency", "updated_at"],
-    "ts_cols": ["updated_at"],
-    "int_cols": [],
+    "ts_cols": [],
+    "int_cols": ["updated_at"],  # epoch-milliseconds (bigint)
     "sort_cols": ["row_id"],
 }
 VARIANT_DIAGNOSIS = {
@@ -108,10 +108,9 @@ def generate(seed: int, out: Path) -> dict:
             "row_id": [f"C{i:05d}" for i in range(N_OLD)],
             "name": _names(rng, N_OLD),
             "balance_eur": np.round(rng.uniform(-2000.0, 50000.0, N_OLD), 2),
+            # epoch-milliseconds (bigint) — ingested directly as event-time.
             "updated_at": [
-                (ORIGIN_OLD + pd.Timedelta(minutes=int(m)))
-                .floor("s")
-                .strftime("%Y-%m-%dT%H:%M:%SZ")
+                (ORIGIN_OLD + pd.Timedelta(minutes=int(m))).floor("s").value // 10**6
                 for m in np.sort(rng.integers(0, 30 * 24 * 60, N_OLD))
             ],
         }
@@ -133,9 +132,7 @@ def generate(seed: int, out: Path) -> dict:
                 "balance": np.round(rng.uniform(-2000.0, 50000.0, n), 2),
                 "currency": rng.choice(CURRENCIES, n),
                 "updated_at": [
-                    (ORIGIN_NEW + pd.Timedelta(minutes=int(m)))
-                    .floor("s")
-                    .strftime("%Y-%m-%dT%H:%M:%SZ")
+                    (ORIGIN_NEW + pd.Timedelta(minutes=int(m))).floor("s").value // 10**6
                     for m in np.sort(rng.integers(0, 7 * 24 * 60, n))
                 ],
             }
@@ -182,7 +179,7 @@ def generate(seed: int, out: Path) -> dict:
         "# Schema\n\n## initial_export.csv (the original schema)\n"
         "- **row_id** (string): unique record key\n- **name** (string)\n"
         "- **balance_eur** (double): balance, always in EUR\n"
-        "- **updated_at** (ISO-8601 UTC)\n\n"
+        "- **updated_at** (bigint): epoch MILLISECONDS, the event-time column\n\n"
         "## reload/new_export.csv (the NEW, breaking schema)\n"
         "A complete re-export from the upstream source. Columns were renamed and "
         "extended; every row was re-issued with new values; some old row_ids no "
@@ -190,7 +187,8 @@ def generate(seed: int, out: Path) -> dict:
         "- **row_id** (string): unique record key\n"
         "- **full_name** (string): replaces `name`\n"
         "- **balance** (double): replaces `balance_eur`; currency now varies\n"
-        "- **currency** (string): ISO code\n- **updated_at** (ISO-8601 UTC)\n"
+        "- **currency** (string): ISO code\n"
+        "- **updated_at** (bigint): epoch MILLISECONDS, the event-time column\n"
     )
     (out / "prompt.txt").write_text(
         "The directory data/ contains an initial export of a customers table "
@@ -198,11 +196,12 @@ def generate(seed: int, out: Path) -> dict:
         "change upstream (data/reload/new_export.csv), and data/schema.md "
         "documenting both schemas.\n"
         f"First register a feature table named `{table}`, version 1, on the platform "
-        "(record key `row_id`, event-timestamp column `updated_at`) and load the "
-        "initial export into it.\n"
+        "(record key `row_id`, event-time column `updated_at` in epoch milliseconds) "
+        "and load the initial export into it.\n"
         "Then re-create the table from scratch for the new schema: a feature table "
-        f"`{table}`, version 2 (record key `row_id`, event-timestamp column "
-        "`updated_at`), containing EXACTLY the rows and columns of the new export — "
+        f"`{table}`, version 2 (record key `row_id`, event-time column "
+        "`updated_at` in epoch milliseconds), containing EXACTLY the rows and columns "
+        "of the new export — "
         "no stale rows from version 1, no old column names. Version 2 is the graded "
         "deliverable.\n"
         "Make version 2's features available for low-latency lookup as well "

@@ -42,8 +42,8 @@ AMOUNT_MIN, AMOUNT_MAX = 0.0, 10000.0
 
 SPEC = {
     "columns": ["row_id", "account_id", "event_time", "amount", "category"],
-    "ts_cols": ["event_time"],
-    "int_cols": [],
+    "ts_cols": [],
+    "int_cols": ["event_time"],  # epoch-milliseconds (bigint)
     "sort_cols": ["row_id"],
 }
 VARIANT_DIAGNOSIS = {
@@ -64,8 +64,9 @@ def generate(seed: int, out: Path) -> dict:
         {
             "row_id": [f"R{i:05d}" for i in range(n)],
             "account_id": [f"A{int(a):04d}" for a in rng.integers(0, 150, n)],
+            # epoch-milliseconds (bigint) — ingested directly as event-time.
             "event_time": [
-                (ORIGIN + pd.Timedelta(minutes=int(m))).floor("s").strftime("%Y-%m-%dT%H:%M:%SZ")
+                (ORIGIN + pd.Timedelta(minutes=int(m))).floor("s").value // 10**6
                 for m in np.sort(rng.integers(0, 45 * 24 * 60, n))
             ],
             "amount": np.round(rng.uniform(1.0, 9500.0, n), 2),
@@ -124,7 +125,7 @@ def generate(seed: int, out: Path) -> dict:
     (out / "data" / "contract.md").write_text(
         "# Data contract — events export\n\n"
         "Columns: `row_id` (string, unique record key), `account_id` (string), "
-        "`event_time` (ISO-8601 UTC timestamp), `amount` (double), `category` (string).\n\n"
+        "`event_time` (bigint, epoch milliseconds), `amount` (double), `category` (string).\n\n"
         "A row is VALID only if ALL of the following hold:\n\n"
         "1. **amount is present** — null/empty amounts are contract violations.\n"
         f"2. **amount is within [{AMOUNT_MIN:.0f}, {AMOUNT_MAX:.0f}]** (inclusive).\n"
@@ -136,8 +137,8 @@ def generate(seed: int, out: Path) -> dict:
         "data contract it must satisfy (data/contract.md). Some rows violate the "
         "contract.\n"
         f"Register a feature table named `{table}`, version 1, on the platform, with "
-        "record key `row_id` and event-timestamp column `event_time`, and load ONLY "
-        "the rows that satisfy every contract rule.\n"
+        "record key `row_id` and event-time column `event_time` (epoch milliseconds), "
+        "and load ONLY the rows that satisfy every contract rule.\n"
         "Make the table's features available for low-latency lookup as well "
         "(online/real-time access), where the platform distinguishes the two.\n"
         "Additionally write submission/answers.json listing every rejected row id:\n"

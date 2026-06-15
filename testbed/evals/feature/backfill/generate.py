@@ -36,8 +36,8 @@ TABLE_BASE = "accounts"  # per-instance: f"{TABLE_BASE}{instance_suffix(seed)}"
 
 SPEC = {
     "columns": ["row_id", "status", "balance", "updated_at"],
-    "ts_cols": ["updated_at"],
-    "int_cols": [],
+    "ts_cols": [],
+    "int_cols": ["updated_at"],  # epoch-milliseconds (bigint)
     "sort_cols": ["row_id"],
 }
 VARIANT_DIAGNOSIS = {
@@ -73,6 +73,18 @@ def generate(seed: int, out: Path) -> dict:
     corrections["balance"] = np.round(corrections["balance"] + rng.normal(0, 800, N_CORRECTED), 2)
     corrections["updated_at"] = corrections["updated_at"] + pd.to_timedelta(
         rng.integers(60, 5_000, N_CORRECTED), unit="m"
+    )
+
+    # Encode the revision time as epoch-milliseconds (bigint) — the unit
+    # Hopsworks ingests directly as an event-time column (no client-side parsing
+    # needed). Epoch-ms preserves chronological order, so the latest-revision
+    # sort/groupby below is unaffected.
+    # Force ns resolution before the int cast: pandas 3.0 defaults datetimes to
+    # microseconds, so a bare `astype("int64") // 10**6` would yield SECONDS, not
+    # milliseconds. `.dt.as_unit("ns")` makes `// 10**6` reliably produce ms.
+    base["updated_at"] = base["updated_at"].dt.as_unit("ns").astype("int64") // 10**6
+    corrections["updated_at"] = (
+        corrections["updated_at"].dt.as_unit("ns").astype("int64") // 10**6
     )
 
     # truth: latest updated_at per row_id
@@ -118,9 +130,7 @@ def generate(seed: int, out: Path) -> dict:
     (out / "data").mkdir(parents=True)
     (out / "solution").mkdir()
     for name, df in batches.items():
-        emit = df.copy()
-        emit["updated_at"] = emit["updated_at"].dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-        emit.to_csv(out / "data" / name, index=False)
+        df.to_csv(out / "data" / name, index=False)
     (out / "data" / "schema.md").write_text(
         "# Schema\n\nThree batch files of one `accounts` table, delivered OUT OF "
         "ORDER: the same `row_id` may appear in more than one batch, and the row "
@@ -129,16 +139,17 @@ def generate(seed: int, out: Path) -> dict:
         "- **row_id** (string): unique record key\n"
         "- **status** (string): active | dormant | closed\n"
         "- **balance** (double)\n"
-        "- **updated_at**: revision timestamp (ISO-8601 UTC)\n"
+        "- **updated_at** (bigint): revision time as epoch MILLISECONDS — "
+        "register it as the event-time column\n"
     )
     (out / "prompt.txt").write_text(
         "The directory data/ contains three batch files of an `accounts` table "
         "(data/batch_1.csv, data/batch_2.csv, data/batch_3.csv — see data/schema.md; "
         "they arrived out of order and contain corrections keyed by `row_id`).\n"
         f"Register a feature table named `{table}`, version 1, on the platform, with "
-        "record key `row_id` and event-timestamp column `updated_at`, and load the "
-        "batches so the table's final contents are each row's LATEST revision — "
-        "exactly one row per row_id.\n"
+        "record key `row_id` and event-time column `updated_at` (epoch "
+        "milliseconds), and load the batches so the table's final contents are each "
+        "row's LATEST revision — exactly one row per row_id.\n"
         "Make the table's features available for low-latency lookup as well "
         "(online/real-time access), where the platform distinguishes the two.\n"
     )

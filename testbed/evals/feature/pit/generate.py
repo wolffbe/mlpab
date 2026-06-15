@@ -228,7 +228,7 @@ def canonicalize(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
     out = out[columns].sort_values("account_id").reset_index(drop=True)
     for c in columns:
         if c == "label_time":
-            out[c] = pd.to_datetime(out[c], utc=True).dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+            out[c] = pd.to_numeric(out[c]).astype("int64")  # epoch-milliseconds (bigint)
         elif pd.api.types.is_float_dtype(out[c]):
             out[c] = out[c].astype(float).round(6)
         elif c in ("credit_score", "sessions_7d", "churned"):
@@ -261,8 +261,9 @@ def _prompt(knobs: dict, columns: list[str], dataset_name: str) -> str:
         f"Produce a versioned training dataset named `{dataset_name}`, version 1, on the platform, "
         f"with exactly these columns: {', '.join(columns)}. One row per row of labels.csv.\n"
         "For each (account_id, label_time) in labels.csv, every feature value must be the MOST "
-        "RECENT value from its source table at or before label_time — values with timestamps "
-        "after label_time must not be used, in any table. Join on account_id.\n"
+        "RECENT value from its source table at or before label_time — values with event_time "
+        "after label_time must not be used, in any table. `event_time` and `label_time` are "
+        "epoch milliseconds. Join on account_id.\n"
     )
 
 
@@ -281,6 +282,17 @@ def generate(seed: int, out: Path) -> dict:
     rng = np.random.default_rng(seed)
     labels, tables = _gen_world(rng, knobs)
     columns = canonical_columns(knobs["tables"])
+
+    # Encode all event/label times as epoch-MILLISECONDS (bigint) so the CLI can
+    # ingest them directly as event-time columns (no client-side timestamp
+    # parsing). Done after world generation (which uses Timestamps internally);
+    # epoch-ms preserves ordering, so the as-of join/scan below is unaffected.
+    def _to_ms(s: pd.Series) -> pd.Series:
+        return pd.to_datetime(s, utc=True).dt.as_unit("ns").astype("int64") // 10**6
+
+    labels["label_time"] = _to_ms(labels["label_time"])
+    for _name in tables:
+        tables[_name]["event_time"] = _to_ms(tables[_name]["event_time"])
 
     truth = canonicalize(_truth_scan(labels, tables), columns)
 
@@ -326,14 +338,18 @@ def generate(seed: int, out: Path) -> dict:
     schema = [
         "# Schema",
         "",
-        "All tables join on `account_id`. `event_time` is when the row became valid.",
+        "All tables join on `account_id`. `event_time` (bigint, epoch "
+        "MILLISECONDS) is when the row became valid.",
         "",
     ]
     for name in emit:
         schema.append(
-            f"- **{name}.csv**: account_id, event_time, " + ", ".join(TABLE_FEATURES[name])
+            f"- **{name}.csv**: account_id, event_time (epoch ms), "
+            + ", ".join(TABLE_FEATURES[name])
         )
-    schema.append("- **labels.csv**: account_id, label_time, churned (1 = churned)")
+    schema.append(
+        "- **labels.csv**: account_id, label_time (epoch ms), churned (1 = churned)"
+    )
     (out / "data" / "schema.md").write_text("\n".join(schema) + "\n")
 
     (out / "prompt.txt").write_text(_prompt(knobs, columns, dataset_name))

@@ -5,18 +5,18 @@ Usage:
     python -m evals.feature.ingest.generate --selftest
 
 Full load: register a feature table `transactions<sfx>` (`<sfx>` = the
-6-hex per-instance suffix from the seed; record key `row_id`,
-event-timestamp `event_time`) and load the provided export. Two realistic
-complications, both stated in the schema doc:
-  * the export comes as TWO files whose row ranges OVERLAP (the second is a
-    re-delivery that includes the tail of the first) — rows are identified by
-    `row_id` and must be loaded exactly once;
-  * `event_time` appears in two formats (ISO-8601 strings and epoch
-    MILLISECONDS) — both must land as proper timestamps.
+6-hex per-instance suffix from the seed; record key `row_id`, event-time
+column `event_time`) and load the provided export. One realistic
+complication remains, stated in the schema doc: the export comes as TWO
+files whose row ranges OVERLAP (the second is a re-delivery that includes
+the tail of the first) — rows are identified by `row_id` and must land
+exactly once. This is navigable on the baseline because the platform's
+keyed upsert collapses the overlap on read; loading both files suffices.
 
-Ground truth by construction: the generator made the rows. Naive variants
-(gates assert they differ): keeping the overlap duplicated; loading the epoch
-timestamps unconverted.
+`event_time` is delivered as epoch MILLISECONDS (a bigint) — the unit
+Hopsworks accepts directly as an event-time column, so no client-side
+timestamp parsing is required. (The earlier mixed ISO/epoch format was a
+CLI-unparseable gotcha and was removed.) Ground truth is the rows made here.
 """
 
 from __future__ import annotations
@@ -35,18 +35,16 @@ from evals.common import canonicalize, digest, instance_suffix
 ORIGIN = pd.Timestamp("2026-01-01", tz="UTC")
 N_ROWS = 600
 OVERLAP = 80  # rows re-delivered in the second file
-EPOCH_FRACTION = 0.2  # rows whose event_time is epoch-milliseconds
 TABLE_BASE = "transactions"  # per-instance: f"{TABLE_BASE}{instance_suffix(seed)}"
 
 SPEC = {
     "columns": ["row_id", "account_id", "event_time", "amount", "category"],
-    "ts_cols": ["event_time"],
-    "int_cols": [],
+    "ts_cols": [],
+    "int_cols": ["event_time"],  # epoch-milliseconds (bigint)
     "sort_cols": ["row_id"],
 }
 VARIANT_DIAGNOSIS = {
     "keep_overlap": "the re-delivered overlap rows were loaded twice (dedupe by row_id)",
-    "raw_epoch": "epoch-millisecond event_time values were not converted to timestamps",
 }
 
 
@@ -58,63 +56,47 @@ def generate(seed: int, out: Path) -> dict:
     rng = np.random.default_rng(seed)
     table = TABLE_BASE + instance_suffix(seed)
     n = N_ROWS
+    times = [
+        (ORIGIN + pd.Timedelta(minutes=int(m))).floor("s")
+        for m in np.sort(rng.integers(0, 60 * 24 * 60, n))
+    ]
+    # event_time as epoch-milliseconds (bigint) — the unit Hopsworks ingests
+    # directly as an event-time column; no client-side parsing needed.
+    event_ms = pd.DatetimeIndex(times).as_unit("ns").astype("int64") // 10**6
     truth_df = pd.DataFrame(
         {
             "row_id": [f"R{i:05d}" for i in range(n)],
             "account_id": [f"A{int(a):04d}" for a in rng.integers(0, 120, n)],
-            "event_time": [
-                (ORIGIN + pd.Timedelta(minutes=int(m))).floor("s")
-                for m in np.sort(rng.integers(0, 60 * 24 * 60, n))
-            ],
+            "event_time": event_ms.astype("int64"),
             "amount": np.round(rng.lognormal(3.0, 1.0, n), 2),
             "category": rng.choice(["grocery", "travel", "salary", "rent", "other"], n),
         }
     )
 
-    # The emitted view: ISO strings, with a seeded subset as epoch-milliseconds.
-    # Force ns resolution before the int cast: `astype("int64")` yields the
-    # column's UNIT-many ticks since epoch, and pandas 3.0 defaults datetimes to
-    # microseconds (2.x used nanoseconds). Pinning to ns makes `// 10**6` reliably
-    # produce milliseconds on both — else under pandas 3.0 the "epoch-ms" values
-    # come out as seconds and every consumer misparses them to ~1970.
-    emit = truth_df.copy()
-    iso = emit["event_time"].dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-    epoch_idx = rng.choice(n, int(n * EPOCH_FRACTION), replace=False)
-    mixed = iso.astype(object)
-    ev_ns = emit["event_time"].iloc[epoch_idx].dt.as_unit("ns").astype("int64")
-    mixed.iloc[epoch_idx] = (ev_ns // 10**6).astype(str)
-    emit["event_time"] = mixed
-
-    split = n - OVERLAP - rng.integers(150, 250)
-    part1 = emit.iloc[: split + OVERLAP]  # ...includes the overlap tail
-    part2 = emit.iloc[split:].sample(frac=1.0, random_state=seed)  # re-delivery, shuffled
+    # Two exports whose row ranges OVERLAP: the second is a re-delivery that
+    # includes the tail of the first. `row_id` is the record key, so the
+    # platform's keyed upsert collapses the overlap on read — both CLI and SDK
+    # navigate this by loading both files (no client-side dedupe required).
+    split = n - OVERLAP - int(rng.integers(150, 250))
+    part1 = truth_df.iloc[: split + OVERLAP]  # ...includes the overlap tail
+    part2 = truth_df.iloc[split:].sample(frac=1.0, random_state=seed)  # re-delivery, shuffled
 
     truth = canonicalize(truth_df, SPEC)
 
     # --- gates ---------------------------------------------------------------
+    # Diagnostic variant: keeping the re-delivered overlap duplicated.
     variants = {
         "keep_overlap": canonicalize(
-            pd.concat([part1, part2], ignore_index=True)
-            .assign(event_time=lambda d: _parse_mixed(d["event_time"]))
-            # duplicates kept: disambiguate the sort so the digest is stable
-            .sort_values(["row_id", "event_time"]),
-            {**SPEC, "sort_cols": ["row_id"]} | {"columns": SPEC["columns"]},
-        ),
-        "raw_epoch": canonicalize(
-            pd.concat([part1, part2], ignore_index=True)
-            .drop_duplicates(subset="row_id")
-            .assign(event_time=lambda d: _parse_naive(d["event_time"])),
-            SPEC,
+            pd.concat([part1, part2], ignore_index=True).sort_values(["row_id", "event_time"]),
+            {**SPEC, "sort_cols": ["row_id"]},
         ),
     }
     for name, v in variants.items():
         if digest(v) == digest(truth):
             raise GateError(f"variant {name!r} matches truth (seed={seed})")
-    # reference: dedupe by row_id + parse both formats == truth
+    # reference: load both files, dedupe by row_id == truth (what the platform does)
     ref = canonicalize(
-        pd.concat([part1, part2], ignore_index=True)
-        .drop_duplicates(subset="row_id")
-        .assign(event_time=lambda d: _parse_mixed(d["event_time"])),
+        pd.concat([part1, part2], ignore_index=True).drop_duplicates(subset="row_id"),
         SPEC,
     )
     if digest(ref) != digest(truth):
@@ -128,14 +110,14 @@ def generate(seed: int, out: Path) -> dict:
     part1.to_csv(out / "data" / "transactions_export_1.csv", index=False)
     part2.to_csv(out / "data" / "transactions_export_2.csv", index=False)
     (out / "data" / "schema.md").write_text(
-        "# Schema\n\nBoth export files share one schema; together they contain the full "
-        "table, but their row ranges OVERLAP (the second file is a re-delivery that "
-        "includes the tail of the first). `row_id` uniquely identifies a row.\n\n"
+        "# Schema\n\nBoth export files share one schema; together they contain the "
+        "full table, but their row ranges OVERLAP (the second file is a "
+        "re-delivery that includes the tail of the first). `row_id` uniquely "
+        "identifies a row.\n\n"
         "- **row_id** (string): unique record key\n"
         "- **account_id** (string)\n"
-        "- **event_time**: when the row became valid — ISO-8601 UTC strings, EXCEPT "
-        "some rows carry epoch MILLISECONDS instead; both must be loaded as proper "
-        "timestamps\n"
+        "- **event_time** (bigint): when the row became valid, as epoch "
+        "MILLISECONDS — register it as the event-time column\n"
         "- **amount** (double)\n- **category** (string)\n"
     )
     (out / "prompt.txt").write_text(
@@ -143,9 +125,8 @@ def generate(seed: int, out: Path) -> dict:
         "(data/transactions_export_1.csv, data/transactions_export_2.csv) and "
         "data/schema.md documenting the columns and their quirks.\n"
         f"Register a feature table named `{table}`, version 1, on the platform, with "
-        "record key `row_id` and event-timestamp column `event_time`, and load the "
-        "full export into it: every row exactly once, with `event_time` as a proper "
-        "timestamp for ALL rows.\n"
+        "record key `row_id` and event-time column `event_time` (epoch "
+        "milliseconds), and load the full export into it: every row exactly once.\n"
         "Make the table's features available for low-latency lookup as well "
         "(online/real-time access), where the platform distinguishes the two.\n"
     )
@@ -165,31 +146,6 @@ def generate(seed: int, out: Path) -> dict:
     (out / "solution" / "truth.json").write_text(json.dumps(meta, indent=2))
     (out / "instance.json").write_text(json.dumps({"family": "ingest", "seed": seed}, indent=2))
     return meta
-
-
-def _parse_mixed(s: pd.Series) -> pd.Series:
-    """ISO strings + epoch-millisecond strings → tz-aware timestamps.
-
-    Both branches are forced to nanosecond resolution before combining: pandas
-    3.0 defaults ISO parses to microsecond and `unit="ms"` to millisecond, and a
-    cross-resolution `fillna` reinterprets the raw integers (an epoch-ms value
-    lands as ~1970). Aligning the unit keeps this correct on pandas 2.x and 3.x.
-    """
-    out = pd.to_datetime(s.where(~s.str.fullmatch(r"\d+"), None), utc=True).dt.as_unit("ns")
-    epoch = pd.to_datetime(
-        pd.to_numeric(s.where(s.str.fullmatch(r"\d+"), None)), unit="ms", utc=True
-    ).dt.as_unit("ns")
-    return out.fillna(epoch)
-
-
-def _parse_naive(s: pd.Series) -> pd.Series:
-    """The naive load: epoch values parsed as if they were nanosecond ints.
-    Units aligned to ns before combining (same pandas-3.0 reason as _parse_mixed)."""
-    out = pd.to_datetime(s.where(~s.str.fullmatch(r"\d+"), None), utc=True).dt.as_unit("ns")
-    naive = pd.to_datetime(
-        pd.to_numeric(s.where(s.str.fullmatch(r"\d+"), None)), utc=True
-    ).dt.as_unit("ns")
-    return out.fillna(naive)
 
 
 def main(argv: list[str] | None = None) -> int:

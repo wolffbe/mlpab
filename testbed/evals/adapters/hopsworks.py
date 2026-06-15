@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -30,13 +31,17 @@ from evals.adapters import TableInfo
 
 
 class HopsworksChecker:
-    """Checker over the single per-run Hopsworks project (setup.py guarantees
-    exactly one project for the key, so login() needs no project name)."""
+    """Checker over the run's Hopsworks project. The runner exports
+    HOPSWORKS_PROJECT (the name setup.py created), so we log in to THAT project
+    by name — essential once parallel runs leave more than one project on the
+    cluster, where a bare login() would prompt or attach to the wrong one. When
+    unset (standalone use against a single-project key), login() falls back to
+    auto-selecting the only project."""
 
     def __init__(self) -> None:
         import hopsworks  # lazy: see module docstring
 
-        self._project = hopsworks.login()
+        self._project = hopsworks.login(project=os.environ.get("HOPSWORKS_PROJECT"))
         self._fs = self._project.get_feature_store()
 
     # -- feature tables ----------------------------------------------------

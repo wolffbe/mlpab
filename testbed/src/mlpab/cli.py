@@ -205,8 +205,9 @@ def _dispatch_config(config_path: Path, runs_root: Path, assume_yes: bool = Fals
 # any terminal (or Claude). One session per config, named mlpab-<config-stem>;
 # created by `start`, dies on its own when the run finishes (or via `stop`).
 # Per-run detail persists in each attempt's task/agent.log regardless.
-# Never run two sessions of the SAME platform at once (per-run teardown sweeps
-# it); different platforms are safe in parallel.
+# Same-platform sessions are parallel-safe: each run mints a unique
+# HOPSWORKS_PROJECT (runner.py) and setup/teardown are scoped to ONLY that
+# project, so concurrent runs on one cluster never sweep each other's work.
 # ---------------------------------------------------------------------------
 
 
