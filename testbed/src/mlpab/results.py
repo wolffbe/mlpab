@@ -3,7 +3,8 @@
 One row per (task, platform, interface, skills, auth) run. Token/cost
 columns come from the stream-json transcript's `result` event (Claude Code's
 `total_cost_usd` + aggregated `usage`); command counts from walking each
-`tool_use` block in the same transcript; asserts_passed/asserts_total from the
+`tool_use` block in the same transcript; the assert tally
+(asserts_passed/asserts_failed/asserts_skipped/total_asserts) from the
 assertion-suite grading report.
 """
 
@@ -103,7 +104,9 @@ CALL_COUNT_COLUMNS: tuple[str, ...] = (
 # Order = chart order. One chart per metric.
 TRACKED_METRICS: list[str] = [
     "asserts_passed",
-    "asserts_total",
+    "asserts_failed",
+    "asserts_skipped",
+    "total_asserts",
     "total_tokens",
     "wall_time_s",
     "cost_usd",
@@ -114,7 +117,9 @@ TRACKED_METRICS: list[str] = [
 # endpoint columns (no per-config endpoint policy is configured).
 RESULTS_TRACKED_METRICS: list[str] = [
     "asserts_passed",
-    "asserts_total",
+    "asserts_failed",
+    "asserts_skipped",
+    "total_asserts",
     "total_tokens",
     "wall_time_s",
     "cost_usd",
@@ -193,8 +198,13 @@ _RESULTS_VIEW = {
     "valid": "valid",
     "success": "success",
     # Assertion-suite grading (full breakdown in the per-run grading.json).
+    # `total_asserts` is the family's full suite size on every row; passed +
+    # failed + skipped == total. `skipped` = checks not reached (a prerequisite
+    # failed) or not applicable on this platform.
     "asserts_passed": "asserts_passed",
-    "asserts_total": "asserts_total",
+    "asserts_failed": "asserts_failed",
+    "asserts_skipped": "asserts_skipped",
+    "total_asserts": "total_asserts",
     # Agent metrics. `wall_time_s` is COMPUTE time; rate-limit back-off
     # sleeps land in `rate_limit_wait_s` instead.
     "wall_time_s": "wall_time_s",
@@ -416,9 +426,14 @@ class Row:
     valid: bool = False
     success: bool = False
     # Slim grading: assertion-suite tallies (full breakdown in the
-    # per-run `grading.json`).
+    # per-run `grading.json`). passed + failed + skipped == total_asserts, the
+    # family's full suite size (always reported, even on failed/no-deliverable
+    # runs). `skipped` = checks not reached (prerequisite failed) or not
+    # applicable on this platform.
     asserts_passed: int = 0
-    asserts_total: int = 0
+    asserts_failed: int = 0
+    asserts_skipped: int = 0
+    total_asserts: int = 0
     # Wall + tokens + cost from the agent's `claude -p`. Wall time is COMPUTE
     # time — rate-limit back-off sleeps are excluded and recorded in
     # `rate_limit_wait_s`.
@@ -757,9 +772,7 @@ def _classify_tool_use(
     def _aux_present() -> bool:
         # Extra on-interface binaries (e.g. `bq` alongside `gcloud`) count as cli.
         aux = [b for b in (cli_aux or []) if b]
-        return any(
-            t == b or t.endswith(f"/{b}") for t in exec_tokens for b in aux
-        )
+        return any(t == b or t.endswith(f"/{b}") for t in exec_tokens for b in aux)
 
     if _cli_present() or _aux_present():
         return "cli"

@@ -179,7 +179,8 @@ def run(
         f"\n=== {task} [{row.platform}/{row.interface}, skills={row.skills}] "
         f"done in {row.wall_time_s:.1f}s "
         f"({row.total_tokens} tokens, ${row.cost_usd:.4f}); "
-        f"asserts={row.asserts_passed}/{row.asserts_total} ===\n"
+        f"asserts={row.asserts_passed} passed/{row.asserts_failed} failed/"
+        f"{row.asserts_skipped} skipped of {row.total_asserts} ===\n"
         f"run dir: {row.run_dir}"
     )
 

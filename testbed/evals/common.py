@@ -118,9 +118,94 @@ def table_exists_info(adapter: str, table: str, version: int):
     return None
 
 
+def tally(asserts: list[dict]) -> dict:
+    """Roll an assertion list up into the standard outcome fields.
+
+    Every assert carries a `status` in {"pass","fail","skip"}. `skip` means the
+    check was not reached (a prerequisite failed) or not applicable on this
+    platform (e.g. the `platform none` baseline) — it neither passes nor fails
+    the task. `success` = no failed asserts AND at least one passed (an
+    all-skipped suite verified nothing, so it is not a success)."""
+    p = sum(a.get("status") == "pass" for a in asserts)
+    f = sum(a.get("status") == "fail" for a in asserts)
+    s = sum(a.get("status") == "skip" for a in asserts)
+    return {
+        "success": f == 0 and p >= 1,
+        "asserts_passed": p,
+        "asserts_failed": f,
+        "asserts_skipped": s,
+        "total_asserts": len(asserts),
+    }
+
+
+class Suite:
+    """Accumulates an assertion suite with three-way status, so the FULL suite
+    size is always reported even when later checks are skipped.
+
+    - `check(name, ok, detail)` records a pass/fail and returns the bool. Detail
+      is kept only on failure unless `detail_on_pass=True` (for checks whose
+      pass carries an informative note, e.g. "platform metrics differ").
+    - `skip(name, detail)` records a not-reached / not-applicable assert and
+      returns True (non-blocking — skips never fail the task).
+    - `report(**extra)` returns the tally fields + the assert list + extras.
+
+    Each assert keeps a legacy `passed` bool (== status == "pass") so existing
+    consumers (the first-assert `deliverable_exists` probe) keep working."""
+
+    def __init__(self) -> None:
+        self.asserts: list[dict] = []
+
+    def check(self, name: str, ok, detail: str = "", *, detail_on_pass: bool = False) -> bool:
+        ok = bool(ok)
+        keep_detail = bool(detail) and (not ok or detail_on_pass)
+        self.asserts.append(
+            {
+                "name": name,
+                "status": "pass" if ok else "fail",
+                "passed": ok,
+                **({"detail": detail} if keep_detail else {}),
+            }
+        )
+        return ok
+
+    def skip(self, name: str, detail: str = "") -> bool:
+        self.asserts.append(
+            {
+                "name": name,
+                "status": "skip",
+                "passed": False,
+                **({"detail": detail} if detail else {}),
+            }
+        )
+        return True
+
+    def report(self, **extra) -> dict:
+        return {**tally(self.asserts), "asserts": self.asserts, **extra}
+
+
+def read_csv_or_empty(path) -> pd.DataFrame:
+    """Read a CSV deliverable, returning an EMPTY frame when the file is missing
+    or empty (0 bytes). Lets a grader still enumerate its full suite (the
+    deliverable check fails on missing columns, dependents skip) instead of
+    crashing on a `pandas.errors.EmptyDataError` for a 0-byte file."""
+    path = Path(path)
+    if not path.exists():
+        return pd.DataFrame()
+    try:
+        return pd.read_csv(path)
+    except pd.errors.EmptyDataError:
+        return pd.DataFrame()
+
+
 def grade_table_main(family: str, grade_fn, argv: list[str] | None = None) -> int:
     """CLI shared by table-deliverable families: --instance + (--csv | --adapter).
-    `grade_fn(instance_dir, produced_df, adapter_or_none) -> report`."""
+    `grade_fn(instance_dir, produced_df, adapter_or_none) -> report`.
+
+    A missing/empty `--csv` or an unreadable platform deliverable yields an EMPTY
+    DataFrame rather than an early return, so the grader still enumerates its
+    full assert suite (deliverable check fails, dependents skip). The reason the
+    deliverable was unreadable is surfaced on the report's `error` key so it
+    reaches the results CSV (rather than a generic "missing columns")."""
     import argparse
 
     ap = argparse.ArgumentParser()
@@ -130,10 +215,15 @@ def grade_table_main(family: str, grade_fn, argv: list[str] | None = None) -> in
     src.add_argument("--adapter", choices=["hopsworks", "databricks", "aws", "azure", "gcp"])
     args = ap.parse_args(argv)
 
-    truth = json.loads((args.instance / "solution" / "truth.json").read_text())
+    deliverable_err = None
     if args.csv:
-        produced = pd.read_csv(args.csv)
+        if not args.csv.exists():
+            produced = pd.DataFrame()
+            deliverable_err = f"no deliverable produced at {args.csv}"
+        else:
+            produced = read_csv_or_empty(args.csv)
     else:
+        truth = json.loads((args.instance / "solution" / "truth.json").read_text())
         try:
             produced = fetch_table(
                 args.adapter,
@@ -142,17 +232,14 @@ def grade_table_main(family: str, grade_fn, argv: list[str] | None = None) -> in
                 truth.get("record_ids"),
             )
         except (LookupError, NotImplementedError) as e:
-            report = {
-                "family": family,
-                "seed": truth["seed"],
-                "success": False,
-                "asserts_passed": 0,
-                "asserts_total": 1,
-                "asserts": [{"name": "A0_deliverable_exists", "passed": False, "detail": str(e)}],
-            }
-            print(json.dumps(report, indent=2, default=str))
-            return 1
+            # Deliverable could not be read back — grade an EMPTY frame so the
+            # suite still enumerates (deliverable check fails, dependents skip),
+            # but keep the real reason for the report.
+            produced = pd.DataFrame()
+            deliverable_err = str(e)
     report = grade_fn(args.instance, produced, args.adapter)
+    if deliverable_err:
+        report.setdefault("error", deliverable_err)
     print(json.dumps(report, indent=2, default=str))
     return 0 if report["success"] else 1
 
@@ -162,47 +249,42 @@ def grade_table_content(family: str, instance_dir: Path, produced: pd.DataFrame)
     with named diagnosis via the generator's known-wrong variant digests."""
     truth = json.loads((instance_dir / "solution" / "truth.json").read_text())
     spec = truth["spec"]
-    asserts: list[dict] = []
+    s = Suite()
     diagnostic = None
-
-    def check(name, ok, detail=""):
-        asserts.append(
-            {"name": name, "passed": bool(ok), **({"detail": detail} if detail and not ok else {})}
-        )
-        return bool(ok)
 
     produced.columns = [str(c).strip().lower() for c in produced.columns]
     missing = [c for c in spec["columns"] if c not in produced.columns]
-    a1 = check("A1_columns", not missing, f"missing columns: {missing}")
-    a2 = a3 = False
-    if a1:
+    a1 = s.check("A1_columns", not missing, f"missing columns: {missing}")
+    if not a1:
+        # No gradeable deliverable — the content checks are unreachable.
+        s.skip("A2_row_count", "skipped: required columns are missing")
+        s.skip("A3_content", "skipped: required columns are missing")
+    else:
         try:
             norm = canonicalize(produced, spec)
         except Exception as e:
-            check("A2_canonical_form", False, f"could not normalize: {e}")
+            s.check("A2_row_count", False, f"could not normalize: {e}")
+            s.skip("A3_content", "skipped: could not normalize the deliverable")
             norm = None
         if norm is not None:
-            a2 = check(
+            s.check(
                 "A2_row_count",
                 len(norm) == truth["row_count"],
                 f"got {len(norm)}, expected {truth['row_count']}",
             )
             d = digest(norm)
-            a3 = check("A3_content", d == truth["digest"], "content digest mismatch")
+            a3 = s.check("A3_content", d == truth["digest"], "content digest mismatch")
             if not a3:
                 for vname, vdig in truth.get("variant_digests", {}).items():
                     if d == vdig:
                         diagnostic = truth.get("variant_diagnosis", {}).get(vname, vname)
                         break
 
-    success = a1 and a2 and a3
     return {
         "family": family,
         "seed": truth["seed"],
-        "success": success,
-        "asserts_passed": sum(a["passed"] for a in asserts),
-        "asserts_total": len(asserts),
-        "asserts": asserts,
+        **tally(s.asserts),
+        "asserts": s.asserts,
         **({"diagnostic": diagnostic} if diagnostic else {}),
     }
 
@@ -225,23 +307,10 @@ def grade_answers_main(family: str, grade_fn, argv: list[str] | None = None) -> 
     ap.add_argument("--answers", type=Path, required=True)
     args = ap.parse_args(argv)
 
+    # A missing answers file is passed through as None so the grader still
+    # enumerates its full suite (deliverable check fails, dependents skip).
     answers = load_answers(args.answers)
-    if answers is None:
-        report = {
-            "family": family,
-            "success": False,
-            "asserts_passed": 0,
-            "asserts_total": 1,
-            "asserts": [
-                {
-                    "name": "A0_deliverable_exists",
-                    "passed": False,
-                    "detail": f"no answers file at {args.answers}",
-                }
-            ],
-        }
-    else:
-        report = grade_fn(args.instance, answers)
+    report = grade_fn(args.instance, answers)
     print(json.dumps(report, indent=2, default=str))
     return 0 if report["success"] else 1
 

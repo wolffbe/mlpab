@@ -85,6 +85,19 @@ class RunSpec:
     preflight: bool = True
 
 
+def _deliverable_exists(asserts: list[dict]) -> bool:
+    """Whether a gradeable deliverable was produced — the `valid` column,
+    separating "wrong answer" from "no deliverable".
+
+    It is the verdict of the FIRST GRADED (non-skip) assert: skipped checks
+    (not reached, or not applicable on this platform — e.g. the `none`
+    baseline's table-exists check) are stepped over, so the probe lands on the
+    first assert actually evaluated rather than positionally `asserts[0]` (which
+    can now be a skip carrying passed=False)."""
+    graded = [a for a in asserts if a.get("status") != "skip"]
+    return bool(graded) and bool(graded[0].get("passed"))
+
+
 def _results_root_from(runs_root: Path) -> Path:
     """Nearest `results/` ancestor of `runs_root` (…/results/<config>/…).
     Falls back to `runs_root` if none found."""
@@ -657,15 +670,18 @@ def run(spec: RunSpec) -> results.Row:
             try:
                 interfaces.install_for_grader(spec.platform, run_dir, venv_python)
             except Exception as e:
-                print(f"[mlpab] grader-deps install failed for {spec.platform}: {e}",
-                      file=sys.stderr)
+                print(
+                    f"[mlpab] grader-deps install failed for {spec.platform}: {e}", file=sys.stderr
+                )
         try:
             grading = evals_provider.grade(spec.task, run_dir, spec.platform, venv_python)
         except Exception as e:
             grading = {
                 "success": False,
                 "asserts_passed": 0,
-                "asserts_total": 0,
+                "asserts_failed": 0,
+                "asserts_skipped": 0,
+                "total_asserts": 0,
                 "asserts": [],
                 "error": str(e),
             }
@@ -758,23 +774,24 @@ def run(spec: RunSpec) -> results.Row:
         if _wl or _bl:
             (run_dir / "endpoint_coverage.json").write_text(json.dumps(endpoint_cov, indent=2))
         # Assertion-suite report → Row fields: the passed/total tallies
-        # (all green = task solved). `deliverable_exists` = the deliverable
-        # exists on the platform (first assert passed), separating "wrong" from
-        # "absent". The full report (asserts, diagnostic) lives in grading.json.
-        _asserts = grading.get("asserts") or []
-        deliverable_exists = bool(_asserts) and bool(_asserts[0].get("passed"))
+        # (all green = task solved). The full report lives in grading.json.
+        deliverable_exists = _deliverable_exists(grading.get("asserts") or [])
         slim_grading = {
             # valid = a gradeable deliverable was produced (first assert passed);
-            # success = the task was solved correctly (all asserts green).
+            # success = the task was solved correctly (no failed asserts).
             "valid": deliverable_exists,
             "success": bool(grading.get("success", False)),
             "asserts_passed": grading.get("asserts_passed", 0),
-            "asserts_total": grading.get("asserts_total", 0),
+            "asserts_failed": grading.get("asserts_failed", 0),
+            "asserts_skipped": grading.get("asserts_skipped", 0),
+            "total_asserts": grading.get("total_asserts", 0),
         }
-        if grading.get("asserts_total"):
+        if grading.get("total_asserts"):
             print(
-                f"[mlpab] graded: {grading.get('asserts_passed', 0)}/"
-                f"{grading['asserts_total']} asserts"
+                f"[mlpab] graded: {grading.get('asserts_passed', 0)} passed / "
+                f"{grading.get('asserts_failed', 0)} failed / "
+                f"{grading.get('asserts_skipped', 0)} skipped "
+                f"of {grading['total_asserts']} asserts"
                 + (f" — {grading['diagnostic']}" if grading.get("diagnostic") else ""),
                 flush=True,
             )

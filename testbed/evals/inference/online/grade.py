@@ -21,7 +21,13 @@ import json
 import sys
 from pathlib import Path
 
-from evals.common import grade_platform_main, load_answers, state_checker, table_exists_info
+from evals.common import (
+    Suite,
+    grade_platform_main,
+    load_answers,
+    state_checker,
+    table_exists_info,
+)
 
 TOL = 1e-6
 
@@ -29,18 +35,15 @@ TOL = 1e-6
 def grade(instance_dir: Path, adapter: str, run_dir: Path) -> dict:
     truth = json.loads((Path(instance_dir) / "solution" / "truth.json").read_text())
     feats, keys = truth["features"], truth["keys"]
-    asserts: list[dict] = []
-
-    def check(name, ok, detail=""):
-        asserts.append({"name": name, "passed": bool(ok), **({"detail": detail} if detail else {})})
-        return bool(ok)
+    s = Suite()
+    check = s.check
 
     # A1 — feature table exists
     if adapter == "none":
-        a1 = check("A1_table_exists", True, "no checker adapter (platform none) — skipped")
+        s.skip("A1_table_exists", "no checker adapter (platform none) — skipped")
     else:
         info = table_exists_info(adapter, truth["table_name"], truth["table_version"])
-        a1 = check(
+        check(
             "A1_table_exists",
             info is not None,
             "" if info else f"feature table {truth['table_name']!r} not found",
@@ -50,7 +53,7 @@ def grade(instance_dir: Path, adapter: str, run_dir: Path) -> dict:
     answers = load_answers(Path(run_dir) / "submission" / "answers.json")
     vectors = (answers or {}).get("vectors") if isinstance(answers, dict) else None
     if not isinstance(vectors, dict):
-        a2 = check("A2_vectors", False, "submission/answers.json must contain a 'vectors' object")
+        check("A2_vectors", False, "submission/answers.json must contain a 'vectors' object")
     else:
         bad = []
         for k in keys:
@@ -66,9 +69,7 @@ def grade(instance_dir: Path, adapter: str, run_dir: Path) -> dict:
                 ok = False
             if not ok:
                 bad.append(k)
-        a2 = check(
-            "A2_vectors", not bad, f"wrong/missing vectors for keys: {bad[:5]}" if bad else ""
-        )
+        check("A2_vectors", not bad, f"wrong/missing vectors for keys: {bad[:5]}" if bad else "")
 
     # A3 — independent online read (sagemaker only)
     if adapter == "sagemaker":
@@ -83,25 +84,17 @@ def grade(instance_dir: Path, adapter: str, run_dir: Path) -> dict:
                 )
                 if not ok:
                     bad.append(k)
-            a3 = check(
+            check(
                 "A3_online_read", not bad, f"online store disagrees for keys: {bad}" if bad else ""
             )
         except Exception as e:
-            a3 = check("A3_online_read", False, f"online read failed: {e}")
+            check("A3_online_read", False, f"online read failed: {e}")
     elif adapter == "none":
-        a3 = check("A3_online_read", True, "no checker adapter (platform none) — skipped")
+        s.skip("A3_online_read", "no checker adapter (platform none) — skipped")
     else:
-        a3 = check("A3_online_read", True, "independent online read only implemented for sagemaker")
+        s.skip("A3_online_read", "independent online read only implemented for sagemaker")
 
-    success = a1 and a2 and a3
-    return {
-        "family": "online",
-        "seed": truth["seed"],
-        "success": success,
-        "asserts_passed": sum(a["passed"] for a in asserts),
-        "asserts_total": len(asserts),
-        "asserts": asserts,
-    }
+    return s.report(family="online", seed=truth["seed"])
 
 
 def main(argv=None) -> int:

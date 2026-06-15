@@ -20,17 +20,14 @@ import json
 import sys
 from pathlib import Path
 
-from evals.common import grade_platform_main, load_answers, state_checker
+from evals.common import Suite, grade_platform_main, load_answers, state_checker
 
 
 def grade(instance_dir: Path, adapter: str, run_dir: Path) -> dict:
     truth = json.loads((Path(instance_dir) / "solution" / "truth.json").read_text())
     job = truth["job_name"]
-    asserts: list[dict] = []
-
-    def check(name, ok, detail=""):
-        asserts.append({"name": name, "passed": bool(ok), **({"detail": detail} if detail else {})})
-        return bool(ok)
+    s = Suite()
+    check = s.check
 
     answers = load_answers(Path(run_dir) / "submission" / "answers.json")
     a1_ok = (
@@ -38,39 +35,31 @@ def grade(instance_dir: Path, adapter: str, run_dir: Path) -> dict:
         and str(answers.get("job_name", "")).strip() == job
         and bool(str(answers.get("alert", "") or "").strip())
     )
-    a1 = check(
+    check(
         "A1_answers_present",
         a1_ok,
         "" if a1_ok else f"answers.json must contain job_name = {job!r} and a non-empty 'alert'",
     )
 
     if adapter == "none":
-        a2 = check("A2_job_exists", True, "no checker adapter (platform none) — skipped")
-        a3 = check("A3_alert_exists", True, "no checker adapter (platform none) — skipped")
+        s.skip("A2_job_exists", "no checker adapter (platform none) — skipped")
+        s.skip("A3_alert_exists", "no checker adapter (platform none) — skipped")
     else:
         checker = state_checker(adapter)
         st = checker.get_job(job)
-        a2 = check(
+        check(
             "A2_job_exists",
             st.get("exists"),
             "" if st.get("exists") else f"job {job!r} not found: {st}",
         )
         al = checker.get_alert(job)
-        a3 = check(
+        check(
             "A3_alert_exists",
             al.get("exists"),
             "" if al.get("exists") else f"no alert naming/hinting {job!r} found: {al}",
         )
 
-    success = a1 and a2 and a3
-    return {
-        "family": "alerting",
-        "seed": truth["seed"],
-        "success": success,
-        "asserts_passed": sum(a["passed"] for a in asserts),
-        "asserts_total": len(asserts),
-        "asserts": asserts,
-    }
+    return s.report(family="alerting", seed=truth["seed"])
 
 
 def main(argv=None) -> int:

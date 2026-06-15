@@ -131,7 +131,13 @@ class GradeNoneTests(unittest.TestCase):
         self._write(task, truth, good)
         rep = self._grade(attempt, task)
         self.assertTrue(rep["success"])
-        self.assertEqual(rep["asserts_total"], 3)  # A1 table, A1 coverage, A2 metric
+        # Full suite always enumerated: A1 table, A1 coverage, A2 metric (graded
+        # here) + A3 feature group, A4 training dataset, A5 model (skipped on
+        # platform `none`).
+        self.assertEqual(rep["total_asserts"], 6)
+        self.assertEqual(rep["asserts_passed"], 3)
+        self.assertEqual(rep["asserts_skipped"], 3)
+        self.assertEqual(rep["asserts_failed"], 0)
 
     def test_constant_prediction_fails_metric(self):
         attempt, task, truth, labels = self._instance(cc)

@@ -140,9 +140,25 @@ def prepare(task: str, run_dir: Path, seed: int) -> str:
     return body
 
 
+def _plumbing_error(msg: str) -> dict[str, Any]:
+    """A grading report for a failure BEFORE the grader could enumerate its
+    suite (no adapter, subprocess died, no parseable report). The full suite
+    size is unknowable here, so the tally fields are all zero."""
+    return {
+        "success": False,
+        "asserts_passed": 0,
+        "asserts_failed": 0,
+        "asserts_skipped": 0,
+        "total_asserts": 0,
+        "asserts": [],
+        "error": msg,
+    }
+
+
 def grade(task: str, run_dir: Path, platform: str, venv_python: Path) -> dict[str, Any]:
     """Grade the run. Returns the report dict (always contains `success`,
-    `asserts_passed`, `asserts_total`; `error` on plumbing failures).
+    `asserts_passed`, `asserts_failed`, `asserts_skipped`, `total_asserts`;
+    `error` on plumbing failures).
 
     `dataset` deliverables: platform with an adapter → read the deliverable
     back through the platform, using the run venv's python (its evals package +
@@ -172,30 +188,15 @@ def grade(task: str, run_dir: Path, platform: str, venv_python: Path) -> dict[st
         meta = json.loads((inst / "solution" / "truth.json").read_text())
         deliverable = meta.get("dataset_name") or meta.get("table_name")
         local = Path(run_dir) / "submission" / f"{deliverable}.csv"
-        if not local.exists():
-            return {
-                "success": False,
-                "asserts_passed": 0,
-                "asserts_total": 1,
-                "asserts": [
-                    {
-                        "name": "A0_deliverable_exists",
-                        "passed": False,
-                        "detail": f"no local deliverable at {local}",
-                    }
-                ],
-                "error": "no deliverable produced",
-            }
+        # Pass --csv even when the local deliverable is missing — the grader reads
+        # a missing/empty file as an empty deliverable and still enumerates its
+        # full assert suite (deliverable check fails, dependents skip).
         cmd += ["--csv", str(local)]
     else:
-        return {
-            "success": False,
-            "asserts_passed": 0,
-            "asserts_total": 0,
-            "asserts": [],
-            "error": f"no checker adapter for platform {platform!r} — "
-            f"available: {', '.join(ADAPTERS)} (+ `none` for local)",
-        }
+        return _plumbing_error(
+            f"no checker adapter for platform {platform!r} — "
+            f"available: {', '.join(ADAPTERS)} (+ `none` for local)"
+        )
 
     try:
         proc = subprocess.run(
@@ -206,24 +207,13 @@ def grade(task: str, run_dir: Path, platform: str, venv_python: Path) -> dict[st
             cwd=str(run_dir),
         )
     except Exception as e:
-        return {
-            "success": False,
-            "asserts_passed": 0,
-            "asserts_total": 0,
-            "asserts": [],
-            "error": f"grader failed to run: {e}",
-        }
+        return _plumbing_error(f"grader failed to run: {e}")
     report = _extract_report(proc.stdout)
     if report is not None:
         return report
-    return {
-        "success": False,
-        "asserts_passed": 0,
-        "asserts_total": 0,
-        "asserts": [],
-        "error": f"grader produced no report (exit {proc.returncode}): "
-        f"{(proc.stderr or proc.stdout)[-500:]}",
-    }
+    return _plumbing_error(
+        f"grader produced no report (exit {proc.returncode}): {(proc.stderr or proc.stdout)[-500:]}"
+    )
 
 
 def _extract_report(stdout: str) -> dict[str, Any] | None:

@@ -19,7 +19,7 @@ import json
 import sys
 from pathlib import Path
 
-from evals.common import grade_platform_main, load_answers, state_checker
+from evals.common import Suite, grade_platform_main, load_answers, state_checker
 
 TOL = 1e-6
 
@@ -27,11 +27,8 @@ TOL = 1e-6
 def grade(instance_dir: Path, adapter: str, run_dir: Path) -> dict:
     truth = json.loads((Path(instance_dir) / "solution" / "truth.json").read_text())
     want = truth["responses"]
-    asserts: list[dict] = []
-
-    def check(name, ok, detail=""):
-        asserts.append({"name": name, "passed": bool(ok), **({"detail": detail} if detail else {})})
-        return bool(ok)
+    s = Suite()
+    check = s.check
 
     answers = load_answers(Path(run_dir) / "submission" / "answers.json")
     responses = (answers or {}).get("responses") if isinstance(answers, dict) else None
@@ -50,7 +47,6 @@ def grade(instance_dir: Path, adapter: str, run_dir: Path) -> dict:
         f"carry a {len(want)}-element 'responses' list",
     )
 
-    a2 = False
     if a1:
         bad = []
         for i, (g, w) in enumerate(zip(responses, want)):
@@ -60,33 +56,25 @@ def grade(instance_dir: Path, adapter: str, run_dir: Path) -> dict:
                 ok = False
             if not ok:
                 bad.append(i)
-        a2 = check(
+        check(
             "A2_responses",
             not bad,
             f"responses differ from the scorer at indices {bad}" if bad else "",
         )
     else:
-        a2 = check("A2_responses", False, "no valid answers to compare")
+        s.skip("A2_responses", "skipped: answers.json invalid (A1 failed)")
 
     if adapter == "none":
-        a3 = check("A3_endpoint_exists", True, "no checker adapter (platform none) — skipped")
+        s.skip("A3_endpoint_exists", "no checker adapter (platform none) — skipped")
     else:
         st = state_checker(adapter).get_endpoint(truth["endpoint_name"])
-        a3 = check(
+        check(
             "A3_endpoint_exists",
             st.get("exists"),
             "" if st.get("exists") else f"endpoint {truth['endpoint_name']!r} not found: {st}",
         )
 
-    success = a1 and a2 and a3
-    return {
-        "family": "llm_serving",
-        "seed": truth["seed"],
-        "success": success,
-        "asserts_passed": sum(a["passed"] for a in asserts),
-        "asserts_total": len(asserts),
-        "asserts": asserts,
-    }
+    return s.report(family="llm_serving", seed=truth["seed"])
 
 
 def main(argv=None) -> int:

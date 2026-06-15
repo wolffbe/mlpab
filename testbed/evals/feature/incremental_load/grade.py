@@ -15,15 +15,17 @@ import json
 import sys
 from pathlib import Path
 
-import pandas as pd
 
 from evals.common import (
+    Suite,
     canonicalize,
     digest,
     fetch_table,
     grade_platform_main,
+    read_csv_or_empty,
     state_checker,
     table_exists_info,
+    tally,
 )
 
 FAMILY = "incremental_load"
@@ -32,15 +34,13 @@ FAMILY = "incremental_load"
 def grade(instance_dir: Path, adapter: str, run_dir: Path) -> dict:
     truth = json.loads((Path(instance_dir) / "solution" / "truth.json").read_text())
     spec = truth["spec"]
-    asserts: list[dict] = []
+    s = Suite()
+    check = s.check
     diagnostic = None
-
-    def check(name, ok, detail=""):
-        asserts.append({"name": name, "passed": bool(ok), **({"detail": detail} if detail else {})})
-        return bool(ok)
 
     # --- A1: table exists / local deliverable exists --------------------------
     produced = None
+    read_err = None
     if adapter == "none":
         local = Path(run_dir) / "submission" / f"{truth['table_name']}.csv"
         if check(
@@ -48,7 +48,7 @@ def grade(instance_dir: Path, adapter: str, run_dir: Path) -> dict:
             local.exists(),
             "" if local.exists() else f"no local deliverable at {local}",
         ):
-            produced = pd.read_csv(local)
+            produced = read_csv_or_empty(local)
     else:
         info = table_exists_info(adapter, truth["table_name"], truth["table_version"])
         if check(
@@ -63,7 +63,7 @@ def grade(instance_dir: Path, adapter: str, run_dir: Path) -> dict:
                     adapter, truth["table_name"], truth["table_version"], truth.get("record_ids")
                 )
             except (LookupError, NotImplementedError) as e:
-                check("A2_row_count", False, f"could not read table back: {e}")
+                read_err = f"could not read table back: {e}"
 
     # --- A2/A3: content --------------------------------------------------------
     if produced is not None:
@@ -71,6 +71,7 @@ def grade(instance_dir: Path, adapter: str, run_dir: Path) -> dict:
             norm = canonicalize(produced, spec)
         except Exception as e:
             check("A2_row_count", False, f"could not normalize: {e}")
+            s.skip("A3_content", "skipped: could not normalize the deliverable")
             norm = None
         if norm is not None:
             check(
@@ -90,29 +91,26 @@ def grade(instance_dir: Path, adapter: str, run_dir: Path) -> dict:
                     if d == vdig:
                         diagnostic = truth.get("variant_diagnosis", {}).get(vname, vname)
                         break
+    elif read_err is not None:
+        check("A2_row_count", False, read_err)
+        s.skip("A3_content", "skipped: could not read the table back")
+    else:
+        s.skip("A2_row_count", "skipped: no gradeable deliverable")
+        s.skip("A3_content", "skipped: no gradeable deliverable")
 
     # --- A4: recurring job ------------------------------------------------------
     if adapter == "none":
-        asserts.append(
-            {
-                "name": "A4_job_scheduled",
-                "passed": True,
-                "detail": "no platform — job assert skipped",
-            }
-        )
+        s.skip("A4_job_scheduled", "no platform — job assert skipped")
     else:
         job = state_checker(adapter).get_job(truth["job_name"])
         ok = bool(job.get("exists")) and bool(job.get("scheduled"))
         check("A4_job_scheduled", ok, "" if ok else f"job {truth['job_name']!r}: {job}")
 
-    success = all(a["passed"] for a in asserts)
     return {
         "family": FAMILY,
         "seed": truth["seed"],
-        "success": success,
-        "asserts_passed": sum(a["passed"] for a in asserts),
-        "asserts_total": len(asserts),
-        "asserts": asserts,
+        **tally(s.asserts),
+        "asserts": s.asserts,
         **({"diagnostic": diagnostic} if diagnostic else {}),
     }
 

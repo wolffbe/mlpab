@@ -23,6 +23,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from evals.common import Suite, read_csv_or_empty, tally
 from evals.feature.pit.generate import canonicalize, digest
 
 VARIANT_DIAGNOSIS = {
@@ -37,25 +38,23 @@ VARIANT_DIAGNOSIS = {
 def grade(instance_dir: Path, produced: pd.DataFrame) -> dict:
     truth_meta = json.loads((instance_dir / "solution" / "truth.json").read_text())
     columns = truth_meta["columns"]
-    asserts: list[dict] = []
+    s = Suite()
     diagnostic = None
-
-    def check(name: str, ok: bool, detail: str = "") -> bool:
-        asserts.append(
-            {"name": name, "passed": bool(ok), **({"detail": detail} if detail and not ok else {})}
-        )
-        return bool(ok)
 
     # A1 — column set (canonicalize would throw on missing columns; check first)
     produced.columns = [str(c).strip().lower() for c in produced.columns]
     missing = [c for c in columns if c not in produced.columns]
-    a1 = check("A1_columns", not missing, f"missing columns: {missing}")
+    a1 = s.check("A1_columns", not missing, f"missing columns: {missing}")
 
-    a2 = a3 = a4 = False
-    if a1:
+    if not a1:
+        # No gradeable deliverable — the downstream checks are unreachable.
+        s.skip("A2_row_count", "skipped: required columns are missing")
+        s.skip("A3_labels", "skipped: required columns are missing")
+        s.skip("A4_content", "skipped: required columns are missing")
+    else:
         norm = canonicalize(produced, columns)
         # A2 — one row per label row
-        a2 = check(
+        a2 = s.check(
             "A2_row_count",
             len(norm) == truth_meta["row_count"],
             f"got {len(norm)}, expected {truth_meta['row_count']}",
@@ -64,20 +63,22 @@ def grade(instance_dir: Path, produced: pd.DataFrame) -> dict:
         truth = pd.read_csv(instance_dir / "solution" / "truth.csv")
         truth = canonicalize(truth, columns)
         if a2:
-            a3 = check(
+            s.check(
                 "A3_labels",
                 norm[["account_id", "churned"]].equals(truth[["account_id", "churned"]]),
                 "account_id/churned do not match labels.csv",
             )
+        else:
+            s.skip("A3_labels", "skipped: row count differs, label alignment undefined")
         # A4 — content
         d = digest(norm)
-        a4 = check("A4_content", d == truth_meta["digest"], "content digest mismatch")
+        a4 = s.check("A4_content", d == truth_meta["digest"], "content digest mismatch")
         if not a4:
             for vname, vdigest in truth_meta.get("variant_digests", {}).items():
                 if d == vdigest:
                     diagnostic = VARIANT_DIAGNOSIS.get(vname, vname)
                     break
-            if diagnostic is None and a1 and a2:
+            if diagnostic is None and a2:
                 # first few differing cells, for a readable report
                 neq = norm != truth
                 bad = neq.any(axis=1)
@@ -95,14 +96,11 @@ def grade(instance_dir: Path, produced: pd.DataFrame) -> dict:
                     )
                 diagnostic = f"content differs on {int(bad.sum())} rows; examples: {examples}"
 
-    success = a1 and a2 and a3 and a4
     return {
         "family": "pit",
         "seed": truth_meta["seed"],
-        "success": success,
-        "asserts_passed": sum(a["passed"] for a in asserts),
-        "asserts_total": len(asserts),
-        "asserts": asserts,
+        **tally(s.asserts),
+        "asserts": s.asserts,
         **({"diagnostic": diagnostic} if diagnostic else {}),
     }
 
@@ -120,8 +118,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = ap.parse_args(argv)
 
+    deliverable_err = None
     if args.csv:
-        produced = pd.read_csv(args.csv)
+        if not args.csv.exists():
+            produced = pd.DataFrame()
+            deliverable_err = f"no deliverable produced at {args.csv}"
+        else:
+            produced = read_csv_or_empty(args.csv)
     else:
         meta = json.loads((args.instance / "solution" / "truth.json").read_text())
         if args.adapter == "hopsworks":
@@ -139,18 +142,15 @@ def main(argv: list[str] | None = None) -> int:
         try:
             produced = checker.read_training_dataset(meta["dataset_name"], meta["dataset_version"])
         except LookupError as e:
-            report = {
-                "family": meta["family"],
-                "seed": meta["seed"],
-                "success": False,
-                "asserts_passed": 0,
-                "asserts_total": 1,
-                "asserts": [{"name": "A0_deliverable_exists", "passed": False, "detail": str(e)}],
-            }
-            print(json.dumps(report, indent=2, default=str))
-            return 1
+            # Deliverable could not be read back — grade an EMPTY frame so the
+            # suite still enumerates (deliverable check fails, dependents skip),
+            # but keep the real reason for the report.
+            produced = pd.DataFrame()
+            deliverable_err = str(e)
 
     report = grade(args.instance, produced)
+    if deliverable_err:
+        report.setdefault("error", deliverable_err)
     print(json.dumps(report, indent=2, default=str))
     return 0 if report["success"] else 1
 

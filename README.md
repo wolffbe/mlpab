@@ -39,7 +39,7 @@ banter/
 
 ## How a run works
 
-1. A treatment config (`configs/treatments/<platform>/<platform>-<family>.yaml`) expands into a grid of runs over models, interfaces, skills, and tasks.
+1. A treatment config (`configs/treatments/<platform>/<platform>-<engine>.yaml`, where `<engine>` is `claude`, `gpt`, or `mistral`) expands into a grid of runs over models, interfaces, skills, and tasks.
 2. A session-start check confirms that every platform credential, skill bundle, and model is available and responds to a live probe before any work begins.
 3. Each interface is built once and installed into a per-interface prepared virtual environment. Every run then clones that environment read-only, so runs do not reinstall anything or mutate shared state, and parallel sessions do not interfere.
 4. For each run: a fresh seeded task instance is generated, `setup.py` provisions the platform and a `verify` step confirms it is ready, the sandboxed agent attempts the task using only its interface, then `teardown.py` removes what the agent created and a `verify` step confirms nothing was left behind.
@@ -50,7 +50,7 @@ banter/
 
 | Family | Example tasks |
 |---|---|
-| feature | `ingest`, `backfill`, `mit`, `validate`, `incremental_load`, `full_reload`, `training_data` (point-in-time correct), `leakage` |
+| feature | `ingest`, `backfill`, `mit`, `validate`, `incremental_load`, `full_reload`, `pit` (point-in-time correct), `leakage` |
 | training | `train`, `mdt`, `register`, `llm_finetuning` |
 | inference | `batch`, `online`, `odt`, `skew`, `llm_serving`, `recsys`, `vector_search` |
 | ops | `drift`, `prediction_monitoring`, `scheduled_jobs`, `alerting`, `lineage` |

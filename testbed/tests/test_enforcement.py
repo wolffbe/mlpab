@@ -968,7 +968,7 @@ class DeadRowSchemaTests(unittest.TestCase):
         got = list(csv.DictReader(out.open()))[0]
         self.assertEqual(got["error"], "no valid submission produced")
         self.assertEqual(got["asserts_passed"], "0")  # Row default
-        self.assertEqual(got["asserts_total"], "0")
+        self.assertEqual(got["total_asserts"], "0")
 
 
 if __name__ == "__main__":

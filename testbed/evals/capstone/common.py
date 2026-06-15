@@ -30,6 +30,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from evals.common import Suite, read_csv_or_empty, tally
+
 RAW_DIR = Path(__file__).parent / "_data"
 
 
@@ -116,7 +118,9 @@ def _read_predictions(
     local = run_dir / "submission" / f"{table}.csv"
     if not local.exists():
         raise LookupError(f"no local predictions at {local}")
-    return pd.read_csv(local)
+    # Empty (0-byte) file → empty frame, so A1 fails on missing columns rather
+    # than crashing the grader with EmptyDataError.
+    return read_csv_or_empty(local)
 
 
 def grade_capstone(instance_dir: Path, adapter: str, run_dir: Path) -> dict:
@@ -130,14 +134,9 @@ def grade_capstone(instance_dir: Path, adapter: str, run_dir: Path) -> dict:
     labels = pd.read_csv(instance_dir / "solution" / "test_labels.csv")
     id_col, pred_col, label_col = truth["id_col"], truth["pred_col"], truth["label_col"]
     mspec = METRICS[truth["metric"]]
-    asserts: list[dict] = []
+    s = Suite()
+    check = s.check
     diagnostic: str | None = None
-
-    def check(name, ok, detail=""):
-        asserts.append(
-            {"name": name, "passed": bool(ok), **({"detail": detail} if detail and not ok else {})}
-        )
-        return bool(ok)
 
     # A1 — predictions table exists, has the right columns, covers every row ----
     preds = None
@@ -154,6 +153,8 @@ def grade_capstone(instance_dir: Path, adapter: str, run_dir: Path) -> dict:
         check("A1_predictions_table", False, str(e))
 
     complete = False
+    have_cols = False
+    scored = None
     if preds is not None:
         have_cols = id_col in preds.columns and pred_col in preds.columns
         check(
@@ -181,29 +182,41 @@ def grade_capstone(instance_dir: Path, adapter: str, run_dir: Path) -> dict:
                 n_missing == 0,
                 f"{n_missing}/{len(merged)} scored rows missing a prediction",
             )
-            # A2 — metric clears the bar --------------------------------------
             scored = merged.dropna(subset=[pred_col])
-            if len(scored):
-                got = mspec["fn"](scored[label_col].to_numpy(), scored[pred_col].to_numpy())
-                bar = float(truth["bar"])
-                passed = bool(complete and mspec["passes"](got, bar))
-                check(
-                    "A2_metric",
-                    passed,
-                    f"{truth['metric']}={got:.4f} {mspec['arrow']} bar={bar:.4f} "
-                    f"(naive={truth['naive']:.4f}, reference={truth['reference']:.4f})"
-                    + ("" if complete else " — incomplete predictions"),
-                )
-                if complete and not passed:
-                    diagnostic = (
-                        f"model is no better than the naive baseline "
-                        f"({truth['metric']}={got:.4f} vs naive "
-                        f"{truth['naive']:.4f}); the FTI pipeline ran but the "
-                        f"model has no signal"
-                    )
+
+    # A1_coverage — emitted on every path (skip when there is no table/columns to
+    # cover) so the suite size stays constant.
+    if not have_cols:
+        s.skip("A1_coverage", "skipped: no predictions table with the required columns")
+
+    # A2_metric — emitted on every path (skip when there are no scored rows).
+    if scored is not None and len(scored):
+        got = mspec["fn"](scored[label_col].to_numpy(), scored[pred_col].to_numpy())
+        bar = float(truth["bar"])
+        passed = bool(complete and mspec["passes"](got, bar))
+        check(
+            "A2_metric",
+            passed,
+            f"{truth['metric']}={got:.4f} {mspec['arrow']} bar={bar:.4f} "
+            f"(naive={truth['naive']:.4f}, reference={truth['reference']:.4f})"
+            + ("" if complete else " — incomplete predictions"),
+        )
+        if complete and not passed:
+            diagnostic = (
+                f"model is no better than the naive baseline "
+                f"({truth['metric']}={got:.4f} vs naive "
+                f"{truth['naive']:.4f}); the FTI pipeline ran but the "
+                f"model has no signal"
+            )
+    else:
+        s.skip("A2_metric", "skipped: no scored predictions to evaluate the metric on")
 
     # A3–A5 — on-platform FTI artifacts (real platforms only) -------------------
-    if adapter != "none":
+    if adapter == "none":
+        s.skip("A3_feature_group", "no platform — feature group assert skipped")
+        s.skip("A4_training_dataset", "no platform — training dataset assert skipped")
+        s.skip("A5_model_registered", "no platform — model registry assert skipped")
+    else:
         from evals.common import state_checker
 
         ck = state_checker(adapter)
@@ -232,15 +245,13 @@ def grade_capstone(instance_dir: Path, adapter: str, run_dir: Path) -> dict:
             f"model {truth['model_name']!r} not registered with metrics on {adapter}",
         )
 
-    success = all(a["passed"] for a in asserts) and len(asserts) > 0
+    rolled = tally(s.asserts)
     return {
         "family": truth["family"],
         "seed": truth["seed"],
-        "success": success,
-        "asserts_passed": sum(a["passed"] for a in asserts),
-        "asserts_total": len(asserts),
-        "asserts": asserts,
-        **({"diagnostic": diagnostic} if diagnostic and not success else {}),
+        **rolled,
+        "asserts": s.asserts,
+        **({"diagnostic": diagnostic} if diagnostic and not rolled["success"] else {}),
     }
 
 

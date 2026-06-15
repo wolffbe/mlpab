@@ -10,39 +10,27 @@ import json
 import sys
 from pathlib import Path
 
-from evals.common import grade_answers_main
+from evals.common import Suite, grade_answers_main
 
 
-def grade(instance_dir: Path, answers: dict) -> dict:
+def grade(instance_dir: Path, answers: dict | None) -> dict:
     truth = json.loads((instance_dir / "solution" / "truth.json").read_text())
-    asserts: list[dict] = []
+    s = Suite()
 
-    def check(name, ok, detail=""):
-        asserts.append(
-            {"name": name, "passed": bool(ok), **({"detail": detail} if detail and not ok else {})}
-        )
-        return bool(ok)
-
-    a1 = check(
+    a1 = s.check(
         "A1_answers_present",
         isinstance(answers, dict) and "feature" in answers,
         "answers.json must contain 'feature'",
     )
-    a2 = False
     if a1:
-        a2 = check(
+        s.check(
             "A2_feature",
             str(answers["feature"]).strip() == truth["feature"],
             f"got {answers['feature']!r}, leaky feature differs",
         )
-    return {
-        "family": "leakage",
-        "seed": truth["seed"],
-        "success": a1 and a2,
-        "asserts_passed": sum(a["passed"] for a in asserts),
-        "asserts_total": len(asserts),
-        "asserts": asserts,
-    }
+    else:
+        s.skip("A2_feature", "skipped: no answers.json with 'feature'")
+    return s.report(family="leakage", seed=truth["seed"])
 
 
 def main(argv=None) -> int:

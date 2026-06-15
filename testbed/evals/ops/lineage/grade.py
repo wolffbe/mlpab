@@ -20,34 +20,33 @@ import json
 import sys
 from pathlib import Path
 
-import pandas as pd
 
 from evals.common import (
+    Suite,
     canonicalize,
     digest,
     fetch_table,
     grade_platform_main,
     load_answers,
+    read_csv_or_empty,
     table_exists_info,
+    tally,
 )
 
 
 def grade(instance_dir: Path, adapter: str, run_dir: Path) -> dict:
     truth = json.loads((Path(instance_dir) / "solution" / "truth.json").read_text())
     spec, table = truth["spec"], truth["table_name"]
-    asserts: list[dict] = []
+    s = Suite()
+    check = s.check
     diagnostic = None
-
-    def check(name, ok, detail=""):
-        asserts.append({"name": name, "passed": bool(ok), **({"detail": detail} if detail else {})})
-        return bool(ok)
 
     # A1 — derived table content
     produced, src_err = None, ""
     if adapter == "none":
         local = Path(run_dir) / "submission" / f"{table}.csv"
         if local.exists():
-            produced = pd.read_csv(local)
+            produced = read_csv_or_empty(local)
         else:
             src_err = f"no local deliverable at {local}"
     else:
@@ -75,37 +74,34 @@ def grade(instance_dir: Path, adapter: str, run_dir: Path) -> dict:
 
     # A2 — source tables exist
     if adapter == "none":
-        a2 = check("A2_sources_exist", True, "no checker adapter (platform none) — skipped")
+        s.skip("A2_sources_exist", "no checker adapter (platform none) — skipped")
     else:
         missing = [
-            s
-            for s in truth["source_tables"]
-            if table_exists_info(adapter, s, truth["table_version"]) is None
+            src
+            for src in truth["source_tables"]
+            if table_exists_info(adapter, src, truth["table_version"]) is None
         ]
-        a2 = check(
+        check(
             "A2_sources_exist", not missing, f"missing source tables: {missing}" if missing else ""
         )
 
     # A3 — lineage answer
     answers = load_answers(Path(run_dir) / "submission" / "answers.json")
     if not isinstance(answers, dict) or "_parse_error" in (answers or {}):
-        a3 = check(
+        check(
             "A3_lineage_answer", False, "no parseable submission/answers.json with 'derived_from'"
         )
     else:
         got = answers.get("derived_from")
         want = sorted(truth["source_tables"])
         ok = isinstance(got, list) and sorted(str(x).strip().lower() for x in got) == want
-        a3 = check("A3_lineage_answer", ok, "" if ok else f"derived_from {got!r} != {want}")
+        check("A3_lineage_answer", ok, "" if ok else f"derived_from {got!r} != {want}")
 
-    success = a1 and a2 and a3
     return {
         "family": "lineage",
         "seed": truth["seed"],
-        "success": success,
-        "asserts_passed": sum(a["passed"] for a in asserts),
-        "asserts_total": len(asserts),
-        "asserts": asserts,
+        **tally(s.asserts),
+        "asserts": s.asserts,
         **({"diagnostic": diagnostic} if diagnostic else {}),
     }
 

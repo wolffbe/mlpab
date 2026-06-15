@@ -17,7 +17,7 @@ import json
 import sys
 from pathlib import Path
 
-from evals.common import grade_platform_main, load_answers, state_checker
+from evals.common import Suite, grade_platform_main, load_answers, state_checker
 
 FAMILY = "register"
 METRIC_TOL = 1e-6
@@ -27,11 +27,8 @@ def grade_answers(instance_dir: Path, adapter: str, answers: dict | None) -> dic
     """The full assert suite over an already-loaded answers dict (the selftest
     gates call this directly — no platform, no files needed)."""
     truth = json.loads((Path(instance_dir) / "solution" / "truth.json").read_text())
-    asserts: list[dict] = []
-
-    def check(name, ok, detail=""):
-        asserts.append({"name": name, "passed": bool(ok), **({"detail": detail} if detail else {})})
-        return bool(ok)
+    s = Suite()
+    check = s.check
 
     # --- A1: answers present with matching name/version ------------------------
     if answers is None:
@@ -68,13 +65,7 @@ def grade_answers(instance_dir: Path, adapter: str, answers: dict | None) -> dic
 
     # --- A3: registry entry exists on the platform -------------------------------
     if adapter == "none":
-        asserts.append(
-            {
-                "name": "A3_registry_entry",
-                "passed": True,
-                "detail": "no platform — registry assert skipped",
-            }
-        )
+        s.skip("A3_registry_entry", "no platform — registry assert skipped")
     else:
         m = state_checker(adapter).get_model(truth["model_name"], truth["version"])
         ok = bool(m.get("exists"))
@@ -102,17 +93,11 @@ def grade_answers(instance_dir: Path, adapter: str, answers: dict | None) -> dic
                 detail = "platform could not return metrics (informative — exists only)"
         else:
             detail = f"model {truth['model_name']!r} v{truth['version']} not found: {m}"
-        asserts.append({"name": "A3_registry_entry", "passed": ok, "detail": detail})
+        # detail_on_pass: the platform-metrics note is informative even when the
+        # registry entry exists (e.g. metrics differ but that is not a failure).
+        check("A3_registry_entry", ok, detail, detail_on_pass=True)
 
-    success = all(a["passed"] for a in asserts)
-    return {
-        "family": FAMILY,
-        "seed": truth["seed"],
-        "success": success,
-        "asserts_passed": sum(a["passed"] for a in asserts),
-        "asserts_total": len(asserts),
-        "asserts": asserts,
-    }
+    return s.report(family=FAMILY, seed=truth["seed"])
 
 
 def grade(instance_dir: Path, adapter: str, run_dir: Path) -> dict:

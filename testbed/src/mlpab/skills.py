@@ -142,6 +142,13 @@ def _fetch_repo_bundle(project: str, name: str, entry: dict) -> Path:
         ) from e
 
     sub = src / entry["path"] if entry.get("path") else src
+    # Defense-in-depth: `path` comes from a committed (trusted) skills.yaml, but a
+    # `..` segment would let the copy escape the checkout. Confine it to `src`.
+    if not sub.resolve().is_relative_to(src.resolve()):
+        shutil.rmtree(home, ignore_errors=True)
+        raise RuntimeError(
+            f"skill bundle {name!r}: path {entry.get('path')!r} escapes the checkout"
+        )
     if not sub.is_dir():
         shutil.rmtree(home, ignore_errors=True)
         raise RuntimeError(

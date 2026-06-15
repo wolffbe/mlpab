@@ -462,7 +462,7 @@ def run_treatments(
             row = runner.run(spec)
             completed.append(row)
             print(
-                f"[mlpab] asserts={row.asserts_passed}/{row.asserts_total}  "
+                f"[mlpab] asserts={row.asserts_passed}/{row.total_asserts}  "
                 f"tokens={row.total_tokens}  "
                 f"wall={row.wall_time_s:.1f}s  cost=${row.cost_usd:.4f}"
             )
@@ -521,7 +521,7 @@ def _print_summary(rows: list[results.Row], failed: list[str], rollup_csv: Path)
         for r in rows:
             print(
                 f"{r.task:<35} {r.platform}/{r.interface:<18} {r.skills:<18} "
-                f"{f'{r.asserts_passed}/{r.asserts_total}':<8} "
+                f"{f'{r.asserts_passed}/{r.total_asserts}':<8} "
                 f"{r.total_tokens:<8} {r.wall_time_s:<7.1f} ${r.cost_usd:.4f}"
             )
     if failed:

@@ -35,19 +35,16 @@ import json
 import sys
 from pathlib import Path
 
-from evals.common import grade_platform_main, load_answers, state_checker
+from evals.common import Suite, grade_platform_main, load_answers, state_checker, tally
 
 
 def grade(instance_dir: Path, adapter: str, run_dir: Path) -> dict:
     truth = json.loads((Path(instance_dir) / "solution" / "truth.json").read_text())
     want = truth["neighbors"]
     valid_ids = {f"I{i:04d}" for i in range(truth["n_items"])}
-    asserts: list[dict] = []
+    s = Suite()
+    check = s.check
     diagnostic = None
-
-    def check(name, ok, detail=""):
-        asserts.append({"name": name, "passed": bool(ok), **({"detail": detail} if detail else {})})
-        return bool(ok)
 
     answers = load_answers(Path(run_dir) / "submission" / "answers.json")
     got = (answers or {}).get("neighbors") if isinstance(answers, dict) else None
@@ -74,7 +71,6 @@ def grade(instance_dir: Path, adapter: str, run_dir: Path) -> dict:
                 break
     a1 = check("A1_format", a1_ok, a1_detail)
 
-    a2 = False
     if a1:
         norm = {qid: [str(i) for i in ids] for qid, ids in got.items()}
         bad = [qid for qid in want if norm[qid] != want[qid]]
@@ -92,13 +88,13 @@ def grade(instance_dir: Path, adapter: str, run_dir: Path) -> dict:
                     diagnostic = truth.get("variant_diagnosis", {}).get(vname, vname)
                     break
     else:
-        a2 = check("A2_neighbors", False, "no valid answers to compare")
+        s.skip("A2_neighbors", "skipped: answers.json invalid (A1 failed)")
 
     if adapter == "none":
-        a3 = check("A3_platform_state", True, "no checker adapter (platform none) — skipped")
+        s.skip("A3_platform_state", "no checker adapter (platform none) — skipped")
     else:
         st = state_checker(adapter).get_vector_store(truth["table_name"])
-        a3 = check(
+        check(
             "A3_platform_state",
             st.get("exists"),
             ""
@@ -106,14 +102,11 @@ def grade(instance_dir: Path, adapter: str, run_dir: Path) -> dict:
             else f"vector store {truth['table_name']!r} not found on the platform: {st}",
         )
 
-    success = a1 and a2 and a3
     return {
         "family": "vector_search",
         "seed": truth["seed"],
-        "success": success,
-        "asserts_passed": sum(a["passed"] for a in asserts),
-        "asserts_total": len(asserts),
-        "asserts": asserts,
+        **tally(s.asserts),
+        "asserts": s.asserts,
         **({"diagnostic": diagnostic} if diagnostic else {}),
     }
 

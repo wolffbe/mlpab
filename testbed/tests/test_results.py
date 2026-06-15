@@ -23,7 +23,7 @@ def _append_bench_row(csv_path: str, i: int) -> None:
         category="img",
         task="c1",
         asserts_passed=3,
-        asserts_total=4,
+        total_asserts=4,
         wall_time_s=1.0,
         total_tokens=10,
         cost_usd=0.1,
@@ -109,7 +109,7 @@ class RollUpResultsTests(unittest.TestCase):
                         skills="none",
                         n=1,
                         asserts_passed=passed,
-                        asserts_total=4,
+                        total_asserts=4,
                         wall_time_s=100,
                         total_tokens=5000,
                         cost_usd=0.5,
@@ -133,7 +133,7 @@ class RollUpResultsTests(unittest.TestCase):
         cli_rows = [r for r in csv_rows if r["interface"] == "cli"]
         self.assertEqual(len(cli_rows), 2)
         self.assertEqual(cli_rows[0]["asserts_passed"], "3")
-        self.assertEqual(cli_rows[0]["asserts_total"], "4")
+        self.assertEqual(cli_rows[0]["total_asserts"], "4")
         self.assertEqual(cli_rows[0]["interface_calls"], "4")
         # The whole point: same flat columns as the per-run CSVs — no eng_/res_,
         # no avg_, no run/prev_run/whitelist columns.
@@ -194,7 +194,7 @@ class RollUpResultsTests(unittest.TestCase):
             interface="cli",
             skills="none",
             asserts_passed=4,
-            asserts_total=4,
+            total_asserts=4,
         )
         out = parent / "results.csv"
         self._write_csv(
@@ -228,7 +228,7 @@ class RollUpResultsTests(unittest.TestCase):
             interface="cli",
             skills="none",
             asserts_passed=4,
-            asserts_total=4,
+            total_asserts=4,
         )
         self._write_csv(parent / "rq1" / "results.csv", [{**base, "run_dir": "/runs/a/1", "n": 1}])
         out = parent / "results.csv"
@@ -248,7 +248,7 @@ class RollUpResultsTests(unittest.TestCase):
             interface="cli",
             skills="none",
             asserts_passed=4,
-            asserts_total=4,
+            total_asserts=4,
         )
         row = {**base, "run_dir": "/runs/a/1", "n": 1}
         self._write_csv(parent / "rq1" / "results.csv", [row])  # old rollup
@@ -278,7 +278,7 @@ class RollUpResultsTests(unittest.TestCase):
             interface="cli",
             skills="none",
             asserts_passed=4,
-            asserts_total=4,
+            total_asserts=4,
         )
         self._write_csv(parent / "rq1" / "results.csv", [{**base, "run_dir": "/runs/a/1", "n": 1}])
         rows = results.roll_up_results(parent, out)
@@ -334,7 +334,7 @@ class RollUpResultsTests(unittest.TestCase):
         self.assertEqual(list(written[0].keys()), results.RESULTS_FIELDS)
         self.assertEqual(written[0]["task"], "feature")  # kept verbatim
         self.assertEqual(written[0]["asserts_passed"], "")  # blank, no migration
-        self.assertEqual(written[0]["asserts_total"], "")
+        self.assertEqual(written[0]["total_asserts"], "")
 
 
 class AppendRepeatNumberTests(unittest.TestCase):
@@ -349,7 +349,7 @@ class AppendRepeatNumberTests(unittest.TestCase):
             category="t",
             task="a",
             asserts_passed=asserts_passed,
-            asserts_total=4,
+            total_asserts=4,
             run_dir=run_dir,
         )
 
@@ -383,7 +383,15 @@ class RowSchemaTests(unittest.TestCase):
         self.assertEqual(results.RESULTS_FIELDS[8:10], ["n", "started_at"])
         # Grading outcome (valid/success) then the assertion-suite tallies.
         self.assertEqual(
-            results.RESULTS_FIELDS[10:14], ["valid", "success", "asserts_passed", "asserts_total"]
+            results.RESULTS_FIELDS[10:16],
+            [
+                "valid",
+                "success",
+                "asserts_passed",
+                "asserts_failed",
+                "asserts_skipped",
+                "total_asserts",
+            ],
         )
         self.assertEqual(results.RESULTS_FIELDS[-1], "run_dir")
         # The legacy schema (and its annotation columns) is gone entirely.
@@ -417,7 +425,7 @@ class RowSchemaTests(unittest.TestCase):
             interface_ref="v2",
             model="claude-sonnet-4-6",
             asserts_passed=3,
-            asserts_total=4,
+            total_asserts=4,
             wall_time_s=12.3,
             total_tokens=100,
             cost_usd=0.4,
@@ -438,7 +446,7 @@ class RowSchemaTests(unittest.TestCase):
         self.assertEqual(w["interface"], "cli")
         self.assertEqual(w["n"], "1")
         self.assertEqual(w["asserts_passed"], "3")
-        self.assertEqual(w["asserts_total"], "4")
+        self.assertEqual(w["total_asserts"], "4")
         self.assertAlmostEqual(float(w["cost_usd"]), 0.4)
         self.assertAlmostEqual(float(w["wall_time_s"]), 12.3)
         self.assertEqual(w["total_tokens"], "100")
@@ -470,7 +478,7 @@ class RowSchemaTests(unittest.TestCase):
             "total_tokens",
             "cost_usd",
             "asserts_passed",
-            "asserts_total",
+            "total_asserts",
             "interface_calls",
             "python_calls",
             "bash_calls",
@@ -509,7 +517,7 @@ class RowSchemaTests(unittest.TestCase):
             category="img",
             task="c1",
             asserts_passed=2,
-            asserts_total=4,
+            total_asserts=4,
             wall_time_s=10.0,
             total_tokens=100,
             cost_usd=0.5,
