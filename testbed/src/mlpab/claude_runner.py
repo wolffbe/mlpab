@@ -1076,20 +1076,26 @@ def streaming_is_rate_limited(
     raw_path: Path,
     stderr_path: Path,
     event_blob: Callable[[dict[str, Any]], str],
+    text_is_retryable: Callable[[str], bool] = text_is_transient_error,
 ) -> bool:
     """Shared rate-limit detector for streaming engines (codex/vibe). Scans the
     tail of the raw events file — `event_blob(event)` maps a parsed event to its
     error text (or "" if the event is not an error) — and the stderr tail, for
-    transient-error text. Engines differ only in `event_blob`."""
+    transient-error text. Engines differ only in `event_blob`.
+
+    `text_is_retryable` decides whether a piece of error text is worth retrying;
+    it defaults to `text_is_transient_error` (rate-limit / 5xx). An engine can
+    pass a wider predicate — e.g. codex also retries its weekly usage-limit
+    ("out of credits") errors, which clear on a ~5h reset boundary."""
     if raw_path.exists():
         for line in _read_tail(raw_path).splitlines():
             try:
                 event = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if text_is_transient_error(event_blob(event)):
+            if text_is_retryable(event_blob(event)):
                 return True
-    return text_is_transient_error(_read_tail(stderr_path))
+    return text_is_retryable(_read_tail(stderr_path))
 
 
 def run_streaming_with_backoff(
@@ -1103,6 +1109,7 @@ def run_streaming_with_backoff(
     timeout_s: int | None = None,
     on_line: Callable[[str], None] | None = None,
     log_prefix: str = "mlpab",
+    retry_window_s: int = RATE_LIMIT_RETRY_WINDOW_S,
 ) -> tuple[int, float, float]:
     """Run a streaming JSON subprocess (codex `exec --json` / vibe `--output
     streaming`) with the SAME accounting as `run_with_retry`: exponential
@@ -1205,10 +1212,10 @@ def run_streaming_with_backoff(
             RATE_LIMIT_BASE_BACKOFF_S * (2 ** (rl_attempts - 1)),
             RATE_LIMIT_MAX_BACKOFF_S,
         )
-        if elapsed + backoff > RATE_LIMIT_RETRY_WINDOW_S:
+        if elapsed + backoff > retry_window_s:
             print(
                 f"[{log_prefix}] rate-limited after {rl_attempts} attempts "
-                f"({elapsed:.0f}s elapsed); {RATE_LIMIT_RETRY_WINDOW_S // 3600}h retry budget "
+                f"({elapsed:.0f}s elapsed); {retry_window_s // 3600}h retry budget "
                 f"exhausted, giving up.",
                 flush=True,
             )

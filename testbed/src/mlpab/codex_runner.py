@@ -43,6 +43,7 @@ from mlpab.claude_runner import (
     run_streaming_with_backoff,
     set_enforcement_env,
     streaming_is_rate_limited,
+    text_is_transient_error,
 )
 
 
@@ -271,14 +272,40 @@ def _print_event(line: str) -> None:
                 print(ln, flush=True)
 
 
+# codex's plan enforces a WEEKLY usage allowance (~5 hours of agent time). When
+# it's spent, codex emits an error event ("Your workspace is out of credits.
+# Ask your workspace owner to refill ...") that reads like quota exhaustion but,
+# unlike a hard quota, CLEARS on a rolling ~5h reset boundary — so it IS worth
+# waiting out rather than failing the run immediately. We therefore treat it as
+# retryable and keep retrying for WEEKLY_LIMIT_RETRY_WINDOW_S (5h15m: the 5h
+# reset window plus a 15-minute margin to be sure we cross the boundary). These
+# phrases are codex-specific and deliberately NOT added to the shared
+# `text_is_transient_error` (which excludes quota for the other engines).
+WEEKLY_LIMIT_RETRY_WINDOW_S = 5 * 3600 + 15 * 60
+_WEEKLY_LIMIT_PHRASES = (
+    "out of credits",
+    "usage limit",
+    "weekly limit",
+    "refill",
+)
+
+
+def _codex_text_is_retryable(text: str) -> bool:
+    """codex retries the shared transient/5xx conditions AND its weekly
+    usage-limit ("out of credits") error, which resets on a ~5h boundary."""
+    t = (text or "").lower()
+    return text_is_transient_error(text) or any(p in t for p in _WEEKLY_LIMIT_PHRASES)
+
+
 def _rate_limited(raw_path: Path, stderr_path: Path) -> bool:
-    """A codex run failed on a rate-limit / transient-server condition. codex
-    surfaces these as `{"type":"error","message":...}` events (and on stderr)."""
+    """A codex run failed on a rate-limit / transient-server condition, or hit
+    its weekly usage limit. codex surfaces these as `{"type":"error",
+    "message":...}` events (and on stderr)."""
 
     def _err_text(event: dict) -> str:
         return str(event.get("message") or "") if (event.get("type") or "").lower() == "error" else ""
 
-    return streaming_is_rate_limited(raw_path, stderr_path, _err_text)
+    return streaming_is_rate_limited(raw_path, stderr_path, _err_text, _codex_text_is_retryable)
 
 
 def run(
@@ -391,6 +418,10 @@ def run(
         timeout_s=timeout_s,
         on_line=_print_event,
         log_prefix="mlpab:codex",
+        # The binding ceiling for codex is the weekly usage limit, so keep
+        # retrying out-of-credits / rate-limit conditions for 5h15m before
+        # giving up (vs the engine-default 6h window).
+        retry_window_s=WEEKLY_LIMIT_RETRY_WINDOW_S,
     )
     if rl_wait:
         print(f"[mlpab] codex rate-limit waits excluded from wall time: {rl_wait:.0f}s", flush=True)
