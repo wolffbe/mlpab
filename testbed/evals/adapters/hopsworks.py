@@ -165,7 +165,14 @@ class HopsworksChecker:
         try:
             fv = self._fs.get_feature_view(name)
         except Exception as e:
-            raise LookupError(f"feature view {name!r} not found: {e}") from e
+            # Same discriminator as _get_fg: a "not found" error is a deterministic
+            # miss → LookupError (the caller's read_with_retry won't retry it, and
+            # the grader degrades gracefully). Any other error is a transient lookup
+            # flake → re-raise the original so read_with_retry retries it, instead
+            # of masking it as a missing feature view.
+            if _looks_missing(e):
+                raise LookupError(f"feature view {name!r} not found: {e}") from e
+            raise
         if fv is None:
             raise LookupError(f"feature view {name!r} not found")
 
