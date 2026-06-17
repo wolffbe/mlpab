@@ -30,7 +30,7 @@ class FetchRetryTests(unittest.TestCase):
             mock.patch.object(common, "fetch_table", side_effect=flaky),
             mock.patch("time.sleep"),
         ):
-            out = common._fetch_table_with_retry("hopsworks", "t", 1, None)
+            out = common.fetch_table_with_retry("hopsworks", "t", 1, None)
         self.assertEqual(len(calls), 2)
         self.assertTrue(out.equals(df))
 
@@ -40,7 +40,7 @@ class FetchRetryTests(unittest.TestCase):
             mock.patch("time.sleep") as slept,
         ):
             with self.assertRaises(RuntimeError):
-                common._fetch_table_with_retry("hopsworks", "t", 1, None)
+                common.fetch_table_with_retry("hopsworks", "t", 1, None)
         # One sleep between each of the FETCH_RETRIES attempts (not after the last).
         self.assertEqual(slept.call_count, common.FETCH_RETRIES - 1)
 
@@ -56,7 +56,7 @@ class FetchRetryTests(unittest.TestCase):
             mock.patch("time.sleep") as slept,
         ):
             with self.assertRaises(LookupError):
-                common._fetch_table_with_retry("hopsworks", "t", 1, None)
+                common.fetch_table_with_retry("hopsworks", "t", 1, None)
         self.assertEqual(len(calls), 1)
         slept.assert_not_called()
 

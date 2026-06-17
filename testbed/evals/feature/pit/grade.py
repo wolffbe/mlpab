@@ -23,7 +23,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from evals.common import Suite, read_csv_or_empty, tally
+from evals.common import FETCH_RETRIES, Suite, read_csv_or_empty, read_with_retry, tally
 from evals.feature.pit.generate import canonicalize, digest
 
 VARIANT_DIAGNOSIS = {
@@ -131,15 +131,24 @@ def main(argv: list[str] | None = None) -> int:
         # (hopsworks/databricks/aws/azure/gcp) — uniform, no per-platform branch.
         from evals.common import state_checker
 
-        checker = state_checker(args.adapter)
+        # Read back the training dataset through the shared retry policy, which
+        # rides out the transient client-side HQS flake (hsfs masks the real
+        # Arrow Flight error as a generic FeatureStoreException; the server
+        # serves rows reliably on repeat). The read NEVER crashes the grader: a
+        # deterministic miss (LookupError) or a post-retry flake degrades to an
+        # empty frame with the reason recorded.
         try:
-            produced = checker.read_training_dataset(meta["dataset_name"], meta["dataset_version"])
+            produced = read_with_retry(
+                lambda: state_checker(args.adapter).read_training_dataset(
+                    meta["dataset_name"], meta["dataset_version"]
+                )
+            )
         except LookupError as e:
-            # Deliverable could not be read back — grade an EMPTY frame so the
-            # suite still enumerates (deliverable check fails, dependents skip),
-            # but keep the real reason for the report.
             produced = pd.DataFrame()
             deliverable_err = str(e)
+        except Exception as e:  # noqa: BLE001 — read-back flake survived the retries
+            produced = pd.DataFrame()
+            deliverable_err = f"read-back failed after {FETCH_RETRIES} attempts: {e}"
 
     report = grade(args.instance, produced)
     if deliverable_err:

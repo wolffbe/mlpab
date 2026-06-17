@@ -20,7 +20,7 @@ from evals.common import (
     Suite,
     canonicalize,
     digest,
-    fetch_table,
+    fetch_table_with_retry,
     grade_platform_main,
     read_csv_or_empty,
     state_checker,
@@ -59,10 +59,13 @@ def grade(instance_dir: Path, adapter: str, run_dir: Path) -> dict:
             else f"feature table {truth['table_name']!r} v{truth['table_version']} not found",
         ):
             try:
-                produced = fetch_table(
+                produced = fetch_table_with_retry(
                     adapter, truth["table_name"], truth["table_version"], truth.get("record_ids")
                 )
-            except (LookupError, NotImplementedError) as e:
+            except Exception as e:  # noqa: BLE001
+                # Deterministic adapter limit OR a client-side read-back flake that
+                # survived the retries — either way, degrade gracefully (A2 fails,
+                # A3 skips) instead of crashing the grader with no report.
                 read_err = f"could not read table back: {e}"
 
     # --- A2/A3: content --------------------------------------------------------

@@ -25,7 +25,7 @@ from evals.common import (
     Suite,
     canonicalize,
     digest,
-    fetch_table,
+    fetch_table_with_retry,
     grade_platform_main,
     load_answers,
     read_csv_or_empty,
@@ -51,8 +51,12 @@ def grade(instance_dir: Path, adapter: str, run_dir: Path) -> dict:
             src_err = f"no local deliverable at {local}"
     else:
         try:
-            produced = fetch_table(adapter, table, truth["table_version"], truth.get("record_ids"))
-        except (LookupError, NotImplementedError) as e:
+            produced = fetch_table_with_retry(
+                adapter, table, truth["table_version"], truth.get("record_ids")
+            )
+        except Exception as e:  # noqa: BLE001
+            # Deterministic adapter limit OR a client-side read-back flake that
+            # survived the retries — degrade gracefully instead of crashing.
             src_err = str(e)
     a1 = False
     if produced is None:

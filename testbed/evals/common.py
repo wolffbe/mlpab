@@ -31,22 +31,42 @@ import pandas as pd
 # (see arrow_flight_client.afs_error_handler_wrapper). The server serves the
 # rows reliably on repeat, so retry transient read failures before giving up.
 # LookupError/NotImplementedError are deterministic adapter limits — not retried.
-FETCH_RETRIES = 3
+# Backoff is exponential (5, 10, 20, 30, …s capped) because a fixed 3×5s window
+# proved too short for the cluster's flake — a healthy read would be marked a
+# false-negative read-back failure, counting against the model unfairly.
+FETCH_RETRIES = 5
 FETCH_BACKOFF_S = 5
+FETCH_BACKOFF_CAP_S = 30
 
 
-def _fetch_table_with_retry(adapter, table, version, record_ids):
+def read_with_retry(read_fn):
+    """Run a platform read (a zero-arg callable), retrying the transient
+    client-side HQS flake with exponential backoff. THE single retry policy for
+    every grader read-back — table reads and training-dataset reads alike route
+    through here. LookupError/NotImplementedError are deterministic misses,
+    re-raised immediately; any other error is treated as the read-back flake and
+    retried up to FETCH_RETRIES times, then re-raised for the caller to degrade
+    on (so the grader records a clean reason instead of crashing)."""
     last = None
     for attempt in range(1, FETCH_RETRIES + 1):
         try:
-            return fetch_table(adapter, table, version, record_ids)
+            return read_fn()
         except (LookupError, NotImplementedError):
             raise  # deterministic — retrying cannot change the outcome
         except Exception as e:  # noqa: BLE001 — client read flake; retry
             last = e
             if attempt < FETCH_RETRIES:
-                time.sleep(FETCH_BACKOFF_S)
+                time.sleep(min(FETCH_BACKOFF_S * 2 ** (attempt - 1), FETCH_BACKOFF_CAP_S))
     raise last
+
+
+def fetch_table_with_retry(adapter, table, version, record_ids):
+    """Read a feature table back, retrying the transient client-side flake.
+
+    Every grader should read through THIS (or `read_with_retry`), not raw
+    `fetch_table`: a bare `fetch_table` call that hits the hsfs
+    FeatureStoreException flake crashes the grader (no report)."""
+    return read_with_retry(lambda: fetch_table(adapter, table, version, record_ids))
 
 
 def instance_suffix(seed: int) -> str:
@@ -248,7 +268,7 @@ def grade_table_main(family: str, grade_fn, argv: list[str] | None = None) -> in
     else:
         truth = json.loads((args.instance / "solution" / "truth.json").read_text())
         try:
-            produced = _fetch_table_with_retry(
+            produced = fetch_table_with_retry(
                 args.adapter,
                 truth["table_name"],
                 truth.get("table_version", 1),
