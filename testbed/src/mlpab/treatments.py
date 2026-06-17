@@ -38,6 +38,12 @@ Config format (YAML):
 
     max_seconds: 1200  # OPTIONAL per-agent-run wall-clock cap in SECONDS
                        # (legacy: `max_min`, `timeout_s`). Absent/null → NO cap.
+
+    concurrency: 3     # OPTIONAL — run this many of the config's runs at once,
+                       # each in its OWN process and its OWN Hopsworks project
+                       # (alias: `parallel`). Default 1 = sequential. Orthogonal
+                       # to launching several `mlpab start` in separate terminals
+                       # (each of those is already its own process + project).
 """
 
 from __future__ import annotations
@@ -81,6 +87,15 @@ class TreatmentConfig:
     # repeat lands in its own …/<task>/<n> attempt folder and gets its own
     # results.csv row (n = 1..repeats).
     repeats: int = 1
+    # How many runs to execute CONCURRENTLY within this one `mlpab run`
+    # (config key `concurrency:` / `parallel:`). 1 = sequential (the default,
+    # unchanged behavior). >1 fans the runs out across that many worker
+    # PROCESSES — each worker is its own process, so each run mints its OWN
+    # HOPSWORKS_PROJECT (runner.py) and setup/teardown stay scoped to it: N runs
+    # share one cluster + API key, one project per run, never sweeping each
+    # other. Builds/prepared venvs are materialized once upfront (preflight), so
+    # workers only clone read-only — no build barrier.
+    concurrency: int = 1
 
 
 def _parse_runs(data: dict[str, Any]) -> list[RunEntry]:
@@ -229,6 +244,7 @@ def load_config(path: Path) -> TreatmentConfig:
         auth=data.get("auth", os.environ.get("MLPAB_AUTH", "api-key")),
         max_seconds=max_seconds,
         repeats=max(1, int(data.get("n", data.get("repeats", 1)) or 1)),
+        concurrency=max(1, int(data.get("concurrency", data.get("parallel", 1)) or 1)),
     )
 
 
@@ -283,6 +299,17 @@ def check_llm_live(
             ok, detail = claude_runner.engine_live(m, auth=config.auth, timeout_s=timeout_s)
         report.append((m, ok, detail))
     return all(ok for _, ok, _ in report), report
+
+
+def _pool_worker_init() -> None:
+    """Initializer for the concurrency ProcessPool workers.
+
+    Force quiet so concurrent runs don't interleave their live agent streams on
+    the shared terminal — each run's full output is still teed to its own
+    task/agent.log. Workers inherit the parent's env (creds, OAuth token cache)
+    at spawn; we only add the quiet flag here.
+    """
+    os.environ["MLPAB_QUIET"] = "1"
 
 
 def run_treatments(
@@ -411,12 +438,17 @@ def run_treatments(
     completed: list[results.Row] = []
     failed: list[str] = []
 
+    # Build every run's spec UP FRONT, assigning each its own /<n> attempt
+    # folder. Attempt numbers are computed here (not inside the run) so the
+    # repeats of one combo get DISTINCT, collision-free attempts even when the
+    # runs execute concurrently — the old "read the disk max inside the loop"
+    # scheme raced once two runs of the same combo ran at once. We seed each
+    # leaf's counter from the on-disk max so re-running a config still
+    # accumulates (n+1) across separate invocations.
     expanded = [e for e in config.runs for _ in range(config.repeats)]
-    for idx, entry in enumerate(expanded, 1):
-        print(
-            f"\n[treatment {idx}/{total}] {entry.model} | {entry.task} | "
-            f"{entry.platform}/{entry.interface} | skills={entry.skills}"
-        )
+    next_attempt: dict[Path, int] = {}
+    plan: list[tuple[runner.RunSpec, str]] = []
+    for entry in expanded:
         # Nest by model/platform/interface/version/skills — the results.csv identity
         # columns — so no two combos share a <category>/<task> dir. The version
         # segment is the manifest's pinned version/ref; the local baseline has
@@ -432,60 +464,96 @@ def run_treatments(
         leaf_root = (
             run_path / entry.model / entry.platform / entry.interface / version_seg / skills_seg
         )
-        # Repeat counter: next free /<n> attempt folder under this task.
         task_dir = leaf_root / entry.category / entry.task
-        existing = (
-            [int(d.name) for d in task_dir.iterdir() if d.is_dir() and d.name.isdigit()]
-            if task_dir.is_dir()
-            else []
+        if task_dir not in next_attempt:
+            existing = (
+                [int(d.name) for d in task_dir.iterdir() if d.is_dir() and d.name.isdigit()]
+                if task_dir.is_dir()
+                else []
+            )
+            next_attempt[task_dir] = max(existing, default=0) + 1
+        attempt = next_attempt[task_dir]
+        next_attempt[task_dir] += 1
+        spec = runner.RunSpec(
+            task=entry.task,
+            platform=entry.platform,
+            interface=entry.interface,
+            skills=entry.skills,
+            model=entry.model,
+            auth=config.auth,
+            timeout_s=int(config.max_seconds) if config.max_seconds is not None else None,
+            runs_root=leaf_root,
+            run_id=run_id,  # tagged into the `config` column of the master CSV
+            category=entry.category,
+            attempt=attempt,
+            preflight=False,  # union already verified upfront
+            results_csv=global_csv,  # the ONE results CSV, appended per run
         )
-        attempt = max(existing, default=0) + 1
-        try:
-            spec = runner.RunSpec(
-                task=entry.task,
-                platform=entry.platform,
-                interface=entry.interface,
-                skills=entry.skills,
-                model=entry.model,
-                auth=config.auth,
-                timeout_s=int(config.max_seconds) if config.max_seconds is not None else None,
-                runs_root=leaf_root,
-                run_id=run_id,  # tagged into the `config` column of the master CSV
-                category=entry.category,
-                attempt=attempt,
-                preflight=False,  # union already verified upfront
-                results_csv=global_csv,  # the ONE results CSV, appended per run
-            )
-            # No build barrier: every interface was prepared up front, so this
-            # run only clones its prepared venv read-only — nothing to wait on,
-            # even with parallel sessions running concurrently.
-            row = runner.run(spec)
-            completed.append(row)
-            print(
-                f"[mlpab] asserts={row.asserts_passed}/{row.total_asserts}  "
-                f"tokens={row.total_tokens}  "
-                f"wall={row.wall_time_s:.1f}s  cost=${row.cost_usd:.4f}"
-            )
-            # The runner appended the row to the global results.csv; refresh
-            # the global results.ipynb to match, so both stay current after
-            # EVERY run instead of only at end of the session.
-            _refresh_notebook(parent)
-        except preflight_mod.PlatformNotReadyError as exc:
-            # Setup verification failed — the platform is unusable, so every
-            # remaining run would fail the same way. Abort the whole config
-            # (print what completed so far, then propagate).
-            print(
-                f"\n[mlpab] ABORTING config {config_name!r} — platform "
-                f"{entry.platform!r} is not ready:\n{exc}",
-                file=sys.stderr,
-            )
-            print(f"[mlpab] results: {global_csv}", flush=True)
-            _print_summary(completed, failed, global_csv)
-            raise
-        except Exception as exc:
-            label = f"{entry.task}/{entry.platform}/{entry.interface}"
-            print(f"[mlpab] FAILED {label}: {exc}", file=sys.stderr)
-            failed.append(f"{label}: {exc}")
+        plan.append((spec, f"{entry.model} | {entry.task} | {entry.platform}/{entry.interface}"))
+
+    concurrency = min(max(1, config.concurrency), total)
+
+    def _record(idx: int, spec: runner.RunSpec, row: results.Row) -> None:
+        completed.append(row)
+        print(
+            f"[mlpab] [{idx}/{total}] done: {spec.task} {spec.platform}/{spec.interface}  "
+            f"asserts={row.asserts_passed}/{row.total_asserts}  "
+            f"tokens={row.total_tokens}  wall={row.wall_time_s:.1f}s  cost=${row.cost_usd:.4f}"
+        )
+        # The runner appended the row to the global results.csv; refresh the
+        # global results.ipynb to match, so both stay current after EVERY run.
+        _refresh_notebook(parent)
+
+    if concurrency == 1:
+        # Sequential path — unchanged behavior. A failed platform setup aborts
+        # the whole config (every later run would hit the same broken platform).
+        for idx, (spec, label) in enumerate(plan, 1):
+            print(f"\n[treatment {idx}/{total}] {label} | skills={spec.skills}")
+            try:
+                _record(idx, spec, runner.run(spec))
+            except preflight_mod.PlatformNotReadyError as exc:
+                print(
+                    f"\n[mlpab] ABORTING config {config_name!r} — platform "
+                    f"{spec.platform!r} is not ready:\n{exc}",
+                    file=sys.stderr,
+                )
+                print(f"[mlpab] results: {global_csv}", flush=True)
+                _print_summary(completed, failed, global_csv)
+                raise
+            except Exception as exc:
+                label = f"{spec.task}/{spec.platform}/{spec.interface}"
+                print(f"[mlpab] FAILED {label}: {exc}", file=sys.stderr)
+                failed.append(f"{label}: {exc}")
+    else:
+        # Concurrent path — fan out across worker PROCESSES. A process per run
+        # means each run keeps its OWN os.environ (so the per-run HOPSWORKS_PROJECT
+        # set in runner.run never clobbers another run's), and the results.csv
+        # append is already flock-serialized across processes. Workers run quiet
+        # (per-run agent.log still captures everything) so their live output does
+        # not interleave on the terminal.
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+
+        print(
+            f"[mlpab] running {total} runs at concurrency={concurrency} "
+            f"(one Hopsworks project per run; live output → each run's agent.log)"
+        )
+        with ProcessPoolExecutor(
+            max_workers=concurrency, initializer=_pool_worker_init
+        ) as pool:
+            futures = {
+                pool.submit(runner.run, spec): (i, spec) for i, (spec, _label) in enumerate(plan, 1)
+            }
+            for fut in as_completed(futures):
+                idx, spec = futures[fut]
+                try:
+                    _record(idx, spec, fut.result())
+                except Exception as exc:
+                    # PlatformNotReadyError included: with runs already in flight
+                    # we cannot cleanly abort the others, so record it as a
+                    # failure rather than tearing the pool down mid-run.
+                    label = f"{spec.task}/{spec.platform}/{spec.interface}"
+                    print(f"[mlpab] FAILED {label}: {exc}", file=sys.stderr)
+                    failed.append(f"{label}: {exc}")
 
     print(f"[mlpab] results: {global_csv}", flush=True)
     _print_summary(completed, failed, global_csv)

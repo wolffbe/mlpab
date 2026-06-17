@@ -18,6 +18,7 @@ The first failed check raises PreflightError with an actionable fix.
 from __future__ import annotations
 
 import os
+import random
 import shutil
 import subprocess
 import sys
@@ -26,6 +27,12 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from mlpab import interfaces, skills
+
+
+# How many skills to spot-check per bundle in the access probe. Skill access is a
+# property of the bundle install, not the individual skill, so a small random
+# sample is enough to confirm the bundle is reachable without probing all ~23.
+_SKILL_PROBE_SAMPLE = 3
 
 
 class PreflightError(RuntimeError):
@@ -254,9 +261,28 @@ def _check_skill(
     if not model.lower().startswith("claude"):
         return
 
-    # 2) Confirm the agent can ACCESS each skill by invoking it directly with
+    # 2) Confirm the agent can ACCESS skills by invoking them directly with
     # `/skill-name` (per https://code.claude.com/docs/en/skills) — no LLM judgment.
-    for skill_name in skills.skill_names(project, name):
+    # Each probe spawns a blocking `claude -p /skill` whose output is captured (not
+    # streamed), so without the log lines below the run looks frozen during preflight.
+    # Probing every skill in a large bundle (e.g. ~23) is slow and redundant — skill
+    # access is a property of the bundle install, not the individual skill, so a
+    # random spot-check of a few is enough to confirm the bundle is reachable.
+    all_skills = list(skills.skill_names(project, name))
+    sample_n = min(_SKILL_PROBE_SAMPLE, len(all_skills))
+    skill_list = random.sample(all_skills, sample_n) if all_skills else []
+    print(
+        f"[mlpab] preflight: probing {len(skill_list)} of {len(all_skills)} skill(s) "
+        f"in bundle {name!r} with `claude -p` (model {model})...",
+        file=sys.stderr,
+        flush=True,
+    )
+    for i, skill_name in enumerate(skill_list, 1):
+        print(
+            f"[mlpab] preflight: probing skill {i}/{len(skill_list)} /{skill_name} ...",
+            file=sys.stderr,
+            flush=True,
+        )
         result = _probe_skill_invocation(
             project,
             name,
@@ -270,6 +296,11 @@ def _check_skill(
                 f"skill {skill_name!r} (bundle {name!r}): the agent "
                 f"could not invoke it.\n  {result.detail}"
             )
+        print(
+            f"[mlpab] preflight: skill {i}/{len(skill_list)} /{skill_name} OK",
+            file=sys.stderr,
+            flush=True,
+        )
 
 
 def _probe_skill_invocation(

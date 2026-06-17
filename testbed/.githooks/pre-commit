@@ -1,0 +1,105 @@
+#!/usr/bin/env python3
+"""Pre-commit secret guard.
+
+We TRACK results/ and configs/treatments/ (so runs and treatment definitions are
+versioned, never silently lost). This hook is the safety net that lets us do
+that without ever committing a credential: it scans every staged file for the
+literal secret VALUES in the repo's .env, and blocks OAuth token caches outright.
+
+Enable once per clone (done by `make install`):
+    git config core.hooksPath .githooks
+
+Bypass in a genuine emergency with `git commit --no-verify` (don't).
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+# Env var names whose values are real secrets worth blocking. Substring match,
+# so e.g. AWS_SECRET_ACCESS_KEY, DATABRICKS_TOKEN, MISTRAL_API_KEY all qualify.
+_SECRET_HINTS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL")
+_MIN_SECRET_LEN = 16  # ignore short values — too collision-prone to match safely
+
+
+def _staged_files() -> list[str]:
+    out = subprocess.run(
+        ["git", "diff", "--cached", "--name-only", "--diff-filter=ACM"],
+        capture_output=True,
+        text=True,
+    ).stdout
+    return [f for f in out.splitlines() if f.strip()]
+
+
+def _staged_blob(path: str) -> bytes:
+    """The staged content of `path` (the index version, not the worktree)."""
+    return subprocess.run(["git", "show", f":{path}"], capture_output=True).stdout
+
+
+def _env_secret_values() -> list[tuple[str, str]]:
+    """(name, value) pairs from .env worth scanning for. Skips short values and
+    path-like values (e.g. GOOGLE_APPLICATION_CREDENTIALS=/path/to.json) — a path
+    is not itself a secret and would false-positive on every log mentioning it.
+
+    The .env lives beside this hook's project (``testbed/.env``), resolved from
+    the hook's own location — git runs hooks with cwd at the repo ROOT (one level
+    up from testbed), so a bare ``.env`` would miss it."""
+    env = Path(__file__).resolve().parent.parent / ".env"
+    if not env.exists():
+        return []
+    secrets: list[tuple[str, str]] = []
+    for line in env.read_text().splitlines():
+        m = re.match(r"\s*(?:export\s+)?([A-Za-z0-9_]+)\s*=\s*(.+)", line)
+        if not m:
+            continue
+        name, raw = m.group(1), m.group(2).strip()
+        # strip a trailing inline comment only when unquoted
+        val = raw.strip('"').strip("'") if raw[:1] in "\"'" else raw.split(" #")[0].strip()
+        if len(val) < _MIN_SECRET_LEN:
+            continue
+        if val.startswith(("/", "~", "./")):  # path, not a secret value
+            continue
+        if any(h in name.upper() for h in _SECRET_HINTS):
+            secrets.append((name, val))
+    return secrets
+
+
+def main() -> int:
+    files = _staged_files()
+    secrets = _env_secret_values()
+    problems: list[str] = []
+
+    for f in files:
+        base = os.path.basename(f)
+        if base == ".claude-oauth":
+            problems.append(f"{f}: OAuth token cache must never be committed")
+            continue
+        if "/venv/" in f or f.endswith("/venv"):
+            problems.append(f"{f}: per-run venv (build artifact) must not be committed")
+            continue
+        if not secrets:
+            continue
+        blob = _staged_blob(f)
+        for name, val in secrets:
+            if val.encode() in blob:
+                problems.append(f"{f}: contains the value of ${name} (.env secret)")
+                break
+
+    if problems:
+        sys.stderr.write("pre-commit: refusing to commit — secrets/artifacts detected:\n")
+        for p in problems:
+            sys.stderr.write(f"  - {p}\n")
+        sys.stderr.write(
+            "\nUnstage with `git restore --staged <file>` (or scrub the secret), "
+            "then commit again.\n"
+        )
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

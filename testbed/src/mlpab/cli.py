@@ -259,6 +259,37 @@ def _require_tmux() -> None:
         raise click.ClickException("tmux not installed (brew install tmux)")
 
 
+def _tmux_session_exists(session: str) -> bool:
+    return (
+        subprocess.run(["tmux", "has-session", "-t", session], capture_output=True).returncode == 0
+    )
+
+
+def _config_sessions(config_path: Path) -> list[str]:
+    """Every live tmux session for CONFIG: the base `mlpab-<stem>` plus any
+    `mlpab-<stem>-<k>` copies started while the base was busy (three terminals,
+    three runs, one project each)."""
+    base = _tmux_session(config_path)
+    out = subprocess.run(["tmux", "ls", "-F", "#{session_name}"], capture_output=True, text=True)
+    names = out.stdout.split() if out.returncode == 0 else []
+    return sorted(n for n in names if n == base or n.startswith(base + "-"))
+
+
+def _free_session_name(config_path: Path) -> str:
+    """Pick a free session name for a new copy of CONFIG. Uses the bare
+    `mlpab-<stem>` when free, else the first open `mlpab-<stem>-<k>` (k≥2) — so
+    running `mlpab start <same config>` in several terminals each lands in its
+    own session (and therefore its own per-run Hopsworks project) instead of
+    colliding on the one name."""
+    base = _tmux_session(config_path)
+    if not _tmux_session_exists(base):
+        return base
+    k = 2
+    while _tmux_session_exists(f"{base}-{k}"):
+        k += 1
+    return f"{base}-{k}"
+
+
 @main.command("start")
 @click.argument("config", type=click.Path(path_type=Path))
 @click.option(
@@ -276,9 +307,10 @@ def start(config: Path, no_attach: bool) -> None:
     _require_tmux()
     if not config.exists():
         raise click.ClickException(f"Config file not found: {config}")
-    session = _tmux_session(config)
-    if subprocess.run(["tmux", "has-session", "-t", session], capture_output=True).returncode == 0:
-        raise click.ClickException(f"{session} already running (mlpab stop {config} first)")
+    # A config can run in SEVERAL terminals at once (each its own process → its
+    # own per-run Hopsworks project). Don't error when one is already up; take
+    # the next free session name so this `start` lands in its own session.
+    session = _free_session_name(config)
     import shlex
     import sys
 
@@ -315,13 +347,22 @@ def start(config: Path, no_attach: bool) -> None:
 @main.command("stop")
 @click.argument("config", type=click.Path(path_type=Path))
 def stop(config: Path) -> None:
-    """Kill CONFIG's tmux session (it also dies on its own when the run ends)."""
+    """Kill CONFIG's tmux session(s) (they also die on their own when the run ends).
+
+    Kills every session for the config — the base `mlpab-<stem>` and any
+    `mlpab-<stem>-<k>` copies started in other terminals."""
     _require_tmux()
-    session = _tmux_session(config)
-    if subprocess.run(["tmux", "kill-session", "-t", session], capture_output=True).returncode == 0:
-        click.secho(f">> killed {session}", fg="green")
-    else:
-        click.echo(f">> no session {session} (already finished?)")
+    sessions = _config_sessions(config)
+    if not sessions:
+        click.echo(f">> no session {_tmux_session(config)} (already finished?)")
+    for session in sessions:
+        if (
+            subprocess.run(
+                ["tmux", "kill-session", "-t", session], capture_output=True
+            ).returncode
+            == 0
+        ):
+            click.secho(f">> killed {session}", fg="green")
     # Reap an agent subprocess the kill may have orphaned (matched on the
     # task prompt's fixed opening line — never this or other claude sessions).
     if (
@@ -336,9 +377,18 @@ def stop(config: Path) -> None:
 @main.command("attach")
 @click.argument("config", type=click.Path(path_type=Path))
 def attach(config: Path) -> None:
-    """Attach to CONFIG's tmux session (detach again with Ctrl-b d)."""
+    """Attach to CONFIG's tmux session (detach again with Ctrl-b d).
+
+    Attaches to the base session, or — when only numbered copies are live — the
+    first of those. Use `mlpab status` to see them all and `tmux attach -t
+    <name>` to pick a specific copy."""
     _require_tmux()
-    subprocess.run(["tmux", "attach", "-t", _tmux_session(config)])
+    sessions = _config_sessions(config)
+    if not sessions:
+        raise click.ClickException(f"no session for {config} (start one with `mlpab start`)")
+    if len(sessions) > 1:
+        click.echo(f">> {len(sessions)} sessions live: {', '.join(sessions)} — attaching to {sessions[0]}")
+    subprocess.run(["tmux", "attach", "-t", sessions[0]])
 
 
 @main.command("status")

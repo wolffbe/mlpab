@@ -254,6 +254,63 @@ class LoginEnvInjectionTests(InterfaceTestBase):
         self.assertEqual(out.read_text().strip(), "ya29.SECRET")
 
 
+class LoginRetryTests(InterfaceTestBase):
+    """The per-run login check makes a LIVE round-trip to the platform. Under
+    parallel load (several configs against one cluster) a single login can be
+    slow/refused transiently, so login_status retries before failing the run."""
+
+    def _manifest(self) -> Path:
+        return self.write_manifest(
+            "svc", "cli", "keys:\n  - API_KEY\nauth_command: do-login\nprompt: hi\n"
+        )
+
+    def _venv_python(self) -> Path:
+        venv_python = self.root / "venv" / "bin" / "python"
+        venv_python.parent.mkdir(parents=True)
+        return venv_python
+
+    def test_transient_failure_is_retried_then_passes(self):
+        self._manifest()
+        # Fail the first two attempts (slow/refused under load), pass the third.
+        checks = [False, False, True]
+        with (
+            mock.patch.object(interfaces, "_run_check", side_effect=checks) as rc,
+            mock.patch.object(interfaces.time, "sleep") as slept,  # no real backoff
+        ):
+            status = interfaces.login_status(
+                "svc", "cli", venv_python=self._venv_python(), keys={"API_KEY": "k"}
+            )
+        self.assertTrue(status.ok, status.reason)
+        self.assertEqual(rc.call_count, 3)
+        self.assertEqual(slept.call_count, 2)  # backoff between the 3 attempts
+
+    def test_persistent_failure_aborts_after_all_attempts(self):
+        self._manifest()
+        with (
+            mock.patch.object(interfaces, "_run_check", return_value=False) as rc,
+            mock.patch.object(interfaces.time, "sleep"),
+        ):
+            status = interfaces.login_status(
+                "svc", "cli", venv_python=self._venv_python(), keys={"API_KEY": "k"}, attempts=3
+            )
+        self.assertFalse(status.ok)
+        self.assertEqual(rc.call_count, 3)
+        self.assertIn("3 attempt", status.reason)
+
+    def test_first_attempt_success_does_not_sleep(self):
+        self._manifest()
+        with (
+            mock.patch.object(interfaces, "_run_check", return_value=True) as rc,
+            mock.patch.object(interfaces.time, "sleep") as slept,
+        ):
+            status = interfaces.login_status(
+                "svc", "cli", venv_python=self._venv_python(), keys={"API_KEY": "k"}
+            )
+        self.assertTrue(status.ok, status.reason)
+        self.assertEqual(rc.call_count, 1)
+        slept.assert_not_called()
+
+
 class AccountingFieldsTests(InterfaceTestBase):
     """cli_command / sdk_module drive cli_calls / sdk_calls accounting."""
 

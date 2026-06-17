@@ -155,5 +155,137 @@ class UnimplementedFamilyFailFastTests(unittest.TestCase):
                 treatments.run_treatments(cfg, Path(tempfile.mkdtemp()), config_name="t")
 
 
+class _SyncExecutor:
+    """A ProcessPoolExecutor stand-in that runs submit() synchronously in-process
+    so a mocked ``runner.run`` is exercised (a real pool would spawn workers that
+    never see the parent's mock)."""
+
+    def __init__(self, max_workers=None, initializer=None):
+        self._init = initializer
+
+    def __enter__(self):
+        if self._init:
+            self._init()
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def submit(self, fn, *args):
+        import concurrent.futures as cf
+
+        fut = cf.Future()
+        try:
+            fut.set_result(fn(*args))
+        except Exception as e:  # noqa: BLE001
+            fut.set_exception(e)
+        return fut
+
+
+def _fake_row(**kw):
+    import types
+
+    base = dict(
+        task="training_data",
+        platform="hopsworks",
+        interface="cli",
+        skills="none",
+        asserts_passed=1,
+        total_asserts=1,
+        total_tokens=10,
+        wall_time_s=1.0,
+        cost_usd=0.01,
+    )
+    base.update(kw)
+    return types.SimpleNamespace(**base)
+
+
+def _patches(run_side_effect):
+    return [
+        mock.patch.object(preflight, "check_availability", lambda *a, **k: None),
+        mock.patch.object(treatments, "check_readiness", lambda cfg: (True, [])),
+        mock.patch.object(treatments, "check_llm_live", lambda *a, **k: (True, [])),
+        mock.patch.object(preflight, "preflight", lambda *a, **k: None),
+        mock.patch.object(claude_runner, "oauth_token_from_keychain", lambda: None),
+        mock.patch.object(results, "roll_up_results", lambda *a, **k: None),
+        mock.patch.object(treatments, "_refresh_notebook", lambda *a, **k: None),
+        mock.patch.object(runner, "run", side_effect=run_side_effect),
+    ]
+
+
+class ConcurrencyConfigTests(unittest.TestCase):
+    def _write(self, body: str) -> Path:
+        p = Path(tempfile.mkdtemp()) / "t.yaml"
+        p.write_text(body)
+        return p
+
+    def test_default_concurrency_is_one(self):
+        cfg = treatments.load_config(
+            self._write("model: claude-opus-4-8\nruns:\n  - {task: training_data, platform: none, interface: none}\n")
+        )
+        self.assertEqual(cfg.concurrency, 1)
+
+    def test_concurrency_key_parsed(self):
+        cfg = treatments.load_config(
+            self._write("model: claude-opus-4-8\nconcurrency: 3\nruns:\n  - {task: training_data, platform: none, interface: none}\n")
+        )
+        self.assertEqual(cfg.concurrency, 3)
+
+    def test_parallel_alias_and_floor(self):
+        cfg = treatments.load_config(
+            self._write("model: claude-opus-4-8\nparallel: 0\nruns:\n  - {task: training_data, platform: none, interface: none}\n")
+        )
+        self.assertEqual(cfg.concurrency, 1)  # clamped to >= 1
+
+
+class ConcurrentDispatchTests(unittest.TestCase):
+    def test_all_runs_execute_in_pool(self):
+        seen = []
+
+        def fake_run(spec):
+            seen.append((spec.platform, spec.interface, spec.category))
+            return _fake_row()
+
+        cfg = treatments.TreatmentConfig(
+            runs=[
+                treatments.RunEntry(task="training_data", platform="hopsworks", interface="cli", category="feature"),
+                treatments.RunEntry(task="training_data", platform="hopsworks", interface="sdk", category="feature"),
+            ],
+            concurrency=2,
+        )
+        with mock.patch("concurrent.futures.ProcessPoolExecutor", _SyncExecutor):
+            with contextlib.ExitStack() as stack:
+                for p in _patches(fake_run):
+                    stack.enter_context(p)
+                stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+                stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
+                treatments.run_treatments(cfg, Path(tempfile.mkdtemp()), config_name="t")
+        self.assertEqual(len(seen), 2)
+        self.assertIn(("hopsworks", "cli", "feature"), seen)
+        self.assertIn(("hopsworks", "sdk", "feature"), seen)
+
+    def test_repeats_get_distinct_attempts(self):
+        attempts = []
+
+        def fake_run(spec):
+            attempts.append(spec.attempt)
+            return _fake_row()
+
+        # One combo, 3 repeats, run concurrently — each must get its own /<n>.
+        cfg = treatments.TreatmentConfig(
+            runs=[treatments.RunEntry(task="training_data", platform="hopsworks", interface="cli", category="feature")],
+            repeats=3,
+            concurrency=3,
+        )
+        with mock.patch("concurrent.futures.ProcessPoolExecutor", _SyncExecutor):
+            with contextlib.ExitStack() as stack:
+                for p in _patches(fake_run):
+                    stack.enter_context(p)
+                stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+                stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
+                treatments.run_treatments(cfg, Path(tempfile.mkdtemp()), config_name="t")
+        self.assertEqual(sorted(attempts), [1, 2, 3])
+
+
 if __name__ == "__main__":
     unittest.main()

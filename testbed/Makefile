@@ -54,8 +54,19 @@ check-git:
 	@command -v git >/dev/null 2>&1 || { echo "ERROR: git is not installed. Install git and retry."; exit 1; }
 	@echo ">> git OK ($(shell git --version))"
 
+# Enable the committed pre-commit secret guard (.githooks/pre-commit). results/
+# and configs/treatments/ are tracked, so this hook is what keeps secrets +
+# per-run venvs out of git. Idempotent.
+# core.hooksPath is resolved relative to the REPO ROOT, but this project lives
+# in a subdir (testbed/) of the repo — so point it at <prefix>.githooks
+# (e.g. testbed/.githooks) regardless of where make is run from.
+githooks: check-git
+	git config core.hooksPath "$$(git rev-parse --show-prefix).githooks"
+	@chmod +x .githooks/* 2>/dev/null || true
+	@echo ">> pre-commit secret guard enabled (core.hooksPath=$$(git config core.hooksPath))"
 
-install: check-git $(VENV)/.installed link claude codex vibe setup
+
+install: check-git githooks $(VENV)/.installed link claude codex vibe setup
 
 $(VENV)/.installed: pyproject.toml requirements.txt
 	@echo ">> using interpreter: $(PYTHON)"

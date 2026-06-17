@@ -23,6 +23,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -989,12 +990,24 @@ def login_status(
     *,
     venv_python: Path,
     keys: dict[str, str] | None = None,
-    timeout_s: int = 30,
+    timeout_s: int = 90,
+    attempts: int = 3,
 ) -> InterfaceStatus:
     """Per-run login check: run the interface's `auth_command` in the given
     (per-run) venv. Build + test happen once at treatment preflight; login is
     re-verified for EVERY run here (so expired creds are caught mid-session
     and each run authenticates in its own venv).
+
+    The auth_command makes a LIVE round-trip to the platform (e.g. `hops login`
+    authenticates against the Hopsworks cluster). When several configs run in
+    parallel against ONE cluster/API key (three `mlpab start` terminals, or
+    `concurrency:`), that cluster is hit by N× simultaneous login + project
+    create/teardown + agent traffic, so a single login can take far longer than
+    a quiet-cluster round-trip. A tight, no-retry check then times out and
+    aborts the run before the agent even starts. So the check is retried up to
+    `attempts` times with a generous per-attempt `timeout_s` and a short
+    backoff — a transient slow/refused login under load is absorbed, while a
+    genuinely bad credential still fails on every attempt and aborts cleanly.
     """
     if platform == "none" and interface == "none":
         return InterfaceStatus(platform, interface, ok=True, installed=True, authenticated=True)
@@ -1037,7 +1050,23 @@ def login_status(
         [str(bin_dir(platform, interface)), str(venv_python.parent), env.get("PATH", "")]
     )
     env["VIRTUAL_ENV"] = str(venv_python.parent.parent)
-    if not _run_check(auth_command, env, timeout_s):
+    # Retry on transient failure/timeout (cluster slow under parallel load).
+    # Exponential-ish backoff (2s, 4s, …) between attempts; the last attempt's
+    # captured output is what _run_check already printed for the operator.
+    ok = False
+    for attempt in range(1, max(1, attempts) + 1):
+        if _run_check(auth_command, env, timeout_s):
+            ok = True
+            break
+        if attempt < attempts:
+            print(
+                f"[mlpab] login check attempt {attempt}/{attempts} failed; "
+                f"retrying in {2 * attempt}s …",
+                file=sys.stderr,
+                flush=True,
+            )
+            time.sleep(2 * attempt)
+    if not ok:
         return InterfaceStatus(
             platform,
             interface,
@@ -1045,7 +1074,10 @@ def login_status(
             installed=True,
             authenticated=False,
             missing_keys=missing,
-            reason=f"login check failed (`{auth_command}` returned non-zero or timed out)",
+            reason=(
+                f"login check failed (`{auth_command}` returned non-zero or "
+                f"timed out on all {attempts} attempt(s))"
+            ),
             fix_command=setup_fix,
         )
     return InterfaceStatus(
