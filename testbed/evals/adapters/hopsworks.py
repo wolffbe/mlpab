@@ -30,6 +30,25 @@ import pandas as pd
 from evals.adapters import TableInfo
 
 
+def _reassemble_split(parts, n_splits: int) -> pd.DataFrame:
+    """Rebuild the full training-dataset frame from a split getter's flat return.
+
+    hsfs `get_train_test_split` / `get_train_validation_test_split` return a flat
+    tuple: the first `n_splits` entries are the feature (X) frames, and — when
+    the view declares a label — the next `n_splits` are the label (y) frames
+    (else only the X frames are present). Concatenate the X parts row-wise (and
+    the y parts likewise), then join columns, so the grader sees the same
+    canonical frame a non-split training dataset would yield."""
+    parts = list(parts)
+    xs = parts[:n_splits]
+    ys = parts[n_splits : n_splits * 2]
+    x = pd.concat([p.reset_index(drop=True) for p in xs], ignore_index=True)
+    if ys and any(len(getattr(p, "columns", [])) for p in ys):
+        y = pd.concat([p.reset_index(drop=True) for p in ys], ignore_index=True)
+        return pd.concat([x.reset_index(drop=True), y.reset_index(drop=True)], axis=1)
+    return x
+
+
 class HopsworksChecker:
     """Checker over the run's Hopsworks project. The runner exports
     HOPSWORKS_PROJECT (the name setup.py created), so we log in to THAT project
@@ -130,7 +149,22 @@ class HopsworksChecker:
         if fv is None:
             raise LookupError(f"feature view {name!r} not found")
 
-        got = fv.get_training_data(training_dataset_version=version)
+        try:
+            got = fv.get_training_data(training_dataset_version=version)
+        except Exception as e:
+            # A training dataset materialized as a train/test (or train/val/test)
+            # SPLIT refuses get_training_data — hsfs raises "Use
+            # feature_view.get_train_test_split / get_train_validation_test_split
+            # instead". Fall back to the split getter and reassemble the full
+            # frame; anything else is a real read failure.
+            msg = str(e)
+            if "get_train_test_split" in msg:
+                got = fv.get_train_test_split(training_dataset_version=version)
+                return _reassemble_split(got, n_splits=2)
+            if "get_train_validation_test_split" in msg:
+                got = fv.get_train_validation_test_split(training_dataset_version=version)
+                return _reassemble_split(got, n_splits=3)
+            raise
         # hsfs returns (X, y); y is None/empty when the view declares no labels.
         if isinstance(got, tuple):
             x, y = got[0], (got[1] if len(got) > 1 else None)
@@ -251,17 +285,48 @@ def _state_reads(cls):
             return {"exists": False, "error": str(e)}
 
     def get_alert(self, name_or_hint: str) -> dict:
-        """Alert routes/triggers are project-level config in Hopsworks; report
-        whether ANY job alert exists (best-effort: the alerts API surface
-        varies by version)."""
+        """Whether an alert covering the job `name_or_hint` exists. Reads through
+        the SDK alerts API (`project.get_alerts_api()`) — the supported surface.
+        (The previous hand-rolled `project/<id>/service/alerts` REST path was
+        wrong: it returned an empty body without erroring, so this assert was a
+        false negative whenever an alert genuinely existed.)
+
+        First the precise per-job query (`get_job_alerts`); on miss, scan all
+        project alerts for one that mentions the job (project-scoped job alerts
+        fire for every job and may not name it, so any job alert also counts)."""
         try:
-            c_mod = __import__("hopsworks_common.client", fromlist=["client"])
-            c = c_mod.get_instance()
-            res = c._send_request("GET", ["project", self._project.id, "service", "alerts"]) or {}
-            items = res.get("items") or res.get("alerts") or []
-            return {"exists": bool(items), "count": len(items)}
+            aa = self._project.get_alerts_api()
         except Exception as e:
             return {"exists": False, "error": str(e)}
+
+        # Precise: alerts attached to / covering this job.
+        try:
+            job_alerts = list(aa.get_job_alerts(name_or_hint) or [])
+        except Exception:
+            job_alerts = []
+        if job_alerts:
+            return {"exists": True, "count": len(job_alerts)}
+
+        # Fallback: any project alert mentioning the job (or any job alert at all,
+        # since a project-scoped job alert covers this job without naming it).
+        try:
+            alla = list(aa.get_alerts() or [])
+        except Exception as e:
+            return {"exists": False, "error": str(e)}
+        hint = (name_or_hint or "").lower()
+
+        def _mentions(a) -> bool:
+            hay = " ".join(
+                str(getattr(a, k, "") or "")
+                for k in ("job_name", "name", "receiver", "description", "entity", "service")
+            ).lower()
+            return bool(hint) and hint in hay
+
+        matched = [a for a in alla if _mentions(a)]
+        if matched:
+            return {"exists": True, "count": len(matched)}
+        job_kind = [a for a in alla if "job" in str(getattr(a, "service", "") or "").lower()]
+        return {"exists": bool(job_kind), "count": len(job_kind)}
 
     def get_vector_store(self, name: str) -> dict:
         """Vector store realization on Hopsworks: the embedding index lives ON

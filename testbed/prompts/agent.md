@@ -8,6 +8,8 @@ Do NOT take notes or write memory/journal files (no `CLAUDE.md`, no `.claude/`
 memory, no scratch "lessons learned" files): nothing persists beyond this run,
 so it is wasted effort. Produce only the task's deliverable.
 
+{time_budget}
+
 ## Task
 
 {task_body}

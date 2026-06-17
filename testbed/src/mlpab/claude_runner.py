@@ -423,6 +423,35 @@ def text_is_transient_error(text: str) -> bool:
     t = (text or "").lower()
     return any(p in t for p in _TRANSIENT_PHRASES) or bool(_TRANSIENT_CODE_RE.search(t))
 
+
+# Transport disconnects between Claude Code and the Anthropic API: the request
+# socket drops mid-run (the Node/undici fetch error "socket connection was
+# closed unexpectedly", a TLS reset, a hang-up). Distinct from rate-limit/5xx
+# (those return a structured result error and ride the 6h back-off window): a
+# disconnect is an instantaneous network blip, so we retry a small fixed number
+# of times with a short back-off, restarting `claude -p` fresh (same as a
+# rate-limit retry). The phrases are SPECIFIC to the Node transport layer so
+# platform output echoed back in a tool result (e.g. a server-side
+# "Connection closed." log line) can never trip a retry.
+_DISCONNECT_PHRASES = (
+    "socket connection was closed unexpectedly",
+    "socket hang up",
+    "econnreset",
+    "connection reset by peer",
+    "client network socket disconnected",
+    "network socket disconnected before secure tls connection was established",
+)
+DISCONNECT_RETRY_MAX_ATTEMPTS = 3
+DISCONNECT_BACKOFF_S = 5
+
+
+def text_is_disconnect_error(text: str) -> bool:
+    """True if `text` names a Claude<->API transport disconnect worth a quick
+    bounded retry. The phrases are specific to the Node transport layer, so
+    platform output echoed in a tool result does not match."""
+    t = (text or "").lower()
+    return any(p in t for p in _DISCONNECT_PHRASES)
+
 # Auth failures. The injected CLAUDE_CODE_OAUTH_TOKEN can expire mid-session on a
 # long run (a multi-hour session once died on a 401). On these we re-pull a
 # fresh token from the Keychain (Claude Code refreshes it there) and retry a
@@ -861,6 +890,7 @@ def run_with_retry(
     start = time.monotonic()
     attempt = 0
     auth_attempts = 0
+    disconnect_attempts = 0  # transport-disconnect retries — bounded, like auth
     rl_attempts = 0  # rate-limit retries only — drives the backoff exponent
     rl_wait_s = 0.0  # total back-off sleep — returned so wall − wait = compute
     exit_code = 1
@@ -958,6 +988,28 @@ def run_with_retry(
                 f"fresh Keychain token, retrying.",
                 flush=True,
             )
+            continue
+        # Transport disconnect (the socket between Claude Code and the API closed
+        # / reset mid-run): restart `claude -p` fresh after a short back-off,
+        # bounded so a persistent network fault can't loop. Checked before the
+        # rate-limit branch — a disconnect is not a 429/5xx and must not ride the
+        # 6h back-off window. The signal is read off the structured result error
+        # AND the transcript/stderr tails (the Node fetch error can surface as a
+        # streamed line rather than a clean result error), matching only the
+        # transport-specific phrases so platform output never trips it.
+        if (
+            _attempt_is_disconnect(transcript_path, err_tmp_path)
+            and disconnect_attempts < DISCONNECT_RETRY_MAX_ATTEMPTS
+        ):
+            disconnect_attempts += 1
+            print(
+                f"[{log_prefix}] transport disconnect on attempt {attempt} "
+                f"(disconnect-retry {disconnect_attempts}/{DISCONNECT_RETRY_MAX_ATTEMPTS}); "
+                f"sleeping {DISCONNECT_BACKOFF_S}s before a fresh retry.",
+                flush=True,
+            )
+            time.sleep(DISCONNECT_BACKOFF_S)
+            rl_wait_s += DISCONNECT_BACKOFF_S  # waiting != computing
             continue
         if not _last_result_is_rate_limited(transcript_path):
             break
@@ -1204,6 +1256,21 @@ def _last_result_is_auth_error(transcript_path: Path) -> bool:
     """The last `result` stopped on a 401/authentication condition."""
     blob = _last_result_error_blob(transcript_path)
     return bool(blob) and any(t in blob for t in _AUTH_ERROR_TOKENS)
+
+
+def _attempt_is_disconnect(transcript_path: Path, stderr_path: Path) -> bool:
+    """A transport disconnect surfaced this attempt. Checked on the structured
+    result error blob first, then the transcript and stderr TAILS — Claude
+    Code's Node fetch error often lands as a streamed line (it printed to the
+    agent log) or on stderr rather than as a clean `result` error. The
+    disconnect phrases are transport-specific, so scanning the transcript tail
+    (which also carries tool-result text) cannot match platform output."""
+    blob = _last_result_error_blob(transcript_path)
+    if blob and text_is_disconnect_error(blob):
+        return True
+    return text_is_disconnect_error(_read_tail(transcript_path)) or text_is_disconnect_error(
+        _read_tail(stderr_path)
+    )
 
 
 def _refresh_oauth_token(env: dict[str, str]) -> bool:

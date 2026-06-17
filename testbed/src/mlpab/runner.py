@@ -429,6 +429,7 @@ def _build_prompt(
     task_body: str,
     fragment: str,
     interface_under_test: bool = True,
+    max_seconds: int | None = None,
 ) -> str:
     template = TASK_PROMPT_PATH.read_text()
     if interface_under_test:
@@ -438,12 +439,19 @@ def _build_prompt(
         template = _UNDER_TEST_RE.sub("", template)
         template = _LOCAL_ONLY_RE.sub(lambda m: m.group(1), template)
     template = re.sub(r"\n{3,}", "\n\n", template)
+    # Compute budget for the run (wall clock minus rate-limit back-off waits).
+    # None → no fixed cap.
+    if max_seconds is not None:
+        time_budget = f"You have {max_seconds} seconds for this task."
+    else:
+        time_budget = "You have no fixed time limit for this task."
     # The agent never receives platform docs — its only guide is the
     # interface's own self-description.
     return template.format(
         task_body=task_body.strip(),
         fragment=fragment,
         environment=detect_environment(),
+        time_budget=time_budget,
     ).strip()
 
 
@@ -623,6 +631,7 @@ def run(spec: RunSpec) -> results.Row:
             task_body,
             interface_setup.prompt_fragment,
             interface_under_test=interface_setup.interface != "none",
+            max_seconds=spec.timeout_s,
         )
         (run_dir / "prompt.txt").write_text(prompt)
 

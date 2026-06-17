@@ -308,7 +308,11 @@ class AgentEnvConstructionTests(unittest.TestCase):
     def test_keychain_token_injected_when_auth_login(self):
         # Redirected HOME → claude cannot reach the Keychain itself; the
         # runner injects the freshest resolvable token (re-read every run).
-        env = self._invoke(auth="login", token="sk-ant-oat01-TOKEN")["env"]
+        # Clear the ambient env: resolve_oauth_token() checks
+        # CLAUDE_CODE_OAUTH_TOKEN there FIRST, so a host token (e.g. a .env
+        # long-lived token) would otherwise win over the mocked Keychain value.
+        with mock.patch.dict(os.environ, {}, clear=True):
+            env = self._invoke(auth="login", token="sk-ant-oat01-TOKEN")["env"]
         self.assertEqual(env["CLAUDE_CODE_OAUTH_TOKEN"], "sk-ant-oat01-TOKEN")
         self.assertNotIn("ANTHROPIC_API_KEY", env)  # login strips it
 
@@ -361,7 +365,9 @@ class AgentEnvConstructionTests(unittest.TestCase):
         self.assertEqual(captured["env"]["CLAUDE_CODE_OAUTH_TOKEN"], "sk-ant-oat01-INHERITED")
 
     def test_api_key_auth_keeps_api_key_and_injects_oauth_fallback(self):
-        with mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-ant-api01-USER"}, clear=False):
+        # clear=True so a host CLAUDE_CODE_OAUTH_TOKEN can't beat the mocked
+        # Keychain fallback (resolve_oauth_token() reads the env first).
+        with mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-ant-api01-USER"}, clear=True):
             env = self._invoke(auth="api-key", token="sk-ant-oat01-FALLBACK")["env"]
         self.assertEqual(env["ANTHROPIC_API_KEY"], "sk-ant-api01-USER")
         self.assertEqual(env["CLAUDE_CODE_OAUTH_TOKEN"], "sk-ant-oat01-FALLBACK")
