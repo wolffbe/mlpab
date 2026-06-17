@@ -26,6 +26,7 @@ names instead.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import zlib
@@ -205,6 +206,10 @@ def grade(task: str, run_dir: Path, platform: str, venv_python: Path) -> dict[st
             text=True,
             timeout=600,
             cwd=str(run_dir),
+            # PYTHONSAFEPATH stops Python prepending cwd (the agent workspace) to
+            # sys.path under `-m`, so agent-authored files (e.g. a bisect.py) can't
+            # shadow stdlib/dependency modules the grader itself imports.
+            env={**os.environ, "PYTHONSAFEPATH": "1"},
         )
     except Exception as e:
         return _plumbing_error(f"grader failed to run: {e}")
