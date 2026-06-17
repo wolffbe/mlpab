@@ -23,11 +23,21 @@ import argparse
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 import pandas as pd
 
 from evals.adapters import TableInfo
+from evals.common import FETCH_BACKOFF_CAP_S, FETCH_BACKOFF_S, FETCH_RETRIES
+
+
+def _looks_missing(exc: Exception) -> bool:
+    """True when a metadata lookup error means the resource genuinely ISN'T
+    there (a deterministic 404), vs a transient REST/connection blip. Only the
+    former should be reported as absent; the latter is retried."""
+    m = str(exc).lower()
+    return "not found" in m or "could not find" in m or "does not exist" in m
 
 
 def _reassemble_split(parts, n_splits: int) -> pd.DataFrame:
@@ -66,12 +76,22 @@ class HopsworksChecker:
     # -- feature tables ----------------------------------------------------
 
     def _get_fg(self, name: str, version: int | None = None):
-        try:
-            fg = self._fs.get_feature_group(name, version=version)
-        except Exception:
-            return None
-        # Some client versions return None instead of raising on a miss.
-        return fg
+        # Distinguish a genuine miss from a transient metadata-read flake. A
+        # "not found" error (or a None return — some client versions don't raise
+        # on a miss) means the FG genuinely isn't there → report absence at once.
+        # ANY OTHER error is a transient REST/connection blip on the lookup →
+        # retry with backoff before concluding absence, so a flake is never
+        # reported as "feature table not found" (which would count an existing
+        # deliverable against the model). Mirrors the read_with_retry policy.
+        for attempt in range(1, FETCH_RETRIES + 1):
+            try:
+                return self._fs.get_feature_group(name, version=version)
+            except Exception as e:  # noqa: BLE001
+                if _looks_missing(e):
+                    return None  # deterministic miss — retrying cannot change it
+                if attempt < FETCH_RETRIES:
+                    time.sleep(min(FETCH_BACKOFF_S * 2 ** (attempt - 1), FETCH_BACKOFF_CAP_S))
+        return None  # transient errors never cleared — best-effort: treat as absent
 
     def get_feature_table(self, name: str, version: int | None = None) -> TableInfo | None:
         fg = self._get_fg(name, version)
