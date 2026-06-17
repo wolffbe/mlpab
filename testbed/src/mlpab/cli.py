@@ -172,6 +172,16 @@ def main() -> None:
     help="Skip the overwrite prompt when this config's results dir "
     "already exists (it will be replaced).",
 )
+@click.option(
+    "--skip/--no-skip",
+    "skip_existing",
+    default=True,
+    show_default=True,
+    help="On a restart, SKIP any combo that already has a completed "
+    "(valid=True) row in results.csv; only run the missing or failed "
+    "(valid=False) ones. --no-skip runs every combo and accumulates a new "
+    "attempt (n+1), the old behavior. Treatment configs only.",
+)
 def run(
     config: str | None,
     task: str | None,
@@ -185,12 +195,13 @@ def run(
     runs_root: Path,
     quiet: bool,
     yes: bool,
+    skip_existing: bool,
 ) -> None:
     """Run a treatment CONFIG, or a single task."""
     if quiet:
         os.environ["MLPAB_QUIET"] = "1"
     if config is not None:
-        _dispatch_config(Path(config), runs_root, assume_yes=yes)
+        _dispatch_config(Path(config), runs_root, assume_yes=yes, skip_existing=skip_existing)
         return
 
     if task is None:
@@ -224,7 +235,12 @@ def run(
     )
 
 
-def _dispatch_config(config_path: Path, runs_root: Path, assume_yes: bool = False) -> None:
+def _dispatch_config(
+    config_path: Path,
+    runs_root: Path,
+    assume_yes: bool = False,
+    skip_existing: bool = True,
+) -> None:
     """Run a treatment config. The config FILENAME STEM labels the results
     folder and the CSV `config` column — treatment configs are platform-prefixed
     (hopsworks-opus-4-8-skills.yaml, local-haiku-4-5.yaml), so stems are unique."""
@@ -236,7 +252,9 @@ def _dispatch_config(config_path: Path, runs_root: Path, assume_yes: bool = Fals
     from mlpab import treatments as tr_mod
 
     cfg = tr_mod.load_config(config_path.resolve())
-    tr_mod.run_treatments(cfg, rr, config_name=config_name, assume_yes=assume_yes)
+    tr_mod.run_treatments(
+        cfg, rr, config_name=config_name, assume_yes=assume_yes, skip_existing=skip_existing
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -298,7 +316,15 @@ def _free_session_name(config_path: Path) -> str:
     default=False,
     help="Start detached without attaching (just print how to attach).",
 )
-def start(config: Path, no_attach: bool) -> None:
+@click.option(
+    "--skip/--no-skip",
+    "skip_existing",
+    default=True,
+    show_default=True,
+    help="Forwarded to `run`: --skip resumes (skips completed combos), "
+    "--no-skip runs every combo and accumulates a new attempt (n+1).",
+)
+def start(config: Path, no_attach: bool, skip_existing: bool) -> None:
     """Run CONFIG in a tmux session (survives terminal exits) and attach to it.
 
     The session is created detached, so it keeps running even after you detach
@@ -318,7 +344,10 @@ def start(config: Path, no_attach: bool) -> None:
     # Explicit `run` subcommand (not the `mlpab <config>` shorthand) and shell-
     # quoted args, so ANY config path starts cleanly regardless of its name or
     # spaces/quotes — the detached session has no shell of ours to lean on.
-    inner = f"{shlex.quote(str(mlpab_bin))} run {shlex.quote(str(config.resolve()))}"
+    skip_flag = "--skip" if skip_existing else "--no-skip"
+    inner = (
+        f"{shlex.quote(str(mlpab_bin))} run {skip_flag} {shlex.quote(str(config.resolve()))}"
+    )
     subprocess.run(
         [
             "tmux",

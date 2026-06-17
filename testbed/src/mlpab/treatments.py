@@ -49,6 +49,7 @@ Config format (YAML):
 from __future__ import annotations
 
 import os
+import shutil
 import sys
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -317,6 +318,7 @@ def run_treatments(
     runs_root: Path,
     config_name: str | None = None,
     assume_yes: bool = False,  # kept for CLI compat; runs ACCUMULATE, never prompt
+    skip_existing: bool = True,
 ) -> None:
     total = len(config.runs) * config.repeats
     if total == 0:
@@ -445,9 +447,36 @@ def run_treatments(
     # scheme raced once two runs of the same combo ran at once. We seed each
     # leaf's counter from the on-disk max so re-running a config still
     # accumulates (n+1) across separate invocations.
+    # Classify this config's existing rows by combo identity (everything but the
+    # repeat `n`), scoped to THIS config_name so another config's rows never mask
+    # a combo:
+    #   * done — has at least one COMPLETED (valid=True) attempt.
+    #   * dead — has rows but NONE valid=True (the agent died, timed out, or never
+    #     produced a deliverable). Dead runs are always removed and re-run clean.
+    valid_by_combo: dict[tuple[str, ...], bool] = {}
+    for r in results._read_runs(global_csv):
+        if r.get("config") != run_id:
+            continue
+        key = results.combo_key(r)
+        is_valid = str(r.get("valid", "")).strip().lower() == "true"
+        valid_by_combo[key] = valid_by_combo.get(key, False) or is_valid
+    done_combos = {k for k, ok in valid_by_combo.items() if ok}
+    dead_combos = {k for k, ok in valid_by_combo.items() if not ok}
+
+    # A dead combo carries no usable result: purge its stale CSV rows (its on-disk
+    # attempt dirs are removed in the plan loop below) so the re-run replaces it
+    # cleanly instead of accumulating a fresh attempt beside the corpse. This is
+    # unconditional — dead runs are always removed and re-run, under --skip and
+    # --no-skip alike.
+    pruned = results.prune_runs(global_csv, run_id, dead_combos)
+    if pruned:
+        print(f"[mlpab] removed {pruned} dead run row(s) — they will be re-run.", flush=True)
+
     expanded = [e for e in config.runs for _ in range(config.repeats)]
     next_attempt: dict[Path, int] = {}
+    cleaned_dead: set[Path] = set()
     plan: list[tuple[runner.RunSpec, str]] = []
+    skipped = 0
     for entry in expanded:
         # Nest by model/platform/interface/version/skills — the results.csv identity
         # columns — so no two combos share a <category>/<task> dir. The version
@@ -460,11 +489,30 @@ def run_treatments(
             version_seg = interfaces.interface_ref(
                 interfaces.load_manifest(entry.platform, entry.interface)
             )
+        combo_key = (
+            entry.model,
+            entry.platform,
+            entry.interface,
+            version_seg,
+            entry.skills or "none",
+            entry.category,
+            entry.task,
+        )
+        if skip_existing and combo_key in done_combos:
+            skipped += 1
+            continue
         skills_seg = entry.skills if entry.skills and entry.skills != "none" else "no-skills"
         leaf_root = (
             run_path / entry.model / entry.platform / entry.interface / version_seg / skills_seg
         )
         task_dir = leaf_root / entry.category / entry.task
+        # A dead combo's stale CSV rows were already pruned; clear its on-disk
+        # attempt dirs too (once) so the re-run starts at attempt 1 and fully
+        # replaces the corpse instead of accumulating beside it.
+        if combo_key in dead_combos and task_dir not in cleaned_dead:
+            cleaned_dead.add(task_dir)
+            if task_dir.is_dir():
+                shutil.rmtree(task_dir)
         if task_dir not in next_attempt:
             existing = (
                 [int(d.name) for d in task_dir.iterdir() if d.is_dir() and d.name.isdigit()]
@@ -490,6 +538,20 @@ def run_treatments(
             results_csv=global_csv,  # the ONE results CSV, appended per run
         )
         plan.append((spec, f"{entry.model} | {entry.task} | {entry.platform}/{entry.interface}"))
+
+    # --skip dropped already-completed combos: the real workload is the plan, so
+    # progress counters and concurrency size off it (not the pre-skip total).
+    if skipped:
+        print(
+            f"[mlpab] --skip: {skipped}/{total} combo(s) already completed "
+            f"(valid=True) — running the remaining {len(plan)}.",
+            flush=True,
+        )
+    total = len(plan)
+    if total == 0:
+        print("[mlpab] nothing to run — every combo already completed (use --no-skip to rerun).")
+        _print_summary(completed, failed, global_csv)
+        return
 
     concurrency = min(max(1, config.concurrency), total)
 

@@ -151,6 +151,52 @@ def _read_runs(csv_path: Path) -> list[dict[str, str]]:
         return list(csv.DictReader(f))
 
 
+# The identity columns that name one combo (everything except the repeat `n`).
+# A combo's results dir mirrors these, so this is the join key between a CSV row
+# and an on-disk attempt folder.
+COMBO_KEY_COLUMNS: tuple[str, ...] = (
+    "model",
+    "platform",
+    "interface",
+    "version",
+    "skills",
+    "category",
+    "task",
+)
+
+
+def combo_key(row: dict[str, str]) -> tuple[str, ...]:
+    """The combo identity of a CSV row: the COMBO_KEY_COLUMNS values, with an
+    empty `skills` normalized to "none" (the config's literal `skills: none`)."""
+    return tuple(
+        (row.get(c, "") or "none") if c == "skills" else row.get(c, "")
+        for c in COMBO_KEY_COLUMNS
+    )
+
+
+def prune_runs(csv_path: Path, config: str, combo_keys: set[tuple[str, ...]]) -> int:
+    """Drop rows of `config` whose combo identity is in `combo_keys`; return the
+    count removed. Used by --skip to purge DEAD combos (no valid=True attempt) so
+    a restart re-runs them clean instead of leaving a stale row beside the retry.
+    Cross-process safe (same lock + atomic replace as `append`/`roll_up`)."""
+    if not combo_keys or not csv_path.exists():
+        return 0
+    with _locked_csv(csv_path):
+        rows = _read_runs(csv_path)
+        if not rows:
+            return 0
+        fieldnames = list(rows[0].keys())
+        kept = [
+            r
+            for r in rows
+            if not (r.get("config") == config and combo_key(r) in combo_keys)
+        ]
+        removed = len(rows) - len(kept)
+        if removed:
+            _write_csv_atomic(csv_path, fieldnames, kept)
+        return removed
+
+
 def _num_col(runs: list[dict[str, str]], key: str) -> list[float]:
     out: list[float] = []
     for r in runs:
