@@ -243,7 +243,7 @@ class ConfigTomlTests(unittest.TestCase):
 class RateLimitDetectionTests(unittest.TestCase):
     """`_rate_limited` decides whether a failed codex run gets retried with
     back-off. It must fire on transient/rate-limit conditions and NOT on ordinary
-    failures (which would burn the 6h retry window for nothing)."""
+    failures (which would burn the 5h15m retry window for nothing)."""
 
     def _files(self, raw_lines, stderr=""):
         d = Path(tempfile.mkdtemp())

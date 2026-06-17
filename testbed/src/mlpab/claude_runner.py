@@ -377,8 +377,10 @@ def resolve_oauth_token() -> str | None:
 
 # Rate-limit / transient-error retry budget. On a matching exit-error we exp-
 # backoff up to RATE_LIMIT_MAX_BACKOFF_S and retry until total wall-clock reaches
-# RATE_LIMIT_RETRY_WINDOW_S, then give up.
-RATE_LIMIT_RETRY_WINDOW_S = 6 * 3600
+# RATE_LIMIT_RETRY_WINDOW_S, then give up. 5h15m matches codex's weekly-limit
+# window (WEEKLY_LIMIT_RETRY_WINDOW_S): the ~5h reset window plus a 15-minute
+# margin to be sure we cross the boundary. mistral inherits this default too.
+RATE_LIMIT_RETRY_WINDOW_S = 5 * 3600 + 15 * 60
 RATE_LIMIT_BASE_BACKOFF_S = 2
 RATE_LIMIT_MAX_BACKOFF_S = 3600
 
@@ -390,7 +392,7 @@ RATE_LIMIT_MAX_BACKOFF_S = 3600
 #   * PHRASES — substring match (unambiguous; e.g. "rate limit", "overloaded").
 #   * CODES — WORD-BOUNDARY match only. A bare "in" check would fire on any
 #     number containing the code ("429" inside a request id "req_4290", "529"
-#     inside "gpt-5290"), dragging permanent failures into the 6h retry loop;
+#     inside "gpt-5290"), dragging permanent failures into the 5h15m retry loop;
 #     `\b429\b` matches "status 429" but not "4290".
 # NOTE: quota exhaustion is NOT transient (it won't clear within the retry
 # window), so "quota" is deliberately absent.
@@ -1123,7 +1125,7 @@ def run_streaming_with_backoff(
       down. Exhausting the budget yields exit 124.
     - On a non-zero exit whose events/stderr look rate-limited (per
       `is_rate_limited`), sleeps `min(2 * 2^(n-1), 3600)`s and retries until the
-      6h `RATE_LIMIT_RETRY_WINDOW_S` is spent.
+      5h15m `RATE_LIMIT_RETRY_WINDOW_S` is spent.
 
     Returns `(exit_code, total_wall_time_s, rate_limit_wait_s)` — `wall` includes
     sleep time; subtract `wait` for compute time (mirrors `run_with_retry`).
