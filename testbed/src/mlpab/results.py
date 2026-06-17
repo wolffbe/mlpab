@@ -537,12 +537,24 @@ _LITELLM_ALIASES = {
 }
 
 
-def usd_cost(model: str | None, input_tokens: int, output_tokens: int) -> float | None:
+def usd_cost(
+    model: str | None,
+    input_tokens: int,
+    output_tokens: int,
+    cache_read_input_tokens: int = 0,
+) -> float | None:
     """Token→USD via litellm — uniform across every agent engine. Tries the model
     id as-is, its litellm-canonical alias, and a generic `mistral/<id>` form (the
     claude-*/gpt-* ids litellm ships directly; mistral-* are priced under the
     `mistral/` provider prefix). None if litellm can't price it — the caller then
-    keeps any engine-reported cost (e.g. Claude Code's `total_cost_usd`)."""
+    keeps any engine-reported cost (e.g. Claude Code's `total_cost_usd`).
+
+    `cache_read_input_tokens` is the cache-hit subset of `input_tokens` (NOT a
+    separate addend); litellm rebills that portion at the model's discounted
+    cache-read rate. Only pass it when `input_tokens` is cache-INCLUSIVE — codex
+    reports it that way, so without this the cached bulk (≈90% on long runs) is
+    billed at the full input rate. Claude's `input_tokens` already EXCLUDES cache,
+    so its caller passes 0 here."""
     if not model:
         return None
     if int(input_tokens) == 0 and int(output_tokens) == 0:
@@ -561,7 +573,10 @@ def usd_cost(model: str | None, input_tokens: int, output_tokens: int) -> float 
             continue
         try:
             pin, pout = litellm.cost_per_token(
-                model=cand, prompt_tokens=int(input_tokens), completion_tokens=int(output_tokens)
+                model=cand,
+                prompt_tokens=int(input_tokens),
+                completion_tokens=int(output_tokens),
+                cache_read_input_tokens=int(cache_read_input_tokens) or None,
             )
             cost = round(float(pin) + float(pout), 6)
         except Exception:
@@ -632,7 +647,16 @@ def parse_transcript_usage(transcript_path: Path, model: str | None = None) -> d
 
     # Cost via litellm (uniform across engines); keep the transcript's own
     # total_cost_usd only when litellm can't price the model.
-    cost = usd_cost(model, totals["input_tokens"], totals["output_tokens"])
+    # Discount cached input ONLY when input_tokens is cache-inclusive (codex
+    # reports it that way). Claude's input_tokens excludes cache, so its
+    # cache_read (≫ input_tokens) fails the guard and is dropped — leaving
+    # Claude's pricing unchanged.
+    cache_read = 0
+    if final_result:
+        cr = int((final_result.get("usage") or {}).get("cache_read_input_tokens") or 0)
+        if cr <= totals["input_tokens"]:
+            cache_read = cr
+    cost = usd_cost(model, totals["input_tokens"], totals["output_tokens"], cache_read)
     if cost is not None:
         totals["cost_usd"] = cost
     return totals

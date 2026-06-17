@@ -141,7 +141,7 @@ def normalize_events(raw_path: Path, transcript_path: Path) -> None:
     """Rewrite raw `codex exec --json` events as a Claude-style stream-json
     transcript: one `assistant` event per tool call, one final `result` event
     with summed usage + turn count."""
-    input_tokens = output_tokens = num_turns = 0
+    input_tokens = output_tokens = cached_input_tokens = num_turns = 0
     session_id: str | None = None
     out_lines: list[str] = []
     if raw_path.exists():
@@ -160,6 +160,10 @@ def normalize_events(raw_path: Path, transcript_path: Path) -> None:
                 usage = event.get("usage") or {}
                 input_tokens += int(usage.get("input_tokens") or 0)
                 output_tokens += int(usage.get("output_tokens") or 0)
+                # codex's input_tokens is cache-INCLUSIVE; carry the cached
+                # subset so `usd_cost` can rebill it at the cache-read rate
+                # (else the ~90% cached bulk is charged at full input price).
+                cached_input_tokens += int(usage.get("cached_input_tokens") or 0)
                 num_turns += 1
                 continue
             if etype == "item.completed":
@@ -202,7 +206,11 @@ def normalize_events(raw_path: Path, transcript_path: Path) -> None:
             {
                 "type": "result",
                 "session_id": session_id,
-                "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
+                "usage": {
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "cache_read_input_tokens": cached_input_tokens,
+                },
                 "num_turns": num_turns,
                 # codex --json carries no cost; cost_usd stays 0 for codex rows.
                 "total_cost_usd": 0.0,
