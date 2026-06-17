@@ -177,10 +177,20 @@ def main() -> None:
     "skip_existing",
     default=True,
     show_default=True,
-    help="On a restart, SKIP any combo that already has a completed "
-    "(valid=True) row in results.csv; only run the missing or failed "
-    "(valid=False) ones. --no-skip runs every combo and accumulates a new "
-    "attempt (n+1), the old behavior. Treatment configs only.",
+    help="On a restart, SKIP any combo that already has a row in results.csv "
+    "(completed OR failed) and run only the missing ones. --no-skip runs every "
+    "combo and accumulates a new attempt (n+1), the old behavior. Treatment "
+    "configs only.",
+)
+@click.option(
+    "--retry",
+    is_flag=True,
+    default=False,
+    show_default=True,
+    help="With --skip: also re-run FAILED combos (no valid=True row) — purge "
+    "their stale rows + attempt dirs and run them clean. Completed (valid=True) "
+    "combos are still skipped. Off by default, so a plain restart never redoes a "
+    "failed run.",
 )
 def run(
     config: str | None,
@@ -196,12 +206,15 @@ def run(
     quiet: bool,
     yes: bool,
     skip_existing: bool,
+    retry: bool,
 ) -> None:
     """Run a treatment CONFIG, or a single task."""
     if quiet:
         os.environ["MLPAB_QUIET"] = "1"
     if config is not None:
-        _dispatch_config(Path(config), runs_root, assume_yes=yes, skip_existing=skip_existing)
+        _dispatch_config(
+            Path(config), runs_root, assume_yes=yes, skip_existing=skip_existing, retry=retry
+        )
         return
 
     if task is None:
@@ -240,6 +253,7 @@ def _dispatch_config(
     runs_root: Path,
     assume_yes: bool = False,
     skip_existing: bool = True,
+    retry: bool = False,
 ) -> None:
     """Run a treatment config. The config FILENAME STEM labels the results
     folder and the CSV `config` column — treatment configs are platform-prefixed
@@ -253,7 +267,12 @@ def _dispatch_config(
 
     cfg = tr_mod.load_config(config_path.resolve())
     tr_mod.run_treatments(
-        cfg, rr, config_name=config_name, assume_yes=assume_yes, skip_existing=skip_existing
+        cfg,
+        rr,
+        config_name=config_name,
+        assume_yes=assume_yes,
+        skip_existing=skip_existing,
+        retry=retry,
     )
 
 
@@ -321,10 +340,18 @@ def _free_session_name(config_path: Path) -> str:
     "skip_existing",
     default=True,
     show_default=True,
-    help="Forwarded to `run`: --skip resumes (skips completed combos), "
+    help="Forwarded to `run`: --skip resumes (skips any existing combo), "
     "--no-skip runs every combo and accumulates a new attempt (n+1).",
 )
-def start(config: Path, no_attach: bool, skip_existing: bool) -> None:
+@click.option(
+    "--retry",
+    is_flag=True,
+    default=False,
+    show_default=True,
+    help="Forwarded to `run`: with --skip, also re-run FAILED combos (purge + "
+    "rerun); completed combos stay skipped.",
+)
+def start(config: Path, no_attach: bool, skip_existing: bool, retry: bool) -> None:
     """Run CONFIG in a tmux session (survives terminal exits) and attach to it.
 
     The session is created detached, so it keeps running even after you detach
@@ -345,8 +372,10 @@ def start(config: Path, no_attach: bool, skip_existing: bool) -> None:
     # quoted args, so ANY config path starts cleanly regardless of its name or
     # spaces/quotes — the detached session has no shell of ours to lean on.
     skip_flag = "--skip" if skip_existing else "--no-skip"
+    retry_flag = " --retry" if retry else ""
     inner = (
-        f"{shlex.quote(str(mlpab_bin))} run {skip_flag} {shlex.quote(str(config.resolve()))}"
+        f"{shlex.quote(str(mlpab_bin))} run {skip_flag}{retry_flag} "
+        f"{shlex.quote(str(config.resolve()))}"
     )
     subprocess.run(
         [

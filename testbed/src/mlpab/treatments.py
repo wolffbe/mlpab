@@ -319,6 +319,7 @@ def run_treatments(
     config_name: str | None = None,
     assume_yes: bool = False,  # kept for CLI compat; runs ACCUMULATE, never prompt
     skip_existing: bool = True,
+    retry: bool = False,
 ) -> None:
     total = len(config.runs) * config.repeats
     if total == 0:
@@ -451,8 +452,8 @@ def run_treatments(
     # repeat `n`), scoped to THIS config_name so another config's rows never mask
     # a combo:
     #   * done — has at least one COMPLETED (valid=True) attempt.
-    #   * dead — has rows but NONE valid=True (the agent died, timed out, or never
-    #     produced a deliverable). Dead runs are always removed and re-run clean.
+    #   * failed — has rows but NONE valid=True (agent died, timed out, or never
+    #     produced a deliverable).
     valid_by_combo: dict[tuple[str, ...], bool] = {}
     for r in results._read_runs(global_csv):
         if r.get("config") != run_id:
@@ -461,16 +462,19 @@ def run_treatments(
         is_valid = str(r.get("valid", "")).strip().lower() == "true"
         valid_by_combo[key] = valid_by_combo.get(key, False) or is_valid
     done_combos = {k for k, ok in valid_by_combo.items() if ok}
-    dead_combos = {k for k, ok in valid_by_combo.items() if not ok}
+    failed_combos = {k for k, ok in valid_by_combo.items() if not ok}
 
-    # A dead combo carries no usable result: purge its stale CSV rows (its on-disk
-    # attempt dirs are removed in the plan loop below) so the re-run replaces it
-    # cleanly instead of accumulating a fresh attempt beside the corpse. This is
-    # unconditional — dead runs are always removed and re-run, under --skip and
-    # --no-skip alike.
-    pruned = results.prune_runs(global_csv, run_id, dead_combos)
-    if pruned:
-        print(f"[mlpab] removed {pruned} dead run row(s) — they will be re-run.", flush=True)
+    # --retry: a failed combo carries no usable result, so purge its stale CSV
+    # rows (its on-disk attempt dirs are removed in the plan loop below) and
+    # re-run it clean. WITHOUT --retry the default --skip leaves failed combos
+    # exactly as-is (skipped like any other existing row); only a missing combo
+    # runs. So `retry_combos` (the set we purge + re-run) is the failed set under
+    # --retry and empty otherwise.
+    retry_combos = failed_combos if retry else set()
+    if retry:
+        pruned = results.prune_runs(global_csv, run_id, retry_combos)
+        if pruned:
+            print(f"[mlpab] --retry: removed {pruned} failed run row(s) — re-running them.", flush=True)
 
     expanded = [e for e in config.runs for _ in range(config.repeats)]
     next_attempt: dict[Path, int] = {}
@@ -498,7 +502,11 @@ def run_treatments(
             entry.category,
             entry.task,
         )
-        if skip_existing and combo_key in done_combos:
+        # Default --skip leaves EVERY existing combo alone (done or failed); only
+        # --retry pulls failed combos back out for a re-run, so they fall through
+        # this skip into the plan below.
+        skip_combos = done_combos if retry else (done_combos | failed_combos)
+        if skip_existing and combo_key in skip_combos:
             skipped += 1
             continue
         skills_seg = entry.skills if entry.skills and entry.skills != "none" else "no-skills"
@@ -506,10 +514,10 @@ def run_treatments(
             run_path / entry.model / entry.platform / entry.interface / version_seg / skills_seg
         )
         task_dir = leaf_root / entry.category / entry.task
-        # A dead combo's stale CSV rows were already pruned; clear its on-disk
+        # A retried combo's stale CSV rows were already pruned; clear its on-disk
         # attempt dirs too (once) so the re-run starts at attempt 1 and fully
         # replaces the corpse instead of accumulating beside it.
-        if combo_key in dead_combos and task_dir not in cleaned_dead:
+        if combo_key in retry_combos and task_dir not in cleaned_dead:
             cleaned_dead.add(task_dir)
             if task_dir.is_dir():
                 shutil.rmtree(task_dir)
