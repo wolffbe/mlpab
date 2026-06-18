@@ -51,6 +51,7 @@ from mlpab.claude_runner import (
     run_streaming_with_backoff,
     set_enforcement_env,
     streaming_is_rate_limited,
+    text_is_transient_error,
 )
 
 # Testbed model id (alias, used in configs + `--model`) → Mistral API id (what
@@ -280,17 +281,49 @@ def _print_event(line: str) -> None:
             print(ln, flush=True)
 
 
+# Transport-layer blips between vibe and the Mistral API: vibe's httpx client
+# drops the request socket mid-run (an httpx `ReadError`/`ConnectError`, a read
+# timeout), surfaced as `LLM backend error [mistral] … provider_message: Network
+# error` on stderr. These are the vibe analogue of claude_runner's Node-transport
+# `_DISCONNECT_PHRASES`: an instantaneous network fault that clears on retry, NOT
+# a rate limit or 5xx. They live HERE (vibe-scoped), not in the global
+# `_TRANSIENT_PHRASES`, because vibe surfaces them only on its transport layer —
+# folding them into the shared predicate would let a tool result echoing
+# "network error" trip a false retry in the Claude/codex paths.
+_VIBE_TRANSPORT_PHRASES = (
+    "network error",
+    "readerror",
+    "read error",
+    "connecterror",
+    "connect error",
+    "connection error",
+    "read timeout",
+    "readtimeout",
+    "connection reset",
+    "remoteprotocolerror",
+)
+
+
+def _vibe_text_is_retryable(text: str) -> bool:
+    """Retry on a rate-limit / transient-5xx condition (shared predicate) OR on a
+    vibe↔Mistral transport disconnect (`_VIBE_TRANSPORT_PHRASES`)."""
+    t = (text or "").lower()
+    return text_is_transient_error(t) or any(p in t for p in _VIBE_TRANSPORT_PHRASES)
+
+
 def _rate_limited(raw_path: Path, stderr_path: Path) -> bool:
-    """A vibe run failed on a rate-limit / transient-server condition. vibe
-    surfaces errors as `{"type":"error","message":...}` (or a role=="error"
-    message) and on stderr."""
+    """A vibe run failed on a rate-limit / transient-server / transport-disconnect
+    condition worth retrying. vibe surfaces errors as
+    `{"type":"error","message":...}` (or a role=="error" message) and on stderr."""
 
     def _err_text(msg: dict) -> str:
         if (msg.get("type") or "").lower() == "error" or (msg.get("role") or "").lower() == "error":
             return str(msg.get("message") or msg.get("content") or "")
         return ""
 
-    return streaming_is_rate_limited(raw_path, stderr_path, _err_text)
+    return streaming_is_rate_limited(
+        raw_path, stderr_path, _err_text, text_is_retryable=_vibe_text_is_retryable
+    )
 
 
 def run(
