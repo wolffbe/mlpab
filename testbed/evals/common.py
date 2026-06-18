@@ -38,15 +38,54 @@ FETCH_RETRIES = 5
 FETCH_BACKOFF_S = 5
 FETCH_BACKOFF_CAP_S = 30
 
+# Server-side signatures that mean the read failed for a DETERMINISTIC reason,
+# NOT the transient client flake: the feature group exists in metadata but the
+# offline store has no parquet/delta files because nothing was ever ingested.
+# The Arrow Flight server states this plainly ("No active delta files found ...
+# no data has been written yet"), but hsfs collapses it into the same generic
+# `Could not read data using Hopsworks Query Service` as a real transport flake.
+# Without this discriminator an empty FG (a genuine ingest failure by the model)
+# is retried FETCH_RETRIES times for ~65s and then recorded byte-identically to a
+# transport flake — masking a capability gap as infrastructure noise. Verified
+# live 2026-06-18: a registered-but-empty FG read raises exactly this, while a
+# 2-row FG reads back in 0.59s on the same cluster.
+_EMPTY_FG_SIGNATURES = (
+    "no active delta files",
+    "no data has been written",
+)
+
+
+def _cause_chain(e):
+    """Flatten an exception's __cause__/__context__ chain to a list of
+    "Type: message" strings. hsfs masks the real Arrow Flight error behind a
+    generic FeatureStoreException (arrow_flight_client.afs_error_handler_wrapper),
+    so the actionable detail — the server's own message — lives in the chain,
+    not in str(e)."""
+    out, seen, cur = [], set(), e
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        out.append(f"{type(cur).__name__}: {cur}")
+        cur = cur.__cause__ or cur.__context__
+    return out
+
+
+def _is_empty_feature_group(e) -> bool:
+    blob = " ".join(_cause_chain(e)).lower()
+    return any(sig in blob for sig in _EMPTY_FG_SIGNATURES)
+
 
 def read_with_retry(read_fn):
     """Run a platform read (a zero-arg callable), retrying the transient
     client-side HQS flake with exponential backoff. THE single retry policy for
     every grader read-back — table reads and training-dataset reads alike route
     through here. LookupError/NotImplementedError are deterministic misses,
-    re-raised immediately; any other error is treated as the read-back flake and
-    retried up to FETCH_RETRIES times, then re-raised for the caller to degrade
-    on (so the grader records a clean reason instead of crashing)."""
+    re-raised immediately. A read against a registered-but-empty feature group is
+    ALSO deterministic — re-raised at once as a LookupError with a distinct
+    reason, never retried (retrying an empty FG only burns ~65s). Any other error
+    is treated as the read-back flake and retried up to FETCH_RETRIES times, then
+    re-raised with the masked root cause appended so the grader's recorded reason
+    distinguishes one failure mode from another (the generic FeatureStoreException
+    string is identical for every cause)."""
     last = None
     for attempt in range(1, FETCH_RETRIES + 1):
         try:
@@ -54,10 +93,18 @@ def read_with_retry(read_fn):
         except (LookupError, NotImplementedError):
             raise  # deterministic — retrying cannot change the outcome
         except Exception as e:  # noqa: BLE001 — client read flake; retry
+            if _is_empty_feature_group(e):
+                # FG exists but no rows were ever ingested — deterministic, and a
+                # genuine capability gap (not infra noise). Surface it as such.
+                raise LookupError(
+                    "feature group exists but has no data (no rows were ingested)"
+                ) from e
             last = e
             if attempt < FETCH_RETRIES:
                 time.sleep(min(FETCH_BACKOFF_S * 2 ** (attempt - 1), FETCH_BACKOFF_CAP_S))
-    raise last
+    # all retries exhausted on a genuine flake — append the masked root cause so
+    # the CSV reason is actionable instead of the uniform generic message.
+    raise RuntimeError(f"{last} [root cause: {' <- '.join(_cause_chain(last))}]") from last
 
 
 def fetch_table_with_retry(adapter, table, version, record_ids):
