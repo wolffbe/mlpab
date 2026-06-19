@@ -112,11 +112,14 @@ def _read_predictions(
 ) -> pd.DataFrame:
     """Predictions read back THROUGH the platform (or local CSV for `none`)."""
     if adapter not in (None, "none"):
-        from evals.common import fetch_table
+        from evals.common import fetch_table_deliverable
 
-        # fetch_table supports every real adapter (hopsworks/databricks/aws/
-        # azure/gcp); never read the engineer's local CSV on a real platform.
-        return fetch_table(adapter, table, version, record_ids)
+        # Read through fetch_table_deliverable (single attempt, surfaces a clean
+        # reason on failure) — NOT raw fetch_table, whose masked hsfs
+        # FeatureStoreException would crash the grader (no report). Supports every
+        # real adapter (hopsworks/databricks/aws/azure/gcp); never read the
+        # engineer's local CSV on a real platform.
+        return fetch_table_deliverable(adapter, table, version, record_ids)
     local = run_dir / "submission" / f"{table}.csv"
     if not local.exists():
         raise LookupError(f"no local predictions at {local}")
@@ -151,7 +154,11 @@ def grade_capstone(instance_dir: Path, adapter: str, run_dir: Path) -> dict:
             run_dir,
         )
         preds.columns = [str(c).strip().lower() for c in preds.columns]
-    except (LookupError, NotImplementedError) as e:
+    except Exception as e:  # noqa: BLE001 — unreadable predictions = no results, not a crash
+        # The deliverable could not be read back (missing table, empty/no-column
+        # feature group, or any other read failure). On a reliable service that is
+        # "no results": fail A1 with the reason and let the suite enumerate the
+        # rest (dependents skip) — never crash the grader with no report.
         check("A1_predictions_table", False, str(e))
 
     complete = False

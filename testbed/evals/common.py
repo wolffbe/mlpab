@@ -21,34 +21,29 @@ from __future__ import annotations
 
 import hashlib
 import json
-import time
 from pathlib import Path
 
 import pandas as pd
 
-# Read-back can flake on the client even when the server returns data: hsfs
-# collapses the real Arrow Flight error into a generic FeatureStoreException
-# (see arrow_flight_client.afs_error_handler_wrapper). The server serves the
-# rows reliably on repeat, so retry transient read failures before giving up.
-# LookupError/NotImplementedError are deterministic adapter limits — not retried.
-# Backoff is exponential (5, 10, 20, 30, …s capped) because a fixed 3×5s window
-# proved too short for the cluster's flake — a healthy read would be marked a
-# false-negative read-back failure, counting against the model unfairly.
-FETCH_RETRIES = 5
-FETCH_BACKOFF_S = 5
-FETCH_BACKOFF_CAP_S = 30
+# hsfs collapses the real Arrow Flight error into a generic FeatureStoreException
+# (see arrow_flight_client.afs_error_handler_wrapper), so the grader-visible
+# message is uninformative — the actionable detail lives in the exception's CAUSE
+# CHAIN. The Hopsworks Query Service is reliable (live-probed 2026-06-19: a
+# healthy feature group read back 30/30 with zero transport flakes; the
+# arrowflight deployment had 0 restarts over 4 days), so a read failure is NOT
+# retried: it means the deliverable could not be read back — which, on a healthy
+# service, means the result was never produced (an empty / no-column / missing
+# feature group). A read is attempted ONCE; on failure the grader degrades to an
+# empty frame ("no results") with the reason recorded, never retrying (retries
+# only burned ~65s reaching the same verdict) and never crashing.
 
-# Server-side signatures that mean the read failed for a DETERMINISTIC reason,
-# NOT the transient client flake: the feature group exists in metadata but the
-# offline store has no parquet/delta files because nothing was ever ingested.
-# The Arrow Flight server states this plainly ("No active delta files found ...
-# no data has been written yet"), but hsfs collapses it into the same generic
-# `Could not read data using Hopsworks Query Service` as a real transport flake.
-# Without this discriminator an empty FG (a genuine ingest failure by the model)
-# is retried FETCH_RETRIES times for ~65s and then recorded byte-identically to a
-# transport flake — masking a capability gap as infrastructure noise. Verified
-# live 2026-06-18: a registered-but-empty FG read raises exactly this, while a
-# 2-row FG reads back in 0.59s on the same cluster.
+# Server-side signature of a registered-but-EMPTY feature group: it exists in
+# metadata but the offline store has no parquet/delta files because nothing was
+# ever ingested. The Arrow Flight server states this plainly ("No active delta
+# files found ... no data has been written yet"); hsfs masks it behind the same
+# generic `Could not read data using Hopsworks Query Service`. Surfaced as a clean
+# reason so the recorded message says "no rows ingested" rather than the uniform
+# generic string. (Verified live 2026-06-18.)
 _EMPTY_FG_SIGNATURES = (
     "no active delta files",
     "no data has been written",
@@ -74,46 +69,40 @@ def _is_empty_feature_group(e) -> bool:
     return any(sig in blob for sig in _EMPTY_FG_SIGNATURES)
 
 
-def read_with_retry(read_fn):
-    """Run a platform read (a zero-arg callable), retrying the transient
-    client-side HQS flake with exponential backoff. THE single retry policy for
-    every grader read-back — table reads and training-dataset reads alike route
-    through here. LookupError/NotImplementedError are deterministic misses,
-    re-raised immediately. A read against a registered-but-empty feature group is
-    ALSO deterministic — re-raised at once as a LookupError with a distinct
-    reason, never retried (retrying an empty FG only burns ~65s). Any other error
-    is treated as the read-back flake and retried up to FETCH_RETRIES times, then
-    re-raised with the masked root cause appended so the grader's recorded reason
-    distinguishes one failure mode from another (the generic FeatureStoreException
-    string is identical for every cause)."""
-    last = None
-    for attempt in range(1, FETCH_RETRIES + 1):
-        try:
-            return read_fn()
-        except (LookupError, NotImplementedError):
-            raise  # deterministic — retrying cannot change the outcome
-        except Exception as e:  # noqa: BLE001 — client read flake; retry
-            if _is_empty_feature_group(e):
-                # FG exists but no rows were ever ingested — deterministic, and a
-                # genuine capability gap (not infra noise). Surface it as such.
-                raise LookupError(
-                    "feature group exists but has no data (no rows were ingested)"
-                ) from e
-            last = e
-            if attempt < FETCH_RETRIES:
-                time.sleep(min(FETCH_BACKOFF_S * 2 ** (attempt - 1), FETCH_BACKOFF_CAP_S))
-    # all retries exhausted on a genuine flake — append the masked root cause so
-    # the CSV reason is actionable instead of the uniform generic message.
-    raise RuntimeError(f"{last} [root cause: {' <- '.join(_cause_chain(last))}]") from last
+def read_deliverable(read_fn):
+    """Run a platform read (a zero-arg callable) ONCE and return its result.
+
+    The Hopsworks Query Service is reliable, so the read is NOT retried: if it
+    raises, the deliverable could not be read back, which on a healthy service
+    means the result was not given. The caller treats that as "no results"
+    (degrades to an empty frame, records the reason, never crashes).
+
+    LookupError/NotImplementedError pass through unchanged (deterministic adapter
+    limits / genuine misses). A registered-but-empty feature group is surfaced as
+    a clean LookupError. Any other error is re-raised with the masked root cause
+    appended, so the recorded reason is actionable rather than the uniform generic
+    FeatureStoreException string."""
+    try:
+        return read_fn()
+    except (LookupError, NotImplementedError):
+        raise  # deterministic miss / adapter limit — pass through
+    except Exception as e:  # noqa: BLE001 — read failed: the result was not given
+        if _is_empty_feature_group(e):
+            raise LookupError(
+                "feature group exists but has no data (no rows were ingested)"
+            ) from e
+        raise RuntimeError(f"{e} [root cause: {' <- '.join(_cause_chain(e))}]") from e
 
 
-def fetch_table_with_retry(adapter, table, version, record_ids):
-    """Read a feature table back, retrying the transient client-side flake.
+def fetch_table_deliverable(adapter, table, version, record_ids):
+    """Read a feature table back as a deliverable (single attempt — see
+    `read_deliverable`).
 
-    Every grader should read through THIS (or `read_with_retry`), not raw
-    `fetch_table`: a bare `fetch_table` call that hits the hsfs
-    FeatureStoreException flake crashes the grader (no report)."""
-    return read_with_retry(lambda: fetch_table(adapter, table, version, record_ids))
+    Every grader should read through THIS (or `read_deliverable`), not raw
+    `fetch_table`: a bare `fetch_table` that hits the masked hsfs
+    FeatureStoreException crashes the grader (no report) instead of degrading to
+    "no results"."""
+    return read_deliverable(lambda: fetch_table(adapter, table, version, record_ids))
 
 
 def instance_suffix(seed: int) -> str:
@@ -315,7 +304,7 @@ def grade_table_main(family: str, grade_fn, argv: list[str] | None = None) -> in
     else:
         truth = json.loads((args.instance / "solution" / "truth.json").read_text())
         try:
-            produced = fetch_table_with_retry(
+            produced = fetch_table_deliverable(
                 args.adapter,
                 truth["table_name"],
                 truth.get("table_version", 1),
@@ -328,11 +317,12 @@ def grade_table_main(family: str, grade_fn, argv: list[str] | None = None) -> in
             produced = pd.DataFrame()
             deliverable_err = str(e)
         except Exception as e:  # noqa: BLE001
-            # A client-side read-back flake (e.g. hsfs' masked FeatureStoreException)
-            # must NOT crash the grader — that produces no report at all. Degrade to
-            # an empty frame and surface the real reason on the report instead.
+            # Any other read failure (e.g. hsfs' masked FeatureStoreException) means
+            # the deliverable could not be read back: on a healthy service that is
+            # "no results", not a grader error. Degrade to an empty frame (the suite
+            # still enumerates) and record the real reason — never crash, never retry.
             produced = pd.DataFrame()
-            deliverable_err = f"read-back failed after {FETCH_RETRIES} attempts: {e}"
+            deliverable_err = f"deliverable could not be read back: {e}"
     report = grade_fn(args.instance, produced, args.adapter)
     if deliverable_err:
         report.setdefault("error", deliverable_err)

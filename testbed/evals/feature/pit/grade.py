@@ -23,7 +23,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from evals.common import FETCH_RETRIES, Suite, read_csv_or_empty, read_with_retry, tally
+from evals.common import Suite, read_csv_or_empty, read_deliverable, tally
 from evals.feature.pit.generate import canonicalize, digest
 
 VARIANT_DIAGNOSIS = {
@@ -131,14 +131,13 @@ def main(argv: list[str] | None = None) -> int:
         # (hopsworks/databricks/aws/azure/gcp) — uniform, no per-platform branch.
         from evals.common import state_checker
 
-        # Read back the training dataset through the shared retry policy, which
-        # rides out the transient client-side HQS flake (hsfs masks the real
-        # Arrow Flight error as a generic FeatureStoreException; the server
-        # serves rows reliably on repeat). The read NEVER crashes the grader: a
-        # deterministic miss (LookupError) or a post-retry flake degrades to an
-        # empty frame with the reason recorded.
+        # Read back the training dataset through the shared single-attempt read
+        # (the HQS service is reliable, so a failure means the deliverable could
+        # not be read back). The read NEVER crashes the grader: a deterministic
+        # miss (LookupError) or any other read failure degrades to an empty frame
+        # ("no results") with the reason recorded.
         try:
-            produced = read_with_retry(
+            produced = read_deliverable(
                 lambda: state_checker(args.adapter).read_training_dataset(
                     meta["dataset_name"], meta["dataset_version"]
                 )
@@ -146,9 +145,9 @@ def main(argv: list[str] | None = None) -> int:
         except LookupError as e:
             produced = pd.DataFrame()
             deliverable_err = str(e)
-        except Exception as e:  # noqa: BLE001 — read-back flake survived the retries
+        except Exception as e:  # noqa: BLE001 — deliverable could not be read back
             produced = pd.DataFrame()
-            deliverable_err = f"read-back failed after {FETCH_RETRIES} attempts: {e}"
+            deliverable_err = f"deliverable could not be read back: {e}"
 
     report = grade(args.instance, produced)
     if deliverable_err:
