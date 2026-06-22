@@ -48,6 +48,35 @@ class UsdCostTests(unittest.TestCase):
         u = results.parse_transcript_usage(t, model="mistral-medium-3.5")
         self.assertGreater(u["cost_usd"], 0.0)
 
+    def test_manual_price_wins_and_prices_unpriceable_models(self):
+        price = {"input": 1.5, "output": 7.5}  # USD per 1M tokens
+        # Manual price applies even when litellm can't price the model id.
+        c = results.usd_cost("mistral-medium-3-5", 1_000_000, 1_000_000, price=price)
+        self.assertAlmostEqual(c, 1.5 + 7.5)
+        # And it wins over litellm when both could price.
+        c2 = results.usd_cost("claude-opus-4-8", 2_000_000, 0, price=price)
+        self.assertAlmostEqual(c2, 3.0)
+        # Empty/zero manual price falls through to litellm (None for unknown ids).
+        self.assertIsNone(results.usd_cost("totally-unknown-xyz", 100, 100, price={}))
+
+    def test_parse_transcript_uses_manual_price(self):
+        t = Path(tempfile.mkdtemp()) / "transcript.jsonl"
+        t.write_text(
+            json.dumps(
+                {
+                    "type": "result",
+                    "usage": {"input_tokens": 1_000_000, "output_tokens": 1_000_000},
+                    "num_turns": 1,
+                    "total_cost_usd": 0.0,
+                }
+            )
+            + "\n"
+        )
+        u = results.parse_transcript_usage(
+            t, model="mistral-medium-3-5", price={"input": 1.5, "output": 7.5}
+        )
+        self.assertAlmostEqual(u["cost_usd"], 9.0)
+
     def test_parse_transcript_keeps_engine_cost_when_litellm_cant_price(self):
         t = Path(tempfile.mkdtemp()) / "transcript.jsonl"
         t.write_text(

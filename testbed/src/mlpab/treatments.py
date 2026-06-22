@@ -51,7 +51,7 @@ from __future__ import annotations
 import os
 import shutil
 import sys
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -81,6 +81,10 @@ class TreatmentConfig:
     runs: list[RunEntry]
     model: str = runner.DEFAULT_MODEL
     auth: str = "api-key"
+    # Manual per-million-token prices keyed by model id, from the config's
+    # `prices:` block — e.g. {"mistral-medium-3-5": {"input": 1.5, "output": 7.5}}.
+    # Used to cost models litellm can't price; absent → litellm → 0.
+    prices: dict = field(default_factory=dict)
     # Per-agent-run wall-clock cap, in seconds. None = NO cap (the default):
     # runs go to completion; only Ctrl-C or the agent finishing ends them.
     max_seconds: float | None = None
@@ -243,6 +247,7 @@ def load_config(path: Path) -> TreatmentConfig:
         # setup` chose) unless the config explicitly overrides it.
         model=model_list[0],  # representative; per-run model lives on the RunEntry
         auth=data.get("auth", os.environ.get("MLPAB_AUTH", "api-key")),
+        prices=dict(data.get("prices") or {}),
         max_seconds=max_seconds,
         repeats=max(1, int(data.get("n", data.get("repeats", 1)) or 1)),
         concurrency=max(1, int(data.get("concurrency", data.get("parallel", 1)) or 1)),
@@ -536,6 +541,7 @@ def run_treatments(
             interface=entry.interface,
             skills=entry.skills,
             model=entry.model,
+            price=config.prices.get(entry.model),
             auth=config.auth,
             timeout_s=int(config.max_seconds) if config.max_seconds is not None else None,
             runs_root=leaf_root,

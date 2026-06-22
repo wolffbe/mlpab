@@ -82,7 +82,7 @@ class BuildResultsNotebookTests(unittest.TestCase):
         _write_results_csv(self.results_root, [])
         self.assertIsNone(notebook_mod.build_results_notebook(self.results_root))
 
-    def test_sections_per_config_and_chart_per_tracked_metric(self):
+    def test_four_key_metric_diagrams_comparing_configs(self):
         _write_results_csv(
             self.results_root,
             [
@@ -97,20 +97,20 @@ class BuildResultsNotebookTests(unittest.TestCase):
         nb = nbformat.read(nb_path, as_version=4)
         code = [c for c in nb.cells if c.cell_type == "code"]
         md = [c.source for c in nb.cells if c.cell_type == "markdown"]
-        n_metrics = len(results_mod.RESULTS_TRACKED_METRICS)
-        # Setup + aggregate + (2 configs × 1 model × metrics) chart cells.
-        self.assertEqual(len(code), 2 + 2 * n_metrics)
-        # The setup cell loads results.csv; the aggregate cell averages over
-        # the full (config … skills) identity.
+        # Setup cell + one chart cell per key metric.
+        self.assertEqual(len(code), 1 + len(notebook_mod.KEY_METRICS))
+        # The setup cell loads results.csv and derives the pass rate.
         self.assertTrue(any("read_csv" in c.source for c in code))
-        self.assertTrue(any("groupby(GROUP" in c.source for c in code))
-        # Config headline / model sub-headline structure.
-        self.assertIn("## Config `rq1-a`", md)
-        self.assertIn("## Config `rq1-b`", md)
-        self.assertIn("### Model `claude-opus-4-8`", md)
-        # Charts bar per (platform, interface, version, skills) + average line.
-        chart = next(c.source for c in code if "axhline" in c.source)
-        self.assertIn('"platform", "interface", "version", "skills"', chart)
+        self.assertTrue(any("pass_rate" in c.source for c in code))
+        # One markdown headline per key metric.
+        for m in notebook_mod.KEY_METRICS:
+            self.assertIn(f"## {m['label']}", md)
+        # Each chart groups by config and splits into interface x skills bars,
+        # with an all-config mean line.
+        charts = [c.source for c in code if "axhline" in c.source]
+        self.assertEqual(len(charts), len(notebook_mod.KEY_METRICS))
+        self.assertTrue(all("groupby(['config', 'interface', 'skills'])" in c for c in charts))
+        self.assertTrue(all("cli / no-skills" in c for c in charts))
 
     @unittest.skipUnless(_has_exec_deps(), "needs matplotlib + ipykernel")
     def test_executed_notebook_embeds_outputs(self):

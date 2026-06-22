@@ -140,19 +140,36 @@ class NormalizeEventsTests(unittest.TestCase):
         self.assertTrue(errs)
         self.assertFalse(errs[0]["message"]["content"][0]["is_error"])
 
-    def test_tokens_from_session_meta(self):
+    def _normalize_with_meta(self, stats: dict) -> dict:
         import json as _json
 
         d = Path(tempfile.mkdtemp())
         (d / "vibe_events.jsonl").write_text("")
         meta = d / ".vibe" / "logs" / "session" / "s1"
         meta.mkdir(parents=True)
-        (meta / "meta.json").write_text(
-            _json.dumps({"session_prompt_tokens": 1234, "session_completion_tokens": 56})
-        )
+        (meta / "meta.json").write_text(_json.dumps(stats))
         out = d / "transcript.jsonl"
         mistral_runner.normalize_events(d / "vibe_events.jsonl", out)
-        result = [json.loads(l) for l in out.read_text().splitlines()][-1]
+        return [json.loads(l) for l in out.read_text().splitlines()][-1]
+
+    def test_input_uses_context_tokens_not_cumulative(self):
+        # session_prompt_tokens is the cache-inflated cumulative sum; input must
+        # come from the unique context size instead (completion stays cumulative).
+        result = self._normalize_with_meta(
+            {
+                "session_prompt_tokens": 8_400_000,
+                "context_tokens": 104_882,
+                "session_completion_tokens": 17_175,
+            }
+        )
+        self.assertEqual(result["usage"], {"input_tokens": 104_882, "output_tokens": 17_175})
+
+    def test_tokens_fall_back_when_no_context_tokens(self):
+        # Older vibe schema without context_tokens: fall back to the cumulative
+        # prompt sum so cost is still populated.
+        result = self._normalize_with_meta(
+            {"session_prompt_tokens": 1234, "session_completion_tokens": 56}
+        )
         self.assertEqual(result["usage"], {"input_tokens": 1234, "output_tokens": 56})
 
     def test_empty_events_still_yield_result(self):

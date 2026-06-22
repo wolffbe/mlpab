@@ -69,6 +69,9 @@ class RunSpec:
     category: str = "no_task"  # FTI category (stage) this task belongs to
     model: str = DEFAULT_MODEL
     auth: str = "api-key"
+    # Manual per-million-token price `{"input": .., "output": ..}` from the
+    # treatment yaml `prices:` block; used to cost models litellm can't price.
+    price: dict | None = None
     timeout_s: int | None = 60 * 60  # None → NO per-run wall-clock cap
     runs_root: Path = Path("results")
     # Session tag: the treatment config's name, stored as the `run` column.
@@ -712,7 +715,7 @@ def run(spec: RunSpec) -> results.Row:
         # grading.json lives grader-side, next to the answer key.
         (attempt_dir / "solution" / "grading.json").write_text(json.dumps(grading, indent=2))
 
-        usage = results.parse_transcript_usage(cr.transcript_path, model=spec.model)
+        usage = results.parse_transcript_usage(cr.transcript_path, model=spec.model, price=spec.price)
         # Counting classifies by the ACTIVE interface only: a `hops`/`import
         # hopsworks` call is `cli_calls`/`sdk_calls` ONLY when that interface is
         # under test. (interface_setup markers are resolved for ALL interfaces to

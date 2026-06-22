@@ -542,12 +542,21 @@ def usd_cost(
     input_tokens: int,
     output_tokens: int,
     cache_read_input_tokens: int = 0,
+    price: dict | None = None,
 ) -> float | None:
-    """Token→USD via litellm — uniform across every agent engine. Tries the model
-    id as-is, its litellm-canonical alias, and a generic `mistral/<id>` form (the
-    claude-*/gpt-* ids litellm ships directly; mistral-* are priced under the
-    `mistral/` provider prefix). None if litellm can't price it — the caller then
-    keeps any engine-reported cost (e.g. Claude Code's `total_cost_usd`).
+    """Token→USD. A manual per-million-token `price` (from the treatment yaml's
+    `prices:` block) wins when given — use it for models litellm can't price
+    (e.g. `mistral-medium-3-5`). Otherwise via litellm — uniform across every
+    agent engine. Tries the model id as-is, its litellm-canonical alias, and a
+    generic `mistral/<id>` form (the claude-*/gpt-* ids litellm ships directly;
+    mistral-* are priced under the `mistral/` provider prefix). None if there is
+    no manual price and litellm can't price it either — the caller then keeps any
+    engine-reported cost (e.g. Claude Code's `total_cost_usd`), which is 0 for
+    codex/mistral.
+
+    `price` is `{"input": <usd/M tokens>, "output": <usd/M tokens>}`; the manual
+    path bills every input token at the input rate (no cache discount — the
+    simple config defines none).
 
     `cache_read_input_tokens` is the cache-hit subset of `input_tokens` (NOT a
     separate addend); litellm rebills that portion at the model's discounted
@@ -555,10 +564,20 @@ def usd_cost(
     reports it that way, so without this the cached bulk (≈90% on long runs) is
     billed at the full input rate. Claude's `input_tokens` already EXCLUDES cache,
     so its caller passes 0 here."""
-    if not model:
-        return None
     if int(input_tokens) == 0 and int(output_tokens) == 0:
         return 0.0
+    # Manual price override: read from the yaml `prices:` block. If unset we fall
+    # through to litellm; if litellm also can't price it the caller keeps 0.
+    if price:
+        try:
+            pin = float(price.get("input", 0) or 0)
+            pout = float(price.get("output", 0) or 0)
+        except (AttributeError, TypeError, ValueError):
+            pin = pout = 0.0
+        if pin or pout:
+            return round((int(input_tokens) * pin + int(output_tokens) * pout) / 1_000_000, 6)
+    if not model:
+        return None
     cands = [model, _LITELLM_ALIASES.get(model)]
     if model.lower().startswith("mistral-"):
         cands.append("mistral/" + model)
@@ -589,14 +608,18 @@ def usd_cost(
     return None
 
 
-def parse_transcript_usage(transcript_path: Path, model: str | None = None) -> dict[str, Any]:
+def parse_transcript_usage(
+    transcript_path: Path, model: str | None = None, price: dict | None = None
+) -> dict[str, Any]:
     """Token + cost totals from the agent's stream-json transcript.
 
     Tokens come from the final `result` event's aggregated `usage` (fallback:
-    summed per-turn `message.usage`). COST is computed from those tokens via
-    litellm (`usd_cost`) so it is uniform across claude/codex/mistral engines;
-    only if litellm can't price the model do we fall back to the transcript's
-    own `total_cost_usd` (Claude Code reports it; codex/mistral report 0).
+    summed per-turn `message.usage`). COST is computed from those tokens via a
+    manual per-million-token `price` (from the treatment yaml) when given, else
+    via litellm (`usd_cost`) so it is uniform across claude/codex/mistral
+    engines; only if neither can price the model do we fall back to the
+    transcript's own `total_cost_usd` (Claude Code reports it; codex/mistral
+    report 0, i.e. cost stays 0).
     """
     totals = {
         "input_tokens": 0,
@@ -656,7 +679,7 @@ def parse_transcript_usage(transcript_path: Path, model: str | None = None) -> d
         cr = int((final_result.get("usage") or {}).get("cache_read_input_tokens") or 0)
         if cr <= totals["input_tokens"]:
             cache_read = cr
-    cost = usd_cost(model, totals["input_tokens"], totals["output_tokens"], cache_read)
+    cost = usd_cost(model, totals["input_tokens"], totals["output_tokens"], cache_read, price)
     if cost is not None:
         totals["cost_usd"] = cost
     return totals

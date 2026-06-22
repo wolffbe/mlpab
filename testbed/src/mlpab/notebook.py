@@ -1,17 +1,19 @@
 """Generate the GLOBAL `results.ipynb`.
 
-Reads the global results table (results/results.csv — one row per
-execution across ALL configs) and produces a single self-contained notebook at
-the results root:
+Reads the global results table (results/results.csv — one row per execution
+across ALL configs) and produces a single self-contained notebook at the
+results root with four headline diagrams — one per metric that counts — each a
+grouped bar chart comparing every config across its interface/skills combos:
 
-  1. the raw execution list,
-  2. an aggregated table — one row per (config, model, platform, interface,
-     version, skills), metrics averaged across tasks and repeats (`n`), plus a
-     final `(all)` average row,
-  3. one section per config (headline), one subsection per model, and within
-     it one bar chart per tracked metric — one bar per (platform, interface,
-     version, skills), averaged across tasks/repeats, with a dashed line at
-     that config/model's overall average.
+  1. **pass rate** (`asserts_passed / total_asserts`) — higher is better,
+  2. **local_time_s** — lower is better,
+  3. **cost_usd** — lower is better,
+  4. **llm_calls** — lower is better.
+
+Bars are grouped by config; within each config there are four bars for the
+interface (cli/sdk) × skills (with/without) combos, each averaged across all
+matching executions (every task, version, repeat). The dashed line is the mean
+across all configs.
 
 Triggered after every treatment run (`treatments.run_treatments`). Pure data →
 notebook transform; no AI involved.
@@ -29,72 +31,72 @@ from typing import Any
 import nbformat
 from nbformat.v4 import new_code_cell, new_markdown_cell, new_notebook
 
-# Bars within a chart: every distinct interface build under a (config, model).
-BAR_FIELDS = ["platform", "interface", "version", "skills"]
-# Aggregated-table grouping: the bar identity plus the section identity.
-GROUP_FIELDS = ["config", "model"] + BAR_FIELDS
+# The four headline metrics, in display order. `col` is the column in `num`
+# (`pass_rate` is derived in the setup cell); `direction` drives colour and the
+# ↑/↓ marker; higher pass rate is better, lower time/cost/calls is better.
+KEY_METRICS = [
+    {"col": "pass_rate", "label": "pass rate (asserts_passed / total_asserts)", "direction": "max"},
+    {"col": "local_time_s", "label": "local_time_s", "direction": "min"},
+    {"col": "cost_usd", "label": "cost_usd", "direction": "min"},
+    {"col": "llm_calls", "label": "llm_calls", "direction": "min"},
+]
 
 
 def _setup_cell(csv_rel: str) -> Any:
-    return new_code_cell(
+    """Load the table, coerce the needed columns to numeric, derive `pass_rate`,
+    and expose `num`, `configs`, and the `DIR_*` lookups for the chart cells."""
+    src = (
         "import pandas as pd\n"
         "import matplotlib.pyplot as plt\n"
         "\n"
         f"raw = pd.read_csv({json.dumps(csv_rel)})\n"
-        "raw\n"
-    )
-
-
-def _aggregate_cell(metrics: list[str]) -> Any:
-    """One row per GROUP_FIELDS combo: metrics averaged across tasks and
-    repeats; `runs` counts the executions averaged; the final `(all)` row
-    averages over every execution."""
-    src = (
-        f"GROUP = {json.dumps(GROUP_FIELDS)}\n"
-        f"METRICS = [m for m in {json.dumps(metrics)} if m in raw.columns]\n"
         "num = raw.copy()\n"
-        "for m in METRICS:\n"
-        "    num[m] = pd.to_numeric(num[m], errors='coerce')\n"
-        "agg = (num.groupby(GROUP, dropna=False)\n"
-        "          .agg(runs=('task', 'size'), **{m: (m, 'mean') for m in METRICS})\n"
-        "          .reset_index())\n"
-        "overall = {c: '(all)' for c in GROUP}\n"
-        "overall['runs'] = len(num)\n"
-        "overall.update({m: num[m].mean() for m in METRICS})\n"
-        "pd.concat([agg, pd.DataFrame([overall])], ignore_index=True)\n"
+        "for c in ['asserts_passed', 'total_asserts', 'local_time_s', 'cost_usd', 'llm_calls']:\n"
+        "    if c in num.columns:\n"
+        "        num[c] = pd.to_numeric(num[c], errors='coerce')\n"
+        "# Pass rate per execution; total_asserts == 0 -> undefined (NaN).\n"
+        "num['pass_rate'] = num['asserts_passed'] / num['total_asserts'].replace(0, pd.NA)\n"
+        "configs = sorted(num['config'].dropna().astype(str).unique())\n"
+        "DIR_MARK = {'max': '\\u2191 higher is better', 'min': '\\u2193 lower is better'}\n"
+        "print(f'{len(num)} executions across {len(configs)} configs')\n"
     )
     return new_code_cell(src)
 
 
-def _results_chart_cell(config: str, model: str, metric: str) -> Any:
-    """Bar chart cell for one (config, model, metric): one bar per
-    (platform, interface, version, skills), y = mean across tasks and repeats;
-    dashed line = the config/model average across all its rows."""
+def _key_chart_cell(col: str, label: str, direction: str) -> Any:
+    """One diagram: grouped bars, one group per config, four bars per group for
+    the interface (cli/sdk) × skills (with/without) combos, y = mean of `col`
+    across all matching executions; dashed line = mean across all configs."""
     src = (
-        f"config, model = {json.dumps(config)}, {json.dumps(model)}\n"
-        f"metric = {json.dumps(metric)}\n"
-        "sub = num[(num['config'].astype(str) == config) & (num['model'].astype(str) == model)]\n"
-        "work = (sub.dropna(subset=[metric])\n"
-        f"           .groupby({json.dumps(BAR_FIELDS)}, dropna=False)[metric]\n"
-        "           .mean().reset_index()) if metric in sub.columns else sub.iloc[0:0]\n"
-        "if work.empty:\n"
-        "    print(f'(no data for {metric!r} in {config}/{model} — skipping)')\n"
-        "else:\n"
-        f"    labels = ['/'.join(str(r[c]) for c in {json.dumps(BAR_FIELDS)})\n"
-        "              for _, r in work.iterrows()]\n"
-        "    avg = sub[metric].mean()\n"
-        "    fig, ax = plt.subplots(figsize=(max(7, 0.8 * len(work)), 4))\n"
-        "    ax.bar(range(len(work)), work[metric])\n"
-        "    ax.axhline(avg, color='tab:red', linestyle='--', linewidth=1,\n"
-        "               label=f'average = {avg:.4g}')\n"
-        "    ax.set_xticks(range(len(work)))\n"
-        "    ax.set_xticklabels(labels, rotation=45, ha='right', fontsize=8)\n"
-        "    ax.set_ylabel(metric)\n"
-        "    ax.set_title(f'{metric} — mean across tasks/repeats')\n"
-        "    ax.grid(True, axis='y', alpha=0.3)\n"
-        "    ax.legend()\n"
-        "    plt.tight_layout()\n"
-        "    plt.show()\n"
+        f"col, label, direction = {json.dumps(col)}, {json.dumps(label)}, {json.dumps(direction)}\n"
+        "# Four sub-bars per config: interface (cli/sdk) x skills (with/without).\n"
+        "SUB = [('cli', 'none', 'cli / no-skills'), ('cli', 'official', 'cli / skills'),\n"
+        "       ('sdk', 'none', 'sdk / no-skills'), ('sdk', 'official', 'sdk / skills')]\n"
+        "piv = num.groupby(['config', 'interface', 'skills'])[col].mean()\n"
+        "x = range(len(configs))\n"
+        "nsub = len(SUB)\n"
+        "width = 0.8 / nsub\n"
+        "fig, ax = plt.subplots(figsize=(max(9, 2.4 * len(configs)), 5))\n"
+        "colors = plt.cm.Paired.colors\n"
+        "for j, (iface, sk, lab) in enumerate(SUB):\n"
+        "    vals = [piv.get((cfg, iface, sk), float('nan')) for cfg in configs]\n"
+        "    offs = [i + (j - (nsub - 1) / 2) * width for i in x]\n"
+        "    ax.bar(offs, vals, width=width, label=lab, color=colors[j])\n"
+        "    for o, v in zip(offs, vals):\n"
+        "        if pd.notna(v):\n"
+        "            ax.text(o, v, f'{v:.3g}', ha='center', va='bottom', fontsize=6, rotation=90)\n"
+        "overall = num[col].mean()\n"
+        "if pd.notna(overall):\n"
+        "    ax.axhline(overall, color='tab:red', linestyle='--', linewidth=1,\n"
+        "               label=f'all-config mean = {overall:.4g}')\n"
+        "ax.set_xticks(list(x))\n"
+        "ax.set_xticklabels(configs, rotation=20, ha='right', fontsize=9)\n"
+        "ax.set_ylabel(label)\n"
+        "ax.set_title(f'{label}  ({DIR_MARK[direction]})  \\u2014  mean across all tasks')\n"
+        "ax.legend(title='interface / skills', fontsize=8)\n"
+        "ax.grid(True, axis='y', alpha=0.3)\n"
+        "plt.tight_layout()\n"
+        "plt.show()\n"
     )
     return new_code_cell(src)
 
@@ -122,42 +124,28 @@ def build_results_notebook(
     import os
 
     csv_rel = os.path.relpath(results_csv, results_root)
-    from mlpab import results as results_mod
-
-    tracked = results_mod.RESULTS_TRACKED_METRICS
-
-    # Section structure mirrors the data: config → model → metric charts.
-    sections: dict[str, list[str]] = {}
-    for r in rows:
-        models = sections.setdefault(str(r.get("config", "")), [])
-        model = str(r.get("model", ""))
-        if model not in models:
-            models.append(model)
 
     nb = new_notebook()
     nb.cells = [
         new_markdown_cell(
-            "# Results — global analysis\n\n"
+            "# Results — config comparison\n\n"
             f"Generated from `results.csv` — one row per execution across ALL "
-            f"configs (**{len(rows)} execution(s)**).\n\n"
-            "One section per config, one subsection per model, one chart per "
-            "tracked metric: one bar per `(platform, interface, version, "
-            "skills)`, averaged across tasks and repeats (`n`); "
-            "the dashed line is that config/model's overall average.\n\n"
-            "## Tracked metrics\n" + "\n".join(f"- `{m}`" for m in tracked)
+            f"configs (**{len(rows)} execution(s)**). Each config is one "
+            "experiment.\n\n"
+            "Four diagrams, one per metric that counts. Each bar is a config, "
+            "averaged across all of its executions (every task, interface, "
+            "version, skills, repeat); the dashed line is the mean across all "
+            "configs.\n\n"
+            "- **pass rate** = `asserts_passed / total_asserts` — ↑ higher is better\n"
+            "- **local_time_s** — ↓ lower is better\n"
+            "- **cost_usd** — ↓ lower is better\n"
+            "- **llm_calls** — ↓ lower is better\n"
         ),
-        new_markdown_cell("## Raw executions"),
         _setup_cell(csv_rel),
-        new_markdown_cell("## Averages per (config, model, platform, interface, version, skills)"),
-        _aggregate_cell(list(tracked)),
     ]
-    for config in sorted(sections):
-        nb.cells.append(new_markdown_cell(f"## Config `{config}`"))
-        for model in sorted(sections[config]):
-            nb.cells.append(new_markdown_cell(f"### Model `{model}`"))
-            for metric in tracked:
-                nb.cells.append(new_markdown_cell(f"#### `{metric}`"))
-                nb.cells.append(_results_chart_cell(config, model, metric))
+    for m in KEY_METRICS:
+        nb.cells.append(new_markdown_cell(f"## {m['label']}"))
+        nb.cells.append(_key_chart_cell(m["col"], m["label"], m["direction"]))
 
     if execute:
         import sys

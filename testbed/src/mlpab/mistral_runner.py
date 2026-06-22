@@ -128,8 +128,19 @@ def _tool_use_block(name: str, args: dict[str, Any]) -> dict[str, Any]:
 
 
 def _session_tokens(run_dir: Path) -> tuple[int, int]:
-    """Total (prompt, completion) tokens from vibe's session meta.json (vibe does
-    NOT put usage in the streamed messages; it writes it to the session log)."""
+    """(prompt, completion) tokens from vibe's session meta.json (vibe does NOT
+    put usage in the streamed messages; it writes it to the session log).
+
+    INPUT is cache-EXCLUDED. vibe's `session_prompt_tokens` is the SUM of prompt
+    tokens over every turn — each turn resends the whole growing context, so
+    under prompt caching it double-counts the cached prefix once per turn (a
+    144-turn run showed 8.4M cumulative vs a ~105K real context). Billing that at
+    the full input rate inflated cost ~50×. We use `context_tokens` — the unique
+    context size — so input matches how the Claude runner reports FRESH input
+    (cache excluded), keeping cost comparable across engines. Completion tokens
+    are genuinely generated (never cached), so the cumulative
+    `session_completion_tokens` is correct and kept as-is.
+    """
     metas = sorted((run_dir / ".vibe" / "logs" / "session").glob("*/meta.json"))
     if not metas:
         return 0, 0
@@ -138,9 +149,15 @@ def _session_tokens(run_dir: Path) -> tuple[int, int]:
         # vibe writes usage under a `stats` object; fall back to the top level
         # in case the schema flattens it in a future version.
         stats = m.get("stats") if isinstance(m.get("stats"), dict) else m
-        return int(stats.get("session_prompt_tokens") or 0), int(
-            stats.get("session_completion_tokens") or 0
+        # Prefer the unique context size; fall back to the last turn's prompt
+        # (also ≈ final context), then the old cumulative sum as a last resort.
+        prompt = int(
+            stats.get("context_tokens")
+            or stats.get("last_turn_prompt_tokens")
+            or stats.get("session_prompt_tokens")
+            or 0
         )
+        return prompt, int(stats.get("session_completion_tokens") or 0)
     except Exception:
         return 0, 0
 
