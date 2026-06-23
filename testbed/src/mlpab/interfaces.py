@@ -36,6 +36,31 @@ from mlpab import redact
 INTERFACES = ("cli", "mcp", "sdk", "none")
 _TESTBED_ROOT = Path(__file__).resolve().parents[2]
 
+
+def base_interface(interface: str) -> str:
+    """The behavioral interface family for a possibly-variant interface name.
+
+    A variant manifest (e.g. ``cli-opt1-batch.yaml`` → interface
+    ``cli-opt1-batch``) builds INDEPENDENTLY: its build home, prepared venv, and
+    results path are keyed by the full name, so several variants of the same
+    base build and RUN IN PARALLEL without colliding. But it is accounted,
+    confined by the agent hook, and graded EXACTLY as its base ``cli`` — that is
+    what this helper returns. A name is a variant when its leading
+    ``-``-delimited token is a known base interface; plain ``cli`` / ``sdk`` /
+    ``mcp`` / ``none`` (and anything else) come back unchanged.
+
+    Args:
+        interface: An interface name, possibly a ``<base>-<variant>`` form.
+
+    Returns:
+        The base interface family (one of ``INTERFACES``) when recognised, else
+        ``interface`` unchanged.
+    """
+    if interface in INTERFACES:
+        return interface
+    head = interface.split("-", 1)[0]
+    return head if head in INTERFACES else interface
+
 # Two-way split:
 #     configs/platforms/<platform>/ — the platform's CONFIG FOLDER: flat
 #         interface manifests (cli.yaml / mcp.yaml / sdk.yaml), skills.yaml
@@ -139,7 +164,7 @@ def platform_interface_from_config(config_path: str | Path) -> tuple[str, str]:
     p = Path(config_path)
     interface = p.stem
     platform = p.parent.name
-    if interface not in INTERFACES:
+    if base_interface(interface) not in INTERFACES:
         raise ValueError(
             f"Unknown interface {interface!r} from {config_path!r}. "
             "Expected a path like configs/platforms/<platform>/<interface>.yaml"
@@ -286,14 +311,15 @@ def _resolved_config(platform: str, interface: str) -> dict[str, Any]:
 def _auto_prompt(platform: str, interface: str, binary: str | None) -> str:
     """Generate a sensible default prompt when the config doesn't supply one."""
     cap = platform.capitalize()
-    if interface == "cli" and binary:
+    iface = base_interface(interface)
+    if iface == "cli" and binary:
         return (
             f"The {cap} `{binary}` CLI is installed and authenticated. "
             f"Use `{binary} <subcommand>` for all {cap} operations."
         )
-    if interface == "sdk":
+    if iface == "sdk":
         return f"The {cap} Python SDK is installed. Import and use it for all {cap} operations."
-    if interface == "mcp":
+    if iface == "mcp":
         return f"You have access to the {cap} MCP server. Use the provided MCP tools for all {cap} operations."
     return ""
 
@@ -414,7 +440,7 @@ def _compute_hash(platform: str, interface: str) -> str:
 
 def _check_known(platform: str, interface: str) -> None:
     """Validate the interface exists. Raises ValueError."""
-    if interface not in INTERFACES:
+    if base_interface(interface) not in INTERFACES:
         raise ValueError(f"Unknown interface {interface!r}; expected one of {INTERFACES}")
     if not load_manifest(platform, interface):
         raise ValueError(
@@ -464,7 +490,7 @@ def setup(
     `runtime_install` into the run venv (the legacy per-run install). Pass
     False when the run venv was cloned from a PREPARED venv (see `prepare()`) —
     the interface is already installed, so there's nothing to install per run."""
-    if interface not in INTERFACES:
+    if base_interface(interface) not in INTERFACES:
         raise ValueError(f"Unknown interface {interface!r}; expected one of {INTERFACES}")
 
     if platform == "none" and interface == "none":
@@ -519,7 +545,7 @@ def setup(
         #     binary name also works, but a wheel needs the explicit field).
         #   sdk_module: the importable module (`sdk_module`, else the platform name
         #     — true when package == platform name).
-        cli_binary=cfg.get("cli_command") or (binary if interface == "cli" else None),
+        cli_binary=cfg.get("cli_command") or (binary if base_interface(interface) == "cli" else None),
         cli_subcommand=_norm_subcommands(cfg.get("cli_subcommand")),
         cli_aux_commands=[str(b).strip() for b in (cfg.get("cli_aux_commands") or []) if str(b).strip()],
         sdk_module=cfg.get("sdk_module") or platform,
@@ -744,7 +770,7 @@ def _preflight_impl(
 
     if platform == "none" and interface == "none":
         return InterfaceStatus(platform, interface, ok=True, installed=True, authenticated=True)
-    if interface not in INTERFACES:
+    if base_interface(interface) not in INTERFACES:
         return InterfaceStatus(
             platform,
             interface,

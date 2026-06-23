@@ -28,6 +28,7 @@ from typing import Any
 # enforcement hook applies, so counted interface_calls match what the hook
 # actually allowed.
 from mlpab.hooks.log_tool_call import _cli_arg_after as _hook_cli_arg_after
+from mlpab.interfaces import base_interface as _base_interface
 
 
 @contextlib.contextmanager
@@ -440,7 +441,9 @@ def _results_view(row_dict: dict[str, Any]) -> dict[str, Any]:
         interface — it's noise, bucketed with bash).
     """
     out = {dest: row_dict.get(src, "") for dest, src in _RESULTS_VIEW.items() if src}
-    own_src = _INTERFACE_CALL_SRC.get(str(row_dict.get("interface", "")))
+    # A variant interface (e.g. ``cli-opt1-batch``) is counted as its base
+    # ``cli`` — its own-interface calls live in ``cli_calls``.
+    own_src = _INTERFACE_CALL_SRC.get(_base_interface(str(row_dict.get("interface", ""))))
     triple = {k: _num(row_dict.get(k)) for k in ("cli_calls", "mcp_calls", "sdk_calls")}
     own = triple.pop(own_src) if own_src else 0.0
     out["interface_calls"] = f"{own:g}"

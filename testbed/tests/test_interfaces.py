@@ -665,5 +665,44 @@ class PrepareTests(InterfaceTestBase):
         self.assertFalse(stamp.exists())
 
 
+class VariantInterfaceTests(InterfaceTestBase):
+    """A `<base>-<variant>` interface builds independently but behaves as base."""
+
+    def test_base_interface_mapping(self):
+        self.assertEqual(interfaces.base_interface("cli"), "cli")
+        self.assertEqual(interfaces.base_interface("sdk"), "sdk")
+        self.assertEqual(interfaces.base_interface("none"), "none")
+        # Variant names collapse to their leading known-base token.
+        self.assertEqual(interfaces.base_interface("cli-opt1-batch"), "cli")
+        self.assertEqual(interfaces.base_interface("sdk-foo"), "sdk")
+        # Unknown leading token is returned unchanged (no accidental collapse).
+        self.assertEqual(interfaces.base_interface("weird"), "weird")
+        self.assertEqual(interfaces.base_interface("kli-typo"), "kli-typo")
+
+    def test_variant_config_resolves_and_isolates_build(self):
+        # A variant manifest is accepted (base cli is known) and resolves to its
+        # full interface name, so its build home is isolated from the base.
+        self.write_manifest("svc", "cli-opt1-batch", 'version: "9.9+opt1"\nprompt: hi\n')
+        path = self.configs / "svc" / "cli-opt1-batch.yaml"
+        platform, interface = interfaces.platform_interface_from_config(path)
+        self.assertEqual((platform, interface), ("svc", "cli-opt1-batch"))
+        self.assertEqual(interfaces.base_interface(interface), "cli")
+        # Distinct build home + manifest from the base `cli` interface.
+        self.assertEqual(interfaces.bin_dir("svc", "cli-opt1-batch").name, "cli-opt1-batch")
+        self.assertNotEqual(
+            interfaces.bin_dir("svc", "cli-opt1-batch"), interfaces.bin_dir("svc", "cli")
+        )
+        self.assertEqual(
+            interfaces.interface_ref(interfaces.load_manifest("svc", "cli-opt1-batch")),
+            "9.9+opt1",
+        )
+
+    def test_unknown_interface_still_rejected(self):
+        with self.assertRaises(ValueError):
+            interfaces.platform_interface_from_config(
+                self.configs / "svc" / "kli-bogus.yaml"
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

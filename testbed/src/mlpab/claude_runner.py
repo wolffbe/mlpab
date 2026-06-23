@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from mlpab import streaming
+from mlpab import interfaces, streaming
 
 TESTBED_ROOT = Path(__file__).resolve().parents[2]
 # Real user home from /etc/passwd, NOT $HOME — the runner redirects $HOME into
@@ -131,9 +131,12 @@ def set_enforcement_env(
     _put("TESTBED_SDK_MODULE", sdk_module)
     _put("TESTBED_PLATFORM", platform if platform and platform != "none" else None)
     # Enforce ONLY for real delegation interfaces; a none/none baseline trains
-    # locally by design and the logic no-ops on it.
-    delegating = interface in ("cli", "mcp", "sdk")
-    _put("TESTBED_INTERFACE", interface if delegating else None)
+    # locally by design and the logic no-ops on it. A variant build (e.g.
+    # ``cli-opt1-batch``) is confined exactly as its base ``cli``, so the hook
+    # sees the base — its allowlist/denylist logic is base-keyed.
+    iface_base = interfaces.base_interface(interface) if interface else None
+    delegating = iface_base in ("cli", "mcp", "sdk")
+    _put("TESTBED_INTERFACE", iface_base if delegating else None)
     _put("TESTBED_COMPUTE_DENY", ",".join(compute_deny or DEFAULT_COMPUTE_DENY) if delegating else None)
     _put("TESTBED_INSTANCE_ALLOW", ",".join(instance_allowlist) if instance_allowlist else None)
 
@@ -442,6 +445,11 @@ _DISCONNECT_PHRASES = (
     "connection reset by peer",
     "client network socket disconnected",
     "network socket disconnected before secure tls connection was established",
+    # Anthropic API stream drop ("Connection closed mid-response. The response
+    # above may be incomplete."). The "mid-response" qualifier keeps this from
+    # matching the Hopsworks SDK's benign "Connection closed." log line echoed
+    # back in tool-result text.
+    "connection closed mid-response",
 )
 DISCONNECT_RETRY_MAX_ATTEMPTS = 3
 DISCONNECT_BACKOFF_S = 5
@@ -751,7 +759,7 @@ def run(
         roots = _first_party_roots(run_dir / "venv")
         if roots:
             env["MLPAB_IFACE_SDK"] = ",".join(roots)
-        elif interface in ("cli", "mcp", "sdk"):
+        elif interfaces.base_interface(interface) in ("cli", "mcp", "sdk"):
             # No installed dist ships an mcp/cli subpackage → the shim can't
             # attribute calls and tags everything "other", silently zeroing
             # whitelist_hits. Warn rather than fail quietly so a misbuilt venv

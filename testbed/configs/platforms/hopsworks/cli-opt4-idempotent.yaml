@@ -1,0 +1,107 @@
+# OPTIMIZATION VARIANT — opt4-idempotent (cost/wall-time experiment)
+# `fg create --if-exists get|skip` + actionable not-found/conflict errors.
+# Branches off the 5.1+alerting baseline (fork wolffbe/hopsworks-api,
+# branch hops-opt4-idempotent); ISOLATED — this variant adds ONLY this one
+# optimization, so its results are directly attributable. Compare against
+# the 5.1+alerting baseline CLI run on the same tasks.
+#
+# Hopsworks CLI interface — the `hops` CLI shipped IN hopsworks-api
+# (python/hopsworks/cli, console script `hops` → hopsworks.cli.main:main).
+#
+# Built LOCALLY from source (no PyPI): preflight builds the hopsworks wheel from
+# the repo's python/ dir into $INTERFACE_DIR and each agent run installs THAT
+# wheel into its venv. Same wheel as the SDK + MCP interfaces — only the entry
+# point (the `hops` command) differs.
+#
+# Set keys: edit the global testbed/.env (see `keys:` below).
+
+# --- Where it lives / how to build it (run automatically at preflight) ---
+# The interface version/ref under test — written to the results `version`
+# column. Keep in sync with the pin below (ref: / ==X.Y.Z / VER=).
+version: "5.1+opt4-idempotent"
+
+# TEMPORARY: pinned to the fork branch `hops-cli-alerting` that adds the
+# `hops alert` command group for CLI/SDK parity (logicalclocks/hopsworks-api
+# PR #1009; built on top of the `--verify/--no-verify` work from PR #1007). The
+# commit lives only on the fork, so `repo:` MUST point at the fork for the
+# `git fetch <sha>` to resolve. Once the PR merges, repoint `repo:` back to
+# logicalclocks/hopsworks-api and bump `ref:` to the merge commit (+ delete the
+# built src/).
+repo: https://github.com/wolffbe/hopsworks-api
+# Pinned to a FIXED COMMIT for reproducibility: the interface source never
+# drifts between runs (the checkout is never re-pulled). To advance, update
+# this SHA + delete the built src/.
+ref: 6ff869b40abe896d67bd091f7dc27574e46031fb
+install:
+  # Build the wheel from source into $INTERFACE_DIR, then RENAME it to one fixed,
+  # valid wheel filename (upstream version floats, e.g. 5.0.0.devN — `mv` leaves
+  # exactly one wheel). pip reads the real version from
+  # the wheel's own metadata, so the fixed `-0-` name is cosmetic.
+  - pip install build
+  - python -m build --wheel --outdir "$INTERFACE_DIR" python
+  - sh -c 'mv "$(ls -t "$INTERFACE_DIR"/hopsworks-*.whl | head -1)" "$INTERFACE_DIR/hopsworks-0-py3-none-any.whl"'
+
+# Deterministic, OFFLINE "does it run?" check (no live cluster): the `hops`
+# command installs and responds to --help.
+test_command: hops --help
+
+# Real connectivity check: `hops login` authenticates using HOPSWORKS_API_KEY /
+# HOPSWORKS_HOST from the environment (non-interactive when both are set) and
+# exits non-zero on a bad/missing key. `--no-save-key` keeps it from persisting
+# credentials to disk, so the check leaves no state behind.
+auth_command: hops login --no-save-key
+
+# --- How to run it (per agent run) — install the locally-built wheel. The
+#     `hops` console script ships with the package; `[python]` pulls the deps
+#     its commands need. ---
+binary: hopsworks-0-py3-none-any.whl
+# The invokable command name, so mlpab accounts `hops …` calls as cli_calls.
+cli_command: hops
+runtime_install:
+  # --no-compile: skip pip's byte-compile pass. pip 26.1's _install_wheel
+  # asserts a .pyc exists after each compile_file() (wheel.py:625); that assert
+  # is brittle when this install DOWNGRADES a package (base .venv has a newer
+  # fsspec than hopsworks[python,trino] pins) inside a venv that is a cp -Rc
+  # APFS copy-on-write CLONE of the base .venv (carrying stale __pycache__).
+  # .pyc files are regenerated lazily at import, so skipping precompile changes
+  # nothing at runtime and touches no dependency version.
+  - 'pip install --no-compile "$INTERFACE_DIR/hopsworks-0-py3-none-any.whl[python,trino]"'
+
+# --- Platform setup — run automatically by mlpab at the START of every run,
+#     right AFTER the teardown wipe below, so each run starts with exactly
+#     ONE fresh, empty project for the agent to work in (its `hopsworks.login()` selects the single project with
+#     no prompt). Created for every interface. The logic is the committed
+#     configs/platforms/hopsworks/setup.py — $MLPAB_PLATFORM_DIR points there (fixed
+#     infra). Run under $MLPAB_PLUMBING_PY — mlpab's per-platform plumbing venv,
+#     pinned to the SDK interface and so guaranteed to carry a working hopsworks
+#     python client (`Connection.create_project`). The CLI run venv must NOT be
+#     used: it is built from this interface's own pin, which can drift to an SDK
+#     version where `create_project` no longer exists — the create then fails on
+#     every retry and the project is never made (verify, which already runs under
+#     the plumbing venv, then aborts the run). This matches how verify and the
+#     other platforms (e.g. gcp) invoke their setup. Removal is handled by the
+#     teardown below (deletes every project this key owns at run start + end). ---
+serve:
+  - '"$MLPAB_PLUMBING_PY" "$MLPAB_PLATFORM_DIR/setup.py"'
+
+# --- Platform teardown — run automatically by mlpab at the START and END of
+#     every run, so each run starts and ends with a clean cluster. Deletes every project this API key owns, which
+#     cascades away all feature groups / views / training data / models the agent
+#     created (POST /hopsworks-api/api/project/{id}/delete) — including the empty
+#     project setup.py creates. The cleanup logic is the committed
+#     configs/platforms/hopsworks/teardown.py — $MLPAB_PLATFORM_DIR points
+#     there, so it's fixed infra. Run under $MLPAB_PLUMBING_PY (the plumbing venv
+#     with a stable SDK client) for the same reason as setup above. ---
+teardown:
+  - '"$MLPAB_PLUMBING_PY" "$MLPAB_PLATFORM_DIR/teardown.py"'
+
+# --- Credentials — names only; values resolve from the GLOBAL testbed/.env at
+#     run time (never stored here). ---
+keys:
+  - HOPSWORKS_API_KEY   # secret
+  - HOPSWORKS_HOST      # Hopsworks endpoint
+
+# --- Agent-facing prompt ---
+prompt: |
+  The Hopsworks CLI is available as `hops`. It is authenticated via HOPSWORKS_API_KEY and HOPSWORKS_HOST
+  from the environment. Run `hops --help` to see what it can do.

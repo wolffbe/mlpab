@@ -539,6 +539,10 @@ def run(spec: RunSpec) -> results.Row:
             # per-run install (it would re-pip into the run venv for nothing).
             run_install=not use_prepared,
         )
+        # The interface may be a variant build (e.g. ``cli-opt1-batch``) that
+        # builds independently but is accounted/confined/graded as its base
+        # ``cli``. Compute the base once for every behavioral decision below.
+        iface_base = interfaces.base_interface(interface_setup.interface)
         skills_setup = skills_mod.apply(spec.platform, spec.skills, run_dir)
         if skills_setup.installed:
             print(
@@ -633,7 +637,7 @@ def run(spec: RunSpec) -> results.Row:
         prompt = _build_prompt(
             task_body,
             interface_setup.prompt_fragment,
-            interface_under_test=interface_setup.interface != "none",
+            interface_under_test=iface_base != "none",
             max_seconds=spec.timeout_s,
         )
         (run_dir / "prompt.txt").write_text(prompt)
@@ -693,7 +697,7 @@ def run(spec: RunSpec) -> results.Row:
         # already has it; a CLI/MCP venv does NOT, so install it now — after the
         # agent has finished, so its interface purity stands, and the venv is torn
         # down right after. Idempotent (a no-op when already present).
-        if spec.platform in evals_provider.ADAPTERS and spec.interface != "sdk":
+        if spec.platform in evals_provider.ADAPTERS and iface_base != "sdk":
             try:
                 interfaces.install_for_grader(spec.platform, run_dir, venv_python)
             except Exception as e:
@@ -721,14 +725,14 @@ def run(spec: RunSpec) -> results.Row:
         # under test. (interface_setup markers are resolved for ALL interfaces to
         # feed the cross-interface enforcement HOOK, but counting must not relabel
         # an off-interface call as on-interface.)
-        count_cli = interface_setup.cli_binary if interface_setup.interface == "cli" else None
+        count_cli = interface_setup.cli_binary if iface_base == "cli" else None
         count_cli_sub = (
-            interface_setup.cli_subcommand if interface_setup.interface == "cli" else None
+            interface_setup.cli_subcommand if iface_base == "cli" else None
         )
         count_cli_aux = (
-            interface_setup.cli_aux_commands if interface_setup.interface == "cli" else None
+            interface_setup.cli_aux_commands if iface_base == "cli" else None
         )
-        count_sdk = interface_setup.sdk_module if interface_setup.interface == "sdk" else None
+        count_sdk = interface_setup.sdk_module if iface_base == "sdk" else None
         counts = results.aggregate_commands(
             cr.transcript_path,
             cli_binary=count_cli,
@@ -757,11 +761,11 @@ def run(spec: RunSpec) -> results.Row:
         # reaches the agent as "No such tool available", reading like an empty
         # interface. The agent's HOME (where Claude buries the MCP logs) is the
         # run dir.
-        if interface_setup.interface in ("cli", "mcp", "sdk"):
+        if iface_base in ("cli", "mcp", "sdk"):
             client_log = results.collect_client_logs(
                 run_dir=run_dir,
                 boundary=run_dir,
-                interface=interface_setup.interface,
+                interface=iface_base,
                 platform=spec.platform,
                 mcp_servers=interface_setup.mcp_servers,
                 transcript_path=cr.transcript_path,
@@ -780,11 +784,7 @@ def run(spec: RunSpec) -> results.Row:
         # THROUGH cli/mcp/sdk count — not hand-rolled `requests`, not server-side
         # Job calls (which never reach the venv shim). A none/none baseline has no
         # interface (and no endpoints), so it stays unattributed.
-        _iface = (
-            interface_setup.interface
-            if interface_setup.interface in ("cli", "mcp", "sdk")
-            else None
-        )
+        _iface = iface_base if iface_base in ("cli", "mcp", "sdk") else None
         endpoint_cov = results.endpoint_coverage(
             run_dir / "api_calls.jsonl", _wl, _bl, interface=_iface
         )
