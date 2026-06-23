@@ -1,10 +1,26 @@
 #!/usr/bin/env python3
-"""Pre-commit secret guard.
+"""Pre-commit secret guard — AUTO-REDACTS before every commit.
 
 We TRACK results/ and configs/treatments/ (so runs and treatment definitions are
 versioned, never silently lost). This hook is the safety net that lets us do
-that without ever committing a credential: it scans every staged file for the
-literal secret VALUES in the repo's .env, and blocks OAuth token caches outright.
+that without ever committing a credential.
+
+What it does, on every commit:
+  1. Hard-block files that must never be committed at all (OAuth token caches,
+     per-run venvs) — these are not redacted, the commit is refused.
+  2. AUTO-REDACT every literal value from the repo's .env out of the staged
+     files (in the worktree, then re-stage), replacing each with ***REDACTED***.
+     ALL .env values are scrubbed, not just KEY/TOKEN-named ones (per policy:
+     "anything from the env file should get redacted before committing"), with a
+     length floor so short generic values (a region, "login") aren't blanket-
+     replaced everywhere they coincidentally appear. Path-like values are
+     skipped (a path is not a secret).
+  3. Final safety net: re-scan staged content; if any secret value somehow
+     survived (e.g. an unwritable file), refuse the commit.
+
+Note: redaction edits the WORKTREE copy of a staged file and re-stages it, so
+the secret is gone from both. If a file had unstaged edits on top of staged
+ones, those get folded in by the re-stage — acceptable for this repo's workflow.
 
 Enable once per clone (done by `make install`):
     git config core.hooksPath .githooks
@@ -20,10 +36,14 @@ import subprocess
 import sys
 from pathlib import Path
 
-# Env var names whose values are real secrets worth blocking. Substring match,
-# so e.g. AWS_SECRET_ACCESS_KEY, DATABRICKS_TOKEN, MISTRAL_API_KEY all qualify.
-_SECRET_HINTS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL")
-_MIN_SECRET_LEN = 16  # ignore short values — too collision-prone to match safely
+PLACEHOLDER = b"***REDACTED***"
+# Redact ANY .env value (not only KEY/TOKEN-named). The length floor keeps short
+# generic values from being blanket-replaced wherever they coincidentally appear
+# in logs; path-like values are skipped (not secrets, and would false-positive on
+# every log line that mentions the path).
+_MIN_SECRET_LEN = 12
+
+_ENV_PATH = Path(__file__).resolve().parent.parent / ".env"
 
 
 def _staged_files() -> list[str]:
@@ -35,24 +55,18 @@ def _staged_files() -> list[str]:
     return [f for f in out.splitlines() if f.strip()]
 
 
-def _staged_blob(path: str) -> bytes:
-    """The staged content of `path` (the index version, not the worktree)."""
-    return subprocess.run(["git", "show", f":{path}"], capture_output=True).stdout
-
-
-def _env_secret_values() -> list[tuple[str, str]]:
-    """(name, value) pairs from .env worth scanning for. Skips short values and
-    path-like values (e.g. GOOGLE_APPLICATION_CREDENTIALS=/path/to.json) — a path
-    is not itself a secret and would false-positive on every log mentioning it.
+def _env_secret_values() -> list[tuple[str, bytes]]:
+    """(name, value-bytes) for every .env value worth scrubbing. Skips short and
+    path-like values. Longest first, so a value that contains another as a
+    substring is masked fully before the shorter one is tried.
 
     The .env lives beside this hook's project (``testbed/.env``), resolved from
     the hook's own location — git runs hooks with cwd at the repo ROOT (one level
     up from testbed), so a bare ``.env`` would miss it."""
-    env = Path(__file__).resolve().parent.parent / ".env"
-    if not env.exists():
+    if not _ENV_PATH.exists():
         return []
-    secrets: list[tuple[str, str]] = []
-    for line in env.read_text().splitlines():
+    secrets: list[tuple[str, bytes]] = []
+    for line in _ENV_PATH.read_text().splitlines():
         m = re.match(r"\s*(?:export\s+)?([A-Za-z0-9_]+)\s*=\s*(.+)", line)
         if not m:
             continue
@@ -63,39 +77,89 @@ def _env_secret_values() -> list[tuple[str, str]]:
             continue
         if val.startswith(("/", "~", "./")):  # path, not a secret value
             continue
-        if any(h in name.upper() for h in _SECRET_HINTS):
-            secrets.append((name, val))
-    return secrets
+        secrets.append((name, val.encode()))
+    return sorted(secrets, key=lambda nv: len(nv[1]), reverse=True)
 
 
 def main() -> int:
     files = _staged_files()
     secrets = _env_secret_values()
-    problems: list[str] = []
+    blocked: list[str] = []
+    redacted: dict[str, int] = {}  # secret name -> file count
+    to_restage: list[str] = []
+    env_rel = os.path.relpath(_ENV_PATH, Path.cwd()) if _ENV_PATH.exists() else None
 
     for f in files:
         base = os.path.basename(f)
+        # (1) Hard blocks — never commit these, redaction does not apply.
         if base == ".claude-oauth":
-            problems.append(f"{f}: OAuth token cache must never be committed")
+            blocked.append(f"{f}: OAuth token cache must never be committed")
             continue
         if "/venv/" in f or f.endswith("/venv"):
-            problems.append(f"{f}: per-run venv (build artifact) must not be committed")
+            blocked.append(f"{f}: per-run venv (build artifact) must not be committed")
+            continue
+        # Never rewrite the .env source of truth itself.
+        if env_rel and os.path.normpath(f) == os.path.normpath(env_rel):
+            blocked.append(f"{f}: .env itself must not be committed")
             continue
         if not secrets:
             continue
-        blob = _staged_blob(f)
-        for name, val in secrets:
-            if val.encode() in blob:
-                problems.append(f"{f}: contains the value of ${name} (.env secret)")
-                break
 
-    if problems:
-        sys.stderr.write("pre-commit: refusing to commit — secrets/artifacts detected:\n")
-        for p in problems:
+        # (2) Auto-redact in the worktree, then re-stage.
+        p = Path(f)
+        if not p.is_file():
+            continue
+        try:
+            data = p.read_bytes()
+        except OSError:
+            continue
+        new = data
+        hit_names: list[str] = []
+        for name, val in secrets:
+            if val in new:
+                new = new.replace(val, PLACEHOLDER)
+                hit_names.append(name)
+        if new != data:
+            try:
+                p.write_bytes(new)
+            except OSError as e:
+                blocked.append(f"{f}: contains .env secret(s) and could not be redacted ({e})")
+                continue
+            to_restage.append(f)
+            for name in hit_names:
+                redacted[name] = redacted.get(name, 0) + 1
+
+    if to_restage:
+        # Re-stage in batches so the redacted content is what gets committed.
+        for i in range(0, len(to_restage), 500):
+            subprocess.run(["git", "add", "--"] + to_restage[i : i + 500], check=False)
+        sys.stderr.write(
+            f"pre-commit: auto-redacted .env values in {len(to_restage)} file(s): "
+            + ", ".join(f"{n}×{c}" for n, c in sorted(redacted.items())) + "\n"
+        )
+
+    # (3) Final safety net — confirm the redaction actually took. Only the files
+    # we just rewrote can still carry a secret; everything else never matched. We
+    # re-read the worktree (which we just re-staged, so it IS the staged content)
+    # rather than `git show` per file, to stay fast on large result trees.
+    if secrets:
+        for f in to_restage:
+            try:
+                blob = Path(f).read_bytes()
+            except OSError:
+                continue
+            for name, val in secrets:
+                if val in blob:
+                    blocked.append(f"{f}: STILL contains the value of ${name} after redaction")
+                    break
+
+    if blocked:
+        sys.stderr.write("pre-commit: refusing to commit — unresolved secrets/artifacts:\n")
+        for p in blocked:
             sys.stderr.write(f"  - {p}\n")
         sys.stderr.write(
-            "\nUnstage with `git restore --staged <file>` (or scrub the secret), "
-            "then commit again.\n"
+            "\nThese were NOT auto-fixable. Unstage with `git restore --staged <file>` "
+            "(or remove the file), then commit again.\n"
         )
         return 1
     return 0
