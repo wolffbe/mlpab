@@ -10,8 +10,9 @@ Layout (under the caller-supplied `runs_root`):
             <category>/<task>/<n>/   # one attempt; repeats accumulate as n+1
     results/results.csv     # the ONE CSV: one row per execution, all
                             # configs, appended after EVERY run
-    results/results.ipynb   # GLOBAL: raw list + averages + charts,
-                            # regenerated after EVERY run
+
+Analysis notebooks (results/*.ipynb) are hand-curated artifacts, NOT generated
+by this code — the runner only ever appends to results.csv.
 
 Per-leaf results.csv files (next to the attempt folders) are deprecated — any
 legacy ones found are merged into the global CSV at run start, deduped by
@@ -425,22 +426,6 @@ def run_treatments(
         results.roll_up_results(parent, global_csv)
     except Exception as e:
         print(f"[mlpab] legacy leaf-CSV merge skipped: {e}", flush=True)
-    global_nb = parent / "results.ipynb"
-    if not global_nb.exists():
-        import nbformat as _nbf
-        from nbformat.v4 import new_markdown_cell, new_notebook
-
-        nb = new_notebook()
-        nb.cells = [
-            new_markdown_cell(
-                "# Results — global analysis\n\n"
-                "_(No results yet — this notebook regenerates at end of every "
-                "treatment run.)_\n"
-            )
-        ]
-        with global_nb.open("w") as f:
-            _nbf.write(nb, f)
-
     print(f"[mlpab] run={run_id}  runs={total}  dir={run_path}")
 
     completed: list[results.Row] = []
@@ -576,10 +561,6 @@ def run_treatments(
             f"asserts={row.asserts_passed}/{row.total_asserts}  "
             f"tokens={row.total_tokens}  wall={row.wall_time_s:.1f}s  cost=${row.cost_usd:.4f}"
         )
-        # The runner appended the row to the global results.csv; refresh the
-        # global results.ipynb to match, so both stay current after EVERY run.
-        _refresh_notebook(parent)
-
     if concurrency == 1:
         # Sequential path — unchanged behavior. A failed platform setup aborts
         # the whole config (every later run would hit the same broken platform).
@@ -633,22 +614,6 @@ def run_treatments(
 
     print(f"[mlpab] results: {global_csv}", flush=True)
     _print_summary(completed, failed, global_csv)
-
-
-def _refresh_notebook(parent: Path) -> None:
-    """Regenerate the GLOBAL results.ipynb at the results root from the
-    global results.csv: per config → per model → one bar chart per
-    TRACKED_METRICS metric, one bar per (platform, interface, version,
-    skills), averaged across categories, tasks, and repeats. Replaces the
-    placeholder created at run start. Failures never abort the session."""
-    try:
-        from mlpab import notebook as notebook_mod
-
-        nb_path = notebook_mod.build_results_notebook(parent)
-        if nb_path is not None:
-            print(f"[mlpab] refreshed analysis notebook: {nb_path}", flush=True)
-    except Exception as e:
-        print(f"[mlpab] notebook refresh skipped: {e}", flush=True)
 
 
 def _print_summary(rows: list[results.Row], failed: list[str], rollup_csv: Path) -> None:

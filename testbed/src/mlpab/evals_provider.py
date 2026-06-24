@@ -89,6 +89,12 @@ FAMILIES: dict[str, tuple[str, str]] = {
 # Platforms with a checker adapter (grading reads through the platform).
 ADAPTERS = ("hopsworks", "databricks", "aws", "azure", "gcp")
 
+# Upper bound on deterministic reseeds when a generator's validity gate rejects
+# a seed (see prepare()). Gate rejections are rare, so a clean seed is normally
+# found in the first one or two tries; this is just a guard against a generator
+# whose gate can never pass.
+_MAX_RESEEDS = 50
+
 
 def seed_for(run_id: str, category: str, task: str, attempt: int) -> int:
     """Deterministic, distinct seed per (session, category, task, repeat):
@@ -122,11 +128,35 @@ def prepare(task: str, run_dir: Path, seed: int) -> str:
     run_dir = Path(run_dir).absolute()
     attempt = run_dir.parent
     staging = attempt / ".staging"
-    if staging.exists():
-        shutil.rmtree(staging)
 
     gen = importlib.import_module(f"evals.{fam}.generate")
-    gen.generate(seed, staging)
+    # A generator's validity gates (e.g. cross-checking the answer key against
+    # an independent implementation) can reject a seed: the random instance it
+    # drew is one the gate can't certify (for `mit`, two transactions of one
+    # account share an event_time, which the pandas rolling cross-check counts
+    # differently from the row scan). Because the seed is deterministic per
+    # (config, category, task, attempt), such a seed would kill that combo on
+    # EVERY run. So on a gate rejection, deterministically reseed and retry —
+    # a clean instance for the same combo, still fully reproducible. A seed that
+    # passes the gate (the common case) succeeds on the first iteration, so
+    # already-valid instances are byte-for-byte unchanged.
+    gate_err = getattr(gen, "GateError", ())
+    cur_seed = seed
+    last_gate: Exception | None = None
+    for _ in range(_MAX_RESEEDS):
+        if staging.exists():
+            shutil.rmtree(staging)
+        try:
+            gen.generate(cur_seed, staging)
+            break
+        except gate_err as e:  # type: ignore[misc]  # () catches nothing when no gate
+            last_gate = e
+            cur_seed = zlib.crc32(f"{cur_seed}:reseed".encode()) & 0x7FFFFFFF
+    else:
+        raise RuntimeError(
+            f"could not generate a gate-valid {task!r} instance after "
+            f"{_MAX_RESEEDS} reseeds (seed {seed}): {last_gate}"
+        )
 
     for target in (run_dir / "data", attempt / "solution"):
         if target.exists():

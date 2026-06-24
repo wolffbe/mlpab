@@ -1,7 +1,9 @@
 """Tests for runner helpers: dynamic environment detection + prompt rendering."""
 
+import json
 import os
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -21,6 +23,115 @@ class SeedForTests(unittest.TestCase):
     def test_unimplemented_family_fails_fast(self):
         with self.assertRaises(ValueError):
             evals_provider._family("not-a-real-eval")
+
+
+class PrepareReseedTests(unittest.TestCase):
+    """prepare() deterministically reseeds when a generator's validity gate
+    rejects a seed, instead of letting the GateError kill the combo forever
+    (the seed is fixed per config, so a bad seed would fail on every run)."""
+
+    @staticmethod
+    def _fake_generator(fail_times, seen):
+        """A stand-in evals.<fam>.generate: raises its own GateError for the
+        first `fail_times` seeds, then stages a minimal valid instance."""
+
+        class _FakeGate(RuntimeError):
+            pass
+
+        mod = types.SimpleNamespace(GateError=_FakeGate)
+        state = {"calls": 0}
+
+        def generate(seed, staging):
+            seen.append(seed)
+            if state["calls"] < fail_times:
+                state["calls"] += 1
+                raise _FakeGate(f"gate reject seed={seed}")
+            staging = Path(staging)
+            (staging / "data").mkdir(parents=True)
+            (staging / "data" / "rows.csv").write_text("a\n1\n")
+            (staging / "solution").mkdir(parents=True)
+            (staging / "solution" / "truth.json").write_text("{}")
+            (staging / "prompt.txt").write_text("BODY")
+            (staging / "instance.json").write_text(json.dumps({"seed": seed}))
+
+        mod.generate = generate
+        return mod
+
+    def _prepare_with(self, fake, task, run_dir, seed):
+        with (
+            mock.patch.object(evals_provider, "_family", return_value=("fake.fam", "table")),
+            mock.patch("importlib.import_module", return_value=fake),
+        ):
+            return evals_provider.prepare(task, run_dir, seed)
+
+    def _attempt_dir(self):
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(__import__("shutil").rmtree, tmp, True)
+        run_dir = tmp / "1" / "task"
+        run_dir.mkdir(parents=True)
+        return run_dir
+
+    def test_passing_seed_unchanged_first_try(self):
+        seen = []
+        run_dir = self._attempt_dir()
+        body = self._prepare_with(self._fake_generator(0, seen), "anytask", run_dir, 4242)
+        self.assertEqual(body, "BODY")
+        self.assertEqual(seen, [4242])  # no reseed: succeeded on the original seed
+        used = json.loads((run_dir.parent / "solution" / "instance.json").read_text())["seed"]
+        self.assertEqual(used, 4242)
+        self.assertTrue((run_dir / "data" / "rows.csv").exists())
+
+    def test_gate_rejection_reseeds_then_succeeds(self):
+        seen = []
+        run_dir = self._attempt_dir()
+        body = self._prepare_with(self._fake_generator(2, seen), "anytask", run_dir, 4242)
+        self.assertEqual(body, "BODY")
+        self.assertEqual(len(seen), 3)  # two rejected + one accepted
+        self.assertEqual(seen[0], 4242)
+        self.assertEqual(len(set(seen)), 3)  # each retry drew a distinct seed
+        used = json.loads((run_dir.parent / "solution" / "instance.json").read_text())["seed"]
+        self.assertEqual(used, seen[-1])
+        self.assertNotEqual(used, 4242)
+
+    def test_reseed_sequence_is_deterministic(self):
+        seen_a, seen_b = [], []
+        self._prepare_with(self._fake_generator(2, seen_a), "anytask", self._attempt_dir(), 4242)
+        self._prepare_with(self._fake_generator(2, seen_b), "anytask", self._attempt_dir(), 4242)
+        self.assertEqual(seen_a, seen_b)  # same start seed -> same instance, reproducible
+
+    def test_exhausted_reseeds_raises(self):
+        seen = []
+        # always-failing gate: prepare gives up after _MAX_RESEEDS tries
+        with self.assertRaises(RuntimeError) as ctx:
+            self._prepare_with(self._fake_generator(10**9, seen), "anytask", self._attempt_dir(), 4242)
+        self.assertEqual(len(seen), evals_provider._MAX_RESEEDS)
+        self.assertNotIn("GateError", type(ctx.exception).__name__)  # surfaced as RuntimeError
+
+    def test_real_mit_bad_seed_is_recovered(self):
+        """Regression for the reported 13/mit failure: the seed treatment 13
+        deterministically draws trips mit's scan-vs-rolling gate; prepare() must
+        still yield a valid instance by reseeding. (If a future fix to mit's
+        _rolling_7d makes this seed pass on the first try, this test becomes
+        obsolete and should be removed.)"""
+        import shutil
+
+        import evals.feature.mit.generate as mitgen
+
+        bad_seed = evals_provider.seed_for(
+            "13_hw-cli-opt2-session-reuse-skills-opt-opus", "feature", "mit", 1
+        )
+        # precondition: the raw generator really does reject this seed
+        staging = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, staging, True)
+        with self.assertRaises(mitgen.GateError):
+            mitgen.generate(bad_seed, staging)
+        # prepare() recovers it: a valid instance on a reseeded value
+        run_dir = self._attempt_dir()
+        body = evals_provider.prepare("mit", run_dir, bad_seed)
+        self.assertTrue(body)
+        used = json.loads((run_dir.parent / "solution" / "instance.json").read_text())["seed"]
+        self.assertNotEqual(used, bad_seed)
+        self.assertTrue((run_dir / "data").is_dir())
 
 
 class PlatformEnvTests(unittest.TestCase):

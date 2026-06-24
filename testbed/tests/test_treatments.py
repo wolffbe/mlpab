@@ -208,7 +208,6 @@ def _patches(run_side_effect):
         mock.patch.object(preflight, "preflight", lambda *a, **k: None),
         mock.patch.object(claude_runner, "oauth_token_from_keychain", lambda: None),
         mock.patch.object(results, "roll_up_results", lambda *a, **k: None),
-        mock.patch.object(treatments, "_refresh_notebook", lambda *a, **k: None),
         mock.patch.object(runner, "run", side_effect=run_side_effect),
     ]
 
