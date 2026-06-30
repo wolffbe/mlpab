@@ -19,7 +19,12 @@ from types import SimpleNamespace
 
 import pandas as pd
 
-from evals.adapters.databricks import CATALOG, GRADER_WAREHOUSE_NAME, DatabricksChecker
+from evals.adapters.databricks import (
+    CATALOG,
+    DEFAULT_SCHEMA,
+    GRADER_WAREHOUSE_NAME,
+    DatabricksChecker,
+)
 
 
 def _wh(id_, name=None, state=None):
@@ -58,11 +63,16 @@ class _FakeStmtExec:
         return self._next()
 
 
-def _checker(*, warehouses=None, statements=None):
+def _checker(*, warehouses=None, statements=None, schema=None):
     c = DatabricksChecker.__new__(DatabricksChecker)
     c._fqn_cache = {}
     c._POLL_SECS = 0  # no real sleeps
     c._warehouse = "wh"
+    # __init__ derives these from MLPAB_DATABRICKS_SCHEMA; mirror that here.
+    fqn = schema or f"{CATALOG}.{DEFAULT_SCHEMA}"
+    c._schema = fqn
+    c._catalog, c._schema_name = (fqn.split(".", 1) + [DEFAULT_SCHEMA])[:2]
+    c._per_run = schema is not None  # a per-run schema override enables scoping
     c._w = SimpleNamespace(
         warehouses=SimpleNamespace(list=lambda: list(warehouses or [])),
         statement_execution=_FakeStmtExec(statements or []),
@@ -132,8 +142,30 @@ class ResolveFqnTests(unittest.TestCase):
         c._sql = lambda q: self._df([(CATALOG, "feature_store"), (CATALOG, "default")])
         self.assertEqual(c._resolve_fqn("t"), f"{CATALOG}.default.t")
 
+    def test_prefers_per_run_schema_over_default(self):
+        # with a per-run landing zone, the run schema wins even over default
+        c = _checker(schema=f"{CATALOG}.mlpabrun1")
+        c._sql = lambda q: self._df(
+            [(CATALOG, "default"), (CATALOG, "mlpabrun1"), (CATALOG, "feature_store")]
+        )
+        self.assertEqual(c._resolve_fqn("t"), f"{CATALOG}.mlpabrun1.t")
+
+    def test_per_run_ignores_leftover_catalog(self):
+        # per-run mode: a leftover table in an agent catalog (fs_online) from
+        # another run must NOT be matched, even if it sorts first alphabetically.
+        c = _checker(schema=f"{CATALOG}.mlpabrun1")
+        c._sql = lambda q: self._df([("fs_online", "default"), (CATALOG, "mlpabrun1")])
+        self.assertEqual(c._resolve_fqn("t"), f"{CATALOG}.mlpabrun1.t")
+
+    def test_per_run_returns_none_when_only_leftover_exists(self):
+        # only a leftover-catalog copy exists → scoped out → not found (so the
+        # grader reports a missing deliverable rather than grading stale data).
+        c = _checker(schema=f"{CATALOG}.mlpabrun1")
+        c._sql = lambda q: self._df([("fs_online", "default")])
+        self.assertIsNone(c._resolve_fqn("t"))
+
     def test_finds_non_default_schema(self):
-        # the mistral-large case: table only in workspace.feature_store
+        # the mistral-large case (NON per-run): table only in workspace.feature_store
         c = _checker()
         c._sql = lambda q: self._df([(CATALOG, "feature_store")])
         self.assertEqual(c._resolve_fqn("t"), f"{CATALOG}.feature_store.t")

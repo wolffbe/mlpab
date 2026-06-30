@@ -49,9 +49,14 @@ class DatabricksAdapterReadTests(unittest.TestCase):
     grader subprocess into a "produced no report" with a raw traceback."""
 
     def _checker(self):
-        from evals.adapters.databricks import DatabricksChecker
+        from evals.adapters.databricks import CATALOG, DEFAULT_SCHEMA, DatabricksChecker
 
-        return DatabricksChecker.__new__(DatabricksChecker)  # skip __init__/SDK
+        c = DatabricksChecker.__new__(DatabricksChecker)  # skip __init__/SDK
+        c._fqn_cache = {}
+        c._schema = f"{CATALOG}.{DEFAULT_SCHEMA}"
+        c._catalog, c._schema_name = CATALOG, DEFAULT_SCHEMA
+        c._per_run = False
+        return c
 
     def test_missing_table_becomes_lookuperror(self):
         c = self._checker()

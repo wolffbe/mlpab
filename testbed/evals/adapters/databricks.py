@@ -61,6 +61,18 @@ class DatabricksChecker:
         self._w = WorkspaceClient()
         self._warehouse = os.environ.get("DATABRICKS_WAREHOUSE_ID") or self._first_warehouse()
         self._fqn_cache: dict[str, str | None] = {}
+        # This run's landing-zone schema "<catalog>.<schema>" (runner sets
+        # MLPAB_DATABRICKS_SCHEMA per run; falls back to workspace.default for a
+        # manual probe). Preferred when resolving / fabricating table names.
+        fqn = (os.environ.get("MLPAB_DATABRICKS_SCHEMA") or SCHEMA).strip()
+        self._schema = fqn
+        self._catalog, self._schema_name = (fqn.split(".", 1) + [DEFAULT_SCHEMA])[:2]
+        # Per-run mode: a run-specific landing schema is set, so the agent's
+        # deliverables live in it. Scope reads to it (+ workspace.default) so a
+        # leftover same-named table/endpoint from another run — which the
+        # metastore-wide search would otherwise pick up — can't be graded as
+        # this run's output (cross-run false positive).
+        self._per_run = bool(os.environ.get("MLPAB_DATABRICKS_SCHEMA"))
 
     @staticmethod
     def _wh_state(w) -> str:
@@ -132,9 +144,10 @@ class DatabricksChecker:
         catalog or schema, so a model may land it in any schema of the
         `workspace` catalog (the literal `default`, a self-named `feature_store`)
         or even a catalog it created itself. Search the metastore-wide
-        information_schema and prefer the conventional `workspace.default`,
-        then any `workspace.*`, then any non-system location. Cached per name;
-        returns None if the name is nowhere in the metastore."""
+        information_schema and prefer this run's schema, then the conventional
+        `workspace.default`, then any `workspace.*`, then any non-system
+        location. Cached per name; returns None if the name is nowhere in the
+        metastore."""
         if name in self._fqn_cache:
             return self._fqn_cache[name]
         self._fqn_cache[name] = fqn = self._search_table(name)
@@ -165,15 +178,21 @@ class DatabricksChecker:
                 )
                 if str(c) not in self._SKIP_CATALOGS and str(s) not in self._SKIP_SCHEMAS
             ]
+            if self._per_run:
+                # Only this run's schema (or the shared default landing zone) —
+                # never a leftover agent catalog (e.g. fs_online) from another run.
+                allowed = {(self._catalog, self._schema_name), (CATALOG, DEFAULT_SCHEMA)}
+                cands = [cs for cs in cands if cs in allowed]
             if not cands:
                 continue
 
             def rank(cs):
                 cat, sch = cs
                 return (
-                    0 if (cat == CATALOG and sch == DEFAULT_SCHEMA) else
-                    1 if cat == CATALOG else
-                    2 if sch == DEFAULT_SCHEMA else 3,
+                    0 if (cat == self._catalog and sch == self._schema_name) else
+                    1 if (cat == CATALOG and sch == DEFAULT_SCHEMA) else
+                    2 if cat == CATALOG else
+                    3 if sch == DEFAULT_SCHEMA else 4,
                     cat,
                     sch,
                 )
@@ -185,7 +204,7 @@ class DatabricksChecker:
     # -- feature tables ----------------------------------------------------
 
     def get_feature_table(self, name: str, version: int | None = None) -> TableInfo | None:
-        full = self._resolve_fqn(name) or f"{SCHEMA}.{name}"
+        full = self._resolve_fqn(name) or f"{self._schema}.{name}"
         try:
             t = self._w.tables.get(full)
         except Exception:
@@ -223,7 +242,7 @@ class DatabricksChecker:
             fqn = self._resolve_fqn(cand)
             if fqn is not None:
                 break
-        fqn = fqn or f"{SCHEMA}.{name}"
+        fqn = fqn or f"{self._schema}.{name}"
         try:
             return self._sql(f"SELECT * FROM {fqn}")
         except RuntimeError as e:
@@ -274,8 +293,15 @@ class DatabricksChecker:
                     )
                     if is_model:
                         continue  # hosted LLM/embedding endpoint — never a feature store
-                    refs = [e.name] + [str(getattr(x, "entity_name", "") or "") for x in ents]
-                    if any(name in r for r in refs):
+                    entity_names = [str(getattr(x, "entity_name", "") or "") for x in ents]
+                    if self._per_run:
+                        # Per-run: require a served entity in THIS run's schema, so
+                        # a leftover endpoint serving another run's table (whose
+                        # name happens to be a substring) can't be matched.
+                        matched = any(f"{self._schema}." in en for en in entity_names)
+                    else:
+                        matched = any(name in r for r in [e.name] + entity_names)
+                    if matched:
                         cands.append(e.name)
                 except Exception:
                     continue
@@ -405,9 +431,9 @@ def _state_reads(cls):
         """Fully-qualified registered-model names to try, conventional location
         first. Tasks pin a model NAME but not a schema/catalog, so — like
         feature tables — a model may be registered in any non-system schema.
-        Probe workspace.default, then every other non-system schema of every
+        Probe this run's schema, then every other non-system schema of every
         non-system catalog."""
-        out = [f"{SCHEMA}.{name}"]
+        out = [f"{self._schema}.{name}"]
         try:
             for cat in self._w.catalogs.list():
                 cn = getattr(cat, "name", None)

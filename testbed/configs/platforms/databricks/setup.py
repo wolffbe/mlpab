@@ -1,4 +1,4 @@
-"""Databricks platform setup — ensure the `workspace.default` UC schema exists.
+"""Databricks platform setup — ensure this run's UC landing-zone schema exists.
 
 Run automatically by `mlpab run` (the interface `serve:` step) at the START of
 every challenge, right AFTER `teardown.py` has swept the workspace — same
@@ -6,13 +6,14 @@ contract as the hopsworks setup.
 
 Unlike Hopsworks there is NO project container to pre-create: the token scopes
 to the whole workspace and every interface authenticates without any
-pre-existing resource. The one piece of platform plumbing worth guaranteeing is
-the Unity Catalog schema `workspace.default` — the MCP interface launches its
-server bound to it (`unitycatalog-mcp -s workspace.default`, see mcp.yaml), and
-it is the natural landing zone for feature tables on the other interfaces.
-`teardown.py` deliberately never deletes the `workspace` catalog or `default`
-schemas, so this is normally a no-op guard that only acts if the schema went
-missing (e.g. a manually wiped workspace).
+pre-existing resource. Instead the runner mints a PER-RUN Unity Catalog schema
+name in the `workspace` catalog (`MLPAB_DATABRICKS_SCHEMA=workspace.mlpab<hex>`,
+see src/mlpab/runner.py) that is this run's landing zone for feature tables and
+every other UC object — the single source of truth setup creates, the agent
+lands tables in, the grader reads back through, and teardown force-deletes ONLY.
+Scoping the schema per run is what lets two databricks runs share one workspace
+token without their teardowns deleting each other's tables. When the env var is
+unset (a manual/single-run invocation) we fall back to `workspace.default`.
 
 Talks to the REST API with the stdlib only (urllib), like teardown.py, so the
 same script works for cli, sdk, and mcp runs.
@@ -36,8 +37,10 @@ if HOST and "://" not in HOST:
     HOST = "https://" + HOST
 TOKEN = os.environ.get("DATABRICKS_TOKEN") or ""
 
-CATALOG = "workspace"
-SCHEMA = "default"
+# Per-run landing-zone schema as `<catalog>.<schema>` (runner sets it; falls
+# back to the conventional workspace.default for manual/single-run use).
+_SCHEMA_FQN = os.environ.get("MLPAB_DATABRICKS_SCHEMA") or "workspace.default"
+CATALOG, SCHEMA = (_SCHEMA_FQN.split(".", 1) + ["default"])[:2]
 # Stable SQL warehouse the GRADER reads through (see evals/adapters/databricks.py).
 # teardown.py preserves it by name so it survives the per-run sweep.
 GRADER_WAREHOUSE = "mlpab-grader"
@@ -133,10 +136,10 @@ def main() -> None:
 
 def verify() -> int:
     """Twofold setup check (`setup.py verify`): (1) the workspace CONNECTS with
-    the run's token, then (2) the `workspace.default` schema setup guarantees is
-    PRESENT. Exit 0 iff ready, non-zero with a reason otherwise — the runner
-    fails the run on non-zero, so the agent never works against a platform it
-    can't reach. Read-only.
+    the run's token, then (2) this run's landing-zone schema (CATALOG.SCHEMA,
+    per-run when MLPAB_DATABRICKS_SCHEMA is set) is PRESENT. Exit 0 iff ready,
+    non-zero with a reason otherwise — the runner fails the run on non-zero, so
+    the agent never works against a platform it can't reach. Read-only.
 
     Connection is the hard gate; the schema is best-effort (setup.py itself only
     creates it where Unity Catalog exists), so a non-UC workspace that connects

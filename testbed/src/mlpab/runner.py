@@ -586,6 +586,21 @@ def run(spec: RunSpec) -> results.Row:
         # delete race documented in setup.py.
         if spec.platform == "hopsworks":
             os.environ["HOPSWORKS_PROJECT"] = f"mlpab{secrets.token_hex(3)}"
+        # Per-run Databricks namespace, the same single-source-of-truth pattern.
+        # Databricks has no project container whose deletion cascades, so the
+        # per-run id does double duty: it names a Unity Catalog SCHEMA in the
+        # `workspace` catalog that is this run's landing zone for all UC objects
+        # (setup creates it, the agent lands tables there, the grader reads it
+        # back, teardown force-deletes ONLY it), and it is the NAME PREFIX / path
+        # segment for the resource types that live outside any schema (jobs,
+        # pipelines, endpoints, clusters, MLflow experiments, workspace/DBFS
+        # files) so teardown can scope those to this run too. A fresh random id
+        # per run is what lets two databricks runs share one workspace token
+        # without their start/end teardowns deleting each other's resources.
+        if spec.platform == "databricks":
+            run = f"mlpab{secrets.token_hex(3)}"
+            os.environ["MLPAB_DATABRICKS_SCHEMA"] = f"workspace.{run}"
+            os.environ["MLPAB_DATABRICKS_PREFIX"] = run
         base_keys_env = {
             **os.environ,
             **interface_setup.keys,
