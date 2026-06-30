@@ -44,11 +44,20 @@ class AzureMLChecker:
         self._ws = MLClient(self._cred, sub, rg, os.environ["AZUREML_WORKSPACE_NAME"])
         fs = os.environ.get("AZUREML_FEATURE_STORE_NAME")
         self._fs = MLClient(self._cred, sub, rg, fs) if fs else self._ws
+        # Per-run prefix (runner sets MLPAB_AZURE_PREFIX). Azure ML has one
+        # workspace/feature store (no per-run namespace), so the agent is told to
+        # name every asset `<run>-<name>` and the reads below prepend the same.
+        # Empty on a manual probe → bare names.
+        self._prefix = os.environ.get("MLPAB_AZURE_PREFIX") or ""
+
+    def _q(self, name: str) -> str:
+        """Prefix an asset name with this run's id (no-op when unset)."""
+        return f"{self._prefix}-{name}" if self._prefix else name
 
     # -- managed feature store -------------------------------------------------
     def get_feature_table(self, name: str, version: int | None = None) -> TableInfo | None:
         try:
-            fset = self._fs.feature_sets.get(name=name, version=str(version or 1))
+            fset = self._fs.feature_sets.get(name=self._q(name), version=str(version or 1))
         except Exception:
             return None
         feats = getattr(fset, "features", None) or []
@@ -69,7 +78,7 @@ class AzureMLChecker:
         Data asset named `name` (the feature set's materialized/source data) and
         read it via the ADLS filesystem with the SP credential."""
         try:
-            asset = self._ws.data.get(name=name, version=str(version or 1))
+            asset = self._ws.data.get(name=self._q(name), version=str(version or 1))
             return _read_uri(asset.path, self._cred)
         except Exception as e:
             raise LookupError(
@@ -80,7 +89,7 @@ class AzureMLChecker:
     def read_training_dataset(self, name: str, version: int = 1) -> pd.DataFrame:
         for n, v in ((f"{name}_v{version}", "1"), (name, str(version)), (name, "1")):
             try:
-                asset = self._ws.data.get(name=n, version=v)
+                asset = self._ws.data.get(name=self._q(n), version=v)
                 return _read_uri(asset.path, self._cred)
             except Exception:
                 continue
@@ -127,6 +136,7 @@ def _read_uri(uri: str, cred) -> pd.DataFrame:
 
 def _state_reads(cls):
     def get_model(self, name: str, version: int = 1) -> dict:
+        name = self._q(name)
         try:
             m = self._ws.models.get(name=name, version=str(version))
         except Exception:
@@ -147,6 +157,7 @@ def _state_reads(cls):
         return {"exists": True, "version": getattr(m, "version", None), "metrics": metrics or None}
 
     def get_job(self, name: str) -> dict:
+        name = self._q(name)
         try:
             j = self._ws.jobs.get(name)
         except Exception:
@@ -164,6 +175,7 @@ def _state_reads(cls):
         }
 
     def get_endpoint(self, name: str) -> dict:
+        name = self._q(name)
         for getter in ("online_endpoints", "batch_endpoints"):
             try:
                 e = getattr(self._ws, getter).get(name)
@@ -185,10 +197,11 @@ def _state_reads(cls):
             sub = os.environ["AZURE_SUBSCRIPTION_ID"]
             rg = os.environ["AZURE_RESOURCE_GROUP"]
             mon = MonitorManagementClient(self._cred, sub)
+            hint = self._q(name_or_hint)
             hits = [
                 r.name
                 for r in mon.metric_alerts.list_by_resource_group(rg)
-                if name_or_hint in (r.name or "")
+                if hint in (r.name or "")
             ]
             return {"exists": bool(hits), "count": len(hits), "matches": hits}
         except Exception as e:

@@ -36,7 +36,16 @@ class VertexChecker:
     def __init__(self) -> None:
         self.project = os.environ["GCP_PROJECT"]
         self.location = os.environ.get("GCP_LOCATION", "us-central1")
+        # Per-run dataset (runner overrides GCP_BQ_DATASET=mlpab_<run>); BQ reads
+        # are scoped by it, so feature/training-dataset NAMES stay bare. The
+        # schema-less aiplatform/monitoring resources instead carry a per-run
+        # display_name prefix (`<run>_`), which the state reads below prepend.
         self.dataset = os.environ.get("GCP_BQ_DATASET", "mlpab")
+        self._prefix = os.environ.get("MLPAB_GCP_PREFIX") or ""
+
+    def _q(self, name: str) -> str:
+        """Prefix a state-resource name with this run's id (no-op when unset)."""
+        return f"{self._prefix}_{name}" if self._prefix else name
 
     # -- BigQuery-backed feature reads -------------------------------------
     def _bq(self):
@@ -96,7 +105,7 @@ def _state_reads(cls):
         model evaluation if one was uploaded."""
         try:
             ai = _init_ai(self)
-            models = list(ai.Model.list(filter=f'display_name="{name}"'))
+            models = list(ai.Model.list(filter=f'display_name="{self._q(name)}"'))
             if not models:
                 return {"exists": False}
             m = models[0]
@@ -120,10 +129,11 @@ def _state_reads(cls):
         """Custom / pipeline jobs by display_name; scheduled = a Schedule exists."""
         try:
             ai = _init_ai(self)
+            qname = self._q(name)
             hits = []
             for lister in (ai.CustomJob, ai.PipelineJob):
                 try:
-                    hits += [j for j in lister.list(filter=f'display_name="{name}"')]
+                    hits += [j for j in lister.list(filter=f'display_name="{qname}"')]
                 except Exception:
                     pass
             if not hits:
@@ -132,7 +142,7 @@ def _state_reads(cls):
             scheduled = False
             try:
                 scheduled = any(
-                    name in (s.display_name or "") for s in ai.PipelineJobSchedule.list()
+                    qname in (s.display_name or "") for s in ai.PipelineJobSchedule.list()
                 )
             except Exception:
                 pass
@@ -148,7 +158,7 @@ def _state_reads(cls):
     def get_endpoint(self, name: str) -> dict:
         try:
             ai = _init_ai(self)
-            eps = list(ai.Endpoint.list(filter=f'display_name="{name}"'))
+            eps = list(ai.Endpoint.list(filter=f'display_name="{self._q(name)}"'))
             if not eps:
                 return {"exists": False}
             e = eps[0]
@@ -163,10 +173,11 @@ def _state_reads(cls):
 
             client = monitoring_v3.AlertPolicyServiceClient()
             project = f"projects/{self.project}"
+            hint = self._q(name_or_hint)
             hits = [
                 p.display_name
                 for p in client.list_alert_policies(name=project)
-                if name_or_hint in (p.display_name or "")
+                if hint in (p.display_name or "")
             ]
             return {"exists": bool(hits), "count": len(hits), "matches": hits}
         except Exception as e:
@@ -177,7 +188,8 @@ def _state_reads(cls):
         display_name. native_ann=True — the platform has first-class ANN."""
         try:
             ai = _init_ai(self)
-            idxs = [i for i in ai.MatchingEngineIndex.list() if name in (i.display_name or "")]
+            qname = self._q(name)
+            idxs = [i for i in ai.MatchingEngineIndex.list() if qname in (i.display_name or "")]
             return {
                 "exists": bool(idxs),
                 "kind": "vertex-vector-search",

@@ -54,12 +54,22 @@ class SageMakerChecker:
             account = sts.get_caller_identity()["Account"]
             bucket = f"sagemaker-{region}-{account}"
         self._bucket = bucket
+        # Per-run prefix (runner sets MLPAB_AWS_PREFIX). SageMaker has no
+        # namespace, so the agent is told to name every resource `<run>-<name>`
+        # and write training-set objects under the `<run>/` S3 key prefix; the
+        # reads below prepend the same so a parallel run's same-named resources
+        # are never mistaken for this run's. Empty on a manual probe → bare names.
+        self._prefix = os.environ.get("MLPAB_AWS_PREFIX") or ""
+
+    def _q(self, name: str) -> str:
+        """Prefix a resource name with this run's id (no-op when unset)."""
+        return f"{self._prefix}-{name}" if self._prefix else name
 
     # -- feature tables ----------------------------------------------------
 
     def get_feature_table(self, name: str, version: int | None = None) -> TableInfo | None:
         try:
-            d = self._sm.describe_feature_group(FeatureGroupName=name)
+            d = self._sm.describe_feature_group(FeatureGroupName=self._q(name))
         except Exception:
             return None
         return TableInfo(
@@ -91,7 +101,7 @@ class SageMakerChecker:
             resp = self._fsr.batch_get_record(
                 Identifiers=[
                     {
-                        "FeatureGroupName": name,
+                        "FeatureGroupName": self._q(name),
                         "RecordIdentifiersValueAsString": chunk,
                     }
                 ]
@@ -106,7 +116,13 @@ class SageMakerChecker:
         markers = (f"v{version}", f"version={version}", f"/{version}/")
         keys: list[str] = []
         paginator = self._s3.get_paginator("list_objects_v2")
-        for page in paginator.paginate(Bucket=self._bucket):
+        # Per-run mode: the agent writes under the `<prefix>/` key prefix, so
+        # scope the S3 listing there (and a parallel run's same-named objects
+        # under a different prefix are invisible). Bare in a manual probe.
+        list_kwargs = {"Bucket": self._bucket}
+        if self._prefix:
+            list_kwargs["Prefix"] = f"{self._prefix}/"
+        for page in paginator.paginate(**list_kwargs):
             for obj in page.get("Contents", []):
                 k = obj["Key"]
                 if name in k and any(m in k for m in markers) and re.search(r"\.(csv|parquet)$", k):
@@ -172,25 +188,62 @@ if __name__ == "__main__":
 def _state_reads(cls):
     def get_model(self, name: str, version: int = 1) -> dict:
         """Model registry realization: a model package group named `name`
-        with at least `version` package versions."""
+        with at least `version` package versions. `metrics` mirrors the
+        cross-adapter {exists, version, metrics} contract — capstone A5 needs it
+        truthy. SageMaker carries metrics on the model PACKAGE (not the group):
+        the agent attaches them as CustomerMetadataProperties (simple key→value)
+        or as ModelMetrics.ModelQuality (a Statistics JSON in S3), so read the
+        latest package and surface whichever is present."""
+        group = self._q(name)
         try:
-            self._sm.describe_model_package_group(ModelPackageGroupName=name)
+            self._sm.describe_model_package_group(ModelPackageGroupName=group)
         except Exception as e:
             return {"exists": False, "error": str(e)}
         try:
-            pkgs = self._sm.list_model_packages(ModelPackageGroupName=name)[
+            pkgs = self._sm.list_model_packages(ModelPackageGroupName=group)[
                 "ModelPackageSummaryList"
             ]
-            # `version` mirrors the cross-adapter {exists, version, metrics}
-            # contract; for SageMaker it's the package-version count. SageMaker
-            # model packages don't carry training metrics, so `metrics` is {}.
-            return {"exists": True, "version": len(pkgs), "metrics": {}}
+            return {
+                "exists": True,
+                "version": len(pkgs),
+                "metrics": self._package_metrics(pkgs),
+            }
         except Exception:
             return {"exists": True, "version": None, "metrics": {}}
+
+    def _package_metrics(self, pkgs: list[dict]) -> dict:
+        """Best-effort metrics for the latest model package in a group: prefer
+        CustomerMetadataProperties; else parse the ModelQuality Statistics JSON
+        from S3, falling back to a non-empty marker that records its URI. {} when
+        the package carries no metrics at all."""
+        arns = [p.get("ModelPackageArn") for p in pkgs if p.get("ModelPackageArn")]
+        if not arns:
+            return {}
+        try:
+            d = self._sm.describe_model_package(ModelPackageName=arns[0])
+        except Exception:
+            return {}
+        meta = d.get("CustomerMetadataProperties") or {}
+        if meta:
+            return dict(meta)
+        uri = (
+            ((d.get("ModelMetrics") or {}).get("ModelQuality") or {}).get("Statistics") or {}
+        ).get("S3Uri")
+        if not uri:
+            return {}
+        try:
+            _, _, rest = uri.partition("s3://")
+            bucket, _, key = rest.partition("/")
+            body = self._s3.get_object(Bucket=bucket, Key=key)["Body"].read()
+            parsed = json.loads(body)
+            return parsed if parsed else {"model_metrics_uri": uri}
+        except Exception:
+            return {"model_metrics_uri": uri}
 
     def get_job(self, name: str) -> dict:
         """Job realization (checked in order): SageMaker Pipeline (scheduled
         pipelines), training job, processing job."""
+        name = self._q(name)
         try:
             p = self._sm.describe_pipeline(PipelineName=name)
             return {
@@ -223,7 +276,7 @@ def _state_reads(cls):
     def get_endpoint(self, name: str) -> dict:
         """Real-time endpoint: {exists, status}."""
         try:
-            d = self._sm.describe_endpoint(EndpointName=name)
+            d = self._sm.describe_endpoint(EndpointName=self._q(name))
             return {"exists": True, "status": d.get("EndpointStatus", "")}
         except Exception as e:
             return {"exists": False, "error": str(e)}
@@ -238,7 +291,8 @@ def _state_reads(cls):
 
             cw = boto3.client("cloudwatch", region_name=os.environ.get("AWS_REGION"))
             alarms = cw.describe_alarms()["MetricAlarms"]
-            hits = [a for a in alarms if name_or_hint in a["AlarmName"]]
+            hint = self._q(name_or_hint)
+            hits = [a for a in alarms if hint in a["AlarmName"]]
             return {"exists": bool(hits), "count": len(hits)}
         except Exception as e:
             return {"exists": False, "error": str(e)}
@@ -261,10 +315,11 @@ def _state_reads(cls):
             import boto3
 
             s3v = boto3.client("s3vectors", region_name=os.environ.get("AWS_REGION"))
+            qname = self._q(name)
             for vb in s3v.list_vector_buckets().get("vectorBuckets", []):
                 bname = vb.get("vectorBucketName")
                 for idx in s3v.list_indexes(vectorBucketName=bname).get("indexes", []):
-                    if idx.get("indexName") == name:
+                    if idx.get("indexName") == qname:
                         return {
                             "exists": True,
                             "kind": "s3vectors-index",
@@ -274,7 +329,7 @@ def _state_reads(cls):
         except Exception:
             pass  # no IAM grant / old botocore → fall through to other shapes
         try:
-            d = self._sm.describe_feature_group(FeatureGroupName=name)
+            d = self._sm.describe_feature_group(FeatureGroupName=self._q(name))
             return {
                 "exists": True,
                 "kind": "feature-group",
@@ -284,7 +339,7 @@ def _state_reads(cls):
         except Exception:
             pass
         try:
-            e = self._sm.describe_endpoint(EndpointName=name)
+            e = self._sm.describe_endpoint(EndpointName=self._q(name))
             if e.get("EndpointStatus") == "InService":
                 return {
                     "exists": True,
@@ -300,6 +355,7 @@ def _state_reads(cls):
             return {"exists": False, "error": str(e)}
 
     cls.get_model = get_model
+    cls._package_metrics = _package_metrics
     cls.get_job = get_job
     cls.get_endpoint = get_endpoint
     cls.get_alert = get_alert

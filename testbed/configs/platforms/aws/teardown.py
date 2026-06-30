@@ -7,11 +7,20 @@ teardown).
 
 Unlike Hopsworks there is NO project container whose deletion cascades:
 SageMaker resources live flat in the (account, region) and must be enumerated
-and deleted PER TYPE. This script therefore ASSUMES the AWS account/region
-behind the .env credentials is DEDICATED to the testbed — it deletes ALL
-resources of the swept types in AWS_REGION, regardless of name (the agent picks
-its own names, exactly like the hopsworks teardown deletes whatever project the
-agent created).
+and deleted PER TYPE. There are two modes, mirroring the databricks teardown:
+
+  * PER-RUN (default, when MLPAB_AWS_PREFIX is set): delete only THIS run's
+    resources, so two runs can share one AWS account/region without their
+    start/end teardowns deleting each other's work. SageMaker has no per-run
+    namespace, so the per-run id is a NAME PREFIX (`mlpab<hex>-`) the agent
+    stamps on every resource (and an S3 key prefix `<id>/` for training-set
+    objects) that this sweep matches on. A billed resource the agent leaves
+    un-prefixed is KEPT — run `teardown.py --all` to sweep those.
+
+  * FULL SWEEP (`teardown.py --all`, or when no prefix is set): the original
+    behaviour — ASSUMES the AWS account/region behind the .env credentials is
+    DEDICATED to the testbed and deletes ALL resources of the swept types in
+    AWS_REGION regardless of name. Kept as a between-batch janitor.
 
 Sweeps in COST order — the runner caps each aux step (~60 s), so if the script
 is cut short the billable resources are already gone:
@@ -45,6 +54,20 @@ from __future__ import annotations
 
 import os
 
+# Per-run identity (set by src/mlpab/runner.py). Empty on a manual invocation →
+# full-sweep mode. _RUN_MODE is finalised in main()/verify(). The agent is told
+# to name resources `<PREFIX>-<name>`, so startswith(PREFIX) selects this run's.
+PREFIX = os.environ.get("MLPAB_AWS_PREFIX") or ""
+_RUN_MODE = False
+
+
+def _scoped(name) -> bool:
+    """In per-run mode keep only names carrying this run's prefix; in full-sweep
+    mode keep everything."""
+    if not _RUN_MODE:
+        return True
+    return bool(name) and str(name).startswith(PREFIX)
+
 
 def _list(client, op: str, result_key: str, **kwargs) -> list[dict]:
     """All items from a NextToken-paginated SageMaker list call; [] on failure."""
@@ -71,12 +94,18 @@ def _sweep(
     name_key: str,
     delete_op: str,
     delete_param: str,
+    scope_key: str | None = None,
     **list_kwargs,
 ) -> None:
-    """List every <name_key> and call <delete_op> on each, best-effort."""
+    """List every <name_key> and call <delete_op> on each, best-effort. In
+    per-run mode an item is skipped unless its <scope_key> (default <name_key>)
+    value carries this run's prefix — used where the delete key is an ARN
+    (scope_key names the human-readable field instead)."""
     for item in _list(client, list_op, result_key, **list_kwargs):
         name = item.get(name_key)
         if not name:
+            continue
+        if not _scoped(item.get(scope_key) if scope_key else name):
             continue
         try:
             getattr(client, delete_op)(**{delete_param: name})
@@ -96,11 +125,16 @@ def _empty_default_bucket(session, region: str) -> None:
         print(f"[sagemaker teardown] s3 client unavailable: {e}")
         return
     bucket = f"sagemaker-{region}-{account}"
+    # Per-run mode: only this run's objects, which the agent is told to write
+    # under the `<prefix>/` key prefix; full sweep empties the whole bucket.
+    key_prefix = f"{PREFIX}/" if _RUN_MODE else ""
     deleted = 0
     token = None
     try:
         while True:
             params = {"Bucket": bucket}
+            if key_prefix:
+                params["Prefix"] = key_prefix
             if token:
                 params["ContinuationToken"] = token
             resp = s3.list_objects_v2(**params)
@@ -139,6 +173,11 @@ def _delete_sagemaker_log_groups(session, region: str) -> None:
                 name = group.get("logGroupName")
                 if not name:
                     continue
+                # Per-run mode: only groups whose name carries the run prefix
+                # (e.g. /aws/sagemaker/TrainingJobs/<prefix>-...); shared groups
+                # of other runs are left in place.
+                if _RUN_MODE and PREFIX not in name:
+                    continue
                 try:
                     logs.delete_log_group(logGroupName=name)
                     deleted += 1
@@ -155,7 +194,14 @@ def _delete_sagemaker_log_groups(session, region: str) -> None:
         print(f"[sagemaker teardown] deleted {deleted} /aws/sagemaker/ log group(s)")
 
 
-def main() -> None:
+def main(all_mode: bool = False) -> None:
+    global _RUN_MODE
+    _RUN_MODE = bool(PREFIX) and not all_mode
+    print(
+        f"[sagemaker teardown] per-run mode: prefix {PREFIX!r}"
+        if _RUN_MODE
+        else f"[sagemaker teardown] full sweep ({'forced (--all)' if all_mode else 'no run prefix set'})"
+    )
     try:
         import botocore.session
     except Exception as e:  # no AWS lib in this venv → nothing to do
@@ -300,7 +346,7 @@ def main() -> None:
     # Model packages nest under groups: delete packages, then their group.
     for group in _list(sm, "list_model_package_groups", "ModelPackageGroupSummaryList"):
         gname = group.get("ModelPackageGroupName")
-        if not gname:
+        if not gname or not _scoped(gname):
             continue
         _sweep(
             sm,
@@ -321,7 +367,7 @@ def main() -> None:
     # Experiments nest trials nest components: unwind inside-out.
     for exp in _list(sm, "list_experiments", "ExperimentSummaries"):
         ename = exp.get("ExperimentName")
-        if not ename:
+        if not ename or not _scoped(ename):
             continue
         for trial in _list(sm, "list_trials", "TrialSummaries", ExperimentName=ename):
             tname = trial.get("TrialName")
@@ -363,7 +409,8 @@ def main() -> None:
             if not bname:
                 continue
             # delete_index needs (vectorBucketName, indexName) or the ARN;
-            # _sweep passes a single delete param, so sweep by indexArn.
+            # _sweep passes a single delete param, so sweep by indexArn but scope
+            # by the human-readable indexName (which carries the run prefix).
             _sweep(
                 s3v,
                 "vector index",
@@ -372,8 +419,13 @@ def main() -> None:
                 "indexArn",
                 "delete_index",
                 "indexArn",
+                scope_key="indexName",
                 vectorBucketName=bname,
             )
+            # Only delete the bucket itself when it carries the run prefix; in a
+            # shared bucket we removed just this run's indexes above and leave it.
+            if not _scoped(bname):
+                continue
             try:
                 s3v.delete_vector_bucket(vectorBucketName=bname)
                 print(f"[sagemaker teardown] deleted vector bucket {bname!r}")
@@ -389,11 +441,15 @@ def main() -> None:
     print("[sagemaker teardown] done")
 
 
-def verify() -> int:
+def verify(all_mode: bool = False) -> int:
     """Twofold teardown check (`teardown.py verify`): (1) AWS CONNECTS, then (2)
     no billed SageMaker ENDPOINTS survive the sweep (the per-hour cost the
-    teardown targets first). Exit non-zero on no-connection or a leak; the runner
-    WARNS on a leak (the run already happened). Read-only, best-effort."""
+    teardown targets first). In per-run mode only THIS run's prefixed endpoints
+    count as a leak; with --all (or no prefix) any surviving endpoint does. Exit
+    non-zero on no-connection or a leak; the runner WARNS on a leak (the run
+    already happened). Read-only, best-effort."""
+    global _RUN_MODE
+    _RUN_MODE = bool(PREFIX) and not all_mode
     try:
         import botocore.session
     except Exception as e:
@@ -402,11 +458,13 @@ def verify() -> int:
     session = botocore.session.get_session()
     region = os.environ.get("AWS_REGION") or session.get_config_variable("region")
     try:
-        eps = (
-            session.create_client("sagemaker", region_name=region)
+        eps = [
+            e
+            for e in session.create_client("sagemaker", region_name=region)
             .list_endpoints()
             .get("Endpoints", [])
-        )
+            if _scoped(e.get("EndpointName"))
+        ]
     except Exception as e:
         print(f"[sagemaker verify-teardown] NO CONNECTION: {e}")
         return 1
@@ -423,4 +481,7 @@ def verify() -> int:
 if __name__ == "__main__":
     import sys
 
-    sys.exit(verify() if sys.argv[1:2] == ["verify"] else (main() or 0))
+    argv = sys.argv[1:]
+    all_mode = "--all" in argv
+    do_verify = "verify" in argv
+    sys.exit(verify(all_mode) if do_verify else (main(all_mode) or 0))

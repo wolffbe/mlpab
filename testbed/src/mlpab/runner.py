@@ -601,6 +601,24 @@ def run(spec: RunSpec) -> results.Row:
             run = f"mlpab{secrets.token_hex(3)}"
             os.environ["MLPAB_DATABRICKS_SCHEMA"] = f"workspace.{run}"
             os.environ["MLPAB_DATABRICKS_PREFIX"] = run
+        # The other three clouds get the same per-run isolation. AWS and Azure
+        # feature stores are flat namespaces (no schema to hide in), so the
+        # per-run id is purely a NAME PREFIX the agent stamps on every resource
+        # and the grader/teardown match on. GCP DOES have a namespace — the
+        # BigQuery dataset — so it mirrors databricks: a per-run dataset
+        # (override GCP_BQ_DATASET, the var setup/grader/teardown all read; the
+        # .env value stays the manual-probe default) for feature tables, plus a
+        # name prefix for the schema-less aiplatform/monitoring resources. A
+        # fresh id per run is what lets two runs share one set of cloud creds
+        # without their start/end teardowns deleting each other's resources.
+        if spec.platform == "aws":
+            os.environ["MLPAB_AWS_PREFIX"] = f"mlpab{secrets.token_hex(3)}"
+        if spec.platform == "azure":
+            os.environ["MLPAB_AZURE_PREFIX"] = f"mlpab{secrets.token_hex(3)}"
+        if spec.platform == "gcp":
+            run = f"mlpab{secrets.token_hex(3)}"
+            os.environ["MLPAB_GCP_PREFIX"] = run
+            os.environ["GCP_BQ_DATASET"] = f"mlpab_{run}"
         base_keys_env = {
             **os.environ,
             **interface_setup.keys,

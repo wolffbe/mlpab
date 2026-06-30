@@ -6,6 +6,13 @@ store is BigQuery-backed, so the plumbing the agent needs is a BigQuery DATASET
 (the feature-group backing store) — ensure it exists. Uses the
 google-cloud-bigquery client installed in the run venv.
 
+The dataset is named by GCP_BQ_DATASET, which the runner overrides per run
+(GCP_BQ_DATASET=mlpab_<run>) so each run lands its feature tables in its OWN
+dataset — this run's landing zone, which teardown drops whole at run end. The
+.env value (`mlpab`) is only the default for a manual probe. Creating whatever
+GCP_BQ_DATASET points at therefore provisions the per-run dataset with no
+special-casing here.
+
 ⚠ LIVE-VALIDATION REQUIRED — dataset location must match GCP_LOCATION's multi-
 region; adjust if the project uses a specific region.
 """

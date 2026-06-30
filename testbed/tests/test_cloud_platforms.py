@@ -2,9 +2,11 @@
 adapter registration, manifest parsing, the single-skill bundle path, and the
 implicit `official` bundle resolution (all offline — no cloud/network)."""
 
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from mlpab import evals_provider as ep
 from mlpab import interfaces as I
@@ -129,6 +131,40 @@ class SkillBundleTests(unittest.TestCase):
             (root / "loose.txt").write_text("ignored")
             got = sorted(p.name for p in skills._skill_dirs_under(root))
             self.assertEqual(got, ["deploy", "tune"])
+
+
+class PerRunIsolationWiringTests(unittest.TestCase):
+    """The per-run id env vars the runner injects must match the names each
+    platform's teardown reads — a rename on one side silently disables scoping,
+    so pin both ends together."""
+
+    def _src(self, *parts):
+        return Path(__file__).resolve().parents[1].joinpath(*parts).read_text()
+
+    def test_runner_injects_prefix_env_vars(self):
+        src = self._src("src", "mlpab", "runner.py")
+        for var in ("MLPAB_AWS_PREFIX", "MLPAB_AZURE_PREFIX", "MLPAB_GCP_PREFIX"):
+            self.assertIn(var, src, f"runner must set {var}")
+        # GCP also overrides the dataset name per run.
+        self.assertIn('os.environ["GCP_BQ_DATASET"] = f"mlpab_{run}"', src)
+
+    def test_teardowns_read_matching_prefix_var(self):
+        import importlib.util
+
+        for platform, var in (
+            ("aws", "MLPAB_AWS_PREFIX"),
+            ("gcp", "MLPAB_GCP_PREFIX"),
+            ("azure", "MLPAB_AZURE_PREFIX"),
+        ):
+            path = (
+                Path(__file__).resolve().parents[1]
+                / "configs" / "platforms" / platform / "teardown.py"
+            )
+            with mock.patch.dict(os.environ, {var: "mlpabXYZ"}, clear=False):
+                spec = importlib.util.spec_from_file_location(f"{platform}_td", path)
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)
+            self.assertEqual(mod.PREFIX, "mlpabXYZ", f"{platform} teardown reads {var}")
 
 
 if __name__ == "__main__":
