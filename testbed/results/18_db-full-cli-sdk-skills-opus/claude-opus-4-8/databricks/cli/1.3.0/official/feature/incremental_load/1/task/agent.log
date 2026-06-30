@@ -1,0 +1,604 @@
+[mlpab] skills (95c4b1b4): databricks-apps,databricks-core,databricks-dabs,databricks-jobs,databricks-lakebase,databricks-model-serving,databricks-pipelines,databricks-serverless-migration,databricks-vector-search
+[agent] I'll start by exploring the task inputs and environment.
+[agent:bash] cat data/schema.md; echo "---"; ls -la data/; echo "---ENV---"; env | grep -i MLPAB; echo "---"; echo "HOST set: ${DATABRICKS_HOST:+yes}"; echo "TOKEN set: ${DATABRICKS_TOKEN:+yes}"
+[agent:result] # Schema
+[agent:result] 
+[agent:result] Daily increment files of one events table; each file holds one day's new rows (no overlaps between files). `row_id` uniquely identifies a row.
+[agent:result] 
+[agent:result] - **row_id** (string): unique record key
+[agent:result] - **account_id** (string)
+[agent:result] - **event_time** (bigint): when the row became valid, as epoch MILLISECONDS — register it as the event-time column
+[agent:result] - **amount** (double)
+[agent:result] - **category** (string)
+[agent:result] ---
+[agent:result] total 88
+[agent:result] drwxr-xr-x@  9 wolffbe  staff   288 Jun 29 17:07 .
+[agent:result] drwxr-xr-x@ 11 wolffbe  staff   352 Jun 29 17:08 ..
+[agent:result] -rw-r--r--@  1 wolffbe  staff  4645 Jun 29 17:07 increment_01.csv
+[agent:result] -rw-r--r--@  1 wolffbe  staff  3630 Jun 29 17:07 increment_02.csv
+[agent:result] -rw-r--r--@  1 wolffbe  staff  3845 Jun 29 17:07 increment_03.csv
+[agent:result] -rw-r--r--@  1 wolffbe  staff  4687 Jun 29 17:07 increment_04.csv
+[agent:result] -rw-r--r--@  1 wolffbe  staff  4408 Jun 29 17:07 increment_05.csv
+[agent:result] -rw-r--r--@  1 wolffbe  staff  4907 Jun 29 17:07 increment_06.csv
+[agent:result] -rw-r--r--@  1 wolffbe  staff   384 Jun 29 17:07 schema.md
+[agent:result] ---ENV---
+[agent:result] AZUREML_WORKSPACE_NAME=mlpab-ws
+[agent:result] AZURE_RESOURCE_GROUP=mlpab-rg
+[agent:result] GCP_BQ_DATASET=mlpab
+[agent:result] GCP_PROJECT=***REDACTED***
+[agent:result] MLPAB_AUTH=login
+[agent:result] MLPAB_TOKEN_CACHE=/Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/.claude-oauth
+[agent:result] MLPAB_DATABRICKS_SCHEMA=workspace.mlpab77f9d2
+[agent:result] MLPAB_DATABRICKS_PREFIX=mlpab77f9d2
+[agent:result] MLPAB_API_LOG=/Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/cli/1.3.0/official/feature/incremental_load/1/task/api_calls.jsonl
+[agent:result] MLPAB_IFACE_SDK=huggingface_hub
+[agent:result] ---
+[agent:result] HOST set: yes
+[agent:result] TOKEN set: yes
+[agent:bash] head -3 data/increment_01.csv; echo "---"; wc -l data/*.csv; echo "---"; databricks --version
+[agent:result] row_id,account_id,event_time,amount,category
+[agent:result] R00000,A0109,1772410680000,22.67,salary
+[agent:result] R00001,A0008,1772411340000,35.7,other
+[agent:result] ---
+[agent:result]      118 data/increment_01.csv
+[agent:result]       92 data/increment_02.csv
+[agent:result]       98 data/increment_03.csv
+[agent:result]      119 data/increment_04.csv
+[agent:result]      112 data/increment_05.csv
+[agent:result]      125 data/increment_06.csv
+[agent:result]      664 total
+[agent:result] ---
+[agent:result] Databricks CLI v1.3.0
+[agent] I'll consult the databricks-core skill for proper CLI usage patterns.
+[agent:tool] Skill
+[agent:result] Launching skill: databricks-core
+[agent] Auth is via env vars (DATABRICKS_HOST/DATABRICKS_TOKEN), so no profile needed. Let me verify connectivity and gather key context.
+[agent:bash] databricks current-user me 2>&1 | grep -iE 'userName|displayName' | head; echo "---WAREHOUSE---"; databricks experimental aitools tools get-default-warehouse 2>&1 | head -20
+[agent:result]   "userName": "benedict@logicalclocks.com"
+[agent:result] ---WAREHOUSE---
+[agent:result] 4dfab06c923fe3cc
+[agent:bash] databricks experimental aitools tools query "SELECT current_catalog(), current_schema()" 2>&1 | head -20; echo "---"; databricks experimental aitools tools query --help 2>&1 | head -40
+[agent:result] [
+[agent:result]   {
+[agent:result]     "current_catalog()": "workspace",
+[agent:result]     "current_schema()": "default"
+[agent:result]   }
+[agent:result] ]
+[agent:result] ---
+[agent:result] Execute one or more SQL statements against a Databricks SQL warehouse
+[agent:result] and return results.
+[agent:result] 
+[agent:result] A single SQL can be provided as a positional argument, read from a file with
+[agent:result] --file, or piped via stdin. If a positional argument ends in .sql and the
+[agent:result] file exists, it is read as a SQL file automatically.
+[agent:result] 
+[agent:result] Pass multiple positional arguments and/or repeat --file to run several
+[agent:result] queries in parallel against the warehouse. Multi-query output is always
+[agent:result] JSON: an array of {sql, statement_id, state, elapsed_ms, columns, rows,
+[agent:result] error} objects. Result order is: --file inputs first (in flag order),
+[agent:result] then positional SQLs (in arg order). The exit code is non-zero if any
+[agent:result] query failed.
+[agent:result] 
+[agent:result] The command auto-detects an available warehouse unless --warehouse is set
+[agent:result] or the DATABRICKS_WAREHOUSE_ID environment variable is configured.
+[agent:result] 
+[agent:result] For a single query, output is JSON in non-interactive contexts. In
+[agent:result] interactive terminals it renders tables, and large results open an
+[agent:result] interactive table browser. Use --output csv to export results as CSV.
+[agent:result] 
+[agent:result] Pass named parameters with --param. Use ":name" markers in the SQL and
+[agent:result] "--param name=value" (string) or "--param name:TYPE=value" (typed, e.g.
+[agent:result] DATE, INT) to bind values. Positional "?" markers are not supported. In
+[agent:result] multi-query mode, the same parameter set is applied to every statement.
+[agent:result] 
+[agent:result] Usage:
+[agent:result]   databricks experimental aitools tools query [SQL | file.sql]... [flags]
+[agent:result] 
+[agent:result] Examples:
+[agent:result]   databricks experimental aitools tools query "SELECT * FROM samples.nyctaxi.trips LIMIT 5"
+[agent:result]   databricks experimental aitools tools query --warehouse abc123 "SELECT 1"
+[agent:result]   databricks experimental aitools tools query --file report.sql
+[agent:result]   databricks experimental aitools tools query report.sql
+[agent:result]   databricks experimental aitools tools query --output csv "SELECT * FROM samples.nyctaxi.trips LIMIT 5"
+[agent:result]   databricks experimental aitools tools query --output json "SELECT 1" "SELECT 2" "SELECT 3"
+[agent:result]   databricks experimental aitools tools query --param name=alice "SELECT * FROM users WHERE name = :name"
+[agent:result]   databricks experimental aitools tools query --param since:DATE=2026-01-01 "SELECT * FROM events WHERE ts > :since"
+[agent:result]   echo "SELECT 1" | databricks experimental aitools tools query
+[agent] Now let me plan the build. Let me test whether a BIGINT event-time column is accepted as a TIMESERIES primary-key component in a feature table.
+[agent:bash] databricks experimental aitools tools query "CREATE TABLE workspace.mlpab77f9d2._ts_probe (row_id STRING NOT NULL, event_time BIGINT NOT NULL, CONSTRAINT pk PRIMARY KEY (row_id, event_time TIMESERIES))" 2>&1 | head -30
+[agent:result] Query executed successfully (no results)
+[agent] BIGINT is accepted as a TIMESERIES column. Let me drop the probe and create the real feature table.
+[agent:bash] databricks experimental aitools tools query "DROP TABLE workspace.mlpab77f9d2._ts_probe" 2>&1 | head
+[agent:bash] databricks experimental aitools tools query "CREATE TABLE workspace.mlpab77f9d2.incrementalb48074 (
+[agent:bash]   row_id STRING NOT NULL,
+[agent:bash]   account_id STRING,
+[agent:bash]   event_time BIGINT NOT NULL,
+[agent:bash]   amount DOUBLE,
+[agent:bash]   category STRING,
+[agent:bash]   CONSTRAINT incrementalb48074_pk PRIMARY KEY (row_id, event_time TIMESERIES)
+[agent:bash] ) TBLPROPERTIES (delta.enableChangeDataFeed = true)" 2>&1 | head -30
+[agent:result] Query executed successfully (no results)
+[agent:result] Query executed successfully (no results)
+[agent] Feature table created. Now I'll create a UC Volume to stage the increment files, then upload them.
+[agent:bash] databricks experimental aitools tools query "CREATE VOLUME IF NOT EXISTS workspace.mlpab77f9d2.increments" 2>&1 | head
+[agent:bash] echo "--- uploading ---"
+[agent:bash] for f in data/increment_0*.csv; do
+[agent:bash]   databricks fs cp "$f" "dbfs:/Volumes/workspace/mlpab77f9d2/increments/$(basename $f)" --overwrite 2>&1 | tail -1
+[agent:bash] done
+[agent:bash] echo "--- listing ---"
+[agent:bash] databricks fs ls "dbfs:/Volumes/workspace/mlpab77f9d2/increments/" 2>&1
+[agent:result] Query executed successfully (no results)
+[agent:result] --- uploading ---
+[agent:result] data/increment_01.csv -> dbfs:/Volumes/workspace/mlpab77f9d2/increments/increment_01.csv
+[agent:result] data/increment_02.csv -> dbfs:/Volumes/workspace/mlpab77f9d2/increments/increment_02.csv
+[agent:result] data/increment_03.csv -> dbfs:/Volumes/workspace/mlpab77f9d2/increments/increment_03.csv
+[agent:result] data/increment_04.csv -> dbfs:/Volumes/workspace/mlpab77f9d2/increments/increment_04.csv
+[agent:result] data/increment_05.csv -> dbfs:/Volumes/workspace/mlpab77f9d2/increments/increment_05.csv
+[agent:result] data/increment_06.csv -> dbfs:/Volumes/workspace/mlpab77f9d2/increments/increment_06.csv
+[agent:result] --- listing ---
+[agent:result] increment_01.csv
+[agent:result] increment_02.csv
+[agent:result] increment_03.csv
+[agent:result] increment_04.csv
+[agent:result] increment_05.csv
+[agent:result] increment_06.csv
+[agent] All files uploaded. Now I'll load them into the feature table with COPY INTO (idempotent — perfect for the recurring job too).
+[agent:bash] databricks experimental aitools tools query "COPY INTO workspace.mlpab77f9d2.incrementalb48074
+[agent:bash] FROM '/Volumes/workspace/mlpab77f9d2/increments/'
+[agent:bash] FILEFORMAT = CSV
+[agent:bash] FORMAT_OPTIONS ('header' = 'true', 'inferSchema' = 'false')
+[agent:bash] COPY_OPTIONS ('mergeSchema' = 'false')" 2>&1 | head -40
+[agent:result] Error: query failed: BAD_REQUEST [DELTA_FAILED_TO_MERGE_FIELDS] Failed to merge fields 'event_time' and 'event_time'.
+[agent] COPY INTO needs explicit casts. Let me use the SELECT form.
+[agent:bash] databricks experimental aitools tools query "COPY INTO workspace.mlpab77f9d2.incrementalb48074
+[agent:bash] FROM (
+[agent:bash]   SELECT
+[agent:bash]     CAST(row_id AS STRING)      AS row_id,
+[agent:bash]     CAST(account_id AS STRING)  AS account_id,
+[agent:bash]     CAST(event_time AS BIGINT)  AS event_time,
+[agent:bash]     CAST(amount AS DOUBLE)      AS amount,
+[agent:bash]     CAST(category AS STRING)    AS category
+[agent:bash]   FROM '/Volumes/workspace/mlpab77f9d2/increments/'
+[agent:bash] )
+[agent:bash] FILEFORMAT = CSV
+[agent:bash] FORMAT_OPTIONS ('header' = 'true')" 2>&1 | head -40
+[agent:result] [
+[agent:result]   {
+[agent:result]     "num_affected_rows": "658",
+[agent:result]     "num_inserted_rows": "658",
+[agent:result]     "num_skipped_corrupt_files": "0"
+[agent:result]   }
+[agent:result] ]
+[agent] 658 rows loaded (664 lines − 6 headers). Let me verify the count and the data.
+[agent:bash] databricks experimental aitools tools query "SELECT COUNT(*) AS n, COUNT(DISTINCT row_id) AS distinct_ids, MIN(event_time) AS min_et, MAX(event_time) AS max_et FROM workspace.mlpab77f9d2.incrementalb48074" 2>&1 | head -20
+[agent:result] [
+[agent:result]   {
+[agent:result]     "distinct_ids": "658",
+[agent:result]     "max_et": "1772927640000",
+[agent:result]     "min_et": "1772410680000",
+[agent:result]     "n": "658"
+[agent:result]   }
+[agent:result] ]
+[agent] Data verified: 658 rows, all distinct. Now I'll set up online (low-latency) access. Let me check the online-tables CLI.
+[agent:bash] databricks online-tables --help 2>&1 | head -30; echo "===CREATE==="; databricks online-tables create --help 2>&1 | head -40
+[agent:result] This command is in Public Preview and may change without notice.
+[agent:result] 
+[agent:result] Online tables provide lower latency and higher QPS access to data from Delta
+[agent:result]   tables.
+[agent:result] 
+[agent:result] Usage:
+[agent:result]   databricks online-tables [flags]
+[agent:result]   databricks online-tables [command]
+[agent:result] 
+[agent:result] Available Commands:
+[agent:result]   create      *Public Preview* Create an Online Table.
+[agent:result]   delete      *Public Preview* Delete an Online Table.
+[agent:result]   get         *Public Preview* Get an Online Table.
+[agent:result] 
+[agent:result] Flags:
+[agent:result]   -h, --help   help for online-tables
+[agent:result] 
+[agent:result] Global Flags:
+[agent:result]       --debug            enable debug logging
+[agent:result]   -o, --output type      output type: text or json (default text)
+[agent:result]   -p, --profile string   ~/.databrickscfg profile
+[agent:result]   -t, --target string    bundle target to use (if applicable)
+[agent:result] 
+[agent:result] Use "databricks online-tables [command] --help" for more information about a command.
+[agent:result] ===CREATE===
+[agent:result] This command is in Public Preview and may change without notice.
+[agent:result] 
+[agent:result] Create an Online Table.
+[agent:result] 
+[agent:result]   Create a new Online Table.
+[agent:result] 
+[agent:result] Usage:
+[agent:result]   databricks online-tables create [flags]
+[agent:result] 
+[agent:result] Flags:
+[agent:result]   -h, --help               help for create
+[agent:result]       --json JSON          either inline JSON string or @path/to/file.json with request body (default JSON (0 bytes))
+[agent:result]       --name string        Full three-part (catalog, schema, table) name of the table.
+[agent:result]       --no-wait            do not wait to reach ACTIVE state
+[agent:result]       --timeout duration   maximum amount of time to reach ACTIVE state (default 20m0s)
+[agent:result] 
+[agent:result] Global Flags:
+[agent:result]       --debug            enable debug logging
+[agent:result]   -o, --output type      output type: text or json (default text)
+[agent:result]   -p, --profile string   ~/.databrickscfg profile
+[agent:result]   -t, --target string    bundle target to use (if applicable)
+[agent] Online tables need a JSON spec. Let me create one with `row_id` as primary key and `event_time` as the timeseries key.
+[agent:bash] mkdir -p .tmp submission
+[agent:bash] cat > .tmp/online.json <<'JSON'
+[agent:bash] {
+[agent:bash]   "name": "workspace.mlpab77f9d2.incrementalb48074_online",
+[agent:bash]   "spec": {
+[agent:bash]     "source_table_full_name": "workspace.mlpab77f9d2.incrementalb48074",
+[agent:bash]     "primary_key_columns": ["row_id"],
+[agent:bash]     "timeseries_key": "event_time",
+[agent:bash]     "run_triggered": {}
+[agent:bash]   }
+[agent:bash] }
+[agent:bash] JSON
+[agent:bash] databricks online-tables create --json @.tmp/online.json --timeout 20m0s 2>&1 | head -50
+[agent:result-err] PreToolUse:Bash hook error: [python3 /Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/cli/1.3.0/official/feature/incremental_load/1/task/.claude/hooks/log_tool_call.py]: DENIED: 'name:' is off-interface in 'cli' mode — only the `databricks` CLI may do work on databricks; local interpreters, network tools, and stray binaries are blocked. Basic shell (cp/mkdir/cat/head/grep) is allowed for the floor submission and data inspection. If you can't do the work through the `databricks` CLI, STOP and report the missing capability — do NOT work around it locally.
+[agent] The heredoc content tripped the hook's parser. Let me write the JSON with the Write tool and run the CLI command alone.
+[agent:write] /Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/cli/1.3.0/official/feature/incremental_load/1/task/.tmp/online.json
+[agent:result] File created successfully at: /Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/cli/1.3.0/official/feature/incremental_load/1/task/.tmp/online.json (file state is current in your context — no need to Read it back)
+[agent:bash] databricks online-tables create --json @.tmp/online.json --timeout 20m0s 2>&1 | head -50
+[agent:result] Error: Online Table is being deprecated. Creating new online table is not allowed. Databricks recommends switching to Synced Tables.
+[agent] Online tables are deprecated — the platform now uses Lakebase synced tables for low-latency access. Let me consult the lakebase skill.
+[agent:tool] Skill
+[agent:result] Launching skill: databricks-lakebase
+[agent] Let me read the synced-tables reference and discover the synced-table CLI command.
+[agent:bash] sed -n '1,120p' .claude/skills/databricks-lakebase/references/synced-tables.md 2>&1 | head -130
+[agent:result] # Lakebase synced tables
+[agent:result] 
+[agent:result] > **Official docs:** https://docs.databricks.com/aws/en/oltp/projects/sync-tables
+[agent:result] 
+[agent:result] Lakebase synced tables sync data from Unity Catalog Delta tables into Lakebase as PostgreSQL tables for OLTP access patterns. Previously known as **Reverse ETL**.
+[agent:result] 
+[agent:result] **How it works:** Synced tables create a managed copy — a Unity Catalog table (read-only, managed by sync pipeline) and a Postgres table in Lakebase (queryable by apps). Uses managed Lakeflow Spark Declarative Pipelines.
+[agent:result] 
+[agent:result] **Performance (per Autoscaling CU):**
+[agent:result] - Continuous/Triggered: ~150 rows/sec per CU
+[agent:result] - Snapshot: ~2,000 rows/sec per CU
+[agent:result] - Each synced table uses up to 16 connections
+[agent:result] 
+[agent:result] ## Sync Modes
+[agent:result] 
+[agent:result] | Mode | Description | CDF Required | Best For |
+[agent:result] |------|-------------|-------------|----------|
+[agent:result] | **Snapshot** | One-time full copy | No | Initial setup, small tables, >10% data change |
+[agent:result] | **Triggered** | Scheduled updates | Yes | Dashboards updated hourly/daily |
+[agent:result] | **Continuous** | Real-time (seconds latency, 15s min interval) | Yes | Live applications |
+[agent:result] 
+[agent:result] **Enable CDF on source table:**
+[agent:result] 
+[agent:result] ```sql
+[agent:result] ALTER TABLE your_catalog.your_schema.your_table
+[agent:result] SET TBLPROPERTIES (delta.enableChangeDataFeed = true)
+[agent:result] ```
+[agent:result] 
+[agent:result] ## Prerequisites
+[agent:result] 
+[agent:result] - A Databricks workspace with Lakebase enabled
+[agent:result] - An active Lakebase project with a branch and endpoint
+[agent:result] - A Unity Catalog source table to sync
+[agent:result] - **Permissions:** `USE_SCHEMA` and `CREATE_TABLE` on the target schema
+[agent:result] - For Triggered/Continuous modes: Change Data Feed enabled on the source table
+[agent:result] 
+[agent:result] > **Note:** Your Lakebase database must be registered as a UC catalog (one-time setup per project). Skip if already done.
+[agent:result] >
+[agent:result] > ```bash
+[agent:result] > databricks postgres create-catalog <CATALOG_NAME> \
+[agent:result] >   --json '{
+[agent:result] >     "spec": {
+[agent:result] >       "postgres_database": "<POSTGRES_DATABASE>",
+[agent:result] >       "branch": "projects/<PROJECT_ID>/branches/<BRANCH_ID>"
+[agent:result] >     }
+[agent:result] >   }' --profile <PROFILE>
+[agent:result] > ```
+[agent:result] >
+[agent:result] > The `<POSTGRES_DATABASE>` is the Postgres database name (default: `databricks_postgres`), not the resource path.
+[agent:result] 
+[agent:result] ## Creating Lakebase synced tables
+[agent:result] 
+[agent:result] > **Source table must exist first.** Synced tables sync from an existing UC table, view, or materialized view. If the source needs transformation, ask the user how they want to prepare it (DLT materialized view, regular view, or existing table). Do not run ad-hoc `CREATE TABLE AS SELECT` statements.
+[agent:result] 
+[agent:result] ```bash
+[agent:result] databricks postgres create-synced-table <LAKEBASE_CATALOG>.<SCHEMA>.<TABLE> \
+[agent:result]   --json '{
+[agent:result]     "spec": {
+[agent:result]       "source_table_full_name": "analytics.gold.user_profiles",
+[agent:result]       "primary_key_columns": ["user_id"],
+[agent:result]       "scheduling_policy": "TRIGGERED",
+[agent:result]       "branch": "projects/<PROJECT_ID>/branches/production",
+[agent:result]       "postgres_database": "databricks_postgres",
+[agent:result]       "create_database_objects_if_missing": true,
+[agent:result]       "new_pipeline_spec": {
+[agent:result]         "storage_catalog": "<REGULAR_UC_CATALOG>",
+[agent:result]         "storage_schema": "default"
+[agent:result]       }
+[agent:result]     }
+[agent:result]   }' --profile <PROFILE>
+[agent:result] ```
+[agent:result] 
+[agent:result] | Field | Required | Description |
+[agent:result] |-------|----------|-------------|
+[agent:result] | `source_table_full_name` | Yes | Full Unity Catalog name of the source table |
+[agent:result] | `primary_key_columns` | Yes | Column(s) forming the primary key |
+[agent:result] | `scheduling_policy` | Yes | `SNAPSHOT`, `TRIGGERED`, or `CONTINUOUS` |
+[agent:result] | `branch` | Yes | Target Lakebase branch (`projects/<PROJECT_ID>/branches/<BRANCH_ID>`) |
+[agent:result] | `postgres_database` | Yes | Postgres database name (default: `databricks_postgres`), not the resource path |
+[agent:result] | `create_database_objects_if_missing` | No | Auto-create Postgres schema/database if missing (default: `false`) |
+[agent:result] | `new_pipeline_spec.storage_catalog` | Yes | A **regular** UC catalog for DLT pipeline metadata (NOT the Lakebase catalog) |
+[agent:result] | `new_pipeline_spec.storage_schema` | Yes | Schema in the storage catalog for pipeline metadata (e.g. `default`) |
+[agent:result] | `timeseries_key` | No | Column for deduplication when source has duplicate PKs (latest wins). Performance penalty. |
+[agent:result] 
+[agent:result] > **Note:** Nulls in PK columns are excluded from sync.
+[agent:result] 
+[agent:result] Long-running operation; CLI waits by default. Use `--no-wait` to return immediately.
+[agent:result] 
+[agent:result] **Supported source types:** managed/external Delta tables, managed/external Iceberg tables, views, and materialized views.
+[agent:result] 
+[agent:result] **Check status:**
+[agent:result] 
+[agent:result] ```bash
+[agent:result] databricks postgres get-synced-table "synced_tables/<LAKEBASE_CATALOG>.<SCHEMA>.<TABLE>" --profile <PROFILE>
+[agent:result] ```
+[agent:result] 
+[agent:result] **Delete:**
+[agent:result] 
+[agent:result] ```bash
+[agent:result] databricks postgres delete-synced-table "synced_tables/<LAKEBASE_CATALOG>.<SCHEMA>.<TABLE>" --profile <PROFILE>
+[agent:result] ```
+[agent:result] 
+[agent:result] Deletes the sync pipeline and the UC table entry. The Postgres table remains and must be dropped manually if no longer needed (`DROP TABLE <schema>.<table>`).
+[agent:result] 
+[agent:result] > **DABs:** The bundle schema includes `synced_database_tables`, but it maps to the Provisioned Terraform resource (`databricks_database_synced_database_table`), not the Autoscaling API. **Do not use `synced_database_tables` in DABs with Autoscaling projects** — it routes through the Provisioned API and may create unintended Provisioned instances. DAB support for Autoscaling synced tables (`postgres_synced_tables`) is blocked on Terraform provider work and not yet available. **For Autoscaling projects, use the CLI commands above.**
+[agent:result] 
+[agent:result] ## Example: Sync NYC Taxi Data to Lakebase
+[agent:result] 
+[agent:result] Sync the `samples.nyctaxi.trips` sample table into Lakebase for low-latency app queries.
+[agent:result] 
+[agent:result] **1. Register a UC catalog** (if not already done — see Prerequisites above).
+[agent:result] 
+[agent:result] **2. Create the synced table (Snapshot mode):**
+[agent:result] 
+[agent:result] ```bash
+[agent:result] databricks postgres create-synced-table <LAKEBASE_CATALOG>.public.nyc_trips \
+[agent:result]   --json '{
+[agent:result]     "spec": {
+[agent:result]       "source_table_full_name": "samples.nyctaxi.trips",
+[agent:result]       "primary_key_columns": ["tpep_pickup_datetime", "tpep_dropoff_datetime", "pickup_zip", "dropoff_zip"],
+[agent] This is the online path: a Lakebase project + synced table. Let me create the Lakebase project (long-running; I'll let it block).
+[agent:bash] databricks postgres create-project mlpab77f9d2-incrb48074 --json '{"spec": {"display_name": "mlpab77f9d2 incrementalb48074 online store"}}' 2>&1 | head -60
+[agent:result] {
+[agent:result]   "create_time": "2026-06-29T15:11:43Z",
+[agent:result]   "name": "projects/mlpab77f9d2-incrb48074",
+[agent:result]   "status": {
+[agent:result]     "branch_logical_size_limit_bytes": 17592186044416,
+[agent:result]     "default_branch": "projects/mlpab77f9d2-incrb48074/branches/production",
+[agent:result]     "default_endpoint_settings": {
+[agent:result]       "autoscaling_limit_max_cu": 1,
+[agent:result]       "autoscaling_limit_min_cu": 1,
+[agent:result]       "suspend_timeout_duration": "86400s"
+[agent:result]     },
+[agent:result]     "display_name": "mlpab77f9d2 incrementalb48074 online store",
+[agent:result]     "enable_pg_native_login": false,
+[agent:result]     "history_retention_duration": "604800s",
+[agent:result]     "owner": "benedict@logicalclocks.com",
+[agent:result]     "pg_version": 17,
+[agent:result]     "project_id": "mlpab77f9d2-incrb48074",
+[agent:result]     "synthetic_storage_size_bytes": 0
+[agent:result]   },
+[agent:result]   "uid": "9496b370-9429-4661-ad91-2a192b328ade",
+[agent:result]   "update_time": "2026-06-29T15:11:44Z"
+[agent:result] }
+[agent] Project created. Let me confirm the Postgres database, then register a UC catalog mapping to the Lakebase database.
+[agent:bash] databricks postgres list-databases projects/mlpab77f9d2-incrb48074/branches/production 2>&1 | grep -iE 'postgres_database|name' | head; echo "=== create-catalog help ==="; databricks postgres create-catalog --help 2>&1 | sed -n '1,30p'
+[agent:result]     "name": "projects/mlpab77f9d2-incrb48074/branches/production/databases/databricks-postgres",
+[agent:result]       "postgres_database": "databricks_postgres",
+[agent:result] === create-catalog help ===
+[agent:result] This command is in Beta and may change without notice.
+[agent:result] 
+[agent:result] Register a Database in UC.
+[agent:result] 
+[agent:result]   Register a Postgres database in the Unity Catalog.
+[agent:result] 
+[agent:result]   This is a long-running operation. By default, the command waits for the
+[agent:result]   operation to complete. Use --no-wait to return immediately with the raw
+[agent:result]   operation details. The operation's 'name' field can then be used to poll for
+[agent:result]   completion using the get-operation command.
+[agent:result] 
+[agent:result]   Arguments:
+[agent:result]     CATALOG_ID: The ID in the Unity Catalog. It becomes the full resource name, for
+[agent:result]       example "my_catalog" becomes "catalogs/my_catalog".
+[agent:result] 
+[agent:result] Usage:
+[agent:result]   databricks postgres create-catalog CATALOG_ID [flags]
+[agent:result] 
+[agent:result] Flags:
+[agent:result]   -h, --help               help for create-catalog
+[agent:result]       --json JSON          either inline JSON string or @path/to/file.json with request body (default JSON (0 bytes))
+[agent:result]       --name string        Output only.
+[agent:result]       --no-wait            do not wait to reach DONE state
+[agent:result]       --timeout duration   maximum amount of time to reach DONE state
+[agent:result] 
+[agent:result] Global Flags:
+[agent:result]       --debug            enable debug logging
+[agent:result]   -o, --output type      output type: text or json (default text)
+[agent:result]   -p, --profile string   ~/.databrickscfg profile
+[agent:result]   -t, --target string    bundle target to use (if applicable)
+[agent:bash] databricks postgres create-catalog mlpab77f9d2_incrb48074_lb --json '{"spec": {"postgres_database": "databricks_postgres", "branch": "projects/mlpab77f9d2-incrb48074/branches/production"}}' 2>&1 | head -40
+[agent:result] {
+[agent:result]   "name": "catalogs/mlpab77f9d2_incrb48074_lb",
+[agent:result]   "status": {
+[agent:result]     "branch": "projects/mlpab77f9d2-incrb48074/branches/production",
+[agent:result]     "postgres_database": "databricks_postgres",
+[agent:result]     "project": "projects/mlpab77f9d2-incrb48074"
+[agent:result]   },
+[agent:result]   "uid": "88b7b35d-1496-4857-aa54-63c008bbda23"
+[agent:result] }
+[agent] Now create the synced table (online store) from the feature table. Long-running; I'll let it block.
+[agent:write] /Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/cli/1.3.0/official/feature/incremental_load/1/task/.tmp/synced.json
+[agent:result] File created successfully at: /Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/cli/1.3.0/official/feature/incremental_load/1/task/.tmp/synced.json (file state is current in your context — no need to Read it back)
+[agent:bash] databricks postgres create-synced-table mlpab77f9d2_incrb48074_lb.public.incrementalb48074 --json @.tmp/synced.json 2>&1 | head -60
+[agent:result] {
+[agent:result]   "name": "synced_tables/mlpab77f9d2_incrb48074_lb.public.incrementalb48074",
+[agent:result]   "spec": {
+[agent:result]     "branch": "projects/mlpab77f9d2-incrb48074/branches/production",
+[agent:result]     "create_database_objects_if_missing": true,
+[agent:result]     "new_pipeline_spec": {
+[agent:result]       "storage_catalog": "workspace",
+[agent:result]       "storage_schema": "mlpab77f9d2"
+[agent:result]     },
+[agent:result]     "postgres_database": "databricks_postgres",
+[agent:result]     "primary_key_columns": [
+[agent:result]       "row_id"
+[agent:result]     ],
+[agent:result]     "scheduling_policy": "TRIGGERED",
+[agent:result]     "source_table_full_name": "workspace.mlpab77f9d2.incrementalb48074",
+[agent:result]     "timeseries_key": "event_time"
+[agent:result]   },
+[agent:result]   "status": {
+[agent:result]     "detailed_state": "SYNCED_TABLE_PROVISIONING_PIPELINE_RESOURCES",
+[agent:result]     "message": "Online Table is currently pending setup of pipeline resources. Check latest status in Delta Live Tables: https://***REDACTED***#joblist/pipelines/9604daa2-3ec4-4912-965f-4eee7fe408b6/updates/9039a77d-5469-44fa-8b90-2fe9d453808d",
+[agent:result]     "ongoing_sync_progress": {},
+[agent:result]     "pipeline_id": "9604daa2-3ec4-4912-965f-4eee7fe408b6",
+[agent:result]     "project": "projects/mlpab77f9d2-incrb48074",
+[agent:result]     "unity_catalog_provisioning_state": "ACTIVE"
+[agent:result]   },
+[agent:result]   "uid": "eb91a563-dd9b-4a29-8df4-fdc566f7a2b2"
+[agent:result] }
+[agent] Synced table is provisioning. Now I'll build the recurring daily ingestion job. First, the ingestion notebook. Let me check the jobs skill and the import command.
+[agent:bash] databricks workspace import --help 2>&1 | sed -n '1,45p'
+[agent:result] Import a workspace object.
+[agent:result] 
+[agent:result]   Imports a workspace object (for example, a notebook or file) or the contents
+[agent:result]   of an entire directory. If path already exists and overwrite is set to
+[agent:result]   false, this call returns an error RESOURCE_ALREADY_EXISTS. To import a
+[agent:result]   directory, you can use either the DBC format or the SOURCE format with the
+[agent:result]   language field unset. To import a single file as SOURCE, you must set the
+[agent:result]   language field. Zip files within directories are not supported.
+[agent:result] 
+[agent:result]   Arguments:
+[agent:result]     PATH: The absolute path of the object or directory. Importing a directory is
+[agent:result]       only supported for the DBC and SOURCE formats.
+[agent:result] 
+[agent:result] Usage:
+[agent:result]   databricks workspace import TARGET_PATH [flags]
+[agent:result] 
+[agent:result] Flags:
+[agent:result]       --content string        The base64-encoded content.
+[agent:result]       --file string           Path of local file to import
+[agent:result]       --format ImportFormat   This specifies the format of the file to be imported. Supported values: [
+[agent:result]                                 AUTO,
+[agent:result]                                 DBC,
+[agent:result]                                 HTML,
+[agent:result]                                 JUPYTER,
+[agent:result]                                 RAW,
+[agent:result]                                 R_MARKDOWN,
+[agent:result]                                 SOURCE,
+[agent:result]                               ]
+[agent:result]   -h, --help                  help for import
+[agent:result]       --json JSON             either inline JSON string or @path/to/file.json with request body (default JSON (0 bytes))
+[agent:result]       --language Language     The language of the object. Supported values: [PYTHON, R, SCALA, SQL]
+[agent:result]       --overwrite             The flag that specifies whether to overwrite existing object.
+[agent:result] 
+[agent:result] Global Flags:
+[agent:result]       --debug            enable debug logging
+[agent:result]   -o, --output type      output type: text or json (default text)
+[agent:result]   -p, --profile string   ~/.databrickscfg profile
+[agent:result]   -t, --target string    bundle target to use (if applicable)
+[agent] Let me create the ingestion notebook locally and import it to the workspace.
+[agent:write] /Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/cli/1.3.0/official/feature/incremental_load/1/task/.tmp/ingest_notebook.py
+[agent:result] File created successfully at: /Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/cli/1.3.0/official/feature/incremental_load/1/task/.tmp/ingest_notebook.py (file state is current in your context — no need to Read it back)
+[agent:bash] databricks workspace mkdirs /Users/benedict@logicalclocks.com/mlpab77f9d2 2>&1 | head
+[agent:bash] databricks workspace import /Users/benedict@logicalclocks.com/mlpab77f9d2/incrementalb48074_ingest --file .tmp/ingest_notebook.py --language PYTHON --format SOURCE --overwrite 2>&1 | head
+[agent:bash] echo "--- verify ---"
+[agent:bash] databricks workspace list /Users/benedict@logicalclocks.com/mlpab77f9d2 2>&1 | head
+[agent:result] --- verify ---
+[agent:result] ID                Type      Language  Path
+[agent:result] 2331397044819189  NOTEBOOK  PYTHON    /Users/benedict@logicalclocks.com/mlpab77f9d2/incrementalb48074_ingest
+[agent] Notebook imported. Now create the recurring job with a daily schedule attached.
+[agent:write] /Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/cli/1.3.0/official/feature/incremental_load/1/task/.tmp/job.json
+[agent:result] File created successfully at: /Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/cli/1.3.0/official/feature/incremental_load/1/task/.tmp/job.json (file state is current in your context — no need to Read it back)
+[agent:bash] databricks jobs create --json @.tmp/job.json 2>&1 | head -20
+[agent:result] {
+[agent:result]   "job_id": 119076999655191
+[agent:result] }
+[agent] Job created. Let me verify the schedule is attached.
+[agent:bash] databricks jobs get 119076999655191 2>&1 | grep -iE 'quartz|timezone|pause_status|name|notebook_path|task_key' | head -20
+[agent:result]   "creator_user_name": "benedict@logicalclocks.com",
+[agent:result]   "run_as_user_name": "benedict@logicalclocks.com",
+[agent:result]     "name": "incrementaljobb48074",
+[agent:result]       "pause_status": "UNPAUSED",
+[agent:result]       "quartz_cron_expression": "0 0 6 * * ?",
+[agent:result]       "timezone_id": "UTC"
+[agent:result]           "notebook_path": "/Users/benedict@logicalclocks.com/mlpab77f9d2/incrementalb48074_ingest",
+[agent:result]         "task_key": "ingest_increments",
+[agent] Job has the daily schedule attached. Let me check the synced table (online store) provisioning status.
+[agent:bash] databricks postgres get-synced-table "synced_tables/mlpab77f9d2_incrb48074_lb.public.incrementalb48074" 2>&1 | grep -iE 'detailed_state|message|provisioning_state|synced_row' | head
+[agent:result]     "detailed_state": "SYNCED_TABLE_ONLINE_NO_PENDING_UPDATE",
+[agent:result]     "message": "Online Table creation succeeded using Delta Live Tables: https://***REDACTED***#joblist/pipelines/9604daa2-3ec4-4912-965f-4eee7fe408b6/updates/9039a77d-5469-44fa-8b90-2fe9d453808d.",
+[agent:result]     "unity_catalog_provisioning_state": "ACTIVE"
+[agent] The online store is ONLINE and synced. Everything is in place. Let me write the deliverable.
+[agent:write] /Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/cli/1.3.0/official/feature/incremental_load/1/task/submission/answers.json
+[agent:result] File created successfully at: /Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/cli/1.3.0/official/feature/incremental_load/1/task/submission/answers.json (file state is current in your context — no need to Read it back)
+[agent] Let me run a final verification of all deliverables.
+[agent:bash] echo "=== Feature table row count & PK ==="
+[agent:bash] databricks experimental aitools tools query "SELECT COUNT(*) AS rows FROM workspace.mlpab77f9d2.incrementalb48074" 2>&1 | grep rows
+[agent:bash] databricks experimental aitools tools query "SELECT constraint_name, constraint_type FROM information_schema.table_constraints WHERE table_schema='mlpab77f9d2' AND table_name='incrementalb48074'" 2>&1 | grep -iE 'constraint'
+[agent:bash] echo "=== Online synced table state ==="
+[agent:bash] databricks postgres get-synced-table "synced_tables/mlpab77f9d2_incrb48074_lb.public.incrementalb48074" 2>&1 | grep detailed_state
+[agent:bash] echo "=== Job + schedule ==="
+[agent:bash] databricks jobs list --name incrementaljobb48074 2>&1 | grep -iE 'job_id|incrementaljob'
+[agent:bash] echo "=== submission ==="
+[agent:bash] cat submission/answers.json
+[agent:result] === Feature table row count & PK ===
+[agent:result]     "rows": "658"
+[agent:result]     "constraint_name": "incrementalb48074_pk",
+[agent:result]     "constraint_type": "PRIMARY KEY"
+[agent:result] === Online synced table state ===
+[agent:result]     "detailed_state": "SYNCED_TABLE_ONLINE_NO_PENDING_UPDATE",
+[agent:result] === Job + schedule ===
+[agent:result] 119076999655191  incrementaljobb48074
+[agent:result] === submission ===
+[agent:result] {"job_name": "incrementaljobb48074"}
+[agent] All deliverables are verified and live on Databricks. Done.
+[agent] ## Summary
+[agent] Built the complete incremental-load feature pipeline on Databricks (CLI mode, everything platform-side):
+[agent] **1. Feature table** — `workspace.mlpab77f9d2.incrementalb48074`
+[agent] - Record key `row_id` + event-time `event_time` registered as a **TIMESERIES** primary key constraint (`incrementalb48074_pk`), making it a proper time-series feature table.
+[agent] - `event_time` kept as BIGINT epoch-milliseconds exactly as specified.
+[agent] - Change Data Feed enabled (required for online sync).
+[agent] - All 6 increments loaded via idempotent `COPY INTO` from a UC Volume → **658 rows, 658 distinct row_ids**.
+[agent] **2. Online / low-latency access** — Online Tables are deprecated on this workspace, so I used the platform's current path: a **Lakebase synced table** (`mlpab77f9d2_incrb48074_lb.public.incrementalb48074`) backed by a Lakebase Autoscaling project (`mlpab77f9d2-incrb48074`). It synced from the offline feature table (PK `row_id`, dedup by `event_time`) and reached `SYNCED_TABLE_ONLINE_NO_PENDING_UPDATE`. This is how the platform distinguishes offline (Delta feature table) from online (Postgres-backed synced table).
+[agent] **3. Recurring daily job** — `incrementaljobb48074` (job_id 119076999655191) with a notebook task that re-runs the idempotent `COPY INTO` (picks up only new increment files) and triggers a refresh of the online synced table. A **daily cron schedule is attached** (`0 0 6 * * ?`, UTC, UNPAUSED).
+[agent] **4. Deliverable** — `submission/answers.json` = `{"job_name": "incrementaljobb48074"}`.
+[agent] All Unity Catalog objects live in `workspace.mlpab77f9d2`; the job, Lakebase project, and notebook are prefixed/placed under the `mlpab77f9d2` namespace.
+[agent] done: 34 turns, $1.8998, stop=end_turn
+Collecting databricks-sdk==0.117.0
+  Downloading databricks_sdk-0.117.0-py3-none-any.whl.metadata (43 kB)
+Requirement already satisfied: requests<3,>=2.28.1 in ./venv/lib/python3.13/site-packages (from databricks-sdk==0.117.0) (2.34.2)
+Collecting google-auth~=2.0 (from databricks-sdk==0.117.0)
+  Downloading google_auth-2.55.1-py3-none-any.whl.metadata (5.1 kB)
+Requirement already satisfied: protobuf!=5.26.*,!=5.27.*,!=5.28.*,!=5.29.0,!=5.29.1,!=5.29.2,!=5.29.3,!=5.29.4,!=6.30.0,!=6.30.1,!=6.31.0,<7.0,>=4.25.8 in ./venv/lib/python3.13/site-packages (from databricks-sdk==0.117.0) (4.25.9)
+Requirement already satisfied: urllib3<3,>=1.26 in ./venv/lib/python3.13/site-packages (from databricks-sdk==0.117.0) (2.7.0)
+Requirement already satisfied: pyasn1-modules>=0.2.1 in ./venv/lib/python3.13/site-packages (from google-auth~=2.0->databricks-sdk==0.117.0) (0.4.2)
+Requirement already satisfied: cryptography>=38.0.3 in ./venv/lib/python3.13/site-packages (from google-auth~=2.0->databricks-sdk==0.117.0) (49.0.0)
+Requirement already satisfied: charset_normalizer<4,>=2 in ./venv/lib/python3.13/site-packages (from requests<3,>=2.28.1->databricks-sdk==0.117.0) (3.4.7)
+Requirement already satisfied: idna<4,>=2.5 in ./venv/lib/python3.13/site-packages (from requests<3,>=2.28.1->databricks-sdk==0.117.0) (3.18)
+Requirement already satisfied: certifi>=2023.5.7 in ./venv/lib/python3.13/site-packages (from requests<3,>=2.28.1->databricks-sdk==0.117.0) (2026.5.20)
+Requirement already satisfied: cffi>=2.0.0 in ./venv/lib/python3.13/site-packages (from cryptography>=38.0.3->google-auth~=2.0->databricks-sdk==0.117.0) (2.0.0)
+Requirement already satisfied: pycparser in ./venv/lib/python3.13/site-packages (from cffi>=2.0.0->cryptography>=38.0.3->google-auth~=2.0->databricks-sdk==0.117.0) (3.0)
+Requirement already satisfied: pyasn1<0.7.0,>=0.6.1 in ./venv/lib/python3.13/site-packages (from pyasn1-modules>=0.2.1->google-auth~=2.0->databricks-sdk==0.117.0) (0.6.3)
+Downloading databricks_sdk-0.117.0-py3-none-any.whl (936 kB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 936.9/936.9 kB 5.8 MB/s  0:00:00
+Downloading google_auth-2.55.1-py3-none-any.whl (252 kB)
+Installing collected packages: google-auth, databricks-sdk
+
+Successfully installed databricks-sdk-0.117.0 google-auth-2.55.1
+[mlpab] graded: 4 passed / 0 failed / 0 skipped of 4 asserts

@@ -84,7 +84,11 @@ def grade(instance_dir: Path, adapter: str, run_dir: Path) -> dict:
         s.skip("A3_online_read", "no checker adapter (platform none) — skipped")
     else:
         checker = state_checker(adapter)
-        if checker is None or not hasattr(checker, "get_records"):
+        if (
+            checker is None
+            or not hasattr(checker, "get_records")
+            or not getattr(checker, "supports_online_read", True)
+        ):
             s.skip(
                 "A3_online_read",
                 f"no independent online read path for adapter {adapter!r}",

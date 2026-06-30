@@ -44,7 +44,7 @@ banter/
 3. Each interface is built once and installed into a per-interface prepared virtual environment. Every run then clones that environment read-only, so runs do not reinstall anything or mutate shared state, and parallel sessions do not interfere.
 4. For each run: a fresh seeded task instance is generated, `setup.py` provisions the platform and a `verify` step confirms it is ready, the sandboxed agent attempts the task using only its interface, then `teardown.py` removes what the agent created and a `verify` step confirms nothing was left behind.
 5. A platform adapter (`evals/adapters/<platform>.py`) reads the deliverable back through the platform and runs the task's assertion suite.
-6. One row per run is appended to `results/results.csv`, and an analysis notebook is regenerated.
+6. One row per run is appended to `results/results.csv`.
 
 ### Eval families (`evals/`)
 
@@ -73,6 +73,12 @@ mlpab attach <config.yaml>  # watch live (detach with Ctrl-b d)
 
 # Or run inline
 mlpab run configs/treatments/gcp/gcp-mistral.yaml
+
+# Resume: re-running a config skips combos already completed — a valid row whose
+# run folder still exists on disk. --retry also re-runs FAILED combos (no valid
+# row, or a valid row whose folder was deleted), purging their rows + folders
+# and running clean; --no-skip re-runs every combo, accumulating attempts.
+mlpab run --retry configs/treatments/databricks/databricks-claude.yaml
 ```
 
 Credentials are read from `testbed/.env`. macOS is the primary target. It uses
@@ -92,7 +98,7 @@ make fmt         # auto-fix: isort imports, then ruff format, then ruff --fix
 ```
 testbed/results/results.csv     one row per run (the single results table)
 testbed/results/<config>/...    per-run artifacts: agent.log, submission/, grading, commands
-testbed/results/results.ipynb   generated analysis, regenerated after each run
+testbed/results/*.ipynb         hand-curated analysis notebooks
 ```
 
 Each row records the identity of the cell (`model`, `platform`, `interface`,

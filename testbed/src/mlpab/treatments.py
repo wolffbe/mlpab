@@ -319,6 +319,38 @@ def _pool_worker_init() -> None:
     os.environ["MLPAB_QUIET"] = "1"
 
 
+def _classify_combos(
+    rows: list[dict[str, str]], config: str
+) -> tuple[set[tuple[str, ...]], set[tuple[str, ...]]]:
+    """Split `config`'s existing CSV rows into (done, failed) combo-key sets.
+
+    * done — has a COMPLETED (valid=True) attempt whose result folder
+      (`run_dir`) is still on disk.
+    * failed — every other seen combo: no completed attempt (agent died, timed
+      out, never produced a deliverable) OR a valid row whose `run_dir` was
+      deleted, leaving stale bookkeeping that points at nothing. A folderless
+      "done" row must re-run rather than be trusted, so it lands here.
+
+    --skip leaves both sets alone; --retry purges + re-runs the failed set.
+    """
+    done_by_combo: dict[tuple[str, ...], bool] = {}
+    seen: set[tuple[str, ...]] = set()
+    for r in rows:
+        if r.get("config") != config:
+            continue
+        key = results.combo_key(r)
+        seen.add(key)
+        run_dir = (r.get("run_dir") or "").strip()
+        is_done = (
+            str(r.get("valid", "")).strip().lower() == "true"
+            and bool(run_dir)
+            and Path(run_dir).is_dir()
+        )
+        done_by_combo[key] = done_by_combo.get(key, False) or is_done
+    done = {k for k, ok in done_by_combo.items() if ok}
+    return done, seen - done
+
+
 def run_treatments(
     config: TreatmentConfig,
     runs_root: Path,
@@ -440,19 +472,8 @@ def run_treatments(
     # accumulates (n+1) across separate invocations.
     # Classify this config's existing rows by combo identity (everything but the
     # repeat `n`), scoped to THIS config_name so another config's rows never mask
-    # a combo:
-    #   * done — has at least one COMPLETED (valid=True) attempt.
-    #   * failed — has rows but NONE valid=True (agent died, timed out, or never
-    #     produced a deliverable).
-    valid_by_combo: dict[tuple[str, ...], bool] = {}
-    for r in results._read_runs(global_csv):
-        if r.get("config") != run_id:
-            continue
-        key = results.combo_key(r)
-        is_valid = str(r.get("valid", "")).strip().lower() == "true"
-        valid_by_combo[key] = valid_by_combo.get(key, False) or is_valid
-    done_combos = {k for k, ok in valid_by_combo.items() if ok}
-    failed_combos = {k for k, ok in valid_by_combo.items() if not ok}
+    # a combo (see _classify_combos for the done/failed definitions).
+    done_combos, failed_combos = _classify_combos(results._read_runs(global_csv), run_id)
 
     # --retry: a failed combo carries no usable result, so purge its stale CSV
     # rows (its on-disk attempt dirs are removed in the plan loop below) and

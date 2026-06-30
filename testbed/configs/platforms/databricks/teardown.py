@@ -63,6 +63,11 @@ KEEP_CATALOGS = {
 # Catalogs not even swept inside (system-managed or not UC-governed).
 SKIP_SWEEP_CATALOGS = {"system", "samples", "hive_metastore", "__databricks_internal"}
 KEEP_SCHEMAS = {"default", "information_schema"}
+# SQL warehouses never swept, even when owned by the token user: the grader
+# reads through a stable warehouse setup.py provisions (see
+# evals/adapters/databricks.py). Sweeping it would reintroduce the readback
+# flake this preservation exists to fix.
+KEEP_WAREHOUSES = {"mlpab-grader"}
 
 
 def _api(method: str, path: str, payload: dict | None = None, query: dict | None = None) -> dict:
@@ -249,6 +254,8 @@ def main() -> None:
 
     resp = _try("GET", "/api/2.0/sql/warehouses") or {}
     for wh in resp.get("warehouses") or []:
+        if wh.get("name") in KEEP_WAREHOUSES:
+            continue
         if wh.get("id") and _mine(wh, me, "creator_name"):
             if _try("DELETE", f"/api/2.0/sql/warehouses/{wh['id']}") is not None:
                 print(
@@ -386,7 +393,7 @@ def verify() -> int:
     leaks += [
         f"warehouse {w['id']}"
         for w in (resp.get("warehouses") or [])
-        if w.get("id") and _mine(w, me, "creator_name")
+        if w.get("id") and w.get("name") not in KEEP_WAREHOUSES and _mine(w, me, "creator_name")
     ]
     resp = _try("GET", "/api/2.1/jobs/list", query={"limit": "100"}) or {}
     leaks += [

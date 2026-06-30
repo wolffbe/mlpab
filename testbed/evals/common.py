@@ -151,7 +151,7 @@ def fetch_table(
     if adapter == "databricks":
         from evals.adapters.databricks import DatabricksChecker
 
-        return DatabricksChecker().read_rows(table)
+        return DatabricksChecker().read_rows(table, version)
     if adapter == "aws":
         from evals.adapters.aws import SageMakerChecker
 

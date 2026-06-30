@@ -38,6 +38,9 @@ TOKEN = os.environ.get("DATABRICKS_TOKEN") or ""
 
 CATALOG = "workspace"
 SCHEMA = "default"
+# Stable SQL warehouse the GRADER reads through (see evals/adapters/databricks.py).
+# teardown.py preserves it by name so it survives the per-run sweep.
+GRADER_WAREHOUSE = "mlpab-grader"
 
 
 def _api(method: str, path: str, payload: dict | None = None) -> dict:
@@ -56,11 +59,7 @@ def _api(method: str, path: str, payload: dict | None = None) -> dict:
     return json.loads(body) if body else {}
 
 
-def main() -> None:
-    if not HOST or not TOKEN:
-        print("[databricks setup] DATABRICKS_HOST/DATABRICKS_TOKEN unset — nothing to do")
-        return
-
+def _ensure_schema() -> None:
     full = f"{CATALOG}.{SCHEMA}"
     try:
         _api("GET", f"/api/2.1/unity-catalog/schemas/{full}")
@@ -68,7 +67,6 @@ def main() -> None:
         return
     except Exception:
         pass  # missing (or no UC at all) → try to create it
-
     try:
         _api("POST", "/api/2.1/unity-catalog/schemas", {"name": SCHEMA, "catalog_name": CATALOG})
         print(f"[databricks setup] created schema {full!r}")
@@ -76,6 +74,61 @@ def main() -> None:
         # Workspace without Unity Catalog, or missing catalog — the agent can
         # still work elsewhere, so don't fail the run.
         print(f"[databricks setup] create of schema {full!r} skipped: {e}")
+
+
+def _ensure_grader_warehouse() -> None:
+    """Provision a small, stable SQL warehouse the GRADER reads through.
+
+    Readback executes SQL on a warehouse. Relying on whatever warehouse happens
+    to exist makes grading flaky: a parallel run's teardown can sweep it out
+    from under a readback ("no SQL warehouse available"), and a cold classic
+    warehouse can leave a statement PENDING past the wait cap. A named,
+    auto-stopping warehouse that teardown.py preserves gives every readback a
+    stable target; serverless (preferred) also starts in seconds. Best-effort:
+    never raises — a workspace without SQL warehouses still grades via whatever
+    the adapter can find."""
+    try:
+        resp = _api("GET", "/api/2.0/sql/warehouses")
+        for wh in resp.get("warehouses") or []:
+            if wh.get("name") == GRADER_WAREHOUSE:
+                print(
+                    f"[databricks setup] grader warehouse {GRADER_WAREHOUSE!r} "
+                    f"present ({wh.get('id')})"
+                )
+                return
+    except Exception as e:
+        print(f"[databricks setup] grader warehouse lookup skipped: {e}")
+        return
+
+    base = {
+        "name": GRADER_WAREHOUSE,
+        "cluster_size": "2X-Small",
+        "min_num_clusters": 1,
+        "max_num_clusters": 1,
+        "auto_stop_mins": 10,
+    }
+    # Prefer serverless (fast cold start); fall back to a classic PRO warehouse
+    # where serverless is not enabled on the account.
+    for payload in ({**base, "enable_serverless_compute": True, "warehouse_type": "PRO"}, base):
+        try:
+            created = _api("POST", "/api/2.0/sql/warehouses", payload)
+            kind = "serverless" if payload.get("enable_serverless_compute") else "classic"
+            print(
+                f"[databricks setup] created {kind} grader warehouse "
+                f"{GRADER_WAREHOUSE!r} ({created.get('id')})"
+            )
+            return
+        except Exception as e:
+            last = e
+    print(f"[databricks setup] grader warehouse provision skipped: {last}")
+
+
+def main() -> None:
+    if not HOST or not TOKEN:
+        print("[databricks setup] DATABRICKS_HOST/DATABRICKS_TOKEN unset — nothing to do")
+        return
+    _ensure_schema()
+    _ensure_grader_warehouse()
 
 
 def verify() -> int:

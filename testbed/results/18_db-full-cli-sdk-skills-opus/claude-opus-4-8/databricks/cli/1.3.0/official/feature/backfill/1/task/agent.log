@@ -1,0 +1,717 @@
+[mlpab] skills (95c4b1b4): databricks-apps,databricks-core,databricks-dabs,databricks-jobs,databricks-lakebase,databricks-model-serving,databricks-pipelines,databricks-serverless-migration,databricks-vector-search
+[agent] I'll start by exploring the task inputs and understanding the environment.
+[agent:bash] cat data/schema.md; echo "---BATCH1---"; head -5 data/batch_1.csv; echo "---BATCH2---"; head -5 data/batch_2.csv; echo "---BATCH3---"; head -5 data/batch_3.csv; echo "---COUNTS---"; wc -l data/*.csv
+[agent:result] # Schema
+[agent:result] 
+[agent:result] Three batch files of one `accounts` table, delivered OUT OF ORDER: the same `row_id` may appear in more than one batch, and the row with the LATEST `updated_at` is the correct, current state (later rows are corrections of earlier ones).
+[agent:result] 
+[agent:result] - **row_id** (string): unique record key
+[agent:result] - **status** (string): active | dormant | closed
+[agent:result] - **balance** (double)
+[agent:result] - **updated_at** (bigint): revision time as epoch MILLISECONDS — register it as the event-time column
+[agent:result] ---BATCH1---
+[agent:result] row_id,status,balance,updated_at
+[agent:result] R00293,active,8893.24,1770397980000
+[agent:result] R00348,active,3405.38,1770285000000
+[agent:result] R00103,active,5583.56,1770603300000
+[agent:result] R00224,active,2522.62,1770348120000
+[agent:result] ---BATCH2---
+[agent:result] row_id,status,balance,updated_at
+[agent:result] R00147,closed,2692.23,1770251700000
+[agent:result] R00365,dormant,4201.31,1770134460000
+[agent:result] R00192,active,5409.59,1769999640000
+[agent:result] R00081,closed,6710.97,1770092100000
+[agent:result] ---BATCH3---
+[agent:result] row_id,status,balance,updated_at
+[agent:result] R00375,active,5979.46,1769973240000
+[agent:result] R00255,closed,6294.04,1770255540000
+[agent:result] R00022,dormant,6355.36,1770282360000
+[agent:result] R00154,closed,6800.65,1770287280000
+[agent:result] ---COUNTS---
+[agent:result]       91 data/batch_1.csv
+[agent:result]      201 data/batch_2.csv
+[agent:result]      201 data/batch_3.csv
+[agent:result]      493 total
+[agent:bash] echo "SCHEMA=$MLPAB_DATABRICKS_SCHEMA"; echo "PREFIX=$MLPAB_DATABRICKS_PREFIX"; echo "HOST=$DATABRICKS_HOST"
+[agent:result] SCHEMA=workspace.mlpab2696b6
+[agent:result] PREFIX=mlpab2696b6
+[agent:result] HOST=***REDACTED***
+[agent] This is a Databricks Feature Store task. Let me load the core skill for up-to-date guidance.
+[agent:tool] Skill
+[agent:result] Launching skill: databricks-core
+[agent:bash] databricks --version; echo "---PROFILES---"; databricks auth profiles 2>&1 | head; echo "---ME---"; databricks current-user me 2>&1 | head -30
+[agent:result] Databricks CLI v1.3.0
+[agent:result] ---PROFILES---
+[agent:result] Error: cannot parse config file: no configuration file found at /Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/cli/1.3.0/official/feature/backfill/1/task/.databrickscfg; please create one by running 'databricks auth login'
+[agent:result] ---ME---
+[agent:result] {
+[agent:result]   "active": true,
+[agent:result]   "emails": [
+[agent:result]     {
+[agent:result]       "primary": true,
+[agent:result]       "type": "work",
+[agent:result]       "value": "benedict@logicalclocks.com"
+[agent:result]     }
+[agent:result]   ],
+[agent:result]   "entitlements": [
+[agent:result]     {
+[agent:result]       "value": "allow-cluster-create"
+[agent:result]     },
+[agent:result]     {
+[agent:result]       "value": "allow-instance-pool-create"
+[agent:result]     }
+[agent:result]   ],
+[agent:result]   "groups": [
+[agent:result]     {
+[agent:result]       "$ref": "Groups/83572394574321",
+[agent:result]       "display": "account users",
+[agent:result]       "type": "direct",
+[agent:result]       "value": "83572394574321"
+[agent:result]     },
+[agent:result]     {
+[agent:result]       "$ref": "Groups/82415167308912",
+[agent:result]       "display": "admins",
+[agent:result]       "type": "direct",
+[agent:result]       "value": "82415167308912"
+[agent:result]     },
+[agent] Auth works via env vars. Let me find the default warehouse and verify the schema.
+[agent:bash] databricks experimental aitools tools get-default-warehouse 2>&1 | head -30
+[agent:bash] databricks schemas get workspace.mlpab2696b6 2>&1 | head -20
+[agent:result] 4dfab06c923fe3cc
+[agent:result] {
+[agent:result]   "browse_only": false,
+[agent:result]   "catalog_name": "workspace",
+[agent:result]   "catalog_type": "MANAGED_CATALOG",
+[agent:result]   "created_at": 1782736565829,
+[agent:result]   "created_by": "benedict@logicalclocks.com",
+[agent:result]   "effective_predictive_optimization_flag": {
+[agent:result]     "inherited_from_name": "metastore_aws_us_west_2",
+[agent:result]     "inherited_from_type": "METASTORE",
+[agent:result]     "value": "ENABLE"
+[agent:result]   },
+[agent:result]   "enable_predictive_optimization": "INHERIT",
+[agent:result]   "full_name": "workspace.mlpab2696b6",
+[agent:result]   "metastore_id": "e4f39cd5-5a4c-42e0-a2a4-8f4d090d7109",
+[agent:result]   "name": "mlpab2696b6",
+[agent:result]   "owner": "benedict@logicalclocks.com",
+[agent:result]   "schema_id": "bd6b6365-1f07-41f4-b486-626889d9174f",
+[agent:result]   "updated_at": 1782736565829,
+[agent:result]   "updated_by": "benedict@logicalclocks.com"
+[agent:result] }
+[agent] Warehouse `4dfab06c923fe3cc` found, schema exists. Now I'll create a volume to upload the CSVs, then build the feature table on the platform. Let me test the query tool and create the volume.
+[agent:bash] databricks experimental aitools tools query "SELECT 1 AS ok" 2>&1 | head -20
+[agent:bash] databricks volumes create workspace mlpab2696b6 ingest MANAGED 2>&1 | head -20
+[agent:result] [
+[agent:result]   {
+[agent:result]     "ok": "1"
+[agent:result]   }
+[agent:result] ]
+[agent:result] {
+[agent:result]   "catalog_name": "workspace",
+[agent:result]   "created_at": 1782736627644,
+[agent:result]   "created_by": "benedict@logicalclocks.com",
+[agent:result]   "encryption_details": {},
+[agent:result]   "full_name": "workspace.mlpab2696b6.ingest",
+[agent:result]   "metastore_id": "e4f39cd5-5a4c-42e0-a2a4-8f4d090d7109",
+[agent:result]   "name": "ingest",
+[agent:result]   "owner": "benedict@logicalclocks.com",
+[agent:result]   "schema_name": "mlpab2696b6",
+[agent:result]   "storage_location": "s3://dbstorage-prod-orz5y/uc/0b7439f3-67e0-443e-a617-1ec1edc192c6/e4f39cd5-5a4c-42e0-a2a4-8f4d090d7109/__unitystorage/catalogs/f6b96a63-02b8-44e8-a3f0-71f9a6bb5601/volumes/c073ad0d-d791-49bb-833c-1fe7ac477500",
+[agent:result]   "updated_at": 1782736627644,
+[agent:result]   "updated_by": "benedict@logicalclocks.com",
+[agent:result]   "volume_id": "c073ad0d-d791-49bb-833c-1fe7ac477500",
+[agent:result]   "volume_type": "MANAGED"
+[agent:result] }
+[agent] Both work. Now upload the three CSVs to the volume.
+[agent:bash] for b in 1 2 3; do databricks fs cp data/batch_${b}.csv dbfs:/Volumes/workspace/mlpab2696b6/ingest/batch_${b}.csv --overwrite 2>&1; done; echo "---LIST---"; databricks fs ls dbfs:/Volumes/workspace/mlpab2696b6/ingest/ 2>&1
+[agent:result] data/batch_1.csv -> dbfs:/Volumes/workspace/mlpab2696b6/ingest/batch_1.csv
+[agent:result] data/batch_2.csv -> dbfs:/Volumes/workspace/mlpab2696b6/ingest/batch_2.csv
+[agent:result] data/batch_3.csv -> dbfs:/Volumes/workspace/mlpab2696b6/ingest/batch_3.csv
+[agent:result] ---LIST---
+[agent:result] batch_1.csv
+[agent:result] batch_2.csv
+[agent:result] batch_3.csv
+[agent] CSVs uploaded. Now I'll create the feature table. On Databricks a feature table is a Delta table with a primary key. Let me create it with CDC enabled (required for online sync), load the deduped latest-per-row_id data, and add the primary key.
+[agent:bash] databricks experimental aitools tools query "CREATE TABLE workspace.mlpab2696b6.accountsb63f12 (
+[agent:bash]   row_id STRING NOT NULL,
+[agent:bash]   status STRING,
+[agent:bash]   balance DOUBLE,
+[agent:bash]   updated_at BIGINT NOT NULL
+[agent:bash] ) TBLPROPERTIES (delta.enableChangeDataFeed = true)" 2>&1 | head -20
+[agent:result] Query executed successfully (no results)
+[agent] Now load the deduped latest-per-row_id data from all three CSVs:
+[agent:bash] databricks experimental aitools tools query "INSERT INTO workspace.mlpab2696b6.accountsb63f12
+[agent:bash] SELECT row_id, status, balance, updated_at
+[agent:bash] FROM (
+[agent:bash]   SELECT row_id, status, balance, CAST(updated_at AS BIGINT) AS updated_at,
+[agent:bash]          ROW_NUMBER() OVER (PARTITION BY row_id ORDER BY CAST(updated_at AS BIGINT) DESC) AS rn
+[agent:bash]   FROM read_files('/Volumes/workspace/mlpab2696b6/ingest/', format => 'csv', header => true)
+[agent:bash] )
+[agent:bash] WHERE rn = 1" 2>&1 | head -20
+[agent:result] [
+[agent:result]   {
+[agent:result]     "num_affected_rows": "400",
+[agent:result]     "num_inserted_rows": "400"
+[agent:result]   }
+[agent:result] ]
+[agent] 400 rows inserted from 490 total. Let me verify uniqueness and a sample latest-revision pick, then add the primary key constraint.
+[agent:bash] databricks experimental aitools tools query "SELECT COUNT(*) total, COUNT(DISTINCT row_id) distinct_ids FROM workspace.mlpab2696b6.accountsb63f12" 2>&1
+[agent:bash] databricks experimental aitools tools query "WITH src AS (SELECT row_id, CAST(updated_at AS BIGINT) ua FROM read_files('/Volumes/workspace/mlpab2696b6/ingest/', format=>'csv', header=>true)) SELECT s.row_id, MAX(s.ua) max_src, t.updated_at tbl FROM src s JOIN workspace.mlpab2696b6.accountsb63f12 t ON s.row_id=t.row_id GROUP BY s.row_id, t.updated_at HAVING MAX(s.ua) <> t.updated_at LIMIT 5" 2>&1
+[agent:result] [
+[agent:result]   {
+[agent:result]     "distinct_ids": "400",
+[agent:result]     "total": "400"
+[agent:result]   }
+[agent:result] ]
+[agent:result] []
+[agent] Content verified: 400 rows, all distinct, each storing the max (latest) `updated_at`. Now add the primary key constraint to register it as a feature table.
+[agent:bash] databricks experimental aitools tools query "ALTER TABLE workspace.mlpab2696b6.accountsb63f12 ADD CONSTRAINT accountsb63f12_pk PRIMARY KEY (row_id)" 2>&1 | head
+[agent:result] Query executed successfully (no results)
+[agent] Primary key added — the table is now a feature table. Now create the online table for low-latency lookup. Let me check the command.
+[agent:bash] databricks online-tables create --help 2>&1 | head -40
+[agent:result] This command is in Public Preview and may change without notice.
+[agent:result] 
+[agent:result] Create an Online Table.
+[agent:result] 
+[agent:result]   Create a new Online Table.
+[agent:result] 
+[agent:result] Usage:
+[agent:result]   databricks online-tables create [flags]
+[agent:result] 
+[agent:result] Flags:
+[agent:result]   -h, --help               help for create
+[agent:result]       --json JSON          either inline JSON string or @path/to/file.json with request body (default JSON (0 bytes))
+[agent:result]       --name string        Full three-part (catalog, schema, table) name of the table.
+[agent:result]       --no-wait            do not wait to reach ACTIVE state
+[agent:result]       --timeout duration   maximum amount of time to reach ACTIVE state (default 20m0s)
+[agent:result] 
+[agent:result] Global Flags:
+[agent:result]       --debug            enable debug logging
+[agent:result]   -o, --output type      output type: text or json (default text)
+[agent:result]   -p, --profile string   ~/.databrickscfg profile
+[agent:result]   -t, --target string    bundle target to use (if applicable)
+[agent:bash] cat > .tmp_online.json 2>/dev/null <<'EOF'
+[agent:bash] {
+[agent:bash]   "name": "workspace.mlpab2696b6.accountsb63f12_online",
+[agent:bash]   "spec": {
+[agent:bash]     "source_table_full_name": "workspace.mlpab2696b6.accountsb63f12",
+[agent:bash]     "primary_key_columns": ["row_id"],
+[agent:bash]     "run_triggered": {}
+[agent:bash]   }
+[agent:bash] }
+[agent:bash] EOF
+[agent:bash] mkdir -p .tmp; mv .tmp_online.json .tmp/online.json 2>/dev/null; cat .tmp/online.json
+[agent:result-err] PreToolUse:Bash hook error: [python3 /Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/cli/1.3.0/official/feature/backfill/1/task/.claude/hooks/log_tool_call.py]: DENIED: 'name:' is off-interface in 'cli' mode — only the `databricks` CLI may do work on databricks; local interpreters, network tools, and stray binaries are blocked. Basic shell (cp/mkdir/cat/head/grep) is allowed for the floor submission and data inspection. If you can't do the work through the `databricks` CLI, STOP and report the missing capability — do NOT work around it locally.
+[agent] The heredoc tripped the allowlist. I'll use the Write tool for the JSON spec instead.
+[agent:write] /Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/cli/1.3.0/official/feature/backfill/1/task/.tmp/online.json
+[agent:result] File created successfully at: /Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/cli/1.3.0/official/feature/backfill/1/task/.tmp/online.json (file state is current in your context — no need to Read it back)
+[agent:bash] databricks online-tables create --json @.tmp/online.json --timeout 20m 2>&1 | head -50
+[agent:result] Error: Online Table is being deprecated. Creating new online table is not allowed. Databricks recommends switching to Synced Tables.
+[agent] Online tables are deprecated — the platform now uses Synced Tables (Lakebase). Let me check the synced-table commands.
+[agent:bash] databricks --help 2>&1 | grep -iE "synced|database|lakebase|online" ; echo "---"; databricks database --help 2>&1 | head -40
+[agent:result]   online-tables                          *Public Preview* Online tables provide lower latency and higher QPS access to data from Delta tables.
+[agent:result]   schemas                                A schema (also called a database) is the second layer of Unity Catalog’s three-level namespace.
+[agent:result] Database Instances
+[agent:result]   database                               *Public Preview* Database Instances provide access to a database via REST API or direct SQL.
+[agent:result]   psql                                   Connect to a Lakebase Postgres database
+[agent:result]   postgres                               *Beta* Use the Postgres API to create and manage Lakebase Autoscaling Postgres infrastructure, including projects, branches, compute endpoints, and roles.
+[agent:result] ---
+[agent:result] This command is in Public Preview and may change without notice.
+[agent:result] 
+[agent:result] Database Instances provide access to a database via REST API or direct SQL.
+[agent:result] 
+[agent:result] Usage:
+[agent:result]   databricks database [flags]
+[agent:result]   databricks database [command]
+[agent:result] 
+[agent:result] Available Commands:
+[agent:result]   create-database-catalog       *Public Preview* Create a Database Catalog.
+[agent:result]   create-database-instance      *Public Preview* Create a Database Instance.
+[agent:result]   create-database-table         *Public Preview* Create a Database Table.
+[agent:result]   create-synced-database-table  *Public Preview* Create a Synced Database Table.
+[agent:result]   delete-database-catalog       *Public Preview* Delete a Database Catalog.
+[agent:result]   delete-database-instance      *Public Preview* Delete a Database Instance.
+[agent:result]   delete-database-table         *Public Preview* Delete a Database Table.
+[agent:result]   delete-synced-database-table  *Public Preview* Delete a Synced Database Table.
+[agent:result]   find-database-instance-by-uid *Public Preview* Find a Database Instance by uid.
+[agent:result]   generate-database-credential  *Public Preview* Generates a credential that can be used to access database instances.
+[agent:result]   get-database-catalog          *Public Preview* Get a Database Catalog.
+[agent:result]   get-database-instance         *Public Preview* Get a Database Instance.
+[agent:result]   get-database-table            *Public Preview* Get a Database Table.
+[agent:result]   get-synced-database-table     *Public Preview* Get a Synced Database Table.
+[agent:result]   list-database-instances       *Public Preview* List Database Instances.
+[agent:result]   update-database-instance      *Public Preview* Update a Database Instance.
+[agent:result] 
+[agent:result] Flags:
+[agent:result]   -h, --help   help for database
+[agent:result] 
+[agent:result] Global Flags:
+[agent:result]       --debug            enable debug logging
+[agent:result]   -o, --output type      output type: text or json (default text)
+[agent:result]   -p, --profile string   ~/.databrickscfg profile
+[agent:result]   -t, --target string    bundle target to use (if applicable)
+[agent:result] 
+[agent:result] Use "databricks database [command] --help" for more information about a command.
+[agent] The online-table replacement is a Synced Database Table backed by a Lakebase instance. Let me load the lakebase skill and check the create commands.
+[agent:tool] Skill
+[agent:result] Launching skill: databricks-lakebase
+[agent:read] /Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/cli/1.3.0/official/feature/backfill/1/task/.claude/skills/databricks-lakebase/references/synced-tables.md
+[agent:result] 1	# Lakebase synced tables
+[agent:result] 2	
+[agent:result] 3	> **Official docs:** https://docs.databricks.com/aws/en/oltp/projects/sync-tables
+[agent:result] 4	
+[agent:result] 5	Lakebase synced tables sync data from Unity Catalog Delta tables into Lakebase as PostgreSQL tables for OLTP access patterns. Previously known as **Reverse ETL**.
+[agent:result] 6	
+[agent:result] 7	**How it works:** Synced tables create a managed copy — a Unity Catalog table (read-only, managed by sync pipeline) and a Postgres table in Lakebase (queryable by apps). Uses managed Lakeflow Spark Declarative Pipelines.
+[agent:result] 8	
+[agent:result] 9	**Performance (per Autoscaling CU):**
+[agent:result] 10	- Continuous/Triggered: ~150 rows/sec per CU
+[agent:result] 11	- Snapshot: ~2,000 rows/sec per CU
+[agent:result] 12	- Each synced table uses up to 16 connections
+[agent:result] 13	
+[agent:result] 14	## Sync Modes
+[agent:result] 15	
+[agent:result] 16	| Mode | Description | CDF Required | Best For |
+[agent:result] 17	|------|-------------|-------------|----------|
+[agent:result] 18	| **Snapshot** | One-time full copy | No | Initial setup, small tables, >10% data change |
+[agent:result] 19	| **Triggered** | Scheduled updates | Yes | Dashboards updated hourly/daily |
+[agent:result] 20	| **Continuous** | Real-time (seconds latency, 15s min interval) | Yes | Live applications |
+[agent:result] 21	
+[agent:result] 22	**Enable CDF on source table:**
+[agent:result] 23	
+[agent:result] 24	```sql
+[agent:result] 25	ALTER TABLE your_catalog.your_schema.your_table
+[agent:result] 26	SET TBLPROPERTIES (delta.enableChangeDataFeed = true)
+[agent:result] 27	```
+[agent:result] 28	
+[agent:result] 29	## Prerequisites
+[agent:result] 30	
+[agent:result] 31	- A Databricks workspace with Lakebase enabled
+[agent:result] 32	- An active Lakebase project with a branch and endpoint
+[agent:result] 33	- A Unity Catalog source table to sync
+[agent:result] 34	- **Permissions:** `USE_SCHEMA` and `CREATE_TABLE` on the target schema
+[agent:result] 35	- For Triggered/Continuous modes: Change Data Feed enabled on the source table
+[agent:result] 36	
+[agent:result] 37	> **Note:** Your Lakebase database must be registered as a UC catalog (one-time setup per project). Skip if already done.
+[agent:result] 38	>
+[agent:result] 39	> ```bash
+[agent:result] 40	> databricks postgres create-catalog <CATALOG_NAME> \
+[agent:result] 41	>   --json '{
+[agent:result] 42	>     "spec": {
+[agent:result] 43	>       "postgres_database": "<POSTGRES_DATABASE>",
+[agent:result] 44	>       "branch": "projects/<PROJECT_ID>/branches/<BRANCH_ID>"
+[agent:result] 45	>     }
+[agent:result] 46	>   }' --profile <PROFILE>
+[agent:result] 47	> ```
+[agent:result] 48	>
+[agent:result] 49	> The `<POSTGRES_DATABASE>` is the Postgres database name (default: `databricks_postgres`), not the resource path.
+[agent:result] 50	
+[agent:result] 51	## Creating Lakebase synced tables
+[agent:result] 52	
+[agent:result] 53	> **Source table must exist first.** Synced tables sync from an existing UC table, view, or materialized view. If the source needs transformation, ask the user how they want to prepare it (DLT materialized view, regular view, or existing table). Do not run ad-hoc `CREATE TABLE AS SELECT` statements.
+[agent:result] 54	
+[agent:result] 55	```bash
+[agent:result] 56	databricks postgres create-synced-table <LAKEBASE_CATALOG>.<SCHEMA>.<TABLE> \
+[agent:result] 57	  --json '{
+[agent:result] 58	    "spec": {
+[agent:result] 59	      "source_table_full_name": "analytics.gold.user_profiles",
+[agent:result] 60	      "primary_key_columns": ["user_id"],
+[agent:result] 61	      "scheduling_policy": "TRIGGERED",
+[agent:result] 62	      "branch": "projects/<PROJECT_ID>/branches/production",
+[agent:result] 63	      "postgres_database": "databricks_postgres",
+[agent:result] 64	      "create_database_objects_if_missing": true,
+[agent:result] 65	      "new_pipeline_spec": {
+[agent:result] 66	        "storage_catalog": "<REGULAR_UC_CATALOG>",
+[agent:result] 67	        "storage_schema": "default"
+[agent:result] 68	      }
+[agent:result] 69	    }
+[agent:result] 70	  }' --profile <PROFILE>
+[agent:result] 71	```
+[agent:result] 72	
+[agent:result] 73	| Field | Required | Description |
+[agent:result] 74	|-------|----------|-------------|
+[agent:result] 75	| `source_table_full_name` | Yes | Full Unity Catalog name of the source table |
+[agent:result] 76	| `primary_key_columns` | Yes | Column(s) forming the primary key |
+[agent:result] 77	| `scheduling_policy` | Yes | `SNAPSHOT`, `TRIGGERED`, or `CONTINUOUS` |
+[agent:result] 78	| `branch` | Yes | Target Lakebase branch (`projects/<PROJECT_ID>/branches/<BRANCH_ID>`) |
+[agent:result] 79	| `postgres_database` | Yes | Postgres database name (default: `databricks_postgres`), not the resource path |
+[agent:result] 80	| `create_database_objects_if_missing` | No | Auto-create Postgres schema/database if missing (default: `false`) |
+[agent:result] 81	| `new_pipeline_spec.storage_catalog` | Yes | A **regular** UC catalog for DLT pipeline metadata (NOT the Lakebase catalog) |
+[agent:result] 82	| `new_pipeline_spec.storage_schema` | Yes | Schema in the storage catalog for pipeline metadata (e.g. `default`) |
+[agent:result] 83	| `timeseries_key` | No | Column for deduplication when source has duplicate PKs (latest wins). Performance penalty. |
+[agent:result] 84	
+[agent:result] 85	> **Note:** Nulls in PK columns are excluded from sync.
+[agent:result] 86	
+[agent:result] 87	Long-running operation; CLI waits by default. Use `--no-wait` to return immediately.
+[agent:result] 88	
+[agent:result] 89	**Supported source types:** managed/external Delta tables, managed/external Iceberg tables, views, and materialized views.
+[agent:result] 90	
+[agent:result] 91	**Check status:**
+[agent:result] 92	
+[agent:result] 93	```bash
+[agent:result] 94	databricks postgres get-synced-table "synced_tables/<LAKEBASE_CATALOG>.<SCHEMA>.<TABLE>" --profile <PROFILE>
+[agent:result] 95	```
+[agent:result] 96	
+[agent:result] 97	**Delete:**
+[agent:result] 98	
+[agent:result] 99	```bash
+[agent:result] 100	databricks postgres delete-synced-table "synced_tables/<LAKEBASE_CATALOG>.<SCHEMA>.<TABLE>" --profile <PROFILE>
+[agent:result] 101	```
+[agent:result] 102	
+[agent:result] 103	Deletes the sync pipeline and the UC table entry. The Postgres table remains and must be dropped manually if no longer needed (`DROP TABLE <schema>.<table>`).
+[agent:result] 104	
+[agent:result] 105	> **DABs:** The bundle schema includes `synced_database_tables`, but it maps to the Provisioned Terraform resource (`databricks_database_synced_database_table`), not the Autoscaling API. **Do not use `synced_database_tables` in DABs with Autoscaling projects** — it routes through the Provisioned API and may create unintended Provisioned instances. DAB support for Autoscaling synced tables (`postgres_synced_tables`) is blocked on Terraform provider work and not yet available. **For Autoscaling projects, use the CLI commands above.**
+[agent:result] 106	
+[agent:result] 107	## Example: Sync NYC Taxi Data to Lakebase
+[agent:result] 108	
+[agent:result] 109	Sync the `samples.nyctaxi.trips` sample table into Lakebase for low-latency app queries.
+[agent:result] 110	
+[agent:result] 111	**1. Register a UC catalog** (if not already done — see Prerequisites above).
+[agent:result] 112	
+[agent:result] 113	**2. Create the synced table (Snapshot mode):**
+[agent:result] 114	
+[agent:result] 115	```bash
+[agent:result] 116	databricks postgres create-synced-table <LAKEBASE_CATALOG>.public.nyc_trips \
+[agent:result] 117	  --json '{
+[agent:result] 118	    "spec": {
+[agent:result] 119	      "source_table_full_name": "samples.nyctaxi.trips",
+[agent:result] 120	      "primary_key_columns": ["tpep_pickup_datetime", "tpep_dropoff_datetime", "pickup_zip", "dropoff_zip"],
+[agent:result] 121	      "scheduling_policy": "SNAPSHOT",
+[agent:result] 122	      "branch": "projects/<PROJECT_ID>/branches/production",
+[agent:result] 123	      "postgres_database": "databricks_postgres",
+[agent:result] 124	      "create_database_objects_if_missing": true,
+[agent:result] 125	      "new_pipeline_spec": {
+[agent:result] 126	        "storage_catalog": "<REGULAR_UC_CATALOG>",
+[agent:result] 127	        "storage_schema": "default"
+[agent:result] 128	      }
+[agent:result] 129	    }
+[agent:result] 130	  }' --profile <PROFILE>
+[agent:result] 131	```
+[agent:result] 132	
+[agent:result] 133	> **Note:** `samples.nyctaxi.trips` has no single unique column, so a composite primary key is used. Snapshot mode is chosen here — Triggered/Continuous require CDF enabled on the source table.
+[agent:result] 134	
+[agent:result] 135	**3. Check sync status:**
+[agent:result] 136	
+[agent:result] 137	```bash
+[agent:result] 138	databricks postgres get-synced-table "synced_tables/<LAKEBASE_CATALOG>.public.nyc_trips" --profile <PROFILE>
+[agent:result] 139	```
+[agent:result] 140	
+[agent:result] 141	**4. Query from Postgres once synced:**
+[agent:result] 142	
+[agent:result] 143	```sql
+[agent:result] 144	SELECT pickup_zip, COUNT(*) AS trip_count, AVG(fare_amount) AS avg_fare
+[agent:result] 145	FROM public.nyc_trips
+[agent:result] 146	GROUP BY pickup_zip
+[agent:result] 147	ORDER BY trip_count DESC
+[agent:result] 148	LIMIT 10;
+[agent:result] 149	```
+[agent:result] 150	
+[agent:result] 151	**5. Clean up:**
+[agent:result] 152	
+[agent:result] 153	```bash
+[agent:result] 154	databricks postgres delete-synced-table "synced_tables/<LAKEBASE_CATALOG>.public.nyc_trips" --profile <PROFILE>
+[agent:result] 155	```
+[agent:result] 156	
+[agent:result] 157	## App Access
+[agent:result] 158	
+[agent:result] 159	If a Databricks App reads synced tables, the app's Service Principal needs explicit GRANT access. See the lakebase skill's SKILL.md "Grant app SP access to synced tables" section for the SQL commands and connection steps.
+[agent:result] 160	
+[agent:result] 161	## Data Type Mapping
+[agent:result] 162	
+[agent:result] 163	| Unity Catalog Type | Postgres Type |
+[agent:result] 164	|-------------------|---------------|
+[agent:result] 165	| BIGINT | BIGINT |
+[agent:result] 166	| BINARY | BYTEA |
+[agent:result] 167	| BOOLEAN | BOOLEAN |
+[agent:result] 168	| DATE | DATE |
+[agent:result] 169	| DECIMAL(p,s) | NUMERIC |
+[agent:result] 170	| DOUBLE | DOUBLE PRECISION |
+[agent:result] 171	| FLOAT | REAL |
+[agent:result] 172	| INT | INTEGER |
+[agent:result] 173	| INTERVAL | INTERVAL |
+[agent:result] 174	| SMALLINT | SMALLINT |
+[agent:result] 175	| STRING | TEXT |
+[agent:result] 176	| TIMESTAMP | TIMESTAMP WITH TIME ZONE |
+[agent:result] 177	| TIMESTAMP_NTZ | TIMESTAMP WITHOUT TIME ZONE |
+[agent:result] 178	| TINYINT | SMALLINT |
+[agent:result] 179	| ARRAY, MAP, STRUCT | JSONB |
+[agent:result] 180	
+[agent:result] 181	**Unsupported:** GEOGRAPHY, GEOMETRY, VARIANT, OBJECT
+[agent:result] 182	
+[agent:result] 183	## Capacity Planning
+[agent:result] 184	
+[agent:result] 185	- **Connections:** Each synced table uses up to 16 connections toward the endpoint limit
+[agent:result] 186	- **Storage:** 8 TB logical data per branch (synced tables count toward the branch storage limit)
+[agent:result] 187	- **Recommendation:** Keep individual tables under 1 TB if they require incremental refreshes
+[agent:result] 188	- **Connections (instance):** 1,000 max concurrent connections per instance
+[agent:result] 189	- **Naming:** Database, schema, and table names allow `[A-Za-z0-9_]+` only
+[agent:result] 190	- **Schema evolution:** Only additive changes (adding columns) for Triggered/Continuous modes
+[agent:result] 191	
+[agent:result] 192	**Cost guidance:**
+[agent:result] 193	- **Continuous mode:** Reuse pipelines for ~10 tables/pipeline — roughly 10x cheaper per table than separate pipelines
+[agent:result] 194	- **Cost formula:** `[Rows / (Speed × CUs × 3600)] × DLT Hourly Rate` (check current DLT pricing for your cloud/region)
+[agent:result] 195	- **Snapshot vs incremental:** Snapshot is ~10x faster when >10% of data changes per cycle
+[agent:result] 196	
+[agent:result] 197	## Lakehouse Sync (Beta)
+[agent:result] 198	
+[agent:result] 199	Reverse direction: continuously streams changes **from** Lakebase Postgres **into** Unity Catalog Delta tables using CDC (SCD Type 2 history). Destination tables are named `lb_<table_name>_history`. Does not require external compute, pipelines, or jobs — it is a native Lakebase feature. Available on AWS, Azure, and GCP.
+[agent:result] 200	
+[agent:result] 201	> **Important:** Tables must reside in the `databricks_postgres` database for Lakehouse Sync to work.
+[agent:result] 202	
+[agent:result] 203	**Lakehouse Sync enablement is a UI-only action** — configured via the "Lakehouse sync" tab in the branch overview, not via CLI or API. It operates at the **schema level**: once enabled, all current and future tables in that schema sync to Unity Catalog. When automating CDC workflows, treat this as a manual post-automation step and inform the user.
+[agent:result] 204	
+[agent:result] 205	**Prerequisites:**
+[agent:result] 206	- Lakebase Autoscaling project running **Postgres 17**
+[agent:result] 207	- Tables must reside in the `databricks_postgres` database
+[agent:result] 208	- `REPLICA IDENTITY FULL` must be set on all source tables before enabling sync:
+[agent:result] 209	  ```sql
+[agent:result] 210	  ALTER TABLE <schema>.<table> REPLICA IDENTITY FULL;
+[agent:result] 211	  ```
+[agent:result] 212	- Verify replica identity:
+[agent:result] 213	  ```sql
+[agent:result] 214	  SELECT n.nspname AS schema, c.relname AS table_name,
+[agent:result] 215	         CASE c.relreplident WHEN 'f' THEN 'full' WHEN 'd' THEN 'default' WHEN 'n' THEN 'nothing' END AS replica_identity
+[agent:result] 216	  FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+[agent:result] 217	  WHERE c.relkind = 'r' AND n.nspname = 'public';
+[agent:result] 218	  ```
+[agent:result] 219	- **Permissions:** CAN MANAGE on source project; USE CATALOG + USE SCHEMA + CREATE TABLE on destination
+[agent:result] 220	- Catalogs with default storage are **unsupported**
+[agent:result] 221	
+[agent:result] 222	**Limitations:**
+[agent:result] 223	- Partitioned tables are not supported
+[agent:result] 224	- Disabling and re-enabling sync does **not** re-snapshot — missing changes are lost permanently
+[agent:result] 225	
+[agent:result] 226	For the full Lakehouse Sync reference, see [lakehouse-sync.md](lakehouse-sync.md). For building medallion pipelines from CDC history, see [medallion-from-cdc.md](medallion-from-cdc.md).
+[agent:result] 227	
+[agent:result] 228	## Use Cases
+[agent:result] 229	
+[agent:result] 230	**Product catalog:** Sync gold-tier product data to Lakebase for low-latency web app reads. Use Triggered mode for hourly/daily updates.
+[agent:result] 231	
+[agent:result] 232	**Real-time feature serving:** Sync ML feature tables to Lakebase with Continuous mode for sub-second feature lookups during inference.
+[agent:result] 233	
+[agent:result] 234	## Best Practices
+[agent:result] 235	
+[agent:result] 236	1. **Sync gold/aggregated tables, not raw tables.** Synced tables are for serving pre-curated data at OLTP speed. If your app needs aggregations (GROUP BY, JOINs across large tables), create a gold Delta table or materialized view first, then sync that. Syncing raw tables and aggregating in Postgres defeats the latency benefit — Postgres is not optimized for OLAP workloads on millions of rows.
+[agent:result] 237	2. Enable CDF on source tables before creating Triggered/Continuous syncs
+[agent:result] 238	3. Snapshot mode is ~10x faster than incremental when >10% of data changes per cycle
+[agent:result] 239	4. Monitor sync status for failures and latency via Catalog Explorer
+[agent:result] 240	5. Create indexes in Postgres for your application query patterns
+[agent:result] 241	6. Account for the 16-connection-per-table limit when planning endpoint capacity
+[agent:result] 242	
+[agent:result] 243	## Constraints
+[agent:result] 244	
+[agent:result] 245	- **Read-only in Postgres:** Only SELECT queries, CREATE INDEX, and DROP TABLE are allowed on synced tables. Any data modifications (INSERT, UPDATE, DELETE) corrupt the sync pipeline.
+[agent:result] 246	- **Null bytes:** Null bytes (0x00) in STRING, ARRAY, MAP, or STRUCT columns cause sync failures. Sanitize source data: `REPLACE(col, CAST(CHAR(0) AS STRING), '')`.
+[agent:result] 247	- **Unsupported types:** GEOGRAPHY, GEOMETRY, VARIANT, OBJECT columns cannot be synced.
+[agent:result] 248	- **FGAC not propagated:** Fine-grained access control (row filters, column masks) from Unity Catalog is not propagated to synced tables. **Workaround:** Create a view on the source table with the desired filter (`SELECT * FROM table WHERE ...`), then sync the view in Snapshot mode. Caveat: the sync runs as the creator and only sees their visible rows.
+[agent:result] 249
+[agent:bash] databricks postgres -h 2>&1 | grep -iE "synced|create-project|create-synced"
+[agent:result]   create-project               *Beta* Create a Project.
+[agent:result]   create-synced-table          *Beta* Create a Synced Database Table.
+[agent:result]   delete-synced-table          *Beta* Delete a Synced Database Table.
+[agent:result]   get-synced-table             *Beta* Get a Synced Database Table.
+[agent] Now I understand the path: online tables are deprecated, so I create a Lakebase Autoscaling project, register it as a UC catalog, and create a synced table for low-latency access. Let me create the project (prefixed per the rules).
+[agent:bash] databricks postgres create-project mlpab2696b6-accountsb63f12 --json '{"spec": {"display_name": "mlpab2696b6 accountsb63f12 online"}}' 2>&1 | tail -40
+[agent:result] {
+[agent:result]   "create_time": "2026-06-29T12:40:14Z",
+[agent:result]   "name": "projects/mlpab2696b6-accountsb63f12",
+[agent:result]   "status": {
+[agent:result]     "branch_logical_size_limit_bytes": 17592186044416,
+[agent:result]     "default_branch": "projects/mlpab2696b6-accountsb63f12/branches/production",
+[agent:result]     "default_endpoint_settings": {
+[agent:result]       "autoscaling_limit_max_cu": 1,
+[agent:result]       "autoscaling_limit_min_cu": 1,
+[agent:result]       "suspend_timeout_duration": "86400s"
+[agent:result]     },
+[agent:result]     "display_name": "mlpab2696b6 accountsb63f12 online",
+[agent:result]     "enable_pg_native_login": false,
+[agent:result]     "history_retention_duration": "604800s",
+[agent:result]     "owner": "benedict@logicalclocks.com",
+[agent:result]     "pg_version": 17,
+[agent:result]     "project_id": "mlpab2696b6-accountsb63f12",
+[agent:result]     "synthetic_storage_size_bytes": 0
+[agent:result]   },
+[agent:result]   "uid": "b1297979-19d6-4af7-90a2-551db6d14daf",
+[agent:result]   "update_time": "2026-06-29T12:40:16Z"
+[agent:result] }
+[agent] Project created with `production` branch. Now register the Lakebase database as a UC catalog. Let me check the database name and create-catalog flags.
+[agent:bash] databricks postgres list-databases projects/mlpab2696b6-accountsb63f12/branches/production 2>&1 | tail -20; echo "---CATALOG HELP---"; databricks postgres create-catalog -h 2>&1 | head -25
+[agent:result] [
+[agent:result]   {
+[agent:result]     "create_time": "2026-06-29T12:40:14Z",
+[agent:result]     "name": "projects/mlpab2696b6-accountsb63f12/branches/production/databases/databricks-postgres",
+[agent:result]     "parent": "projects/mlpab2696b6-accountsb63f12/branches/production",
+[agent:result]     "status": {
+[agent:result]       "database_id": "databricks-postgres",
+[agent:result]       "postgres_database": "databricks_postgres",
+[agent:result]       "role": "projects/mlpab2696b6-accountsb63f12/branches/production/roles/benedict"
+[agent:result]     },
+[agent:result]     "update_time": "2026-06-29T12:40:18Z"
+[agent:result]   }
+[agent:result] ]
+[agent:result] ---CATALOG HELP---
+[agent:result] This command is in Beta and may change without notice.
+[agent:result] 
+[agent:result] Register a Database in UC.
+[agent:result] 
+[agent:result]   Register a Postgres database in the Unity Catalog.
+[agent:result] 
+[agent:result]   This is a long-running operation. By default, the command waits for the
+[agent:result]   operation to complete. Use --no-wait to return immediately with the raw
+[agent:result]   operation details. The operation's 'name' field can then be used to poll for
+[agent:result]   completion using the get-operation command.
+[agent:result] 
+[agent:result]   Arguments:
+[agent:result]     CATALOG_ID: The ID in the Unity Catalog. It becomes the full resource name, for
+[agent:result]       example "my_catalog" becomes "catalogs/my_catalog".
+[agent:result] 
+[agent:result] Usage:
+[agent:result]   databricks postgres create-catalog CATALOG_ID [flags]
+[agent:result] 
+[agent:result] Flags:
+[agent:result]   -h, --help               help for create-catalog
+[agent:result]       --json JSON          either inline JSON string or @path/to/file.json with request body (default JSON (0 bytes))
+[agent:result]       --name string        Output only.
+[agent:result]       --no-wait            do not wait to reach DONE state
+[agent:result]       --timeout duration   maximum amount of time to reach DONE state
+[agent:bash] databricks postgres create-catalog mlpab2696b6_accountsb63f12_lb --json '{"spec": {"postgres_database": "databricks_postgres", "branch": "projects/mlpab2696b6-accountsb63f12/branches/production"}}' 2>&1 | tail -25
+[agent:result] {
+[agent:result]   "name": "catalogs/mlpab2696b6_accountsb63f12_lb",
+[agent:result]   "status": {
+[agent:result]     "branch": "projects/mlpab2696b6-accountsb63f12/branches/production",
+[agent:result]     "postgres_database": "databricks_postgres",
+[agent:result]     "project": "projects/mlpab2696b6-accountsb63f12"
+[agent:result]   },
+[agent:result]   "uid": "24b6f89d-d7e9-4069-ac95-cf401f730b09"
+[agent:result] }
+[agent] Now create the synced table for low-latency access. I'll write the spec and use SNAPSHOT mode (full copy of the static final table; pipeline metadata stored in my schema).
+[agent:write] /Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/cli/1.3.0/official/feature/backfill/1/task/.tmp/synced.json
+[agent:result] File created successfully at: /Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/cli/1.3.0/official/feature/backfill/1/task/.tmp/synced.json (file state is current in your context — no need to Read it back)
+[agent:bash] databricks postgres create-synced-table mlpab2696b6_accountsb63f12_lb.public.accountsb63f12 --json @.tmp/synced.json --timeout 20m 2>&1 | tail -40
+[agent:result] {
+[agent:result]   "name": "synced_tables/mlpab2696b6_accountsb63f12_lb.public.accountsb63f12",
+[agent:result]   "spec": {
+[agent:result]     "branch": "projects/mlpab2696b6-accountsb63f12/branches/production",
+[agent:result]     "create_database_objects_if_missing": true,
+[agent:result]     "new_pipeline_spec": {
+[agent:result]       "storage_catalog": "workspace",
+[agent:result]       "storage_schema": "mlpab2696b6"
+[agent:result]     },
+[agent:result]     "postgres_database": "databricks_postgres",
+[agent:result]     "primary_key_columns": [
+[agent:result]       "row_id"
+[agent:result]     ],
+[agent:result]     "scheduling_policy": "SNAPSHOT",
+[agent:result]     "source_table_full_name": "workspace.mlpab2696b6.accountsb63f12"
+[agent:result]   },
+[agent:result]   "status": {
+[agent:result]     "detailed_state": "SYNCED_TABLE_PROVISIONING_PIPELINE_RESOURCES",
+[agent:result]     "message": "Online Table is currently pending setup of pipeline resources. Check latest status in Delta Live Tables: https://***REDACTED***#joblist/pipelines/383f323e-a5e9-44e4-9c6c-2432895fe632/updates/b4d12295-6e12-4e95-9eec-91d4b362eade",
+[agent:result]     "ongoing_sync_progress": {},
+[agent:result]     "pipeline_id": "383f323e-a5e9-44e4-9c6c-2432895fe632",
+[agent:result]     "project": "projects/mlpab2696b6-accountsb63f12",
+[agent:result]     "unity_catalog_provisioning_state": "ACTIVE"
+[agent:result]   },
+[agent:result]   "uid": "476b7ed1-d40f-47e1-be17-109c50c9ab2d"
+[agent:result] }
+[agent] Synced table provisioning. Let me poll until the sync completes.
+[agent:bash] for i in 1 2 3 4 5 6 7 8 9 10; do
+[agent:bash]   s=$(databricks postgres get-synced-table "synced_tables/mlpab2696b6_accountsb63f12_lb.public.accountsb63f12" -o json 2>&1 | grep -E "detailed_state|message" | head -2)
+[agent:bash]   echo "poll $i: $s"
+[agent:bash]   case "$s" in *ONLINE*|*SYNCED_TABLE_ONLINE*) echo DONE; break;; esac
+[agent:bash]   sleep 30
+[agent:bash] done
+[agent:result-err] PreToolUse:Bash hook error: [python3 /Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/cli/1.3.0/official/feature/backfill/1/task/.claude/hooks/log_tool_call.py]: DENIED: '*SYNCED_TABLE_ONLINE*)' is off-interface in 'cli' mode — only the `databricks` CLI may do work on databricks; local interpreters, network tools, and stray binaries are blocked. Basic shell (cp/mkdir/cat/head/grep) is allowed for the floor submission and data inspection. If you can't do the work through the `databricks` CLI, STOP and report the missing capability — do NOT work around it locally.
+[agent] I'll check status directly without a loop (per the no-poll-loop rule).
+[agent:bash] databricks postgres get-synced-table "synced_tables/mlpab2696b6_accountsb63f12_lb.public.accountsb63f12" 2>&1 | tail -25
+[agent:result] {
+[agent:result]   "name": "synced_tables/mlpab2696b6_accountsb63f12_lb.public.accountsb63f12",
+[agent:result]   "status": {
+[agent:result]     "detailed_state": "SYNCED_TABLE_PROVISIONING_INITIAL_SNAPSHOT",
+[agent:result]     "message": "Online Table is currently is in the process of syncing initial data. Check latest status in Delta Live Tables: https://***REDACTED***#joblist/pipelines/383f323e-a5e9-44e4-9c6c-2432895fe632/updates/b4d12295-6e12-4e95-9eec-91d4b362eade",
+[agent:result]     "ongoing_sync_progress": {},
+[agent:result]     "pipeline_id": "383f323e-a5e9-44e4-9c6c-2432895fe632",
+[agent:result]     "project": "projects/mlpab2696b6-accountsb63f12",
+[agent:result]     "unity_catalog_provisioning_state": "ACTIVE"
+[agent:result]   },
+[agent:result]   "uid": "476b7ed1-d40f-47e1-be17-109c50c9ab2d"
+[agent:result] }
+[agent] It's syncing initial data. Let me wait for completion with a single blocking sleep, then check.
+[agent:bash] sleep 90; databricks postgres get-synced-table "synced_tables/mlpab2696b6_accountsb63f12_lb.public.accountsb63f12" 2>&1 | grep -E "detailed_state|last_sync|message"
+[agent:result]     "detailed_state": "SYNCED_TABLE_ONLINE_NO_PENDING_UPDATE",
+[agent:result]     "last_sync": {
+[agent:result]     "message": "Online Table creation succeeded using Delta Live Tables: https://***REDACTED***#joblist/pipelines/383f323e-a5e9-44e4-9c6c-2432895fe632/updates/b4d12295-6e12-4e95-9eec-91d4b362eade.",
+[agent] Synced table is **ONLINE** and synced. Let me verify the data landed in Postgres via the low-latency path.
+[agent:bash] databricks psql --project mlpab2696b6-accountsb63f12 -- -c "SELECT count(*) AS n, count(distinct row_id) AS d FROM public.accountsb63f12;" 2>&1 | tail -15
+[agent:result] Project: mlpab2696b6 accountsb63f12 online
+[agent:result] Branch: production
+[agent:result] Endpoint: primary
+[agent:result] Connecting to read-write endpoint...
+[agent:result] Error: exec: "psql": executable file not found in $PATH
+[agent] `psql` binary isn't installed locally, so I can't query Postgres directly — but the synced-table status (`SYNCED_TABLE_ONLINE_NO_PENDING_UPDATE`, last_sync succeeded) confirms the online copy is populated. Let me do a final verification of the offline feature table (primary key + content).
+[agent:bash] databricks experimental aitools tools query "SELECT constraint_name, constraint_type FROM workspace.information_schema.table_constraints WHERE table_schema='mlpab2696b6' AND table_name='accountsb63f12'" 2>&1; echo "---SAMPLE---"; databricks experimental aitools tools query "SELECT * FROM workspace.mlpab2696b6.accountsb63f12 ORDER BY row_id LIMIT 3" 2>&1
+[agent:result] [
+[agent:result]   {
+[agent:result]     "constraint_name": "accountsb63f12_pk",
+[agent:result]     "constraint_type": "PRIMARY KEY"
+[agent:result]   }
+[agent:result] ]
+[agent:result] ---SAMPLE---
+[agent:result] [
+[agent:result]   {
+[agent:result]     "balance": "6512.12",
+[agent:result]     "row_id": "R00000",
+[agent:result]     "status": "dormant",
+[agent:result]     "updated_at": "1770171900000"
+[agent:result]   },
+[agent:result]   {
+[agent:result]     "balance": "6514.63",
+[agent:result]     "row_id": "R00001",
+[agent:result]     "status": "dormant",
+[agent:result]     "updated_at": "1770422460000"
+[agent:result]   },
+[agent:result]   {
+[agent:result]     "balance": "4730.92",
+[agent:result]     "row_id": "R00002",
+[agent:result]     "status": "closed",
+[agent:result]     "updated_at": "1770128280000"
+[agent:result]   }
+[agent:result] ]
+[agent] Everything is in place and verified on the platform. The task is complete.
+[agent] ## Summary
+[agent] I registered the feature table and its online counterpart entirely on Databricks (CLI mode), within the per-run namespace.
+[agent] **Offline feature table** — `workspace.mlpab2696b6.accountsb63f12`
+[agent] - Delta table with `PRIMARY KEY (row_id)` constraint (`accountsb63f12_pk`) → record key. On Databricks Unity Catalog, a Delta table with a primary key *is* a Feature Engineering feature table, so this is the registration.
+[agent] - Columns match the schema: `row_id STRING`, `status STRING`, `balance DOUBLE`, `updated_at BIGINT` (event-time, kept as epoch milliseconds as specified).
+[agent] - Loaded all three batches via `read_files` on a UC volume and deduplicated with `ROW_NUMBER() OVER (PARTITION BY row_id ORDER BY updated_at DESC)`, keeping only each row's **latest revision**.
+[agent] - **Result: 400 rows = 400 distinct `row_id`s**, and a join-check confirmed every stored `updated_at` equals the max source `updated_at` for that key. Exactly one row per `row_id`, latest wins.
+[agent] **Online / low-latency lookup** — Lakebase synced table
+[agent] - The platform distinguishes offline (Delta) from online (Lakebase Postgres). Note: classic **online tables are deprecated** ("Creating new online table is not allowed"), so I used the current mechanism — a Lakebase Autoscaling project + synced table.
+[agent] - Created project `mlpab2696b6-accountsb63f12` (prefixed per the rules), registered its Postgres DB as UC catalog `mlpab2696b6_accountsb63f12_lb`, and created synced table `mlpab2696b6_accountsb63f12_lb.public.accountsb63f12` keyed on `row_id`, sourced from the feature table (CDF was enabled on the source).
+[agent] - Status is `SYNCED_TABLE_ONLINE_NO_PENDING_UPDATE` with a successful initial snapshot — the features are live for real-time lookup in Postgres.
+[agent] **Two notes on platform behavior worth reporting:**
+[agent] 1. **Event-time as a formal "timeseries" column was not applied.** Databricks' `TIMESERIES` designation requires a `TIMESTAMP`/`DATE` column, which conflicts with the task's explicit "epoch milliseconds (bigint)" and "exactly one row per row_id." I preserved `updated_at` as bigint epoch-ms and used it to select latest revisions (deduped to one row per key), rather than converting types or storing history.
+[agent] 2. **Online verification via `psql` was unavailable** — the `psql` client binary isn't installed in this environment, so I confirmed the online copy through the synced-table status/last-sync metadata rather than a direct Postgres query.
+[agent] done: 35 turns, $1.8593, stop=end_turn
+Collecting databricks-sdk==0.117.0
+  Downloading databricks_sdk-0.117.0-py3-none-any.whl.metadata (43 kB)
+Requirement already satisfied: requests<3,>=2.28.1 in ./venv/lib/python3.13/site-packages (from databricks-sdk==0.117.0) (2.34.2)
+Collecting google-auth~=2.0 (from databricks-sdk==0.117.0)
+  Downloading google_auth-2.55.1-py3-none-any.whl.metadata (5.1 kB)
+Requirement already satisfied: protobuf!=5.26.*,!=5.27.*,!=5.28.*,!=5.29.0,!=5.29.1,!=5.29.2,!=5.29.3,!=5.29.4,!=6.30.0,!=6.30.1,!=6.31.0,<7.0,>=4.25.8 in ./venv/lib/python3.13/site-packages (from databricks-sdk==0.117.0) (4.25.9)
+Requirement already satisfied: urllib3<3,>=1.26 in ./venv/lib/python3.13/site-packages (from databricks-sdk==0.117.0) (2.7.0)
+Requirement already satisfied: pyasn1-modules>=0.2.1 in ./venv/lib/python3.13/site-packages (from google-auth~=2.0->databricks-sdk==0.117.0) (0.4.2)
+Requirement already satisfied: cryptography>=38.0.3 in ./venv/lib/python3.13/site-packages (from google-auth~=2.0->databricks-sdk==0.117.0) (49.0.0)
+Requirement already satisfied: charset_normalizer<4,>=2 in ./venv/lib/python3.13/site-packages (from requests<3,>=2.28.1->databricks-sdk==0.117.0) (3.4.7)
+Requirement already satisfied: idna<4,>=2.5 in ./venv/lib/python3.13/site-packages (from requests<3,>=2.28.1->databricks-sdk==0.117.0) (3.18)
+Requirement already satisfied: certifi>=2023.5.7 in ./venv/lib/python3.13/site-packages (from requests<3,>=2.28.1->databricks-sdk==0.117.0) (2026.5.20)
+Requirement already satisfied: cffi>=2.0.0 in ./venv/lib/python3.13/site-packages (from cryptography>=38.0.3->google-auth~=2.0->databricks-sdk==0.117.0) (2.0.0)
+Requirement already satisfied: pycparser in ./venv/lib/python3.13/site-packages (from cffi>=2.0.0->cryptography>=38.0.3->google-auth~=2.0->databricks-sdk==0.117.0) (3.0)
+Requirement already satisfied: pyasn1<0.7.0,>=0.6.1 in ./venv/lib/python3.13/site-packages (from pyasn1-modules>=0.2.1->google-auth~=2.0->databricks-sdk==0.117.0) (0.6.3)
+Downloading databricks_sdk-0.117.0-py3-none-any.whl (936 kB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 936.9/936.9 kB 21.7 MB/s  0:00:00
+Downloading google_auth-2.55.1-py3-none-any.whl (252 kB)
+Installing collected packages: google-auth, databricks-sdk
+
+Successfully installed databricks-sdk-0.117.0 google-auth-2.55.1
+[mlpab] graded: 3 passed / 0 failed / 0 skipped of 3 asserts

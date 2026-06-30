@@ -286,5 +286,67 @@ class ConcurrentDispatchTests(unittest.TestCase):
         self.assertEqual(sorted(attempts), [1, 2, 3])
 
 
+class ClassifyCombosTests(unittest.TestCase):
+    """done = a valid=True attempt whose run_dir still exists; everything else
+    seen is failed (so --retry re-runs it, including rows whose folder was
+    deleted out from under the CSV)."""
+
+    _COLS = ("model", "platform", "interface", "version", "skills", "category", "task")
+
+    def _row(self, run_dir, *, valid, config="c1", **over):
+        base = dict(zip(self._COLS, ("m", "p", "cli", "1", "none", "feature", "t")))
+        base.update(over)
+        base.update(config=config, valid="True" if valid else "False", run_dir=str(run_dir))
+        return base
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+
+    def _dir(self, name):
+        d = self.tmp / name
+        d.mkdir()
+        return d
+
+    def test_valid_with_existing_folder_is_done(self):
+        rows = [self._row(self._dir("a"), valid=True, task="t1")]
+        done, failed = treatments._classify_combos(rows, "c1")
+        self.assertEqual(len(done), 1)
+        self.assertEqual(failed, set())
+
+    def test_valid_with_missing_folder_is_failed(self):
+        # the exact scenario: a valid row whose dir was purged → must re-run
+        rows = [self._row(self.tmp / "gone", valid=True, task="t1")]
+        done, failed = treatments._classify_combos(rows, "c1")
+        self.assertEqual(done, set())
+        self.assertEqual(len(failed), 1)
+
+    def test_invalid_row_is_failed(self):
+        rows = [self._row(self._dir("b"), valid=False, task="t1")]
+        done, failed = treatments._classify_combos(rows, "c1")
+        self.assertEqual(done, set())
+        self.assertEqual(len(failed), 1)
+
+    def test_one_live_attempt_keeps_combo_done(self):
+        # two attempts of one combo: a valid dir gone + a valid dir live → done
+        rows = [
+            self._row(self.tmp / "gone", valid=True, task="t1"),
+            self._row(self._dir("live"), valid=True, task="t1"),
+        ]
+        done, failed = treatments._classify_combos(rows, "c1")
+        self.assertEqual(len(done), 1)
+        self.assertEqual(failed, set())
+
+    def test_other_config_rows_ignored(self):
+        rows = [self._row(self._dir("c"), valid=True, task="t1", config="other")]
+        done, failed = treatments._classify_combos(rows, "c1")
+        self.assertEqual((done, failed), (set(), set()))
+
+    def test_empty_run_dir_is_failed(self):
+        rows = [self._row("", valid=True, task="t1")]
+        done, failed = treatments._classify_combos(rows, "c1")
+        self.assertEqual(done, set())
+        self.assertEqual(len(failed), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
