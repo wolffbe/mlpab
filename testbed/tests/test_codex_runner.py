@@ -35,9 +35,11 @@ class AgentEnvTests(unittest.TestCase):
             captured["env"] = env
             return _FakeProc()
 
-        with mock.patch.object(codex_runner.shutil, "which", return_value="/usr/bin/codex"), \
-             mock.patch.object(codex_runner.subprocess, "Popen", _fake_popen), \
-             mock.patch.dict(os.environ, {"OPENAI_API_KEY": "x"}, clear=False):
+        with (
+            mock.patch.object(codex_runner.shutil, "which", return_value="/usr/bin/codex"),
+            mock.patch.object(codex_runner.subprocess, "Popen", _fake_popen),
+            mock.patch.dict(os.environ, {"OPENAI_API_KEY": "x"}, clear=False),
+        ):
             codex_runner.run(
                 prompt="hi",
                 run_dir=run_dir,
@@ -254,11 +256,15 @@ class RateLimitDetectionTests(unittest.TestCase):
         return raw, err
 
     def test_error_event_with_429_is_rate_limited(self):
-        raw, err = self._files([json.dumps({"type": "error", "message": "HTTP 429 Too Many Requests"})])
+        raw, err = self._files(
+            [json.dumps({"type": "error", "message": "HTTP 429 Too Many Requests"})]
+        )
         self.assertTrue(codex_runner._rate_limited(raw, err))
 
     def test_error_event_overloaded_is_rate_limited(self):
-        raw, err = self._files([json.dumps({"type": "error", "message": "server overloaded, retry"})])
+        raw, err = self._files(
+            [json.dumps({"type": "error", "message": "server overloaded, retry"})]
+        )
         self.assertTrue(codex_runner._rate_limited(raw, err))
 
     def test_stderr_rate_limit_is_detected(self):
@@ -266,7 +272,9 @@ class RateLimitDetectionTests(unittest.TestCase):
         self.assertTrue(codex_runner._rate_limited(raw, err))
 
     def test_ordinary_error_is_not_rate_limited(self):
-        raw, err = self._files([json.dumps({"type": "error", "message": "model_not_found: bad id"})])
+        raw, err = self._files(
+            [json.dumps({"type": "error", "message": "model_not_found: bad id"})]
+        )
         self.assertFalse(codex_runner._rate_limited(raw, err))
 
     def test_bare_number_in_normal_output_is_not_rate_limited(self):
@@ -339,10 +347,10 @@ class PrintEventTests(unittest.TestCase):
         f = codex_runner._is_failed_exit
         self.assertFalse(f(None))
         self.assertFalse(f(0))
-        self.assertFalse(f("0"))   # codex may emit exit_code as a string
+        self.assertFalse(f("0"))  # codex may emit exit_code as a string
         self.assertTrue(f(1))
         self.assertTrue(f("2"))
-        self.assertFalse(f(""))    # missing/empty → not a failure
+        self.assertFalse(f(""))  # missing/empty → not a failure
 
     def test_turn_completed_is_silent(self):
         # claude prints only on the final `result` event, not per turn.

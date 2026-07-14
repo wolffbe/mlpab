@@ -220,19 +220,25 @@ class ConcurrencyConfigTests(unittest.TestCase):
 
     def test_default_concurrency_is_one(self):
         cfg = treatments.load_config(
-            self._write("model: claude-opus-4-8\nruns:\n  - {task: training_data, platform: none, interface: none}\n")
+            self._write(
+                "model: claude-opus-4-8\nruns:\n  - {task: training_data, platform: none, interface: none}\n"
+            )
         )
         self.assertEqual(cfg.concurrency, 1)
 
     def test_concurrency_key_parsed(self):
         cfg = treatments.load_config(
-            self._write("model: claude-opus-4-8\nconcurrency: 3\nruns:\n  - {task: training_data, platform: none, interface: none}\n")
+            self._write(
+                "model: claude-opus-4-8\nconcurrency: 3\nruns:\n  - {task: training_data, platform: none, interface: none}\n"
+            )
         )
         self.assertEqual(cfg.concurrency, 3)
 
     def test_parallel_alias_and_floor(self):
         cfg = treatments.load_config(
-            self._write("model: claude-opus-4-8\nparallel: 0\nruns:\n  - {task: training_data, platform: none, interface: none}\n")
+            self._write(
+                "model: claude-opus-4-8\nparallel: 0\nruns:\n  - {task: training_data, platform: none, interface: none}\n"
+            )
         )
         self.assertEqual(cfg.concurrency, 1)  # clamped to >= 1
 
@@ -247,8 +253,12 @@ class ConcurrentDispatchTests(unittest.TestCase):
 
         cfg = treatments.TreatmentConfig(
             runs=[
-                treatments.RunEntry(task="training_data", platform="hopsworks", interface="cli", category="feature"),
-                treatments.RunEntry(task="training_data", platform="hopsworks", interface="sdk", category="feature"),
+                treatments.RunEntry(
+                    task="training_data", platform="hopsworks", interface="cli", category="feature"
+                ),
+                treatments.RunEntry(
+                    task="training_data", platform="hopsworks", interface="sdk", category="feature"
+                ),
             ],
             concurrency=2,
         )
@@ -272,7 +282,11 @@ class ConcurrentDispatchTests(unittest.TestCase):
 
         # One combo, 3 repeats, run concurrently — each must get its own /<n>.
         cfg = treatments.TreatmentConfig(
-            runs=[treatments.RunEntry(task="training_data", platform="hopsworks", interface="cli", category="feature")],
+            runs=[
+                treatments.RunEntry(
+                    task="training_data", platform="hopsworks", interface="cli", category="feature"
+                )
+            ],
             repeats=3,
             concurrency=3,
         )

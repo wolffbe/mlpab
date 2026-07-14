@@ -131,16 +131,12 @@ class HopsworksChecker:
         except Exception:
             fv = None
         if fv is None:
-            fv = self._fs.create_feature_view(
-                name=fv_name, version=1, query=fg.select_all()
-            )
+            fv = self._fs.create_feature_view(name=fv_name, version=1, query=fg.select_all())
 
         rows = []
         for rid in record_ids:
             try:
-                vec = fv.get_feature_vector(
-                    {pk: rid}, return_type="pandas", force_sql_client=True
-                )
+                vec = fv.get_feature_vector({pk: rid}, return_type="pandas", force_sql_client=True)
             except Exception:
                 continue  # unmaterialized / missing key → absent row → mismatch
             if vec is not None and len(vec):

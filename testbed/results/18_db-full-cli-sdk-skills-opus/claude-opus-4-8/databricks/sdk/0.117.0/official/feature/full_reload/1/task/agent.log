@@ -1,0 +1,623 @@
+[mlpab] skills (95c4b1b4): databricks-apps,databricks-core,databricks-dabs,databricks-jobs,databricks-lakebase,databricks-model-serving,databricks-pipelines,databricks-serverless-migration,databricks-vector-search
+[agent] I'll start by exploring the task inputs and understanding the environment.
+[agent:bash] cat data/schema.md; echo "---INITIAL---"; head -5 data/initial_export.csv; echo "---NEW---"; head -5 data/reload/new_export.csv; echo "---ENV---"; echo "SCHEMA=$MLPAB_DATABRICKS_SCHEMA"; echo "PREFIX=$MLPAB_DATABRICKS_PREFIX"; echo "HOST=$DATABRICKS_HOST"
+[agent:result] # Schema
+[agent:result] 
+[agent:result] ## initial_export.csv (the original schema)
+[agent:result] - **row_id** (string): unique record key
+[agent:result] - **name** (string)
+[agent:result] - **balance_eur** (double): balance, always in EUR
+[agent:result] - **updated_at** (bigint): epoch MILLISECONDS, the event-time column
+[agent:result] 
+[agent:result] ## reload/new_export.csv (the NEW, breaking schema)
+[agent:result] A complete re-export from the upstream source. Columns were renamed and extended; every row was re-issued with new values; some old row_ids no longer exist and new ones were added.
+[agent:result] - **row_id** (string): unique record key
+[agent:result] - **full_name** (string): replaces `name`
+[agent:result] - **balance** (double): replaces `balance_eur`; currency now varies
+[agent:result] - **currency** (string): ISO code
+[agent:result] - **updated_at** (bigint): epoch MILLISECONDS, the event-time column
+[agent:result] ---INITIAL---
+[agent:result] row_id,name,balance_eur,updated_at
+[agent:result] C00000,Alan Knuth,22822.36,1768452240000
+[agent:result] C00001,John Lovelace,13948.59,1768476060000
+[agent:result] C00002,Alan Hamilton,19975.81,1768485060000
+[agent:result] C00003,Ada Perlman,27047.97,1768523760000
+[agent:result] ---NEW---
+[agent:result] row_id,full_name,balance,currency,updated_at
+[agent:result] C00173,Margaret Knuth,12592.63,SEK,1775471880000
+[agent:result] C00189,John Liskov,40717.88,EUR,1775507880000
+[agent:result] C00023,Tim Perlman,12167.31,USD,1775056500000
+[agent:result] C00073,Tim Hopper,-1842.09,USD,1775188800000
+[agent:result] ---ENV---
+[agent:result] SCHEMA=workspace.mlpab35a617
+[agent:result] PREFIX=mlpab35a617
+[agent:result] HOST=dbc-2a4591fe-28e4.cloud.databricks.com
+[agent:bash] echo "initial rows:"; wc -l data/initial_export.csv; echo "new rows:"; wc -l data/reload/new_export.csv; echo "---"; ls -la data/ data/reload/
+[agent:result] initial rows:
+[agent:result]      181 data/initial_export.csv
+[agent:result] new rows:
+[agent:result]      194 data/reload/new_export.csv
+[agent:result] ---
+[agent:result] data/:
+[agent:result] total 24
+[agent:result] drwxr-xr-x@  5 wolffbe  staff   160 Jun 30 12:14 .
+[agent:result] drwxr-xr-x@ 11 wolffbe  staff   352 Jun 30 12:14 ..
+[agent:result] -rw-r--r--@  1 wolffbe  staff  7811 Jun 30 12:14 initial_export.csv
+[agent:result] drwxr-xr-x@  3 wolffbe  staff    96 Jun 30 12:14 reload
+[agent:result] -rw-r--r--@  1 wolffbe  staff   723 Jun 30 12:14 schema.md
+[agent:result] 
+[agent:result] data/reload/:
+[agent:result] total 24
+[agent:result] drwxr-xr-x@ 3 wolffbe  staff    96 Jun 30 12:14 .
+[agent:result] drwxr-xr-x@ 5 wolffbe  staff   160 Jun 30 12:14 ..
+[agent:result] -rw-r--r--@ 1 wolffbe  staff  9271 Jun 30 12:14 new_export.csv
+[agent] This is SDK mode on Databricks. Feature tables on Databricks = Unity Catalog Delta tables with a primary key + timeseries column, and "online" access = Online Tables. Let me introspect the SDK and find a SQL warehouse to run server-side work.
+[agent:bash] cd "$(pwd)" && python3 -c "
+[agent:bash] from databricks.sdk import WorkspaceClient
+[agent:bash] w = WorkspaceClient()
+[agent:bash] print('current user:', w.current_user.me().user_name)
+[agent:bash] print('--- warehouses ---')
+[agent:bash] for wh in w.warehouses.list():
+[agent:bash]     print(wh.id, wh.name, wh.state)
+[agent:bash] "
+[agent:result] current user: benedict@logicalclocks.com
+[agent:result] --- warehouses ---
+[agent:result] 4dfab06c923fe3cc mlpab-grader State.RUNNING
+[agent:bash] cd "$(pwd)" && python3 -c "
+[agent:bash] from databricks.sdk import WorkspaceClient
+[agent:bash] w = WorkspaceClient()
+[agent:bash] print('has statement_execution:', hasattr(w,'statement_execution'))
+[agent:bash] print('has files:', hasattr(w,'files'))
+[agent:bash] print('has online_tables:', hasattr(w,'online_tables'))
+[agent:bash] print('has volumes:', hasattr(w,'volumes'))
+[agent:bash] print('--- online_tables methods ---', [m for m in dir(w.online_tables) if not m.startswith('_')])
+[agent:bash] print('--- volumes methods ---', [m for m in dir(w.volumes) if not m.startswith('_')])
+[agent:bash] "
+[agent:result] has statement_execution: True
+[agent:result] has files: True
+[agent:result] has online_tables: True
+[agent:result] has volumes: True
+[agent:result] --- online_tables methods --- ['create', 'create_and_wait', 'delete', 'get', 'wait_get_online_table_active']
+[agent:result] --- volumes methods --- ['create', 'delete', 'list', 'read', 'update']
+[agent] All APIs available. Let me create a volume and upload the CSVs so server-side SQL can read them.
+[agent:bash] cd "$(pwd)" && python3 -c "
+[agent:bash] import io
+[agent:bash] from databricks.sdk import WorkspaceClient
+[agent:bash] w = WorkspaceClient()
+[agent:bash] cat, sch = 'workspace', 'mlpab35a617'
+[agent:bash] # create volume
+[agent:bash] try:
+[agent:bash]     w.volumes.create(catalog_name=cat, schema_name=sch, name='ingest', volume_type='MANAGED')
+[agent:bash]     print('volume created')
+[agent:bash] except Exception as e:
+[agent:bash]     print('volume create:', e)
+[agent:bash] base = f'/Volumes/{cat}/{sch}/ingest'
+[agent:bash] for local, remote in [('data/initial_export.csv','initial_export.csv'),('data/reload/new_export.csv','new_export.csv')]:
+[agent:bash]     with open(local,'rb') as f:
+[agent:bash]         w.files.upload(f'{base}/{remote}', f, overwrite=True)
+[agent:bash]     print('uploaded', remote)
+[agent:bash] print('done')
+[agent:bash] "
+[agent:result-err] Exit code 1
+[agent:result-err] Traceback (most recent call last):
+[agent:result-err]   File "<string>", line 15, in <module>
+[agent:result-err]     w.files.upload(f'{base}/{remote}', f, overwrite=True)
+[agent:result-err]     ~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[agent:result-err]   File "/Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/sdk/0.117.0/official/feature/full_reload/1/task/venv/lib/python3.13/site-packages/databricks/sdk/mixins/files.py", line 1430, in upload
+[agent:result-err]     self._upload_single_thread_with_known_size(ctx, contents)
+[agent:result-err]     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^
+[agent:result-err]   File "/Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/sdk/0.117.0/official/feature/full_reload/1/task/venv/lib/python3.13/site-packages/databricks/sdk/mixins/files.py", line 1513, in _upload_single_thread_with_known_size
+[agent:result-err]     return self._single_thread_single_shot_upload(ctx, contents)
+[agent:result-err]            ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^
+[agent:result-err]   File "/Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/sdk/0.117.0/official/feature/full_reload/1/task/venv/lib/python3.13/site-packages/databricks/sdk/mixins/files.py", line 1521, in _single_thread_single_shot_upload
+[agent:result-err]     return super().upload(file_path=ctx.target_path, contents=contents, overwrite=ctx.overwrite)
+[agent:result-err]            ~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[agent:result-err]   File "/Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/sdk/0.117.0/official/feature/full_reload/1/task/venv/lib/python3.13/site-packages/databricks/sdk/service/files.py", line 1026, in upload
+[agent:result-err]     self._api.do(
+[agent:result-err]     ~~~~~~~~~~~~^
+[agent:result-err]         "PUT",
+[agent:result-err]         ^^^^^^
+[agent:result-err]     ...<3 lines>...
+[agent:result-err]         data=contents,
+[agent:result-err]         ^^^^^^^^^^^^^^
+[agent:result-err]     )
+[agent:result-err]     ^
+[agent:result-err]   File "/Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/sdk/0.117.0/official/feature/full_reload/1/task/venv/lib/python3.13/site-packages/databricks/sdk/core.py", line 95, in do
+[agent:result-err]     return self._api_client.do(
+[agent:result-err]            ~~~~~~~~~~~~~~~~~~~^
+[agent:result-err]         method=method,
+[agent:result-err]         ^^^^^^^^^^^^^^
+[agent:result-err]     ...<8 lines>...
+[agent:result-err]         response_headers=response_headers,
+[agent:result-err]         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[agent:result-err]     )
+[agent:result-err]     ^
+[agent:result-err]   File "/Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/sdk/0.117.0/official/feature/full_reload/1/task/venv/lib/python3.13/site-packages/databricks/sdk/_base_client.py", line 197, in do
+[agent:result-err]     response = call(
+[agent:result-err]         method,
+[agent:result-err]     ...<7 lines>...
+[agent:result-err]         auth=auth,
+[agent:result-err]     )
+[agent:result-err]   File "/Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/sdk/0.117.0/official/feature/full_reload/1/task/venv/lib/python3.13/site-packages/databricks/sdk/retries.py", line 59, in wrapper
+[agent:result-err]     raise err
+[agent:result-err]   File "/Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/sdk/0.117.0/official/feature/full_reload/1/task/venv/lib/python3.13/site-packages/databricks/sdk/retries.py", line 38, in wrapper
+[agent:result-err]     return func(*args, **kwargs)
+[agent:result-err]   File "/Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/sdk/0.117.0/official/feature/full_reload/1/task/venv/lib/python3.13/site-packages/databricks/sdk/_base_client.py", line 299, in _perform
+[agent:result-err]     raise error from None
+[agent:result-err] databricks.sdk.errors.platform.NotFound: Volume 'workspace.mlpab35a617.ingest' does not exist.
+[agent:result-err] volume create: 'str' object has no attribute 'value'
+[agent] Volume create needs the enum type. Let me fix it.
+[agent:bash] cd "$(pwd)" && python3 -c "
+[agent:bash] from databricks.sdk import WorkspaceClient
+[agent:bash] from databricks.sdk.service.catalog import VolumeType
+[agent:bash] w = WorkspaceClient()
+[agent:bash] cat, sch = 'workspace', 'mlpab35a617'
+[agent:bash] try:
+[agent:bash]     w.volumes.create(catalog_name=cat, schema_name=sch, name='ingest', volume_type=VolumeType.MANAGED)
+[agent:bash]     print('volume created')
+[agent:bash] except Exception as e:
+[agent:bash]     print('volume create:', repr(e))
+[agent:bash] base = f'/Volumes/{cat}/{sch}/ingest'
+[agent:bash] for local, remote in [('data/initial_export.csv','initial_export.csv'),('data/reload/new_export.csv','new_export.csv')]:
+[agent:bash]     with open(local,'rb') as f:
+[agent:bash]         w.files.upload(f'{base}/{remote}', f, overwrite=True)
+[agent:bash]     print('uploaded', remote)
+[agent:bash] print('done')
+[agent:bash] "
+[agent:result] volume created
+[agent:result] uploaded initial_export.csv
+[agent:result] uploaded new_export.csv
+[agent:result] done
+[agent] Volume ready, CSVs uploaded. Now let me create version 1 as a feature table (Delta with NOT NULL PK + TIMESERIES) and load the initial export.
+[agent:bash] cd "$(pwd)" && python3 -c "
+[agent:bash] from databricks.sdk import WorkspaceClient
+[agent:bash] from databricks.sdk.service.sql import StatementState
+[agent:bash] w = WorkspaceClient()
+[agent:bash] WH='4dfab06c923fe3cc'
+[agent:bash] CAT,SCH='workspace','mlpab35a617'
+[agent:bash] base=f'/Volumes/{CAT}/{SCH}/ingest'
+[agent:bash] def sql(q):
+[agent:bash]     r=w.statement_execution.execute_statement(warehouse_id=WH, statement=q, wait_timeout='50s')
+[agent:bash]     st=r.status.state
+[agent:bash]     if st!=StatementState.SUCCEEDED:
+[agent:bash]         raise RuntimeError(f'FAILED: {st} :: {r.status.error} :: {q[:80]}')
+[agent:bash]     return r
+[agent:bash] t=f'{CAT}.{SCH}.customers302d18_1'
+[agent:bash] sql(f'''CREATE OR REPLACE TABLE {t} (
+[agent:bash]   row_id STRING NOT NULL,
+[agent:bash]   name STRING,
+[agent:bash]   balance_eur DOUBLE,
+[agent:bash]   updated_at BIGINT NOT NULL
+[agent:bash] ) TBLPROPERTIES (delta.enableChangeDataFeed = true)''')
+[agent:bash] print('created v1')
+[agent:bash] sql(f'''INSERT INTO {t}
+[agent:bash]   SELECT row_id, name, balance_eur, updated_at
+[agent:bash]   FROM read_files('{base}/initial_export.csv', format=>'csv', header=>true,
+[agent:bash]     schema=>'row_id string, name string, balance_eur double, updated_at bigint')''')
+[agent:bash] print('loaded v1')
+[agent:bash] sql(f'ALTER TABLE {t} ADD CONSTRAINT customers302d18_1_pk PRIMARY KEY (row_id, updated_at TIMESERIES)')
+[agent:bash] print('pk v1')
+[agent:bash] r=sql(f'SELECT count(*) FROM {t}')
+[agent:bash] print('v1 rowcount:', r.result.data_array)
+[agent:bash] "
+[agent:result-err] Exit code 1
+[agent:result-err]   File "<string>", line 11
+[agent:result-err]     if st\!=StatementState.SUCCEEDED:
+[agent:result-err]           ^
+[agent:result-err] SyntaxError: unexpected character after line continuation character
+[agent] Shell escaped the `!=`. Let me write scripts to files instead.
+[agent:write] /Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/sdk/0.117.0/official/feature/full_reload/1/task/.tmp/v1.py
+[agent:result] File created successfully at: /Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/sdk/0.117.0/official/feature/full_reload/1/task/.tmp/v1.py (file state is current in your context — no need to Read it back)
+[agent:bash] cd "$(pwd)" && python3 .tmp/v1.py
+[agent:result-err] PreToolUse:Bash hook error: [python3 /Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/sdk/0.117.0/official/feature/full_reload/1/task/.claude/hooks/log_tool_call.py]: DENIED: cannot read local script(s) .tmp/v1.py to verify they don't train locally. Run python from your working directory so the script is readable, drive the SDK inline (`python -c ...`), or push the work to databricks as a remote job.
+[agent:bash] cd "$(pwd)" && mkdir -p work && cp .tmp/v1.py work/v1.py && python3 work/v1.py
+[agent:result-err] PreToolUse:Bash hook error: [python3 /Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/sdk/0.117.0/official/feature/full_reload/1/task/.claude/hooks/log_tool_call.py]: DENIED: cannot read local script(s) work/v1.py to verify they don't train locally. Run python from your working directory so the script is readable, drive the SDK inline (`python -c ...`), or push the work to databricks as a remote job.
+[agent] The hook wants inline Python, not script files. Let me use a heredoc (single-quoted delimiter avoids zsh `!` expansion).
+[agent:bash] cd "$(pwd)" && python3 - <<'PYEOF'
+[agent:bash] from databricks.sdk import WorkspaceClient
+[agent:bash] from databricks.sdk.service.sql import StatementState
+[agent:bash] w = WorkspaceClient()
+[agent:bash] WH='4dfab06c923fe3cc'; CAT,SCH='workspace','mlpab35a617'
+[agent:bash] base=f'/Volumes/{CAT}/{SCH}/ingest'
+[agent:bash] def sql(q):
+[agent:bash]     r=w.statement_execution.execute_statement(warehouse_id=WH, statement=q, wait_timeout='50s')
+[agent:bash]     while r.status.state in (StatementState.PENDING, StatementState.RUNNING):
+[agent:bash]         r=w.statement_execution.get_statement(r.statement_id)
+[agent:bash]     if r.status.state != StatementState.SUCCEEDED:
+[agent:bash]         raise RuntimeError(f'FAILED: {r.status.state} :: {r.status.error} :: {q[:120]}')
+[agent:bash]     return r
+[agent:bash] t=f'{CAT}.{SCH}.customers302d18_1'
+[agent:bash] sql(f'''CREATE OR REPLACE TABLE {t} (
+[agent:bash]   row_id STRING NOT NULL, name STRING, balance_eur DOUBLE, updated_at BIGINT NOT NULL
+[agent:bash] ) TBLPROPERTIES (delta.enableChangeDataFeed = true)''')
+[agent:bash] print('created v1')
+[agent:bash] sql(f'''INSERT INTO {t} SELECT row_id, name, balance_eur, updated_at
+[agent:bash]   FROM read_files('{base}/initial_export.csv', format=>'csv', header=>true,
+[agent:bash]     schema=>'row_id string, name string, balance_eur double, updated_at bigint')''')
+[agent:bash] print('loaded v1')
+[agent:bash] sql(f'ALTER TABLE {t} ADD CONSTRAINT customers302d18_1_pk PRIMARY KEY (row_id, updated_at TIMESERIES)')
+[agent:bash] print('pk v1')
+[agent:bash] print('v1 rowcount:', sql(f'SELECT count(*) FROM {t}').result.data_array)
+[agent:bash] PYEOF
+[agent:result-err] PreToolUse:Bash hook error: [python3 /Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/sdk/0.117.0/official/feature/full_reload/1/task/.claude/hooks/log_tool_call.py]: DENIED: 'from' is off-interface in 'sdk' mode — only the `databricks` Python SDK (no ML libraries) may do work on databricks; local interpreters, network tools, and stray binaries are blocked. Basic shell (cp/mkdir/cat/head/grep) is allowed for the floor submission and data inspection. If you can't do the work through the `databricks` Python SDK (no ML libraries), STOP and report the missing capability — do NOT work around it locally.
+[agent] The `python3 -c "..."` form is what passes. I'll avoid `!=` (zsh `!` expansion) by using `not ==`.
+[agent:bash] cd "$(pwd)" && python3 -c "
+[agent:bash] from databricks.sdk import WorkspaceClient
+[agent:bash] from databricks.sdk.service.sql import StatementState
+[agent:bash] w = WorkspaceClient()
+[agent:bash] WH='4dfab06c923fe3cc'; CAT,SCH='workspace','mlpab35a617'
+[agent:bash] base=f'/Volumes/{CAT}/{SCH}/ingest'
+[agent:bash] def sql(q):
+[agent:bash]     r=w.statement_execution.execute_statement(warehouse_id=WH, statement=q, wait_timeout='50s')
+[agent:bash]     while r.status.state in (StatementState.PENDING, StatementState.RUNNING):
+[agent:bash]         r=w.statement_execution.get_statement(r.statement_id)
+[agent:bash]     if not (r.status.state == StatementState.SUCCEEDED):
+[agent:bash]         raise RuntimeError(f'FAILED: {r.status.state} :: {r.status.error} :: {q[:120]}')
+[agent:bash]     return r
+[agent:bash] t=f'{CAT}.{SCH}.customers302d18_1'
+[agent:bash] sql(f'''CREATE OR REPLACE TABLE {t} (
+[agent:bash]   row_id STRING NOT NULL, name STRING, balance_eur DOUBLE, updated_at BIGINT NOT NULL
+[agent:bash] ) TBLPROPERTIES (delta.enableChangeDataFeed = true)''')
+[agent:bash] print('created v1')
+[agent:bash] sql(f'''INSERT INTO {t} SELECT row_id, name, balance_eur, updated_at
+[agent:bash]   FROM read_files('{base}/initial_export.csv', format=>'csv', header=>true,
+[agent:bash]     schema=>'row_id string, name string, balance_eur double, updated_at bigint')''')
+[agent:bash] print('loaded v1')
+[agent:bash] sql(f'ALTER TABLE {t} ADD CONSTRAINT customers302d18_1_pk PRIMARY KEY (row_id, updated_at TIMESERIES)')
+[agent:bash] print('pk v1')
+[agent:bash] print('v1 rowcount:', sql(f'SELECT count(*) FROM {t}').result.data_array)
+[agent:bash] "
+[agent:result] created v1
+[agent:result] loaded v1
+[agent:result] pk v1
+[agent:result] v1 rowcount: [['180']]
+[agent] Version 1 done (180 rows). Now version 2 with the new schema, created from scratch.
+[agent:bash] cd "$(pwd)" && python3 -c "
+[agent:bash] from databricks.sdk import WorkspaceClient
+[agent:bash] from databricks.sdk.service.sql import StatementState
+[agent:bash] w = WorkspaceClient()
+[agent:bash] WH='4dfab06c923fe3cc'; CAT,SCH='workspace','mlpab35a617'
+[agent:bash] base=f'/Volumes/{CAT}/{SCH}/ingest'
+[agent:bash] def sql(q):
+[agent:bash]     r=w.statement_execution.execute_statement(warehouse_id=WH, statement=q, wait_timeout='50s')
+[agent:bash]     while r.status.state in (StatementState.PENDING, StatementState.RUNNING):
+[agent:bash]         r=w.statement_execution.get_statement(r.statement_id)
+[agent:bash]     if not (r.status.state == StatementState.SUCCEEDED):
+[agent:bash]         raise RuntimeError(f'FAILED: {r.status.state} :: {r.status.error} :: {q[:120]}')
+[agent:bash]     return r
+[agent:bash] t=f'{CAT}.{SCH}.customers302d18_2'
+[agent:bash] sql(f'''CREATE OR REPLACE TABLE {t} (
+[agent:bash]   row_id STRING NOT NULL, full_name STRING, balance DOUBLE, currency STRING, updated_at BIGINT NOT NULL
+[agent:bash] ) TBLPROPERTIES (delta.enableChangeDataFeed = true)''')
+[agent:bash] print('created v2')
+[agent:bash] sql(f'''INSERT INTO {t} SELECT row_id, full_name, balance, currency, updated_at
+[agent:bash]   FROM read_files('{base}/new_export.csv', format=>'csv', header=>true,
+[agent:bash]     schema=>'row_id string, full_name string, balance double, currency string, updated_at bigint')''')
+[agent:bash] print('loaded v2')
+[agent:bash] sql(f'ALTER TABLE {t} ADD CONSTRAINT customers302d18_2_pk PRIMARY KEY (row_id, updated_at TIMESERIES)')
+[agent:bash] print('pk v2')
+[agent:bash] print('v2 rowcount:', sql(f'SELECT count(*) FROM {t}').result.data_array)
+[agent:bash] print('v2 cols:', [c.name for c in sql(f'SELECT * FROM {t} LIMIT 1').manifest.schema.columns])
+[agent:bash] "
+[agent:result] created v2
+[agent:result] loaded v2
+[agent:result] pk v2
+[agent:result] v2 rowcount: [['193']]
+[agent:result] v2 cols: ['row_id', 'full_name', 'balance', 'currency', 'updated_at']
+[agent] Version 2 correct: 193 rows, new columns. Now create the Online Table for low-latency lookup. Let me check the create API signature.
+[agent:bash] cd "$(pwd)" && python3 -c "
+[agent:bash] from databricks.sdk.service.catalog import OnlineTable, OnlineTableSpec, OnlineTableSpecTriggeredSchedulingPolicy
+[agent:bash] import inspect
+[agent:bash] print('OnlineTableSpec fields:', [f for f in OnlineTableSpec.__dataclass_fields__])
+[agent:bash] print('OnlineTable fields:', [f for f in OnlineTable.__dataclass_fields__])
+[agent:bash] "
+[agent:result] OnlineTableSpec fields: ['perform_full_copy', 'pipeline_id', 'primary_key_columns', 'run_continuously', 'run_triggered', 'source_table_full_name', 'timeseries_key']
+[agent:result] OnlineTable fields: ['name', 'spec', 'status', 'table_serving_url', 'unity_catalog_provisioning_state']
+[agent:bash] cd "$(pwd)" && python3 -c "
+[agent:bash] from databricks.sdk import WorkspaceClient
+[agent:bash] from databricks.sdk.service.catalog import OnlineTable, OnlineTableSpec, OnlineTableSpecTriggeredSchedulingPolicy
+[agent:bash] w = WorkspaceClient()
+[agent:bash] CAT,SCH='workspace','mlpab35a617'
+[agent:bash] src=f'{CAT}.{SCH}.customers302d18_2'
+[agent:bash] ot=f'{CAT}.{SCH}.customers302d18_2_online'
+[agent:bash] spec=OnlineTableSpec(
+[agent:bash]     source_table_full_name=src,
+[agent:bash]     primary_key_columns=['row_id'],
+[agent:bash]     timeseries_key='updated_at',
+[agent:bash]     perform_full_copy=True,
+[agent:bash]     run_triggered=OnlineTableSpecTriggeredSchedulingPolicy(),
+[agent:bash] )
+[agent:bash] res=w.online_tables.create_and_wait(table=OnlineTable(name=ot, spec=spec))
+[agent:bash] print('online table:', res.name)
+[agent:bash] print('state:', res.unity_catalog_provisioning_state)
+[agent:bash] print('serving url:', res.table_serving_url)
+[agent:bash] "
+[agent:result-err] Exit code 1
+[agent:result-err] Traceback (most recent call last):
+[agent:result-err]   File "<string>", line 15, in <module>
+[agent:result-err]     res=w.online_tables.create_and_wait(table=OnlineTable(name=ot, spec=spec))
+[agent:result-err]   File "/Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/sdk/0.117.0/official/feature/full_reload/1/task/venv/lib/python3.13/site-packages/databricks/sdk/service/catalog.py", line 14457, in create_and_wait
+[agent:result-err]     return self.create(table=table).result(timeout=timeout)
+[agent:result-err]            ~~~~~~~~~~~^^^^^^^^^^^^^
+[agent:result-err]   File "/Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/sdk/0.117.0/official/feature/full_reload/1/task/venv/lib/python3.13/site-packages/databricks/sdk/service/catalog.py", line 14451, in create
+[agent:result-err]     op_response = self._api.do("POST", "/api/2.0/online-tables", body=body, headers=headers)
+[agent:result-err]   File "/Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/sdk/0.117.0/official/feature/full_reload/1/task/venv/lib/python3.13/site-packages/databricks/sdk/core.py", line 95, in do
+[agent:result-err]     return self._api_client.do(
+[agent:result-err]            ~~~~~~~~~~~~~~~~~~~^
+[agent:result-err]         method=method,
+[agent:result-err]         ^^^^^^^^^^^^^^
+[agent:result-err]     ...<8 lines>...
+[agent:result-err]         response_headers=response_headers,
+[agent:result-err]         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[agent:result-err]     )
+[agent:result-err]     ^
+[agent:result-err]   File "/Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/sdk/0.117.0/official/feature/full_reload/1/task/venv/lib/python3.13/site-packages/databricks/sdk/_base_client.py", line 197, in do
+[agent:result-err]     response = call(
+[agent:result-err]         method,
+[agent:result-err]     ...<7 lines>...
+[agent:result-err]         auth=auth,
+[agent:result-err]     )
+[agent:result-err]   File "/Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/sdk/0.117.0/official/feature/full_reload/1/task/venv/lib/python3.13/site-packages/databricks/sdk/retries.py", line 59, in wrapper
+[agent:result-err]     raise err
+[agent:result-err]   File "/Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/sdk/0.117.0/official/feature/full_reload/1/task/venv/lib/python3.13/site-packages/databricks/sdk/retries.py", line 38, in wrapper
+[agent:result-err]     return func(*args, **kwargs)
+[agent:result-err]   File "/Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/sdk/0.117.0/official/feature/full_reload/1/task/venv/lib/python3.13/site-packages/databricks/sdk/_base_client.py", line 299, in _perform
+[agent:result-err]     raise error from None
+[agent:result-err] databricks.sdk.errors.platform.BadRequest: Online Table is being deprecated. Creating new online table is not allowed. Databricks recommends switching to Synced Tables.
+[agent] Online Tables are deprecated — the platform points to Synced Tables (Lakebase). Let me check that API.
+[agent:bash] cd "$(pwd)" && python3 -c "
+[agent:bash] from databricks.sdk import WorkspaceClient
+[agent:bash] w = WorkspaceClient()
+[agent:bash] print('has database:', hasattr(w,'database'))
+[agent:bash] if hasattr(w,'database'):
+[agent:bash]     print([m for m in dir(w.database) if not m.startswith('_')])
+[agent:bash] "
+[agent:result] has database: True
+[agent:result] ['create_database_catalog', 'create_database_instance', 'create_database_instance_and_wait', 'create_database_instance_role', 'create_database_table', 'create_synced_database_table', 'delete_database_catalog', 'delete_database_instance', 'delete_database_instance_role', 'delete_database_table', 'delete_synced_database_table', 'find_database_instance_by_uid', 'generate_database_credential', 'get_database_catalog', 'get_database_instance', 'get_database_instance_role', 'get_database_table', 'get_synced_database_table', 'list_database_catalogs', 'list_database_instance_roles', 'list_database_instances', 'list_synced_database_tables', 'update_database_catalog', 'update_database_instance', 'update_synced_database_table', 'wait_get_database_instance_database_available']
+[agent] Synced tables (Lakebase) is the modern low-latency path. Let me inspect the relevant signatures.
+[agent:bash] cd "$(pwd)" && python3 -c "
+[agent:bash] from databricks.sdk.service import database as db
+[agent:bash] for n in ['DatabaseInstance','SyncedDatabaseTable','SyncedTableSpec','DatabaseCatalog','SyncedTableSchedulingPolicy','NewPipelineSpec']:
+[agent:bash]     c=getattr(db,n,None)
+[agent:bash]     if c and hasattr(c,'__dataclass_fields__'):
+[agent:bash]         print(n, ':', list(c.__dataclass_fields__))
+[agent:bash] "
+[agent:result] DatabaseInstance : ['name', 'capacity', 'child_instance_refs', 'creation_time', 'creator', 'custom_tags', 'effective_capacity', 'effective_custom_tags', 'effective_enable_pg_native_login', 'effective_enable_readable_secondaries', 'effective_node_count', 'effective_retention_window_in_days', 'effective_stopped', 'effective_usage_policy_id', 'enable_pg_native_login', 'enable_readable_secondaries', 'node_count', 'parent_instance_ref', 'pg_version', 'read_only_dns', 'read_write_dns', 'retention_window_in_days', 'state', 'stopped', 'uid', 'usage_policy_id']
+[agent:result] SyncedDatabaseTable : ['name', 'data_synchronization_status', 'database_instance_name', 'effective_database_instance_name', 'effective_logical_database_name', 'logical_database_name', 'spec', 'unity_catalog_provisioning_state']
+[agent:result] SyncedTableSpec : ['accelerated_sync', 'create_database_objects_if_missing', 'existing_pipeline_id', 'new_pipeline_spec', 'primary_key_columns', 'scheduling_policy', 'source_table_full_name', 'timeseries_key', 'type_overrides']
+[agent:result] DatabaseCatalog : ['name', 'database_instance_name', 'database_name', 'create_database_if_not_exists', 'uid']
+[agent:result] NewPipelineSpec : ['budget_policy_id', 'storage_catalog', 'storage_schema']
+[agent] Let me create the Lakebase database instance (prefixed name), then the synced table.
+[agent:bash] cd "$(pwd)" && python3 -c "
+[agent:bash] from databricks.sdk import WorkspaceClient
+[agent:bash] from databricks.sdk.service.database import DatabaseInstance
+[agent:bash] w = WorkspaceClient()
+[agent:bash] name='mlpab35a617_customers302d18'
+[agent:bash] inst=w.database.create_database_instance_and_wait(DatabaseInstance(name=name, capacity='CU_1'))
+[agent:bash] print('instance:', inst.name, 'state:', inst.state)
+[agent:bash] print('rw dns:', inst.read_write_dns)
+[agent:bash] "
+[agent:result-err] Exit code 1
+[agent:result-err] Traceback (most recent call last):
+[agent:result-err]   File "<string>", line 6, in <module>
+[agent:result-err]     inst=w.database.create_database_instance_and_wait(DatabaseInstance(name=name, capacity='CU_1'))
+[agent:result-err]   File "/Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/sdk/0.117.0/official/feature/full_reload/1/task/venv/lib/python3.13/site-packages/databricks/sdk/service/database.py", line 1722, in create_database_instance_and_wait
+[agent:result-err]     return self.create_database_instance(database_instance=database_instance).result(timeout=timeout)
+[agent:result-err]            ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[agent:result-err]   File "/Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/sdk/0.117.0/official/feature/full_reload/1/task/venv/lib/python3.13/site-packages/databricks/sdk/service/database.py", line 1712, in create_database_instance
+[agent:result-err]     op_response = self._api.do("POST", "/api/2.0/database/instances", body=body, headers=headers)
+[agent:result-err]   File "/Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/sdk/0.117.0/official/feature/full_reload/1/task/venv/lib/python3.13/site-packages/databricks/sdk/core.py", line 95, in do
+[agent:result-err]     return self._api_client.do(
+[agent:result-err]            ~~~~~~~~~~~~~~~~~~~^
+[agent:result-err]         method=method,
+[agent:result-err]         ^^^^^^^^^^^^^^
+[agent:result-err]     ...<8 lines>...
+[agent:result-err]         response_headers=response_headers,
+[agent:result-err]         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[agent:result-err]     )
+[agent:result-err]     ^
+[agent:result-err]   File "/Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/sdk/0.117.0/official/feature/full_reload/1/task/venv/lib/python3.13/site-packages/databricks/sdk/_base_client.py", line 197, in do
+[agent:result-err]     response = call(
+[agent:result-err]         method,
+[agent:result-err]     ...<7 lines>...
+[agent:result-err]         auth=auth,
+[agent:result-err]     )
+[agent:result-err]   File "/Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/sdk/0.117.0/official/feature/full_reload/1/task/venv/lib/python3.13/site-packages/databricks/sdk/retries.py", line 59, in wrapper
+[agent:result-err]     raise err
+[agent:result-err]   File "/Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/sdk/0.117.0/official/feature/full_reload/1/task/venv/lib/python3.13/site-packages/databricks/sdk/retries.py", line 38, in wrapper
+[agent:result-err]     return func(*args, **kwargs)
+[agent:result-err]   File "/Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/sdk/0.117.0/official/feature/full_reload/1/task/venv/lib/python3.13/site-packages/databricks/sdk/_base_client.py", line 299, in _perform
+[agent:result-err]     raise error from None
+[agent:result-err] databricks.sdk.errors.platform.InvalidParameterValue: DatabaseInstance name must be DNS compliant; ensure it contains only alphanumeric characters and hyphens.
+[agent] Name must be DNS-compliant (hyphens, no underscores). Using hyphen.
+[agent:bash] cd "$(pwd)" && python3 -c "
+[agent:bash] from databricks.sdk import WorkspaceClient
+[agent:bash] from databricks.sdk.service.database import DatabaseInstance
+[agent:bash] w = WorkspaceClient()
+[agent:bash] name='mlpab35a617-customers302d18'
+[agent:bash] inst=w.database.create_database_instance_and_wait(DatabaseInstance(name=name, capacity='CU_1'))
+[agent:bash] print('instance:', inst.name, 'state:', inst.state)
+[agent:bash] print('rw dns:', inst.read_write_dns)
+[agent:bash] " 2>&1 | tail -5
+[agent:result] instance: mlpab35a617-customers302d18 state: DatabaseInstanceState.AVAILABLE
+[agent:result] rw dns: ep-restless-glitter-d1efj2ru.database.us-west-2.cloud.databricks.com
+[agent] Instance available. Now create the synced table. Let me check the scheduling policy enum and method signature.
+[agent:bash] cd "$(pwd)" && python3 -c "
+[agent:bash] from databricks.sdk.service import database as db
+[agent:bash] import inspect
+[agent:bash] print('SchedulingPolicy:', [x for x in dir(db.SyncedTableSchedulingPolicy) if not x.startswith('_')])
+[agent:bash] from databricks.sdk import WorkspaceClient
+[agent:bash] w=WorkspaceClient()
+[agent:bash] print(inspect.signature(w.database.create_synced_database_table))
+[agent:bash] "
+[agent:result] SchedulingPolicy: ['CONTINUOUS', 'SNAPSHOT', 'TRIGGERED']
+[agent:result] (synced_table: 'SyncedDatabaseTable') -> 'SyncedDatabaseTable'
+[agent:bash] cd "$(pwd)" && python3 -c "
+[agent:bash] from databricks.sdk import WorkspaceClient
+[agent:bash] from databricks.sdk.service.database import SyncedDatabaseTable, SyncedTableSpec, SyncedTableSchedulingPolicy, NewPipelineSpec
+[agent:bash] w = WorkspaceClient()
+[agent:bash] CAT,SCH='workspace','mlpab35a617'
+[agent:bash] src=f'{CAT}.{SCH}.customers302d18_2'
+[agent:bash] ot=f'{CAT}.{SCH}.customers302d18_2_online'
+[agent:bash] spec=SyncedTableSpec(
+[agent:bash]     source_table_full_name=src,
+[agent:bash]     primary_key_columns=['row_id'],
+[agent:bash]     timeseries_key='updated_at',
+[agent:bash]     scheduling_policy=SyncedTableSchedulingPolicy.SNAPSHOT,
+[agent:bash]     create_database_objects_if_missing=True,
+[agent:bash]     new_pipeline_spec=NewPipelineSpec(storage_catalog=CAT, storage_schema=SCH),
+[agent:bash] )
+[agent:bash] st=SyncedDatabaseTable(name=ot, database_instance_name='mlpab35a617-customers302d18', logical_database_name='databricks_postgres', spec=spec)
+[agent:bash] res=w.database.create_synced_database_table(st)
+[agent:bash] print('created synced table:', res.name)
+[agent:bash] print('provisioning:', res.unity_catalog_provisioning_state)
+[agent:bash] " 2>&1 | tail -8
+[agent:result] created synced table: workspace.mlpab35a617.customers302d18_2_online
+[agent:result] provisioning: None
+[agent] Synced table created. Let me poll its sync status until it's ready.
+[agent:bash] cd "$(pwd)" && python3 -c "
+[agent:bash] import time
+[agent:bash] from databricks.sdk import WorkspaceClient
+[agent:bash] w = WorkspaceClient()
+[agent:bash] ot='workspace.mlpab35a617.customers302d18_2_online'
+[agent:bash] for i in range(40):
+[agent:bash]     r=w.database.get_synced_database_table(ot)
+[agent:bash]     prov=r.unity_catalog_provisioning_state
+[agent:bash]     dss=r.data_synchronization_status
+[agent:bash]     detail=getattr(dss,'detailed_state',None) if dss else None
+[agent:bash]     print(i, 'prov=',prov,'sync=',detail)
+[agent:bash]     if str(prov)=='ProvisioningInfoState.ACTIVE' or (detail and 'ONLINE' in str(detail)):
+[agent:bash]         break
+[agent:bash]     time.sleep(15)
+[agent:bash] " 2>&1 | tail -20
+[agent:result] 0 prov= ProvisioningInfoState.ACTIVE sync= SyncedTableState.SYNCED_TABLE_PROVISIONING_PIPELINE_RESOURCES
+[agent] Provisioning state is ACTIVE but data sync still initializing. Let me poll on the data sync status specifically.
+[agent:bash] cd "$(pwd)" && python3 -c "
+[agent:bash] import time
+[agent:bash] from databricks.sdk import WorkspaceClient
+[agent:bash] w = WorkspaceClient()
+[agent:bash] ot='workspace.mlpab35a617.customers302d18_2_online'
+[agent:bash] last=None
+[agent:bash] for i in range(50):
+[agent:bash]     r=w.database.get_synced_database_table(ot)
+[agent:bash]     dss=r.data_synchronization_status
+[agent:bash]     detail=str(getattr(dss,'detailed_state',None)) if dss else 'None'
+[agent:bash]     if detail != last:
+[agent:bash]         print(i, detail); last=detail
+[agent:bash]     if 'ONLINE' in detail or 'SYNCED_TABLE_ONLINE' in detail:
+[agent:bash]         print('ONLINE'); break
+[agent:bash]     if 'FAILED' in detail or 'OFFLINE' in detail:
+[agent:bash]         print('PROBLEM'); break
+[agent:bash]     time.sleep(15)
+[agent:bash] " 2>&1 | tail -20
+[agent:result]   File "<string>", line 11
+[agent:result]     if detail \!= last:
+[agent:result]                ^
+[agent:result] SyntaxError: unexpected character after line continuation character
+[agent:bash] cd "$(pwd)" && python3 -c "
+[agent:bash] import time
+[agent:bash] from databricks.sdk import WorkspaceClient
+[agent:bash] w = WorkspaceClient()
+[agent:bash] ot='workspace.mlpab35a617.customers302d18_2_online'
+[agent:bash] last=''
+[agent:bash] for i in range(50):
+[agent:bash]     r=w.database.get_synced_database_table(ot)
+[agent:bash]     dss=r.data_synchronization_status
+[agent:bash]     detail=str(getattr(dss,'detailed_state',None)) if dss else 'None'
+[agent:bash]     if not (detail == last):
+[agent:bash]         print(i, detail); last=detail
+[agent:bash]     if 'ONLINE' in detail:
+[agent:bash]         print('ONLINE_REACHED'); break
+[agent:bash]     if 'FAILED' in detail or 'OFFLINE' in detail:
+[agent:bash]         print('PROBLEM'); break
+[agent:bash]     time.sleep(15)
+[agent:bash] " 2>&1 | tail -20
+[agent:result] 0 SyncedTableState.SYNCED_TABLE_PROVISIONING_INITIAL_SNAPSHOT
+[agent:result] 1 SyncedTableState.SYNCED_TABLE_ONLINE_NO_PENDING_UPDATE
+[agent:result] ONLINE_REACHED
+[agent] Synced table is ONLINE. Let me do a final verification of both feature tables' structure and the deliverable.
+[agent:bash] cd "$(pwd)" && python3 -c "
+[agent:bash] from databricks.sdk import WorkspaceClient
+[agent:bash] from databricks.sdk.service.sql import StatementState
+[agent:bash] w = WorkspaceClient()
+[agent:bash] WH='4dfab06c923fe3cc'; CAT,SCH='workspace','mlpab35a617'
+[agent:bash] def sql(q):
+[agent:bash]     r=w.statement_execution.execute_statement(warehouse_id=WH, statement=q, wait_timeout='50s')
+[agent:bash]     while r.status.state in (StatementState.PENDING, StatementState.RUNNING):
+[agent:bash]         r=w.statement_execution.get_statement(r.statement_id)
+[agent:bash]     return r
+[agent:bash] for v in ['1','2']:
+[agent:bash]     t=f'{CAT}.{SCH}.customers302d18_{v}'
+[agent:bash]     cnt=sql(f'SELECT count(*), count(distinct row_id) FROM {t}').result.data_array
+[agent:bash]     pk=sql(f'SELECT constraint_name FROM {SCH}.information_schema.table_constraints WHERE table_name=\'customers302d18_{v}\' AND constraint_type=\'PRIMARY KEY\'').result.data_array
+[agent:bash]     print(f'v{v}: count/distinct={cnt} pk={pk}')
+[agent:bash] # verify v2 has only new columns
+[agent:bash] cols=sql(f'DESCRIBE TABLE {CAT}.{SCH}.customers302d18_2').result.data_array
+[agent:bash] print('v2 schema:', [c[:2] for c in cols if c[0] and not c[0].startswith(\"#\")])
+[agent:bash] "
+[agent:result-err] PreToolUse:Bash hook error: [python3 /Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/sdk/0.117.0/official/feature/full_reload/1/task/.claude/hooks/log_tool_call.py]: DENIED: '"' is off-interface in 'sdk' mode — only the `databricks` Python SDK (no ML libraries) may do work on databricks; local interpreters, network tools, and stray binaries are blocked. Basic shell (cp/mkdir/cat/head/grep) is allowed for the floor submission and data inspection. If you can't do the work through the `databricks` Python SDK (no ML libraries), STOP and report the missing capability — do NOT work around it locally.
+[agent] The escaped quotes tripped the parser. Let me simplify, avoiding inner double quotes.
+[agent:bash] cd "$(pwd)" && python3 -c "
+[agent:bash] from databricks.sdk import WorkspaceClient
+[agent:bash] from databricks.sdk.service.sql import StatementState
+[agent:bash] w = WorkspaceClient()
+[agent:bash] WH='4dfab06c923fe3cc'; CAT,SCH='workspace','mlpab35a617'
+[agent:bash] def sql(q):
+[agent:bash]     r=w.statement_execution.execute_statement(warehouse_id=WH, statement=q, wait_timeout='50s')
+[agent:bash]     while r.status.state in (StatementState.PENDING, StatementState.RUNNING):
+[agent:bash]         r=w.statement_execution.get_statement(r.statement_id)
+[agent:bash]     return r
+[agent:bash] for v in ['1','2']:
+[agent:bash]     t=f'{CAT}.{SCH}.customers302d18_{v}'
+[agent:bash]     cnt=sql(f'SELECT count(*), count(distinct row_id) FROM {t}').result.data_array
+[agent:bash]     pk=sql(f'SELECT constraint_name, constraint_type FROM {SCH}.information_schema.table_constraints WHERE table_name = ' + chr(39)+f'customers302d18_{v}'+chr(39)).result.data_array
+[agent:bash]     cols=[c.name for c in sql(f'SELECT * FROM {t} LIMIT 0').manifest.schema.columns]
+[agent:bash]     print(f'v{v}: count/distinct={cnt} cols={cols} constraints={pk}')
+[agent:bash] st=w.database.get_synced_database_table('workspace.mlpab35a617.customers302d18_2_online')
+[agent:bash] print('online synced table sync state:', st.data_synchronization_status.detailed_state)
+[agent:bash] "
+[agent:result-err] Exit code 1
+[agent:result-err] Traceback (most recent call last):
+[agent:result-err]   File "<string>", line 14, in <module>
+[agent:result-err]     pk=sql(f'SELECT constraint_name, constraint_type FROM {SCH}.information_schema.table_constraints WHERE table_name = ' + chr(39)+f'customers302d18_{v}'+chr(39)).result.data_array
+[agent:result-err]        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[agent:result-err] AttributeError: 'NoneType' object has no attribute 'data_array'
+[agent:bash] cd "$(pwd)" && python3 -c "
+[agent:bash] from databricks.sdk import WorkspaceClient
+[agent:bash] from databricks.sdk.service.sql import StatementState
+[agent:bash] w = WorkspaceClient()
+[agent:bash] WH='4dfab06c923fe3cc'
+[agent:bash] def sql(q):
+[agent:bash]     r=w.statement_execution.execute_statement(warehouse_id=WH, statement=q, wait_timeout='50s')
+[agent:bash]     while r.status.state in (StatementState.PENDING, StatementState.RUNNING):
+[agent:bash]         r=w.statement_execution.get_statement(r.statement_id)
+[agent:bash]     if not (r.status.state == StatementState.SUCCEEDED):
+[agent:bash]         return ['ERR', str(r.status.error)]
+[agent:bash]     return r.result.data_array
+[agent:bash] q=('SELECT table_name, constraint_name, constraint_type FROM workspace.information_schema.table_constraints '
+[agent:bash]    'WHERE table_schema = ' + chr(39)+'mlpab35a617'+chr(39) + ' ORDER BY table_name')
+[agent:bash] print('constraints:', sql(q))
+[agent:bash] st=w.database.get_synced_database_table('workspace.mlpab35a617.customers302d18_2_online')
+[agent:bash] print('online sync state:', st.data_synchronization_status.detailed_state)
+[agent:bash] "
+[agent:result] constraints: [['customers302d18_1', 'customers302d18_1_pk', 'PRIMARY KEY'], ['customers302d18_2', 'customers302d18_2_pk', 'PRIMARY KEY']]
+[agent:result] online sync state: SyncedTableState.SYNCED_TABLE_ONLINE_NO_PENDING_UPDATE
+[agent] Everything is verified and in place. The task is complete.
+[agent] ## Summary
+[agent] I registered the customer feature tables on Databricks (SDK mode) inside the per-run namespace `workspace.mlpab35a617`, using a SQL warehouse for server-side compute. All work ran on the platform — no local computation.
+[agent] **Version 1 — `workspace.mlpab35a617.customers302d18_1`**
+[agent] - Original schema: `row_id, name, balance_eur, updated_at`
+[agent] - Loaded the initial export → **180 rows**
+[agent] - Feature-table contract: `row_id` NOT NULL + `updated_at` NOT NULL, with `PRIMARY KEY (row_id, updated_at TIMESERIES)` (record key + epoch-ms event time).
+[agent] **Version 2 (graded deliverable) — `workspace.mlpab35a617.customers302d18_2`**
+[agent] - Re-created from scratch (`CREATE OR REPLACE`) for the breaking new schema: `row_id, full_name, balance, currency, updated_at` — only the new column names, no stale v1 columns.
+[agent] - Loaded exactly the new full export → **193 rows / 193 distinct `row_id`**, no carryover from v1.
+[agent] - Same feature-table contract: `PRIMARY KEY (row_id, updated_at TIMESERIES)`.
+[agent] **Low-latency / online access for v2**
+[agent] - Online Tables are deprecated and rejected by the API ("switching to Synced Tables"), so I used the current path: provisioned a Lakebase Postgres instance `mlpab35a617-customers302d18` (prefixed) and created a **synced table** `workspace.mlpab35a617.customers302d18_2_online` from the v2 source (key `row_id`, timeseries `updated_at`).
+[agent] - Sync state: `SYNCED_TABLE_ONLINE_NO_PENDING_UPDATE` — initial snapshot completed, features served for real-time lookup. This is how the platform distinguishes online (synced/Postgres-backed) from offline (Delta) access.
+[agent] All objects (volume `ingest`, both Delta feature tables, synced table, Lakebase instance) live in the isolated run namespace.
+[agent] Note on the interface: the SDK's `online_tables` API is now hard-deprecated server-side; the working low-latency path is `database.create_synced_database_table` backed by a Lakebase instance, which is what I used.
+[agent] done: 28 turns, $1.6953, stop=end_turn
+[mlpab] WARNING: databricks sdk client crashed — see /Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/sdk/0.117.0/official/feature/full_reload/1/task/databricks_client.logs (markers: Traceback (most recent call last))
+[mlpab] graded: 3 passed / 0 failed / 0 skipped of 3 asserts

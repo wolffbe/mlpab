@@ -83,9 +83,7 @@ def generate(seed: int, out: Path) -> dict:
     # microseconds, so a bare `astype("int64") // 10**6` would yield SECONDS, not
     # milliseconds. `.dt.as_unit("ns")` makes `// 10**6` reliably produce ms.
     base["updated_at"] = base["updated_at"].dt.as_unit("ns").astype("int64") // 10**6
-    corrections["updated_at"] = (
-        corrections["updated_at"].dt.as_unit("ns").astype("int64") // 10**6
-    )
+    corrections["updated_at"] = corrections["updated_at"].dt.as_unit("ns").astype("int64") // 10**6
 
     # truth: latest updated_at per row_id
     full = pd.concat([base, corrections], ignore_index=True)

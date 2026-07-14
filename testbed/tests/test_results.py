@@ -586,7 +586,11 @@ class CommandClassificationTests(unittest.TestCase):
         # A sleep chained onto an interface command classifies as a cli call, yet
         # its sleep must still be counted (scan is independent of the bucket).
         tr = self._transcript(
-            {"type": "tool_use", "name": "Bash", "input": {"command": "databricks fg get && sleep 90"}},
+            {
+                "type": "tool_use",
+                "name": "Bash",
+                "input": {"command": "databricks fg get && sleep 90"},
+            },
             {"type": "tool_use", "name": "Bash", "input": {"command": "sleep 10"}},
             {"type": "tool_use", "name": "Bash", "input": {"command": "ls"}},
         )
@@ -607,12 +611,24 @@ class CommandClassificationTests(unittest.TestCase):
                 "type": "assistant",
                 "message": {
                     "content": [
-                        {"type": "tool_use", "id": "t1", "name": "Bash",
-                         "input": {"command": "sleep 60; aws athena foo"}},
-                        {"type": "tool_use", "id": "t2", "name": "Bash",
-                         "input": {"command": "sleep 30; aws sagemaker bad-args"}},
-                        {"type": "tool_use", "id": "t3", "name": "Bash",
-                         "input": {"command": "sleep 5"}},
+                        {
+                            "type": "tool_use",
+                            "id": "t1",
+                            "name": "Bash",
+                            "input": {"command": "sleep 60; aws athena foo"},
+                        },
+                        {
+                            "type": "tool_use",
+                            "id": "t2",
+                            "name": "Bash",
+                            "input": {"command": "sleep 30; aws sagemaker bad-args"},
+                        },
+                        {
+                            "type": "tool_use",
+                            "id": "t3",
+                            "name": "Bash",
+                            "input": {"command": "sleep 5"},
+                        },
                     ]
                 },
             },
@@ -620,10 +636,18 @@ class CommandClassificationTests(unittest.TestCase):
                 "type": "user",
                 "message": {
                     "content": [
-                        {"type": "tool_result", "tool_use_id": "t1", "is_error": True,
-                         "content": "DENIED: aws athena is off-interface"},
-                        {"type": "tool_result", "tool_use_id": "t2", "is_error": True,
-                         "content": "aws: error: argument operation: Invalid choice"},
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "t1",
+                            "is_error": True,
+                            "content": "DENIED: aws athena is off-interface",
+                        },
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "t2",
+                            "is_error": True,
+                            "content": "aws: error: argument operation: Invalid choice",
+                        },
                     ]
                 },
             },

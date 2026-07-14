@@ -41,7 +41,9 @@ def _resp(state, statement_id="s1", cols=None, rows=None, types=None):
     status = SimpleNamespace(state=SimpleNamespace(value=state), error=None)
     manifest = SimpleNamespace(schema=SimpleNamespace(columns=columns))
     result = SimpleNamespace(data_array=rows or [])
-    return SimpleNamespace(status=status, manifest=manifest, result=result, statement_id=statement_id)
+    return SimpleNamespace(
+        status=status, manifest=manifest, result=result, statement_id=statement_id
+    )
 
 
 class _FakeStmtExec:
@@ -232,9 +234,14 @@ class NumericCastTests(unittest.TestCase):
 class ModelResolveTests(unittest.TestCase):
     def test_candidates_include_default_first_then_other_schemas(self):
         c = _checker()
-        c._w.catalogs = SimpleNamespace(list=lambda: [SimpleNamespace(name=CATALOG), SimpleNamespace(name="system")])
+        c._w.catalogs = SimpleNamespace(
+            list=lambda: [SimpleNamespace(name=CATALOG), SimpleNamespace(name="system")]
+        )
         c._w.schemas = SimpleNamespace(
-            list=lambda catalog_name=None: [SimpleNamespace(name="default"), SimpleNamespace(name="feature_store")]
+            list=lambda catalog_name=None: [
+                SimpleNamespace(name="default"),
+                SimpleNamespace(name="feature_store"),
+            ]
         )
         cands = c._model_fqn_candidates("m")
         self.assertEqual(cands[0], f"{CATALOG}.default.m")
@@ -338,13 +345,17 @@ class ModelMetricsTests(unittest.TestCase):
     def test_uc_metrics_empty_when_no_run(self):
         # model exists but has no source run → metrics degrade to {}, no crash
         c = self._checker_with_uc_model(run_id=None, metrics={})
-        c._w.model_versions = SimpleNamespace(get=lambda fn, v: SimpleNamespace(version=3, run_id=None), list=lambda fn: [])
+        c._w.model_versions = SimpleNamespace(
+            get=lambda fn, v: SimpleNamespace(version=3, run_id=None), list=lambda fn: []
+        )
         self.assertEqual(c.get_model("m")["metrics"], {})
 
     def test_run_fetch_failure_degrades_to_empty(self):
         c = self._checker_with_uc_model(run_id="r1", metrics={"roc_auc": 0.9})
+
         def boom(*a, **k):
             raise RuntimeError("no access")
+
         c._w.api_client = SimpleNamespace(do=boom)
         out = c.get_model("m")
         self.assertTrue(out["exists"])

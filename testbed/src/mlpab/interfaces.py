@@ -61,6 +61,7 @@ def base_interface(interface: str) -> str:
     head = interface.split("-", 1)[0]
     return head if head in INTERFACES else interface
 
+
 # Two-way split:
 #     configs/platforms/<platform>/ — the platform's CONFIG FOLDER: flat
 #         interface manifests (cli.yaml / mcp.yaml / sdk.yaml), skills.yaml
@@ -545,9 +546,12 @@ def setup(
         #     binary name also works, but a wheel needs the explicit field).
         #   sdk_module: the importable module (`sdk_module`, else the platform name
         #     — true when package == platform name).
-        cli_binary=cfg.get("cli_command") or (binary if base_interface(interface) == "cli" else None),
+        cli_binary=cfg.get("cli_command")
+        or (binary if base_interface(interface) == "cli" else None),
         cli_subcommand=_norm_subcommands(cfg.get("cli_subcommand")),
-        cli_aux_commands=[str(b).strip() for b in (cfg.get("cli_aux_commands") or []) if str(b).strip()],
+        cli_aux_commands=[
+            str(b).strip() for b in (cfg.get("cli_aux_commands") or []) if str(b).strip()
+        ],
         sdk_module=cfg.get("sdk_module") or platform,
         mcp_servers=mcp_servers,
         keys=_resolved_keys(platform, interface),
@@ -1417,6 +1421,7 @@ def prepare_plumbing(platform: str, *, force: bool = False) -> Path | None:
     h.update("\0".join(steps).encode())
     h.update(_base_venv_fingerprint().encode())
     want = h.hexdigest()[:16]
+
     def _ready() -> bool:
         return (
             not force

@@ -15,7 +15,6 @@ import json
 import sys
 from pathlib import Path
 
-
 from evals.common import (
     Suite,
     canonicalize,

@@ -12,11 +12,7 @@ from pathlib import Path
 from unittest import mock
 
 _TEARDOWN = (
-    Path(__file__).resolve().parents[1]
-    / "configs"
-    / "platforms"
-    / "hopsworks"
-    / "teardown.py"
+    Path(__file__).resolve().parents[1] / "configs" / "platforms" / "hopsworks" / "teardown.py"
 )
 
 # uid of the API key's user; a second uid owns a project we must never touch.

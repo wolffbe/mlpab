@@ -415,9 +415,7 @@ def stop(config: Path) -> None:
         click.echo(f">> no session {_tmux_session(config)} (already finished?)")
     for session in sessions:
         if (
-            subprocess.run(
-                ["tmux", "kill-session", "-t", session], capture_output=True
-            ).returncode
+            subprocess.run(["tmux", "kill-session", "-t", session], capture_output=True).returncode
             == 0
         ):
             click.secho(f">> killed {session}", fg="green")
@@ -445,7 +443,9 @@ def attach(config: Path) -> None:
     if not sessions:
         raise click.ClickException(f"no session for {config} (start one with `mlpab start`)")
     if len(sessions) > 1:
-        click.echo(f">> {len(sessions)} sessions live: {', '.join(sessions)} — attaching to {sessions[0]}")
+        click.echo(
+            f">> {len(sessions)} sessions live: {', '.join(sessions)} — attaching to {sessions[0]}"
+        )
     subprocess.run(["tmux", "attach", "-t", sessions[0]])
 
 
@@ -760,7 +760,9 @@ def _setup_claude_auth() -> None:
         # checks env first, so it wins over the short-lived Keychain token, which
         # only refreshes during interactive sessions and otherwise expires
         # mid-run overnight (silently zeroing every subsequent task).
-        if click.confirm("  Run `claude setup-token` to mint a long-lived token now?", default=True):
+        if click.confirm(
+            "  Run `claude setup-token` to mint a long-lived token now?", default=True
+        ):
             token = _mint_setup_token()
             if token:
                 _write_dotenv({"CLAUDE_CODE_OAUTH_TOKEN": token})

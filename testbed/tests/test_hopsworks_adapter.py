@@ -93,7 +93,9 @@ class FakeFeatureView:
 
     def get_training_data(self, training_dataset_version=1):
         if self._split == 2:
-            raise RuntimeError("Incorrect `get` method is used. Use feature_view.get_train_test_split instead.")
+            raise RuntimeError(
+                "Incorrect `get` method is used. Use feature_view.get_train_test_split instead."
+            )
         if self._split == 3:
             raise RuntimeError("Use feature_view.get_train_validation_test_split instead.")
         return self._plain
@@ -107,7 +109,11 @@ class FakeFeatureView:
 
     def get_train_validation_test_split(self, training_dataset_version=1):
         xs = [pd.DataFrame({"f": [1]}), pd.DataFrame({"f": [2]}), pd.DataFrame({"f": [3]})]
-        ys = [pd.DataFrame({"label": [0]}), pd.DataFrame({"label": [1]}), pd.DataFrame({"label": [0]})]
+        ys = [
+            pd.DataFrame({"label": [0]}),
+            pd.DataFrame({"label": [1]}),
+            pd.DataFrame({"label": [0]}),
+        ]
         return (*xs, *ys)
 
 

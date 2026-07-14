@@ -115,7 +115,9 @@ def _ensure_policies(iam, role_name: str) -> None:
     0/1, which reads as a model failure but isn't)."""
     try:
         iam.attach_role_policy(RoleName=role_name, PolicyArn=EXECUTION_POLICY_ARN)
-        print(f"[sagemaker setup] ensured {EXECUTION_POLICY_ARN.rsplit('/', 1)[-1]} on {role_name!r}")
+        print(
+            f"[sagemaker setup] ensured {EXECUTION_POLICY_ARN.rsplit('/', 1)[-1]} on {role_name!r}"
+        )
     except Exception as e:
         print(f"[sagemaker setup] managed policy on {role_name!r} skipped: {e}")
     try:

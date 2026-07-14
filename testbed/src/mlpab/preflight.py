@@ -28,7 +28,6 @@ from pathlib import Path
 
 from mlpab import interfaces, skills
 
-
 # How many skills to spot-check per bundle in the access probe. Skill access is a
 # property of the bundle install, not the individual skill, so a small random
 # sample is enough to confirm the bundle is reachable without probing all ~23.

@@ -144,15 +144,20 @@ class EnforceHookTests(unittest.TestCase):
         self.assertIsNone(self._enforce("cli", "Bash", "cut -d# -f1 data/x.csv"))
 
     def test_cli_solution_answer_key_blocked(self):
-        for cmd in ("cat solution/truth.json", "cat ../solution/truth.json",
-                    "head /abs/run/solution/grading.json"):
+        for cmd in (
+            "cat solution/truth.json",
+            "cat ../solution/truth.json",
+            "head /abs/run/solution/grading.json",
+        ):
             self.assertIsNotNone(
                 __import__("mlpab.hooks.log_tool_call", fromlist=["x"]).gate_check(cmd), cmd
             )
 
     def test_gate_check_matches_enforce_for_offinterface(self):
         import os as _os
+
         from mlpab.hooks import log_tool_call as h
+
         _os.environ.update({"TESTBED_INTERFACE": "cli", "TESTBED_CLI_BINARY": "aws"})
         self.assertIsNotNone(h.gate_check('python -c "import torch"'))
         self.assertIsNone(h.gate_check("aws sagemaker list-training-jobs"))

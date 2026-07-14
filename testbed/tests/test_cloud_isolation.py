@@ -49,8 +49,14 @@ class _FakeAwsClient:
 class AwsTeardownScopingTests(unittest.TestCase):
     def _sweep(self, mod, client, **extra):
         mod._sweep(
-            client, "thing", "list_things", "Things", "Name",
-            "delete_thing", "Name", **extra,
+            client,
+            "thing",
+            "list_things",
+            "Things",
+            "Name",
+            "delete_thing",
+            "Name",
+            **extra,
         )
 
     def test_per_run_deletes_only_prefixed(self):
@@ -79,8 +85,14 @@ class AwsTeardownScopingTests(unittest.TestCase):
         c.list_things = lambda **k: {"Things": items, "NextToken": None}
         mod._RUN_MODE = True
         mod._sweep(
-            c, "vec", "list_things", "Things", "indexArn",
-            "delete_thing", "indexArn", scope_key="indexName",
+            c,
+            "vec",
+            "list_things",
+            "Things",
+            "indexArn",
+            "delete_thing",
+            "indexArn",
+            scope_key="indexName",
         )
         self.assertEqual([d["indexArn"] for d in c.deleted], ["arn:aws:...:1"])
 
@@ -214,6 +226,49 @@ class AwsModelMetricsTests(unittest.TestCase):
     def test_empty_when_no_packages(self):
         c = self._checker({})
         self.assertEqual(c._package_metrics([]), {})
+
+
+# --------------------------------------------------------------------------
+# Per-run override authority — a per-run env override (GCP_BQ_DATASET=mlpab_<run>)
+# must reach the AGENT, not just the grader. interface_setup.keys is resolved
+# from .env BEFORE the override and is merged LAST into the agent env, so without
+# the runner's re-sync the stale base value silently wins: the agent lands its
+# table in the base dataset while the grader reads the per-run one and reports
+# "table not found". Reproduces the run-18/22 GCP ingest miss.
+# --------------------------------------------------------------------------
+class PerRunOverrideAuthorityTests(unittest.TestCase):
+    def _agent_dataset(self, iface_keys, os_environ):
+        """The GCP_BQ_DATASET the agent subprocess ends up with, mirroring the
+        engine's env build: env = os.environ.copy(); env.update(v for v in
+        extra_env if v), where extra_env layers interface_setup.keys last."""
+        agent_keys = {**{}, **iface_keys}  # {**_platform_env(...), **keys}
+        env = dict(os_environ)
+        env.update({k: v for k, v in agent_keys.items() if v})
+        return env.get("GCP_BQ_DATASET")
+
+    def test_stale_env_key_clobbers_without_resync(self):
+        # The bug: keys captured .env's base "mlpab" before the per-run override.
+        iface_keys = {"GCP_BQ_DATASET": "mlpab"}
+        os_environ = {"GCP_BQ_DATASET": "mlpab_run"}  # runner's per-run override
+        self.assertEqual(self._agent_dataset(iface_keys, os_environ), "mlpab")
+
+    def test_resync_makes_override_authoritative(self):
+        # The fix: runner re-syncs overridden keys into interface_setup.keys.
+        iface_keys = {"GCP_BQ_DATASET": "mlpab"}
+        os_environ = {"GCP_BQ_DATASET": "mlpab_run"}
+        for k in ("GCP_BQ_DATASET",):  # run_override_keys ∩ declared keys
+            if k in iface_keys:
+                iface_keys[k] = os_environ[k]
+        self.assertEqual(self._agent_dataset(iface_keys, os_environ), "mlpab_run")
+
+    def test_resync_leaves_undeclared_keys_untouched(self):
+        # A prefix that is NOT a declared .env key never sat in keys, so it is not
+        # touched by the re-sync and survives via os.environ (e.g. hopsworks).
+        iface_keys = {"GCP_BQ_DATASET": "mlpab"}
+        for k in ("GCP_BQ_DATASET", "MLPAB_GCP_PREFIX"):
+            if k in iface_keys:
+                iface_keys[k] = "mlpab_run"
+        self.assertNotIn("MLPAB_GCP_PREFIX", iface_keys)
 
 
 if __name__ == "__main__":

@@ -216,9 +216,21 @@ def _clone_tree(src: Path, dst: Path) -> None:
             subprocess.run(["cp", "-R", str(child), str(target)], check=True, timeout=600)
 
 
+# Gateway timeouts in a platform step's output mean the backend's mutation path
+# is wedged (observed live 2026-07-13: nginx 504 on every hopsworks project
+# create/delete while reads worked). Best-effort steps still exit 0 then — e.g.
+# hopsworks setup.py swallows the failed create — so without scanning their
+# output the run dies later at the setup-verify gate with no visible cause.
+_AUX_GATEWAY_TIMEOUT = re.compile(r"HTTP code:\s*504|Gateway\s*Time-?out", re.IGNORECASE)
+
+
 def _run_aux(steps: list[str], run_dir: Path, env: dict[str, str], timeout: int = 60) -> None:
-    """Best-effort platform housekeeping (serve/teardown). Failures ignored and
-    output discarded — not part of the agent's work.
+    """Best-effort platform housekeeping (serve/teardown). Failures never abort
+    the run, but they are not silent either: a step that exits non-zero, times
+    out, or reports an HTTP 504 gateway timeout (even with exit 0 — these steps
+    swallow their own errors by design) has its output echoed to the run's
+    console (and into agent.log via the tee), so a wedged platform is visible
+    in every run instead of only at the later setup-verify abort.
 
     Setup/teardown scripts run with the per-run venv python, whose site-packages
     carry the request-logging shim — so the api-log env vars are stripped here.
@@ -229,18 +241,40 @@ def _run_aux(steps: list[str], run_dir: Path, env: dict[str, str], timeout: int 
     """
     aux_env = {k: v for k, v in env.items() if k not in ("MLPAB_API_LOG", "MLPAB_IFACE_SDK")}
     for cmd in steps:
+        note = ""
+        out = b""
         try:
-            subprocess.run(
+            proc = subprocess.run(
                 cmd,
                 shell=True,
                 cwd=str(run_dir),
                 env=aux_env,
                 timeout=timeout,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
             )
-        except Exception:
-            pass
+            out = proc.stdout or b""
+            if proc.returncode != 0:
+                note = f"exit {proc.returncode}"
+        except subprocess.TimeoutExpired as e:
+            out = e.stdout or b""
+            note = f"timed out after {timeout}s"
+        except Exception as e:
+            note = str(e)
+        text = out.decode("utf-8", "replace")
+        if not note and _AUX_GATEWAY_TIMEOUT.search(text):
+            note = "HTTP 504 gateway timeout in output"
+        if note:
+            # Scrub credentials before anything reaches the console/agent.log —
+            # the command line too (steps usually reference $VARS, but a
+            # manifest-inlined value would otherwise leak verbatim).
+            tail = redact.redact(text, env=aux_env).strip()[-1000:]
+            print(
+                f"[mlpab] platform step degraded ({note}): {redact.redact(cmd, env=aux_env)}"
+                + (f"\n{tail}" if tail else ""),
+                file=sys.stderr,
+                flush=True,
+            )
 
 
 def _verify_platform(
@@ -584,8 +618,13 @@ def run(spec: RunSpec) -> results.Row:
         # environment unchanged. A fresh name every run (matching the old
         # setup.py behavior) also sidesteps the backend's async namespace/Kafka
         # delete race documented in setup.py.
+        # Keys this block overrides on os.environ for per-run isolation. Collected
+        # so we can re-sync them into interface_setup.keys below (see there for
+        # why): the override must beat the stale .env value that keys captured.
+        run_override_keys: list[str] = []
         if spec.platform == "hopsworks":
             os.environ["HOPSWORKS_PROJECT"] = f"mlpab{secrets.token_hex(3)}"
+            run_override_keys += ["HOPSWORKS_PROJECT"]
         # Per-run Databricks namespace, the same single-source-of-truth pattern.
         # Databricks has no project container whose deletion cascades, so the
         # per-run id does double duty: it names a Unity Catalog SCHEMA in the
@@ -601,6 +640,7 @@ def run(spec: RunSpec) -> results.Row:
             run = f"mlpab{secrets.token_hex(3)}"
             os.environ["MLPAB_DATABRICKS_SCHEMA"] = f"workspace.{run}"
             os.environ["MLPAB_DATABRICKS_PREFIX"] = run
+            run_override_keys += ["MLPAB_DATABRICKS_SCHEMA", "MLPAB_DATABRICKS_PREFIX"]
         # The other three clouds get the same per-run isolation. AWS and Azure
         # feature stores are flat namespaces (no schema to hide in), so the
         # per-run id is purely a NAME PREFIX the agent stamps on every resource
@@ -613,12 +653,28 @@ def run(spec: RunSpec) -> results.Row:
         # without their start/end teardowns deleting each other's resources.
         if spec.platform == "aws":
             os.environ["MLPAB_AWS_PREFIX"] = f"mlpab{secrets.token_hex(3)}"
+            run_override_keys += ["MLPAB_AWS_PREFIX"]
         if spec.platform == "azure":
             os.environ["MLPAB_AZURE_PREFIX"] = f"mlpab{secrets.token_hex(3)}"
+            run_override_keys += ["MLPAB_AZURE_PREFIX"]
         if spec.platform == "gcp":
             run = f"mlpab{secrets.token_hex(3)}"
             os.environ["MLPAB_GCP_PREFIX"] = run
             os.environ["GCP_BQ_DATASET"] = f"mlpab_{run}"
+            run_override_keys += ["MLPAB_GCP_PREFIX", "GCP_BQ_DATASET"]
+        # These per-run overrides were just set on os.environ, but
+        # interface_setup.keys was resolved from .env BEFORE this block ran, so
+        # for any key the manifest ALSO declares (gcp's GCP_BQ_DATASET is the
+        # live case) it still holds the stale base value. Every setup/agent/
+        # teardown env dict below merges interface_setup.keys LAST, so that stale
+        # value would win and silently defeat the per-run isolation — the agent
+        # writes to the base dataset while the grader (pure os.environ, no keys
+        # merge) reads the per-run one and finds nothing. Re-sync ONLY the keys
+        # we just overrode (not all declared keys — manifest-literal values must
+        # not be clobbered) so the override is authoritative everywhere.
+        for _k in run_override_keys:
+            if _k in interface_setup.keys:
+                interface_setup.keys[_k] = os.environ[_k]
         base_keys_env = {
             **os.environ,
             **interface_setup.keys,
@@ -643,6 +699,15 @@ def run(spec: RunSpec) -> results.Row:
         # deliverable it never had a chance to create).
         ok, detail = _verify_platform("setup", spec.platform, run_dir, base_keys_env)
         if not ok:
+            # Echo the reason inside the tee first: the abort below only prints
+            # at top level, and a detached tmux session's pane dies with it —
+            # leaving an empty agent.log as the sole (useless) trace otherwise.
+            print(
+                f"[mlpab] ABORT: platform setup verification failed for "
+                f"{spec.platform!r}:\n{detail.strip()[-1000:]}",
+                file=sys.stderr,
+                flush=True,
+            )
             # PlatformNotReadyError aborts the whole config (the treatment loop
             # re-raises it) — every later run would hit the same broken platform.
             raise preflight_mod.PlatformNotReadyError(
@@ -752,19 +817,17 @@ def run(spec: RunSpec) -> results.Row:
         # grading.json lives grader-side, next to the answer key.
         (attempt_dir / "solution" / "grading.json").write_text(json.dumps(grading, indent=2))
 
-        usage = results.parse_transcript_usage(cr.transcript_path, model=spec.model, price=spec.price)
+        usage = results.parse_transcript_usage(
+            cr.transcript_path, model=spec.model, price=spec.price
+        )
         # Counting classifies by the ACTIVE interface only: a `hops`/`import
         # hopsworks` call is `cli_calls`/`sdk_calls` ONLY when that interface is
         # under test. (interface_setup markers are resolved for ALL interfaces to
         # feed the cross-interface enforcement HOOK, but counting must not relabel
         # an off-interface call as on-interface.)
         count_cli = interface_setup.cli_binary if iface_base == "cli" else None
-        count_cli_sub = (
-            interface_setup.cli_subcommand if iface_base == "cli" else None
-        )
-        count_cli_aux = (
-            interface_setup.cli_aux_commands if iface_base == "cli" else None
-        )
+        count_cli_sub = interface_setup.cli_subcommand if iface_base == "cli" else None
+        count_cli_aux = interface_setup.cli_aux_commands if iface_base == "cli" else None
         count_sdk = interface_setup.sdk_module if iface_base == "sdk" else None
         counts = results.aggregate_commands(
             cr.transcript_path,

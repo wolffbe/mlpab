@@ -485,7 +485,10 @@ def run_treatments(
     if retry:
         pruned = results.prune_runs(global_csv, run_id, retry_combos)
         if pruned:
-            print(f"[mlpab] --retry: removed {pruned} failed run row(s) — re-running them.", flush=True)
+            print(
+                f"[mlpab] --retry: removed {pruned} failed run row(s) — re-running them.",
+                flush=True,
+            )
 
     expanded = [e for e in config.runs for _ in range(config.repeats)]
     next_attempt: dict[Path, int] = {}
@@ -582,6 +585,7 @@ def run_treatments(
             f"asserts={row.asserts_passed}/{row.total_asserts}  "
             f"tokens={row.total_tokens}  wall={row.wall_time_s:.1f}s  cost=${row.cost_usd:.4f}"
         )
+
     if concurrency == 1:
         # Sequential path — unchanged behavior. A failed platform setup aborts
         # the whole config (every later run would hit the same broken platform).
@@ -615,9 +619,7 @@ def run_treatments(
             f"[mlpab] running {total} runs at concurrency={concurrency} "
             f"(one Hopsworks project per run; live output → each run's agent.log)"
         )
-        with ProcessPoolExecutor(
-            max_workers=concurrency, initializer=_pool_worker_init
-        ) as pool:
+        with ProcessPoolExecutor(max_workers=concurrency, initializer=_pool_worker_init) as pool:
             futures = {
                 pool.submit(runner.run, spec): (i, spec) for i, (spec, _label) in enumerate(plan, 1)
             }

@@ -177,9 +177,7 @@ def main(all_mode: bool = False) -> None:
         # still points at the SHARED base dataset (e.g. a manual prefix-only run)
         # must NOT nuke it — fall back to emptying its tables.
         if _RUN_MODE and dataset.startswith("mlpab_"):
-            bq.delete_dataset(
-                f"{project}.{dataset}", delete_contents=True, not_found_ok=True
-            )
+            bq.delete_dataset(f"{project}.{dataset}", delete_contents=True, not_found_ok=True)
             print(f"[gcp teardown] dropped per-run dataset {dataset}")
         else:
             for t in bq.list_tables(f"{project}.{dataset}"):

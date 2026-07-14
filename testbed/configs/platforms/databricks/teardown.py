@@ -300,7 +300,9 @@ def _lakebase_table_scopes(run_mode: bool) -> list[tuple[str, str]]:
         schemas = (
             _try("GET", "/api/2.1/unity-catalog/schemas", query={"catalog_name": cn}) or {}
         ).get("schemas") or []
-        out += [(cn, s["name"]) for s in schemas if s.get("name") and s["name"] != "information_schema"]
+        out += [
+            (cn, s["name"]) for s in schemas if s.get("name") and s["name"] != "information_schema"
+        ]
     return out
 
 
@@ -327,16 +329,23 @@ def _sweep_lakebase(run_mode: bool, me: str) -> None:
     #    the backing instance. Full-sweep scans all non-system schemas so the
     #    janitor catches foreign tables wherever an agent placed them.
     for cat, sch in _lakebase_table_scopes(run_mode):
-        resp = _try(
-            "GET",
-            "/api/2.1/unity-catalog/tables",
-            query={"catalog_name": cat, "schema_name": sch},
-        ) or {}
+        resp = (
+            _try(
+                "GET",
+                "/api/2.1/unity-catalog/tables",
+                query={"catalog_name": cat, "schema_name": sch},
+            )
+            or {}
+        )
         for t in resp.get("tables") or []:
             full = t.get("full_name")
             if full and t.get("table_type") == "FOREIGN":
                 if (
-                    _try("DELETE", f"/api/2.0/database/synced_tables/{full}", query={"purge_data": "true"})
+                    _try(
+                        "DELETE",
+                        f"/api/2.0/database/synced_tables/{full}",
+                        query={"purge_data": "true"},
+                    )
                     is not None
                 ):
                     print(f"[databricks teardown] deleted lakebase synced table {full!r}")
@@ -401,7 +410,11 @@ def _sweep_unity_catalog_run() -> None:
                 print(f"[databricks teardown] deleted catalog {name!r}")
     # Extra prefixed schemas in the workspace catalog (besides the run schema).
     schemas = (
-        _try("GET", "/api/2.1/unity-catalog/schemas", query={"catalog_name": _RUN_CATALOG or "workspace"})
+        _try(
+            "GET",
+            "/api/2.1/unity-catalog/schemas",
+            query={"catalog_name": _RUN_CATALOG or "workspace"},
+        )
         or {}
     ).get("schemas") or []
     for sch in schemas:
@@ -432,9 +445,7 @@ def main(all_mode: bool = False) -> None:
 
     run_mode = bool(PREFIX) and not all_mode
     if run_mode:
-        print(
-            f"[databricks teardown] per-run mode: prefix {PREFIX!r}, schema {SCHEMA_FQN!r}"
-        )
+        print(f"[databricks teardown] per-run mode: prefix {PREFIX!r}, schema {SCHEMA_FQN!r}")
     else:
         why = "forced (--all)" if all_mode else "no run prefix set"
         print(f"[databricks teardown] full-sweep mode ({why}): user {me!r}")
@@ -479,7 +490,9 @@ def main(all_mode: bool = False) -> None:
         resp = _try("GET", "/api/2.1/jobs/runs/list", query=query) or {}
         for run in resp.get("runs") or []:
             delete = (
-                _has_prefix(run.get("run_name")) if run_mode else _mine(run, me, "creator_user_name")
+                _has_prefix(run.get("run_name"))
+                if run_mode
+                else _mine(run, me, "creator_user_name")
             )
             if run.get("run_id") and delete:
                 _try("POST", "/api/2.1/jobs/runs/cancel", {"run_id": run["run_id"]})
@@ -607,7 +620,10 @@ def main(all_mode: bool = False) -> None:
     if run_mode:
         # No label: the run subdir often does not exist (the agent created no
         # workspace files), so a 404 here is the normal case, not a failure.
-        if _try("POST", "/api/2.0/workspace/delete", {"path": run_home, "recursive": True}) is not None:
+        if (
+            _try("POST", "/api/2.0/workspace/delete", {"path": run_home, "recursive": True})
+            is not None
+        ):
             print(f"[databricks teardown] deleted workspace path {run_home!r}")
         store = f"/FileStore/{PREFIX}"
         if _try("POST", "/api/2.0/dbfs/delete", {"path": store, "recursive": True}) is not None:
@@ -669,6 +685,7 @@ def verify(all_mode: bool = False) -> int:
         return _mine(item, me, *creator_keys)
 
     resp = _try("GET", "/api/2.0/serving-endpoints") or {}
+
     # Use only the LIST item's embedded served-entity config here (no per-endpoint
     # GET) — verify is advisory and must stay cheap regardless of endpoint count.
     def _ep_refs(e):

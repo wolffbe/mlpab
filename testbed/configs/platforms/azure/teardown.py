@@ -129,8 +129,16 @@ def verify(all_mode: bool = False) -> int:
     _RUN_MODE = bool(PREFIX) and not all_mode
     try:
         ws = _ml(workspace=os.environ.get("AZUREML_WORKSPACE_NAME"))
-        online = [getattr(e, "name", "?") for e in ws.online_endpoints.list() if _scoped(getattr(e, "name", None))]
-        batch = [getattr(e, "name", "?") for e in ws.batch_endpoints.list() if _scoped(getattr(e, "name", None))]
+        online = [
+            getattr(e, "name", "?")
+            for e in ws.online_endpoints.list()
+            if _scoped(getattr(e, "name", None))
+        ]
+        batch = [
+            getattr(e, "name", "?")
+            for e in ws.batch_endpoints.list()
+            if _scoped(getattr(e, "name", None))
+        ]
     except Exception as e:
         print(f"[azure verify-teardown] NO CONNECTION: {e}")
         return 1

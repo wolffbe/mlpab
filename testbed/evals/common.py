@@ -88,9 +88,7 @@ def read_deliverable(read_fn):
         raise  # deterministic miss / adapter limit — pass through
     except Exception as e:  # noqa: BLE001 — read failed: the result was not given
         if _is_empty_feature_group(e):
-            raise LookupError(
-                "feature group exists but has no data (no rows were ingested)"
-            ) from e
+            raise LookupError("feature group exists but has no data (no rows were ingested)") from e
         raise RuntimeError(f"{e} [root cause: {' <- '.join(_cause_chain(e))}]") from e
 
 

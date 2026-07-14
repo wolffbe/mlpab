@@ -158,7 +158,10 @@ class PerRunIsolationWiringTests(unittest.TestCase):
         ):
             path = (
                 Path(__file__).resolve().parents[1]
-                / "configs" / "platforms" / platform / "teardown.py"
+                / "configs"
+                / "platforms"
+                / platform
+                / "teardown.py"
             )
             with mock.patch.dict(os.environ, {var: "mlpabXYZ"}, clear=False):
                 spec = importlib.util.spec_from_file_location(f"{platform}_td", path)

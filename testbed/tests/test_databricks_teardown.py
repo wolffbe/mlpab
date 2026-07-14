@@ -17,7 +17,9 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-_TEARDOWN = Path(__file__).resolve().parents[1] / "configs" / "platforms" / "databricks" / "teardown.py"
+_TEARDOWN = (
+    Path(__file__).resolve().parents[1] / "configs" / "platforms" / "databricks" / "teardown.py"
+)
 
 ME = "me@example.com"
 OTHER = "someone@else.com"
@@ -126,8 +128,12 @@ class PerRunScopeTests(unittest.TestCase):
                 {"name": "foreign_ep", "creator": ME},
             ],
             serving_detail={
-                "feat_ep": {"config": {"served_entities": [{"entity_name": f"{SCHEMA}.transactions"}]}},
-                "foreign_ep": {"config": {"served_entities": [{"entity_name": "workspace.other.x"}]}},
+                "feat_ep": {
+                    "config": {"served_entities": [{"entity_name": f"{SCHEMA}.transactions"}]}
+                },
+                "foreign_ep": {
+                    "config": {"served_entities": [{"entity_name": "workspace.other.x"}]}
+                },
             },
             pipelines=[
                 {"pipeline_id": "p1", "name": f"{PREFIX}_pipe"},
@@ -197,8 +203,13 @@ class PerRunScopeTests(unittest.TestCase):
         with mock.patch.object(mod, "_api", api):
             mod.main()
         posted = dict(api.posted())
-        self.assertEqual(posted.get("/api/2.0/workspace/delete"), {"path": f"/Users/{ME}/{PREFIX}", "recursive": True})
-        self.assertEqual(posted.get("/api/2.0/dbfs/delete"), {"path": f"/FileStore/{PREFIX}", "recursive": True})
+        self.assertEqual(
+            posted.get("/api/2.0/workspace/delete"),
+            {"path": f"/Users/{ME}/{PREFIX}", "recursive": True},
+        )
+        self.assertEqual(
+            posted.get("/api/2.0/dbfs/delete"), {"path": f"/FileStore/{PREFIX}", "recursive": True}
+        )
 
 
 class FoundationModelSkipTests(unittest.TestCase):

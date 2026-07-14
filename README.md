@@ -39,7 +39,7 @@ banter/
 
 ## How a run works
 
-1. A treatment config (`configs/treatments/<platform>/<platform>-<engine>.yaml`, where `<engine>` is `claude`, `gpt`, or `mistral`) expands into a grid of runs over models, interfaces, skills, and tasks.
+1. A treatment config (`configs/treatments/<n>_<name>.yaml`, a numbered flat file) expands into a grid of runs over models, interfaces, skills, and tasks.
 2. A session-start check confirms that every platform credential, skill bundle, and model is available and responds to a live probe before any work begins.
 3. Each interface is built once and installed into a per-interface prepared virtual environment. Every run then clones that environment read-only, so runs do not reinstall anything or mutate shared state, and parallel sessions do not interfere.
 4. For each run: a fresh seeded task instance is generated, `setup.py` provisions the platform and a `verify` step confirms it is ready, the sandboxed agent attempts the task using only its interface, then `teardown.py` removes what the agent created and a `verify` step confirms nothing was left behind.
@@ -56,6 +56,21 @@ banter/
 | ops | `drift`, `prediction_monitoring`, `scheduled_jobs`, `alerting`, `lineage` |
 | capstone | `ccfraud`, `airquality` |
 
+### Treatments (`configs/treatments/`)
+
+The committed treatment configs are the experiments behind the thesis results.
+Each is a numbered flat yaml; its results live under `results/<n>_<name>/`.
+
+| Treatments | Experiment |
+|---|---|
+| 1–4 | Hopsworks, full grid (CLI + SDK, with and without skills) across models: Opus, Mistral Large, Sonnet, Mistral Medium |
+| 5–10 | Hopsworks CLI optimization arms opt1–opt6 (batch, session-reuse, compact-json, idempotent, quiet, stable-output), Opus, no skills |
+| 11 | Hopsworks CLI with an AI-optimized skills bundle, Opus |
+| 12–17 | Hopsworks CLI optimization arms opt1–opt6 combined with the optimized skills bundle, Opus |
+| 18–21 | Databricks, full grid across models: Opus, Sonnet, Mistral Large, Mistral Medium |
+| 22 | GCP Vertex, full grid, Opus |
+| 23–24 | Hopsworks and Databricks, full grid, Fable |
+
 ## Quickstart
 
 ```bash
@@ -64,21 +79,21 @@ make install        # create .venv, install mlpab + evals + dev tools, link `mlp
 make setup          # interactive: authenticate agent engine(s) and set up platform(s)
 
 # Verify a config is runnable: platform reachable, and each model answers a live probe
-make check CONFIG=configs/treatments/aws/aws-claude.yaml
+make check CONFIG=configs/treatments/1_hw-full-cli-sdk-skills-opus.yaml
 
 # Run a treatment session in tmux, detached from any terminal
-mlpab start configs/treatments/databricks/databricks-claude.yaml
+mlpab start configs/treatments/18_db-full-cli-sdk-skills-opus.yaml
 mlpab status                # list running sessions
 mlpab attach <config.yaml>  # watch live (detach with Ctrl-b d)
 
 # Or run inline
-mlpab run configs/treatments/gcp/gcp-mistral.yaml
+mlpab run configs/treatments/22_gcp-full-cli-sdk-skills-opus.yaml
 
 # Resume: re-running a config skips combos already completed — a valid row whose
 # run folder still exists on disk. --retry also re-runs FAILED combos (no valid
 # row, or a valid row whose folder was deleted), purging their rows + folders
 # and running clean; --no-skip re-runs every combo, accumulating attempts.
-mlpab run --retry configs/treatments/databricks/databricks-claude.yaml
+mlpab run --retry configs/treatments/18_db-full-cli-sdk-skills-opus.yaml
 ```
 
 Credentials are read from `testbed/.env`. macOS is the primary target. It uses

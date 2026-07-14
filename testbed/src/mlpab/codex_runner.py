@@ -311,7 +311,9 @@ def _rate_limited(raw_path: Path, stderr_path: Path) -> bool:
     "message":...}` events (and on stderr)."""
 
     def _err_text(event: dict) -> str:
-        return str(event.get("message") or "") if (event.get("type") or "").lower() == "error" else ""
+        return (
+            str(event.get("message") or "") if (event.get("type") or "").lower() == "error" else ""
+        )
 
     return streaming_is_rate_limited(raw_path, stderr_path, _err_text, _codex_text_is_retryable)
 

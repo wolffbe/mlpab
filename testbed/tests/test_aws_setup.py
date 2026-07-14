@@ -8,7 +8,6 @@ import json
 import os
 import unittest
 from pathlib import Path
-from unittest import mock
 
 _SETUP = Path(__file__).resolve().parents[1] / "configs" / "platforms" / "aws" / "setup.py"
 

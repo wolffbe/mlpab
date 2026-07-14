@@ -1,0 +1,68 @@
+import mlflow
+import os
+import sys
+
+# Set up MLflow to use Unity Catalog
+mlflow.set_registry_uri("databricks-uc")
+
+# Set the experiment path
+mlflow.set_experiment("/Users/benedict@hopsworks.ai/mlpab6a1230/scorer_experiment")
+
+# Define the predict function
+def predict(context, model_input):
+    # Import the scorer module
+    import json
+    import math
+    
+    # Model weights
+    A = 2.653901
+    B = 1.890485
+    C = 1.091312
+    D = 1.69396
+    
+    def _trigram_weight(tri):
+        o0, o1, o2 = (ord(ch) for ch in tri)
+        return math.sin(A * o0 + B * o1 + C * o2 + D)
+    
+    def score(text):
+        ll = 0.0
+        for i in range(len(text) - 2):
+            ll += _trigram_weight(text[i:i + 3])
+        return {"score": round(ll, 6)}
+    
+    # Handle different input formats
+    result = model_input
+    if isinstance(model_input, dict):
+        if "inputs" in model_input:
+            result = model_input["inputs"]
+        elif "data" in model_input:
+            result = model_input["data"]
+        elif "text" in model_input:
+            result = model_input["text"]
+    if isinstance(result, list):
+        result = result[0]
+    if isinstance(result, str):
+        return score(result)
+    return {"score": 0.0}
+
+# Create and log the model
+with mlflow.start_run() as run:
+    # Log the model with a custom Python model
+    class ScorerWrapper(mlflow.pyfunc.PythonModel):
+        def __init__(self):
+            super().__init__()
+        
+        def load_context(self, context):
+            pass
+        
+        def predict(self, context, model_input):
+            return predict(context, model_input)
+    
+    # Log the model
+    model_uri = mlflow.pyfunc.log_model(
+        artifact_path="scorer_model",
+        python_model=ScorerWrapper(),
+        registered_model_name="workspace.mlpab6a1230.scorer40bb09"
+    )
+    
+    print(f"Model registered: {model_uri}")

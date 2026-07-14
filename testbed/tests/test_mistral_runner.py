@@ -54,9 +54,11 @@ class AgentEnvTests(unittest.TestCase):
             captured["env"] = env
             return _FakeProc()
 
-        with mock.patch.object(mistral_runner.shutil, "which", return_value="/usr/bin/vibe"), \
-             mock.patch.object(mistral_runner.subprocess, "Popen", _fake_popen), \
-             mock.patch.dict(os.environ, {"MISTRAL_API_KEY": "x"}, clear=False):
+        with (
+            mock.patch.object(mistral_runner.shutil, "which", return_value="/usr/bin/vibe"),
+            mock.patch.object(mistral_runner.subprocess, "Popen", _fake_popen),
+            mock.patch.dict(os.environ, {"MISTRAL_API_KEY": "x"}, clear=False),
+        ):
             mistral_runner.run(
                 prompt="hi",
                 run_dir=run_dir,
@@ -194,7 +196,9 @@ class RateLimitDetectionTests(unittest.TestCase):
         self.assertTrue(mistral_runner._rate_limited(raw, err))
 
     def test_role_error_content_is_rate_limited(self):
-        raw, err = self._files([json.dumps({"role": "error", "content": "rate_limit hit, slow down"})])
+        raw, err = self._files(
+            [json.dumps({"role": "error", "content": "rate_limit hit, slow down"})]
+        )
         self.assertTrue(mistral_runner._rate_limited(raw, err))
 
     def test_stderr_rate_limit_is_detected(self):

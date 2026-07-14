@@ -38,9 +38,7 @@ class DisconnectDetectionTests(unittest.TestCase):
 
     def _write_result(self, path: Path, *, is_error: bool, text: str) -> None:
         path.write_text(
-            json.dumps(
-                {"type": "result", "is_error": is_error, "subtype": "x", "result": text}
-            )
+            json.dumps({"type": "result", "is_error": is_error, "subtype": "x", "result": text})
             + "\n"
         )
 
@@ -60,9 +58,11 @@ class DisconnectDetectionTests(unittest.TestCase):
             err = Path(d) / "err"
             err.write_text("")
             tr.write_text(
-                json.dumps({"type": "assistant", "message": {"content": []}}) + "\n"
+                json.dumps({"type": "assistant", "message": {"content": []}})
+                + "\n"
                 + "API Error: The socket connection was closed unexpectedly.\n"
-                + json.dumps({"type": "result", "is_error": False, "result": "ok"}) + "\n"
+                + json.dumps({"type": "result", "is_error": False, "result": "ok"})
+                + "\n"
             )
             self.assertTrue(cr._attempt_is_disconnect(tr, err))
 

@@ -165,8 +165,7 @@ class DatabricksChecker:
         for src in ("system.information_schema.tables", f"{CATALOG}.information_schema.tables"):
             try:
                 df = self._sql(
-                    "SELECT table_catalog, table_schema FROM "
-                    f"{src} WHERE table_name = '{name}'"
+                    f"SELECT table_catalog, table_schema FROM {src} WHERE table_name = '{name}'"
                 )
             except Exception:
                 continue
@@ -189,10 +188,15 @@ class DatabricksChecker:
             def rank(cs):
                 cat, sch = cs
                 return (
-                    0 if (cat == self._catalog and sch == self._schema_name) else
-                    1 if (cat == CATALOG and sch == DEFAULT_SCHEMA) else
-                    2 if cat == CATALOG else
-                    3 if sch == DEFAULT_SCHEMA else 4,
+                    0
+                    if (cat == self._catalog and sch == self._schema_name)
+                    else 1
+                    if (cat == CATALOG and sch == DEFAULT_SCHEMA)
+                    else 2
+                    if cat == CATALOG
+                    else 3
+                    if sch == DEFAULT_SCHEMA
+                    else 4,
                     cat,
                     sch,
                 )
@@ -233,9 +237,7 @@ class DatabricksChecker:
         # deliverable" resolves to the explicitly versioned table, then fall
         # back to the bare name (the single-table realization).
         candidates = (
-            [f"{name}_v{version}", f"{name}_{version}", name]
-            if version is not None
-            else [name]
+            [f"{name}_v{version}", f"{name}_{version}", name] if version is not None else [name]
         )
         fqn = None
         for cand in candidates:
@@ -459,9 +461,7 @@ def _state_reads(cls):
         if not run_id:
             return {}
         try:
-            r = self._w.api_client.do(
-                "GET", "/api/2.0/mlflow/runs/get", query={"run_id": run_id}
-            )
+            r = self._w.api_client.do("GET", "/api/2.0/mlflow/runs/get", query={"run_id": run_id})
         except Exception:
             return {}
         data = (r.get("run") or {}).get("data") or {}
@@ -538,10 +538,9 @@ def _state_reads(cls):
                     return str(getattr(getattr(j, "settings", None), "name", "") or "")
 
                 allj = list(self._w.jobs.list())
-                jobs = (
-                    [j for j in allj if _jname(j).lower() == low]
-                    or [j for j in allj if low in _jname(j).lower()]
-                )
+                jobs = [j for j in allj if _jname(j).lower() == low] or [
+                    j for j in allj if low in _jname(j).lower()
+                ]
             if not jobs:
                 return {"exists": False}
             j = self._w.jobs.get(jobs[0].job_id)

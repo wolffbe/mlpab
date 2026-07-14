@@ -28,9 +28,7 @@ class DotenvGroupTests(unittest.TestCase):
             return text
 
     def test_groups_separated_by_blank_line_with_headers(self):
-        text = self._run(
-            {"HOPSWORKS_API_KEY": "h", "GCP_PROJECT": "g", "ANTHROPIC_API_KEY": "a"}
-        )
+        text = self._run({"HOPSWORKS_API_KEY": "h", "GCP_PROJECT": "g", "ANTHROPIC_API_KEY": "a"})
         # Blank line separates groups.
         self.assertIn("\n\n", text)
         # Each group carries its header comment.

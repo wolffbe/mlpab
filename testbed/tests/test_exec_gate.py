@@ -129,11 +129,7 @@ class VibeStyleEndToEndTest(unittest.TestCase):
 
     def test_executable_shell_blocks_offinterface(self):
         async def _go():
-            env = {
-                k: v
-                for k, v in os.environ.items()
-                if not k.startswith("TESTBED_")
-            }
+            env = {k: v for k, v in os.environ.items() if not k.startswith("TESTBED_")}
             env.update(
                 {
                     "TESTBED_INTERFACE": "cli",

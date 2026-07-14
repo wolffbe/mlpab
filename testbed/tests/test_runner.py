@@ -103,7 +103,9 @@ class PrepareReseedTests(unittest.TestCase):
         seen = []
         # always-failing gate: prepare gives up after _MAX_RESEEDS tries
         with self.assertRaises(RuntimeError) as ctx:
-            self._prepare_with(self._fake_generator(10**9, seen), "anytask", self._attempt_dir(), 4242)
+            self._prepare_with(
+                self._fake_generator(10**9, seen), "anytask", self._attempt_dir(), 4242
+            )
         self.assertEqual(len(seen), evals_provider._MAX_RESEEDS)
         self.assertNotIn("GateError", type(ctx.exception).__name__)  # surfaced as RuntimeError
 
@@ -200,6 +202,62 @@ class RunAuxTests(unittest.TestCase):
         self.assertIn("HOPSWORKS_API_KEY=kept", text)
         # The caller's env dict is not mutated.
         self.assertIn("MLPAB_API_LOG", env)
+
+
+class RunAuxDegradedTests(unittest.TestCase):
+    """_run_aux stays best-effort (never raises), but a degraded step must be
+    VISIBLE in the run console: non-zero exit, timeout, and — the wedged-cluster
+    case — an HTTP 504 gateway timeout reported by a step that itself exits 0
+    (setup/teardown scripts swallow their own errors by design, so the 504 only
+    exists in their output). Without this, a 504-wedged platform leaves a dead
+    session and an empty agent.log as the only trace (observed 2026-07-13)."""
+
+    def setUp(self):
+        import tempfile
+
+        self.run_dir = Path(tempfile.mkdtemp())
+        self.env = {"PATH": os.environ.get("PATH", "")}
+
+    def _stderr_of(self, steps, **kwargs) -> str:
+        import contextlib
+        import io
+
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            runner._run_aux(steps, self.run_dir, self.env, **kwargs)
+        return buf.getvalue()
+
+    def test_clean_step_prints_nothing(self):
+        self.assertEqual(self._stderr_of(['echo "created project ok"']), "")
+
+    def test_nonzero_exit_is_surfaced_with_output(self):
+        err = self._stderr_of(['echo "boom reason"; exit 3'])
+        self.assertIn("platform step degraded (exit 3)", err)
+        self.assertIn("boom reason", err)
+
+    def test_504_in_output_is_surfaced_despite_exit_0(self):
+        step = "echo 'create gave up: HTTP code: 504, HTTP reason: Gateway Time-out'"
+        err = self._stderr_of([step])
+        self.assertIn("HTTP 504 gateway timeout in output", err)
+        self.assertIn("Gateway Time-out", err)
+
+    def test_timeout_is_surfaced(self):
+        err = self._stderr_of(["sleep 5"], timeout=1)
+        self.assertIn("timed out after 1s", err)
+
+    def test_surfaced_output_is_redacted(self):
+        env = dict(self.env, HOPSWORKS_API_KEY="supersecretvalue123")
+        import contextlib
+        import io
+
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            runner._run_aux(
+                ['echo "failed with key supersecretvalue123"; exit 1'], self.run_dir, env
+            )
+        err = buf.getvalue()
+        self.assertIn("platform step degraded", err)
+        self.assertNotIn("supersecretvalue123", err)
 
 
 class DetectEnvironmentTests(unittest.TestCase):

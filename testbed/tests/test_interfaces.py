@@ -59,9 +59,7 @@ class KeysTests(InterfaceTestBase):
         self.assertEqual(interfaces.optional_keys("svc", "sdk"), {"ROLE_ARN"})
         self.assertEqual(interfaces.keys_for("svc", "sdk"), {"API_KEY": "", "ROLE_ARN": ""})
         # API_KEY present in env, ROLE_ARN absent → nothing missing.
-        self.assertEqual(
-            interfaces.missing_keys("svc", "sdk", env={"API_KEY": "x"}), []
-        )
+        self.assertEqual(interfaces.missing_keys("svc", "sdk", env={"API_KEY": "x"}), [])
         # API_KEY absent → only the required key is reported.
         self.assertEqual(interfaces.missing_keys("svc", "sdk", env={}), ["API_KEY"])
 
@@ -238,7 +236,7 @@ class LoginEnvInjectionTests(InterfaceTestBase):
             "svc",
             "cli",
             "keys:\n  - GCP_PROJECT\n"
-            f"auth_command: |\n  sh -c 'test -n \"$CLOUDSDK_AUTH_ACCESS_TOKEN\" && "
+            f'auth_command: |\n  sh -c \'test -n "$CLOUDSDK_AUTH_ACCESS_TOKEN" && '
             f'echo "$CLOUDSDK_AUTH_ACCESS_TOKEN" > {out}\'\n'
             "prompt: hi\n",
         )
@@ -699,9 +697,7 @@ class VariantInterfaceTests(InterfaceTestBase):
 
     def test_unknown_interface_still_rejected(self):
         with self.assertRaises(ValueError):
-            interfaces.platform_interface_from_config(
-                self.configs / "svc" / "kli-bogus.yaml"
-            )
+            interfaces.platform_interface_from_config(self.configs / "svc" / "kli-bogus.yaml")
 
 
 if __name__ == "__main__":

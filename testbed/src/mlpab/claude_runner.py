@@ -137,7 +137,10 @@ def set_enforcement_env(
     iface_base = interfaces.base_interface(interface) if interface else None
     delegating = iface_base in ("cli", "mcp", "sdk")
     _put("TESTBED_INTERFACE", iface_base if delegating else None)
-    _put("TESTBED_COMPUTE_DENY", ",".join(compute_deny or DEFAULT_COMPUTE_DENY) if delegating else None)
+    _put(
+        "TESTBED_COMPUTE_DENY",
+        ",".join(compute_deny or DEFAULT_COMPUTE_DENY) if delegating else None,
+    )
     _put("TESTBED_INSTANCE_ALLOW", ",".join(instance_allowlist) if instance_allowlist else None)
 
 
@@ -177,6 +180,7 @@ def install_exec_gate(run_dir: Path, env: dict) -> None:
             link.unlink()
         link.symlink_to(gate)
     env["PATH"] = f"{gate_dir}{os.pathsep}{env.get('PATH', '')}"
+
 
 # Bootstrapped into the agent's run venv (as `_mlpab_apilog.py` + a `.pth`
 # that imports it): wraps `requests.Session.send` to append every outbound
@@ -461,6 +465,7 @@ def text_is_disconnect_error(text: str) -> bool:
     platform output echoed in a tool result does not match."""
     t = (text or "").lower()
     return any(p in t for p in _DISCONNECT_PHRASES)
+
 
 # Auth failures. The injected CLAUDE_CODE_OAUTH_TOKEN can expire mid-session on a
 # long run (a multi-hour session once died on a 401). On these we re-pull a

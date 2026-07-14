@@ -84,9 +84,12 @@ def _connect():
     """
     import hopsworks
 
-    hostname_verification = os.getenv(
-        "HOPSWORKS_HOSTNAME_VERIFICATION", "False"
-    ).lower() in ("true", "1", "y", "yes")
+    hostname_verification = os.getenv("HOPSWORKS_HOSTNAME_VERIFICATION", "False").lower() in (
+        "true",
+        "1",
+        "y",
+        "yes",
+    )
     return hopsworks.connection(
         host=os.environ.get("HOPSWORKS_HOST"),
         port=int(os.environ.get("HOPSWORKS_PORT", "443")),

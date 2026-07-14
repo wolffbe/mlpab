@@ -170,8 +170,7 @@ def combo_key(row: dict[str, str]) -> tuple[str, ...]:
     """The combo identity of a CSV row: the COMBO_KEY_COLUMNS values, with an
     empty `skills` normalized to "none" (the config's literal `skills: none`)."""
     return tuple(
-        (row.get(c, "") or "none") if c == "skills" else row.get(c, "")
-        for c in COMBO_KEY_COLUMNS
+        (row.get(c, "") or "none") if c == "skills" else row.get(c, "") for c in COMBO_KEY_COLUMNS
     )
 
 
@@ -187,11 +186,7 @@ def prune_runs(csv_path: Path, config: str, combo_keys: set[tuple[str, ...]]) ->
         if not rows:
             return 0
         fieldnames = list(rows[0].keys())
-        kept = [
-            r
-            for r in rows
-            if not (r.get("config") == config and combo_key(r) in combo_keys)
-        ]
+        kept = [r for r in rows if not (r.get("config") == config and combo_key(r) in combo_keys)]
         removed = len(rows) - len(kept)
         if removed:
             _write_csv_atomic(csv_path, fieldnames, kept)

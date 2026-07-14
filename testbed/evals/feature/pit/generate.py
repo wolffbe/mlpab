@@ -347,9 +347,7 @@ def generate(seed: int, out: Path) -> dict:
             f"- **{name}.csv**: account_id, event_time (epoch ms), "
             + ", ".join(TABLE_FEATURES[name])
         )
-    schema.append(
-        "- **labels.csv**: account_id, label_time (epoch ms), churned (1 = churned)"
-    )
+    schema.append("- **labels.csv**: account_id, label_time (epoch ms), churned (1 = churned)")
     (out / "data" / "schema.md").write_text("\n".join(schema) + "\n")
 
     (out / "prompt.txt").write_text(_prompt(knobs, columns, dataset_name))

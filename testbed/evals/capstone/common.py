@@ -271,7 +271,9 @@ def grade_main(family: str, argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--instance", type=Path, required=True)
     ap.add_argument(
-        "--adapter", required=True, choices=["hopsworks", "databricks", "aws", "azure", "gcp", "none"]
+        "--adapter",
+        required=True,
+        choices=["hopsworks", "databricks", "aws", "azure", "gcp", "none"],
     )
     args = ap.parse_args(argv)
     report = grade_capstone(args.instance, args.adapter, Path.cwd())
