@@ -15,8 +15,12 @@ What it does, on every commit:
      length floor so short generic values (a region, "login") aren't blanket-
      replaced everywhere they coincidentally appear. Path-like values are
      skipped (a path is not a secret).
-  3. Final safety net: re-scan staged content; if any secret value somehow
-     survived (e.g. an unwritable file), refuse the commit.
+  2b. AUTO-REDACT known TOKEN SHAPES (see _TOKEN_PATTERNS) regardless of .env.
+     This catches secrets the value scan cannot: cloud tokens minted at runtime
+     and captured in agent transcripts (google ya29./1// from gcloud/ADC), and
+     secrets rotated out of .env but still sitting in already-committed results.
+  3. Final safety net: re-scan staged content; if any secret value or token
+     shape somehow survived (e.g. an unwritable file), refuse the commit.
 
 Note: redaction edits the WORKTREE copy of a staged file and re-stages it, so
 the secret is gone from both. If a file had unstaged edits on top of staged
@@ -42,6 +46,21 @@ PLACEHOLDER = b"***REDACTED***"
 # in logs; path-like values are skipped (not secrets, and would false-positive on
 # every log line that mentions the path).
 _MIN_SECRET_LEN = 12
+
+# Token-shape patterns catch secrets that never appear verbatim in .env and so
+# escape the value-based redaction above: cloud tokens minted at RUNTIME and
+# captured in agent transcripts/logs (google ya29./1// issued by gcloud/ADC),
+# and secrets ROTATED in .env but still sitting in already-committed results.
+# (The public-repo leak on 2026-07-14 was exactly this gap.) Matched by shape
+# and applied to every staged file, even when .env is absent. Floors are set
+# above realistic token lengths so short placeholders (e.g. "ya29.SECRET" in a
+# unit test) are left alone.
+_TOKEN_PATTERNS: list[tuple[str, "re.Pattern[bytes]"]] = [
+    ("databricks-pat", re.compile(rb"dapi[0-9a-f]{30,}")),
+    ("google-access", re.compile(rb"ya29\.[A-Za-z0-9_.\-]{15,}")),
+    ("google-refresh", re.compile(rb"1//[A-Za-z0-9_\-]{20,}")),
+    ("aws-key-id", re.compile(rb"AKIA[A-Z0-9]{16}")),
+]
 
 _ENV_PATH = Path(__file__).resolve().parent.parent / ".env"
 
@@ -102,7 +121,7 @@ def main() -> int:
         if env_rel and os.path.normpath(f) == os.path.normpath(env_rel):
             blocked.append(f"{f}: .env itself must not be committed")
             continue
-        if not secrets:
+        if not secrets and not _TOKEN_PATTERNS:
             continue
 
         # (2) Auto-redact in the worktree, then re-stage.
@@ -119,6 +138,11 @@ def main() -> int:
             if val in new:
                 new = new.replace(val, PLACEHOLDER)
                 hit_names.append(name)
+        # (2b) Token shapes — applied to every file, independent of .env.
+        for label, pat in _TOKEN_PATTERNS:
+            new, n = pat.subn(PLACEHOLDER, new)
+            if n:
+                hit_names.append(label)
         if new != data:
             try:
                 p.write_bytes(new)
@@ -134,7 +158,8 @@ def main() -> int:
         for i in range(0, len(to_restage), 500):
             subprocess.run(["git", "add", "--"] + to_restage[i : i + 500], check=False)
         sys.stderr.write(
-            f"pre-commit: auto-redacted .env values in {len(to_restage)} file(s): "
+            f"pre-commit: auto-redacted secrets (.env values + token shapes) in "
+            f"{len(to_restage)} file(s): "
             + ", ".join(f"{n}×{c}" for n, c in sorted(redacted.items())) + "\n"
         )
 
@@ -142,16 +167,20 @@ def main() -> int:
     # we just rewrote can still carry a secret; everything else never matched. We
     # re-read the worktree (which we just re-staged, so it IS the staged content)
     # rather than `git show` per file, to stay fast on large result trees.
-    if secrets:
+    if secrets or _TOKEN_PATTERNS:
         for f in to_restage:
             try:
                 blob = Path(f).read_bytes()
             except OSError:
                 continue
-            for name, val in secrets:
-                if val in blob:
-                    blocked.append(f"{f}: STILL contains the value of ${name} after redaction")
-                    break
+            survived = next((f"${name}" for name, val in secrets if val in blob), None)
+            if survived is None:
+                survived = next(
+                    (f"a {label}-shaped token" for label, pat in _TOKEN_PATTERNS if pat.search(blob)),
+                    None,
+                )
+            if survived is not None:
+                blocked.append(f"{f}: STILL contains {survived} after redaction")
 
     if blocked:
         sys.stderr.write("pre-commit: refusing to commit — unresolved secrets/artifacts:\n")
