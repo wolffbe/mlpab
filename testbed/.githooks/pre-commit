@@ -19,6 +19,8 @@ What it does, on every commit:
      This catches secrets the value scan cannot: cloud tokens minted at runtime
      and captured in agent transcripts (google ya29./1// from gcloud/ADC), and
      secrets rotated out of .env but still sitting in already-committed results.
+     Skipped for .ipynb (base64 chart blobs false-match the shapes); the .env
+     literal pass still covers notebooks, and raw transcripts are .jsonl/.log.
   3. Final safety net: re-scan staged content; if any secret value or token
      shape somehow survived (e.g. an unwritable file), refuse the commit.
 
@@ -63,6 +65,10 @@ _TOKEN_PATTERNS: list[tuple[str, "re.Pattern[bytes]"]] = [
 ]
 
 _ENV_PATH = Path(__file__).resolve().parent.parent / ".env"
+
+
+def _is_notebook(f: str) -> bool:
+    return f.endswith(".ipynb")
 
 
 def _staged_files() -> list[str]:
@@ -138,11 +144,20 @@ def main() -> int:
             if val in new:
                 new = new.replace(val, PLACEHOLDER)
                 hit_names.append(name)
-        # (2b) Token shapes — applied to every file, independent of .env.
-        for label, pat in _TOKEN_PATTERNS:
-            new, n = pat.subn(PLACEHOLDER, new)
-            if n:
-                hit_names.append(label)
+        # (2b) Token shapes — applied to every file, independent of .env, EXCEPT
+        # Jupyter notebooks. A committed .ipynb embeds chart images as long
+        # base64 blobs, and the `1//…`/`AKIA…` shapes false-match inside base64
+        # (it is arbitrary A-Za-z0-9+/ data), which would silently corrupt the
+        # image. Our notebooks are hand-curated chart artifacts, not agent
+        # transcripts; the real runtime-token leak vector is the run `.jsonl` /
+        # `.log` / prompt `.txt` files, which are NOT excepted here. The .env
+        # literal pass above still runs on notebooks (real secret values never
+        # occur by chance in base64).
+        if not _is_notebook(f):
+            for label, pat in _TOKEN_PATTERNS:
+                new, n = pat.subn(PLACEHOLDER, new)
+                if n:
+                    hit_names.append(label)
         if new != data:
             try:
                 p.write_bytes(new)
@@ -174,7 +189,7 @@ def main() -> int:
             except OSError:
                 continue
             survived = next((f"${name}" for name, val in secrets if val in blob), None)
-            if survived is None:
+            if survived is None and not _is_notebook(f):
                 survived = next(
                     (f"a {label}-shaped token" for label, pat in _TOKEN_PATTERNS if pat.search(blob)),
                     None,
