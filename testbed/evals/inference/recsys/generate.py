@@ -33,6 +33,12 @@ import pandas as pd
 
 from evals.common import canonicalize, digest, instance_suffix
 
+KIND = "table"  # deliverable kind: table | dataset | answers | platform
+SUMMARY = (
+    "Measures whether an agent can run a two-tower retrieval and ranking step correctly: dot- "
+    "product relevance, exclusion of already-seen items, and a deterministic tie-break."
+)
+
 N_USERS = 40
 N_ITEMS = 60
 DIM = 8

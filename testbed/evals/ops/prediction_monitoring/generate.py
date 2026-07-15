@@ -29,6 +29,12 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+KIND = "answers"  # deliverable kind: table | dataset | answers | platform
+SUMMARY = (
+    "Measures whether the agent can monitor a deployed model's prediction log and date the "
+    "point where the prediction distribution shifted."
+)
+
 ORIGIN = pd.Timestamp("2026-01-01", tz="UTC")
 N_DAYS = 90
 PER_DAY = 150  # ~150 predictions/day (±20 jitter)

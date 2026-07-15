@@ -33,6 +33,12 @@ import numpy as np
 
 from evals.common import instance_suffix
 
+KIND = "platform"  # deliverable kind: table | dataset | answers | platform
+SUMMARY = (
+    "Measures whether the agent can wire up a job-failure alert on the platform: create a job "
+    "that is guaranteed to fail, attach an alert to that failure, and report what it configured."
+)
+
 JOB_BASE = "flaky"  # per-instance: f"{JOB_BASE}{instance_suffix(seed)}"
 
 FAILING_TEMPLATE = '''"""Flaky job — this task ALWAYS fails (that is the point)."""

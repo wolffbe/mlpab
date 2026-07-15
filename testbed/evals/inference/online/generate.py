@@ -33,6 +33,9 @@ import pandas as pd
 
 from evals.common import instance_suffix
 
+KIND = "platform"  # deliverable kind: table | dataset | answers | platform
+SUMMARY = "Measures whether an agent can materialize features for online serving and retrieve them through the platform's low-latency read path, not by re-reading the source data."
+
 N_ACCOUNTS = 120
 N_LOOKUPS = 20
 FEATURES = ["f1", "f2", "f3", "f4"]

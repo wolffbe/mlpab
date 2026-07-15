@@ -32,6 +32,13 @@ from sklearn.ensemble import GradientBoostingRegressor
 from evals.capstone import common
 from evals.common import instance_suffix
 
+KIND = "platform"  # deliverable kind: table | dataset | answers | platform
+SUMMARY = (
+    "Measures whether an agent can run the full FTI lifecycle on the platform for a PM2.5 "
+    "forecasting problem: engineer features, build a training dataset, train and register a "
+    "regressor, and publish per-day predictions that beat a calibrated RMSE bar."
+)
+
 METRIC = "rmse"
 N_TEST = 90
 REGION = 0.70  # test days are sampled from the last 30% of history

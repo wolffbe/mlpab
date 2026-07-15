@@ -55,6 +55,13 @@ import pandas as pd
 
 from evals.common import instance_suffix
 
+KIND = "platform"  # deliverable kind: table | dataset | answers | platform
+SUMMARY = (
+    "Measures whether an agent can load embeddings into the platform's vector-capable store and "
+    "run its native similarity search with the correct metric (Euclidean L2, not cosine or dot "
+    "product)."
+)
+
 N_ITEMS = 300
 N_QUERIES = 25
 N_CENTERS = 6

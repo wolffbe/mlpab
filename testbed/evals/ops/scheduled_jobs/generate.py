@@ -31,6 +31,12 @@ import numpy as np
 
 from evals.common import instance_suffix
 
+KIND = "platform"  # deliverable kind: table | dataset | answers | platform
+SUMMARY = (
+    "Measures whether the agent can set up a recurring scheduled job on the platform from a "
+    "provided script and prove it ran."
+)
+
 JOB_BASE = "heartbeat"  # per-instance: f"{JOB_BASE}{instance_suffix(seed)}"
 
 HEARTBEAT_TEMPLATE = '''"""Heartbeat — a trivial periodic task. Prints one line and exits 0."""

@@ -27,6 +27,12 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+KIND = "answers"  # deliverable kind: table | dataset | answers | platform
+SUMMARY = (
+    "Measures whether an agent can find the one feature in a training dataset that leaks the "
+    "label through post-outcome computation."
+)
+
 N_ROWS = 800
 FEATURES = [f"f{i}" for i in range(1, 7)]
 

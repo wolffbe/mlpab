@@ -27,6 +27,12 @@ import pandas as pd
 
 from evals.common import canonicalize, digest, instance_suffix
 
+KIND = "platform"  # deliverable kind: table | dataset | answers | platform
+SUMMARY = (
+    "Measures whether an agent can load all daily increments into a feature table and register "
+    "a recurring, scheduled ingestion job on the platform."
+)
+
 ORIGIN = pd.Timestamp("2026-03-02", tz="UTC")
 N_INCREMENTS = 6
 ROWS_PER_INCREMENT = (90, 130)  # seeded per-file row count range

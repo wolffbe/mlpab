@@ -34,6 +34,13 @@ import pandas as pd
 from evals.common import instance_suffix
 from evals.feature.pit.reference import TABLE_FEATURES, latest_join, leaky_join, pit_join
 
+KIND = "dataset"  # deliverable kind: table | dataset | answers | platform
+SUMMARY = (
+    "Measures whether an agent can build a point-in-time-correct training dataset across "
+    "four feature tables with late-arriving rows, duplicates, and a leak-tempting table "
+    "(the task family for the `training_data` FTI sub-category)."
+)
+
 ORIGIN = pd.Timestamp("2026-01-01", tz="UTC")
 HORIZON_DAYS = 90
 LABEL_WINDOW = (55, 75)  # label_time lands in this day range

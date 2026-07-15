@@ -33,6 +33,14 @@ from sklearn.ensemble import GradientBoostingClassifier
 from evals.capstone import common
 from evals.common import instance_suffix
 
+KIND = "platform"  # deliverable kind: table | dataset | answers | platform
+SUMMARY = (
+    "Measures whether an agent can run the full FTI lifecycle on the platform for credit-card "
+    "fraud detection: engineer fraud features, build a training dataset, train and register a "
+    "classifier, and publish per-transaction fraud probabilities that beat a calibrated ROC AUC "
+    "bar."
+)
+
 METRIC = "auc"
 TEST_FRAC = 0.18
 N_CARDS = 220  # sampled per instance (of the fixture's 300)

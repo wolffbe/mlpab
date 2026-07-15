@@ -32,6 +32,12 @@ import pandas as pd
 
 from evals.common import canonicalize, digest, instance_suffix
 
+KIND = "table"  # deliverable kind: table | dataset | answers | platform
+SUMMARY = (
+    "Measures whether an agent can register a feature table and load a full export whose two "
+    "files overlap, landing every row exactly once."
+)
+
 ORIGIN = pd.Timestamp("2026-01-01", tz="UTC")
 N_ROWS = 600
 OVERLAP = 80  # rows re-delivered in the second file

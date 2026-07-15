@@ -28,6 +28,12 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+KIND = "answers"  # deliverable kind: table | dataset | answers | platform
+SUMMARY = (
+    "Measures whether the agent can detect data drift in a daily feature stream: find the "
+    "single feature whose distribution shifted and date the onset."
+)
+
 ORIGIN = pd.Timestamp("2026-01-01", tz="UTC")
 N_DAYS = 90
 N_ENTITIES = 150

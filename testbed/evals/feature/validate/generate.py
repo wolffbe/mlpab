@@ -30,6 +30,12 @@ import pandas as pd
 
 from evals.common import canonicalize, digest, instance_suffix
 
+KIND = "table"  # deliverable kind: table | dataset | answers | platform
+SUMMARY = (
+    "Measures whether an agent can enforce a documented data contract, loading only clean rows "
+    "into a feature table and reporting every rejected row id."
+)
+
 ORIGIN = pd.Timestamp("2026-02-01", tz="UTC")
 N_ROWS = 700
 NULL_FRACTION = 0.03  # nulls in amount

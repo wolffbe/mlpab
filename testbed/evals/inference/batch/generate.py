@@ -33,6 +33,9 @@ import pandas as pd
 
 from evals.common import canonicalize, digest, instance_suffix
 
+KIND = "table"  # deliverable kind: table | dataset | answers | platform
+SUMMARY = "Measures whether an agent can batch-score a whole entity population using point-in-time-correct feature values, an as-of join that must not look past the cutoff."
+
 ORIGIN = pd.Timestamp("2026-02-01", tz="UTC")
 N_ACCOUNTS = 80
 N_DAYS = 60

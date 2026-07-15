@@ -46,6 +46,9 @@ import pandas as pd
 
 from evals.common import canonicalize, digest, instance_suffix
 
+KIND = "table"  # deliverable kind: table | dataset | answers | platform
+SUMMARY = "Measures whether an agent can compute an on-demand feature at request time (a distance derived from request parameters joined with a stored profile) and apply it with the exact formula."
+
 N_REQUESTS = 400
 N_ACCOUNTS = 60
 TABLE_BASE = "scored"  # per-instance: f"{TABLE_BASE}{instance_suffix(seed)}"

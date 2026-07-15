@@ -35,6 +35,11 @@ import pandas as pd
 
 from evals.common import canonicalize, digest, instance_suffix
 
+KIND = "platform"  # deliverable kind: table | dataset | answers | platform
+SUMMARY = (
+    "Measures whether the agent can run a provided deterministic training script as a platform "
+    "job and land its predictions in an online-enabled feature table, bit-exact."
+)
 N_TRAIN = 500
 N_SCORE = 200
 FEATURES = ["f1", "f2", "f3", "f4", "f5"]

@@ -33,6 +33,12 @@ import pandas as pd
 
 from evals.common import canonicalize, digest, instance_suffix
 
+KIND = "table"  # deliverable kind: table | dataset | answers | platform
+SUMMARY = (
+    "Measures whether an agent can fully re-create a feature table after a breaking upstream "
+    "schema change instead of merging the new export into the old data."
+)
+
 ORIGIN_OLD = pd.Timestamp("2026-01-15", tz="UTC")
 ORIGIN_NEW = pd.Timestamp("2026-04-01", tz="UTC")
 N_OLD = 180

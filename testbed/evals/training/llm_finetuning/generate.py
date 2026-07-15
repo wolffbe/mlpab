@@ -49,6 +49,12 @@ import numpy as np
 from evals.common import instance_suffix
 from evals.training.llm_finetuning.grade import grade_answers
 
+KIND = "platform"  # deliverable kind: table | dataset | answers | platform
+SUMMARY = (
+    "Measures whether the agent can run a provided deterministic fine-tuning script as a "
+    "platform job, register the resulting model with its metrics, and report the exact metrics "
+    "the script produced."
+)
 VOCAB = list("abcdefghijklmnopqrstuvwxyz .")
 RANK = 4
 LEARNING_RATE = 2.0

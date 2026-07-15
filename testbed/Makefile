@@ -1,5 +1,5 @@
 .PHONY: help install setup check test lint fmt uninstall venv check-git ml-libs link unlink claude codex vibe \
-        run start stop attach status iface-test clean-runs bootstrap-aws bootstrap-azure bootstrap-gcp
+        run start stop attach status iface-test clean-runs task-docs bootstrap-aws bootstrap-azure bootstrap-gcp
 
 # Python sources to lint/format: the two packages + the platform config scripts.
 LINT_PATHS := src tests evals configs
@@ -150,6 +150,11 @@ check: venv
 
 test: venv
 	$(PY) -m unittest discover -s tests -p 'test_*.py' -v
+
+# Regenerate docs/tasks/ mechanically from the task packages (generated files —
+# never edit the pages by hand).
+task-docs: venv
+	$(PY) -m evals.export_docs
 
 # Lint (no changes): ruff check + isort/ruff-format in --check mode. CI-friendly.
 lint: venv

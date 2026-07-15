@@ -48,13 +48,20 @@ banter/
 
 ### Eval families (`evals/`)
 
-| Family | Example tasks |
+Every task has a documentation page under
+[`testbed/docs/tasks/`](testbed/docs/tasks/README.md), auto-generated from the
+task packages with `make task-docs`: the generator's design notes, the literal
+seed-1 prompt, the staged files, the assert suite, and the diagnosed naive
+variants all come straight from the code, so the pages cannot drift from the
+tasks.
+
+| Family | Tasks |
 |---|---|
-| feature | `ingest`, `backfill`, `mit`, `validate`, `incremental_load`, `full_reload`, `pit` (point-in-time correct), `leakage` |
-| training | `train`, `mdt`, `register`, `llm_finetuning` |
-| inference | `batch`, `online`, `odt`, `skew`, `llm_serving`, `recsys`, `vector_search` |
-| ops | `drift`, `prediction_monitoring`, `scheduled_jobs`, `alerting`, `lineage` |
-| capstone | `ccfraud`, `airquality` |
+| feature | [`ingest`](testbed/docs/tasks/feature/ingest.md), [`backfill`](testbed/docs/tasks/feature/backfill.md), [`mit`](testbed/docs/tasks/feature/mit.md), [`validate`](testbed/docs/tasks/feature/validate.md), [`incremental_load`](testbed/docs/tasks/feature/incremental_load.md), [`full_reload`](testbed/docs/tasks/feature/full_reload.md), [`pit`](testbed/docs/tasks/feature/pit.md) (point-in-time correct), [`leakage`](testbed/docs/tasks/feature/leakage.md) |
+| training | [`train`](testbed/docs/tasks/training/train.md), [`mdt`](testbed/docs/tasks/training/mdt.md), [`register`](testbed/docs/tasks/training/register.md), [`llm_finetuning`](testbed/docs/tasks/training/llm_finetuning.md) |
+| inference | [`batch`](testbed/docs/tasks/inference/batch.md), [`online`](testbed/docs/tasks/inference/online.md), [`odt`](testbed/docs/tasks/inference/odt.md), [`skew`](testbed/docs/tasks/inference/skew.md), [`llm_serving`](testbed/docs/tasks/inference/llm_serving.md), [`recsys`](testbed/docs/tasks/inference/recsys.md), [`vector_search`](testbed/docs/tasks/inference/vector_search.md) |
+| ops | [`drift`](testbed/docs/tasks/ops/drift.md), [`prediction_monitoring`](testbed/docs/tasks/ops/prediction_monitoring.md), [`scheduled_jobs`](testbed/docs/tasks/ops/scheduled_jobs.md), [`alerting`](testbed/docs/tasks/ops/alerting.md), [`lineage`](testbed/docs/tasks/ops/lineage.md) |
+| capstone | [`ccfraud`](testbed/docs/tasks/capstone/ccfraud.md), [`airquality`](testbed/docs/tasks/capstone/airquality.md) |
 
 ### Treatments (`configs/treatments/`)
 

@@ -33,6 +33,12 @@ import numpy as np
 
 from evals.common import instance_suffix
 
+KIND = "platform"  # deliverable kind: table | dataset | answers | platform
+SUMMARY = (
+    "Measures whether an agent can deploy a provided model as a real-time endpoint on the "
+    "platform and invoke it correctly over the platform's inference path."
+)
+
 ENDPOINT_BASE = "scorer"  # per-instance: f"{ENDPOINT_BASE}{instance_suffix(seed)}"
 N_PAYLOADS = 5
 VOCAB = [

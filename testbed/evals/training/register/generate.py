@@ -29,6 +29,11 @@ import numpy as np
 from evals.common import instance_suffix
 from evals.training.register.grade import grade_answers
 
+KIND = "platform"  # deliverable kind: table | dataset | answers | platform
+SUMMARY = (
+    "Measures whether the agent can register a provided model artifact in the platform's model "
+    "registry with the exact provided metrics attached."
+)
 MODEL_BASE = "churnmodel"  # per-instance: f"{MODEL_BASE}{instance_suffix(seed)}"
 VERSION = 1
 FEATURES = ["f1", "f2", "f3", "f4", "f5"]

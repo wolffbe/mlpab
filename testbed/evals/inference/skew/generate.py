@@ -32,6 +32,12 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+KIND = "answers"  # deliverable kind: table | dataset | answers | platform
+SUMMARY = (
+    "Measures whether an agent can diagnose training/serving skew: spotting the single feature "
+    "computed differently between the training pipeline and the online serving path."
+)
+
 N_TRAIN = 300
 N_SERVED = 200
 FEATURES = [f"f{i}" for i in range(1, 6)]

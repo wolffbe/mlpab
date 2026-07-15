@@ -36,6 +36,12 @@ import pandas as pd
 
 from evals.common import canonicalize, digest, instance_suffix
 
+KIND = "platform"  # deliverable kind: table | dataset | answers | platform
+SUMMARY = (
+    "Measures whether the agent can build a derived feature table from two partially overlapping "
+    "sources, register the derivation, and answer a lineage question."
+)
+
 N_IDS = 320  # universe of row ids
 N_A = 250  # ids present in raw_a
 N_B = 240  # ids present in raw_b (overlap is partial by construction)

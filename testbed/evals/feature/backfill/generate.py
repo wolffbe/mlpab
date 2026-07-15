@@ -29,6 +29,12 @@ import pandas as pd
 
 from evals.common import canonicalize, digest, instance_suffix
 
+KIND = "table"  # deliverable kind: table | dataset | answers | platform
+SUMMARY = (
+    "Measures whether an agent can load out-of-order batches containing corrections so the "
+    "feature table holds each row's latest revision."
+)
+
 ORIGIN = pd.Timestamp("2026-02-01", tz="UTC")
 N_ROWS = 400
 N_CORRECTED = 90  # rows that receive a later correction

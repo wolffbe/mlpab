@@ -29,6 +29,11 @@ import pandas as pd
 
 from evals.common import canonicalize, digest, instance_suffix
 
+KIND = "table"  # deliverable kind: table | dataset | answers | platform
+SUMMARY = (
+    "Measures whether the agent applies a model-dependent transformation (standardization) with "
+    "statistics fitted on the training split only, never on the serving data."
+)
 N_TRAIN = 400
 N_SERVE = 250
 FEATURES = ["f1", "f2", "f3", "f4"]

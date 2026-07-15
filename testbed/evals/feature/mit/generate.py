@@ -34,6 +34,12 @@ import pandas as pd
 
 from evals.common import canonicalize, digest, instance_suffix
 
+KIND = "table"  # deliverable kind: table | dataset | answers | platform
+SUMMARY = (
+    "Measures whether an agent can compute model-independent transformations, in particular a "
+    "per-account rolling 7-day sum with exact window semantics, into a derived feature table."
+)
+
 ORIGIN = pd.Timestamp("2026-03-01", tz="UTC")
 N_ROWS = 700
 N_ACCOUNTS = 60
