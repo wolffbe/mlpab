@@ -1,1 +1,0 @@
-SELECT COUNT(*) n, COUNT(amount) amt, COUNT(credit_score) cs, COUNT(sessions_7d) ss, COUNT(health_score) hs FROM `***REDACTED***.mlpab_mlpab7232d6.churntrainingcdae59_v1`

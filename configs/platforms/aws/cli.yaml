@@ -1,0 +1,188 @@
+# Amazon SageMaker CLI interface — the AWS CLI scoped to SageMaker + its data
+# plane. Reference: https://docs.aws.amazon.com/cli/latest/reference/sagemaker/
+#
+# The interface under test is an ENTRYPOINT SET of SageMaker-adjacent `aws`
+# services — NOT the whole AWS CLI. SageMaker is a pure control plane; each
+# extra entrypoint exists because SageMaker work structurally needs it:
+#   - `sagemaker` — the control plane itself (jobs, endpoints, models).
+#   - `s3` + `s3api` — the ONLY data path: jobs read inputs and write outputs
+#     via S3 (seen live 2026-06-10: without it a cactus run floored at AUC 0.5
+#     with a correct missing-capability report). `s3api` is the same data plane
+#     behind a separate CLI service token (head-object, get-bucket-location,
+#     multipart) — allowing only the high-level `s3` denies it confusingly.
+#   - `sagemaker-runtime` — invoke deployed real-time endpoints.
+#   - `sagemaker-featurestore-runtime` — the online Feature Store data plane
+#     (put-record/get-record), if a task exercises Feature Store.
+#   - `logs` — the jobs' debug channel: Describe*Job reports only
+#     "AlgorithmError, exit code: 1"; the traceback lands in CloudWatch
+#     /aws/sagemaker/* log groups (seen live 2026-06-10: a failed processing
+#     job had to be debugged blind, re-deriving the bug from the input zips).
+#   - `cloudwatch` + `sagemaker-metrics` — metric queries (training curves,
+#     endpoint invocation stats) beyond Describe*Job's FinalMetricDataList.
+#   - `service-quotas` — discover which instance types are launchable up front
+#     (seen live 2026-06-10: ml.m5.xlarge training quota 0 + ml.m4 absent from
+#     eu-north-1 were discovered by trial-and-error create-training-job
+#     failures). Read-only.
+#   - `sts` — get-caller-identity sanity checks (account/ARN).
+#   - `s3vectors` — Amazon S3 Vectors, the serverless vector store (vector
+#     buckets + indexes; put-vectors/query-vectors). The ONLY managed vector
+#     similarity search reachable from this interface: SageMaker itself has
+#     none, and AWS's other path (OpenSearch) is both off-interface and
+#     CLI-unreachable (SigV4 HTTP data plane). Verified live in eu-north-1
+#     (2026-06-12).
+# Other services (`aws ec2`, `aws iam`, `aws ecr`, …) stay off-interface. This
+# mirrors the other platform CLIs, whose data path ships in the same binary
+# (`hops files`, `databricks fs`).
+# `cli_command: aws` + the `cli_subcommand` list tell mlpab that only those
+# services are on-interface; others (`aws ec2 …`, `aws iam …`) are off-interface
+# escapes (denied by the agent hook, not counted as interface calls).
+#
+# --- IAM grant model (testbed user credentials in `keys:`) ---
+# The interface boundary is enforced by the agent HOOK (the `cli_subcommand`
+# allowlist), NOT by IAM — so scoping the user's IAM policy adds no experimental
+# value and only manufactures fake-negative runs when a job can't reach some
+# service it legitimately needs (seen live 2026-06-14: a processing-job ingest
+# floored 0/1 because the execution role couldn't pull its ECR image). So the
+# testbed user gets the AWS-managed `PowerUserAccess` (full access to every
+# service EXCEPT IAM / Organizations / Account management) plus ONE inline
+# supplement, mlpab-policy.json in this directory, carrying only the IAM actions
+# PowerUser omits but setup.py needs: bootstrap + PassRole of the SageMaker
+# execution role. Attach BOTH to the user: the managed PowerUserAccess and the
+# inline mlpab-policy.json. The execution role itself (assumed by jobs, not the
+# user) is granted by setup.py: AmazonSageMakerFullAccess + a broad ECR-pull.
+# IAM stays denied to the agent both ways — PowerUser excludes it, and `aws iam`
+# is off-interface (hook-denied) regardless.
+#
+# Installed from PyPI (awscli v1 ships the `aws` console script — pip-installable,
+# fits the run-venv model; v2 is a platform-specific installer). The `aws sagemaker`
+# command surface is equivalent for our purposes.
+#
+# Set keys: edit the global testbed/.env (see `keys:` below).
+
+# --- How to run it (per agent run) — install the pinned AWS CLI from PyPI. ---
+# The interface version/ref under test — written to the results `version`
+# column. Keep in sync with the pin below (ref: / ==X.Y.Z / VER=).
+version: "1.45.30"
+
+runtime_install:
+  - pip install "awscli==1.45.30"
+
+# The invokable command + the subcommand entrypoints that scope this interface.
+cli_command: aws
+cli_subcommand: [sagemaker, sagemaker-runtime, sagemaker-featurestore-runtime,
+                 sagemaker-metrics, s3, s3api, s3vectors, logs, cloudwatch,
+                 service-quotas, sts]
+
+# Deterministic, OFFLINE "does it run?" check (no AWS calls): the `aws` command
+# installs and reports its version.
+test_command: aws --version
+
+# Real connectivity + PERMISSIONS check (python from the run venv — botocore
+# ships with awscli v1). STS alone is not enough: it needs no IAM permission, so
+# it green-lights credentials that cannot call SageMaker at all (seen live
+# 2026-06-10: a zero-policy user passed preflight and floored the run). This
+# probes that (1) the account policy actually grants SageMaker (cheap read), and
+# (2) setup.py's execution-role bootstrap can work — iam:GetRole succeeds or the
+# role merely doesn't exist yet (NoSuchEntity is fine; setup.py creates it).
+# Exits non-zero with the missing grant named; `mlpab test --no-login` skips it.
+auth_command: |
+  python - <<'AUTHCHECK'
+  import os, sys
+  import botocore.session
+  session = botocore.session.get_session()
+  region = os.environ.get("AWS_REGION")
+  ident = session.create_client("sts", region_name=region).get_caller_identity()
+  try:
+      session.create_client("sagemaker", region_name=region).list_training_jobs(MaxResults=1)
+  except Exception as e:
+      sys.exit(f"{ident['Arn']} lacks SageMaker permissions — attach "
+               f"AmazonSageMakerFullAccess (or equivalent) to it: {e}")
+  # An explicit SAGEMAKER_ROLE_ARN (.env or setup.py's platform.env export)
+  # reaches the agent regardless of IAM rights — only the bootstrap path
+  # needs iam:GetRole (NoSuchEntity is fine; setup.py then creates the role).
+  if not os.environ.get("SAGEMAKER_ROLE_ARN"):
+      role = "mlpab-sagemaker-execution-role"
+      try:
+          session.create_client("iam", region_name=region).get_role(RoleName=role)
+      except Exception as e:
+          if getattr(e, "response", {}).get("Error", {}).get("Code") != "NoSuchEntity":
+              sys.exit(f"{ident['Arn']} cannot read execution role {role!r}, so setup.py's "
+                       f"role bootstrap will fail — grant iam:GetRole/CreateRole/"
+                       f"AttachRolePolicy on that role (or pre-provision it and set "
+                       f"SAGEMAKER_ROLE_ARN in .env): {e}")
+  AUTHCHECK
+
+# Outbound hosts the agent needs reachable at run time (drives the sandbox
+# allowedDomains). SageMaker/STS all live under amazonaws.com.
+allowed_domains:
+  - "*.amazonaws.com"
+
+# --- AWS Free Tier guard — the ONLY `ml.<family>.<size>` instance types the
+#     agent may request; the PreToolUse hook DENIES any other instance-type
+#     token in a tool call (TESTBED_INSTANCE_ALLOW). SageMaker Free Tier (first
+#     2 months): training 50 h + real-time inference 125 h on ml.m4.xlarge /
+#     ml.m5.xlarge; Studio/notebooks 250 h on ml.t3.medium; Serverless Inference
+#     (no instance type) 150k seconds. ---
+instance_allowlist:
+  - ml.t3.medium
+  - ml.m4.xlarge
+  - ml.m5.xlarge
+
+# --- Platform setup — run automatically by mlpab at the START of every run,
+#     right AFTER the teardown sweep below. SageMaker has no project container to
+#     pre-create; instead this ensures the baseline plumbing: the default bucket
+#     `sagemaker-<region>-<account>` (the agent could `aws s3 mb` its own, but
+#     a known bucket keeps teardown's sweep simple) and the IAM execution role
+#     (jobs need a RoleArn, and IAM is off-interface), whose ARN setup.py exports
+#     into the agent's env as SAGEMAKER_ROLE_ARN via $MLPAB_PLATFORM_ENV.
+#     The logic is the committed configs/platforms/aws/setup.py —
+#     $MLPAB_PLATFORM_DIR points there (fixed infra); `./venv` is the agent's
+#     run venv (botocore is installed there). ---
+serve:
+  - './venv/bin/python "$MLPAB_PLATFORM_DIR/setup.py"'
+
+# --- Platform teardown — run automatically by mlpab at the START and END of
+#     every run. SageMaker has no project whose deletion cascades, so this sweeps
+#     PER RESOURCE TYPE in cost order: endpoints + MLflow tracking servers, stop
+#     in-flight jobs, then endpoint configs / models / feature groups / pipelines
+#     / model packages / experiments, then the default bucket's contents. By
+#     default it deletes only THIS run's prefixed resources (MLPAB_AWS_PREFIX) so
+#     parallel runs don't clobber each other; `teardown.py --all` does the old
+#     account-wide sweep as a janitor. The cleanup logic is the committed
+#     configs/platforms/aws/teardown.py — $MLPAB_PLATFORM_DIR points there
+#     (fixed infra); `./venv` is the agent's run venv. ---
+teardown:
+  - './venv/bin/python "$MLPAB_PLATFORM_DIR/teardown.py"'
+
+# --- Credentials — names only; values resolve from the GLOBAL testbed/.env at
+#     run time (never stored here). The AWS CLI reads these standard env vars; the
+#     auth_command above verifies them live. ---
+keys:
+  - AWS_ACCESS_KEY_ID       # secret
+  - AWS_SECRET_ACCESS_KEY   # secret
+  - AWS_REGION              # e.g. us-east-1
+  # OPTIONAL override — normally LEAVE UNSET in .env: setup.py creates/finds the
+  # execution role (default name mlpab-sagemaker-execution-role) and exports its
+  # ARN into the agent env as SAGEMAKER_ROLE_ARN automatically. Set it only to
+  # force a specific pre-provisioned role (an explicit .env value wins).
+  - {name: SAGEMAKER_ROLE_ARN, optional: true}
+
+# --- Agent-facing prompt ---
+prompt: |
+  The Amazon SageMaker CLI is available as `aws sagemaker`, plus the surrounding services SageMaker work needs:
+  `aws s3` and `aws s3api` (stage datasets and retrieve job outputs), `aws sagemaker-runtime` (invoke deployed
+  endpoints), `aws sagemaker-featurestore-runtime` (online feature store reads/writes), `aws logs` (read
+  CloudWatch logs of jobs and endpoints, e.g. under /aws/sagemaker/), `aws cloudwatch` and `aws sagemaker-metrics`
+  (metric queries), `aws service-quotas` (check which instance types have quota BEFORE launching jobs), and
+  `aws sts` (identity checks). No other `aws` service is available. It is authenticated via AWS credentials and AWS_REGION from the environment. Operations that require
+  an IAM execution role (RoleArn) must use the pre-provisioned role in SAGEMAKER_ROLE_ARN from the environment.
+  Keep ALL S3 data under the pre-provisioned bucket in SAGEMAKER_DEFAULT_BUCKET from the environment — do not
+  create other buckets. Run `aws sagemaker --help` to see what it can do.
+  Isolate your work so it is cleaned up correctly: PREFIX the name of every resource you create — feature group,
+  training/processing job, pipeline, model package group, endpoint (and its config), CloudWatch alarm — with
+  `${MLPAB_AWS_PREFIX}-` (e.g. `${MLPAB_AWS_PREFIX}-transactions`). Write training-set objects under the key
+  prefix `${MLPAB_AWS_PREFIX}/` in SAGEMAKER_DEFAULT_BUCKET (e.g.
+  `s3://<bucket>/${MLPAB_AWS_PREFIX}/training_datasets/<name>/v<version>/`).
+  Stay within the AWS Free Tier: any job, endpoint, or notebook may request ONLY the instance types ml.m5.xlarge,
+  ml.m4.xlarge (jobs/endpoints) or ml.t3.medium (notebooks), with a single instance — every other instance type is
+  hard-blocked. Serverless Inference (no instance type) is also Free Tier.

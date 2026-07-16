@@ -1,0 +1,96 @@
+# Hopsworks Python SDK interface — config (where it lives + how to build/run it).
+#
+# The SDK is BUILT LOCALLY from source (no PyPI). Preflight clones the source
+# repo and builds a wheel into the interface binary dir
+# (configs/platforms/hopsworks/sdk/), and each agent run installs THAT local wheel
+# into its venv — never `pip install hopsworks` from the index.
+#
+# Set keys: mlpab setup configs/platforms/hopsworks/sdk.yaml   (or `make setup`)
+
+# --- Where it lives / how to build it (run automatically at preflight) ---
+# The interface version/ref under test — written to the results `version`
+# column. Keep in sync with the pin below (ref: / ==X.Y.Z / VER=).
+version: "5.0.0"
+
+repo: https://github.com/logicalclocks/hopsworks-api
+# Pinned to a FIXED COMMIT for reproducibility: the interface source never
+# drifts between runs (the checkout is never re-pulled). To advance, update
+# this SHA + delete the built src/.
+ref: 6317e1cab5771a180e63e556148f6bb5e673fc79
+install:
+  # Build the SDK wheel from source into $INTERFACE_DIR, then RENAME it to one
+  # fixed, valid wheel filename (the upstream version floats, e.g. 5.0.0.devN —
+  # `mv` leaves exactly one wheel in the folder). pip
+  # reads the real version from the wheel's own metadata, so the fixed `-0-` name
+  # is cosmetic. Adjust the `python` sub-path if the repo layout differs.
+  - pip install build
+  - python -m build --wheel --outdir "$INTERFACE_DIR" python
+  - sh -c 'mv "$(ls -t "$INTERFACE_DIR"/hopsworks-*.whl | head -1)" "$INTERFACE_DIR/hopsworks-0-py3-none-any.whl"'
+
+# Deterministic, OFFLINE "does it import?" check (no live cluster): after the
+# wheel + deps install, the package imports cleanly.
+test_command: python -c "import hopsworks"
+
+# Real connectivity check: log in to the cluster using HOPSWORKS_API_KEY /
+# HOPSWORKS_HOST from the environment. Exits non-zero on a bad/missing key, so
+# preflight fails fast instead of letting a challenge hit a dead login.
+auth_command: python -c "import hopsworks; hopsworks.login()"
+
+# --- How to run it (per agent run) — install the locally-built wheel with
+#     the `[python]` extra (pandas/pyarrow/… the SDK needs for real work). ---
+binary: hopsworks-0-py3-none-any.whl
+# The `hops` console script ships in the same wheel. It is NOT the interface
+# under test here — declaring it lets the agent hook + command counter treat
+# a `hops …` call as an OFF-INTERFACE escape (blocked / counted as such).
+cli_command: hops
+runtime_install:
+  # --no-compile: skip pip's byte-compile pass. pip 26.1's _install_wheel
+  # asserts a .pyc exists after each compile_file() (wheel.py:625); that assert
+  # is brittle when this install DOWNGRADES a package (base .venv has a newer
+  # fsspec/pandas than hopsworks[python,trino] pins) inside a venv that is a
+  # cp -Rc APFS copy-on-write CLONE of the base .venv (carrying stale
+  # __pycache__). .pyc files are regenerated lazily at import, so skipping
+  # precompile changes nothing at runtime and touches no dependency version.
+  - 'pip install --no-compile "$INTERFACE_DIR/hopsworks-0-py3-none-any.whl[python,trino]"'
+
+# --- Platform setup — run automatically by mlpab at the START of every run,
+#     right AFTER the teardown wipe below, so each run starts with exactly
+#     ONE fresh, empty project for the agent to work in (its `hopsworks.login()` selects the single project with
+#     no prompt). Created for every interface. The logic is the committed
+#     configs/platforms/hopsworks/setup.py — $MLPAB_PLATFORM_DIR points there (fixed
+#     infra). Run under $MLPAB_PLUMBING_PY — mlpab's per-platform plumbing venv,
+#     pinned to the SDK interface and so guaranteed to carry a working hopsworks
+#     python client (`Connection.create_project`), the same venv verify uses and
+#     independent of whichever interface's run venv is under test. Removal is
+#     handled by the teardown below (deletes every project this key owns at run
+#     start + end). ---
+serve:
+  - '"$MLPAB_PLUMBING_PY" "$MLPAB_PLATFORM_DIR/setup.py"'
+
+# --- Platform teardown — run automatically by mlpab at the START and END of
+#     every run, so each run starts and ends with a clean cluster. Deletes every project this API key owns, which
+#     cascades away all feature groups / views / training data / models the agent
+#     created (POST /hopsworks-api/api/project/{id}/delete) — including the empty
+#     project setup.py creates. The cleanup logic is the committed
+#     configs/platforms/hopsworks/teardown.py — $MLPAB_PLATFORM_DIR points
+#     there, so it's fixed infra. Run under $MLPAB_PLUMBING_PY (the plumbing venv
+#     with a stable SDK client) for the same reason as setup above. ---
+teardown:
+  - '"$MLPAB_PLUMBING_PY" "$MLPAB_PLATFORM_DIR/teardown.py"'
+
+# --- Credentials — names only; values resolve from the GLOBAL testbed/.env at
+#     run time (never stored here). The SDK reads HOPSWORKS_API_KEY /
+#     HOPSWORKS_HOST via hopsworks.login(); the auth_command above verifies them
+#     against the live cluster at preflight (`mlpab test --no-login` skips it). ---
+keys:
+  - HOPSWORKS_API_KEY   # secret
+  - HOPSWORKS_HOST      # Hopsworks endpoint
+
+# --- Agent-facing prompt ---
+prompt: |
+  The Hopsworks Python SDK is available as `import hopsworks`; connect with `hopsworks.login()`. It is
+  authenticated via HOPSWORKS_API_KEY and HOPSWORKS_HOST from the environment. Use Python introspection
+  (`help()`/`dir()`) on the package to see what it can do.
+  Connecting to some services (e.g. Trino via the Trino API) may fail with a TLS/SSL certificate verification
+  error (CERTIFICATE_VERIFY_FAILED, or an IP-address/hostname mismatch). If that happens, skip certificate
+  verification — e.g. pass `verify=False` or an equivalent flag — and retry.

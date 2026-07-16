@@ -1,0 +1,1 @@
+SELECT split, COUNT(*) n FROM mlpab_mlpabd773ad.scaled7b36f6 GROUP BY split ORDER BY split

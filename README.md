@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="testbed/docs/logo.png" alt="MLPlatformAgentBench" width="420">
+  <img src="docs/logo.png" alt="MLPlatformAgentBench" width="420">
 </p>
 
 # MLPlatformAgentBench (MLPAB)
@@ -28,14 +28,9 @@ restricted to the one interface under test. Per-platform setup and teardown
 scripts provision and remove cloud resources around each run.
 
 MLPAB is the testbed for a KTH master's thesis on how interface design and
-supporting skills affect agent performance on ML platform operations. The thesis
-is in `thesis/`.
-
-```
-banter/
-  testbed/   MLPlatformAgentBench: framework, configs, evals, results (cd here)
-  thesis/    KTH LaTeX thesis (thesis/thesis.tex)
-```
+supporting skills affect agent performance on ML platform operations. The
+framework, configs, evals, and results live at the repository root, and the KTH
+LaTeX thesis is in `docs/thesis/` (`docs/thesis/thesis.tex`).
 
 ## How a run works
 
@@ -49,7 +44,7 @@ banter/
 ### Eval families (`evals/`)
 
 Every task has a documentation page under
-[`testbed/docs/tasks/`](testbed/docs/tasks/README.md), auto-generated from the
+[`docs/tasks/`](docs/tasks/README.md), auto-generated from the
 task packages with `make task-docs`: the generator's design notes, the literal
 seed-1 prompt, the staged files, the assert suite, and the diagnosed naive
 variants all come straight from the code, so the pages cannot drift from the
@@ -57,11 +52,11 @@ tasks.
 
 | Family | Tasks |
 |---|---|
-| feature | [`ingest`](testbed/docs/tasks/feature/ingest.md), [`backfill`](testbed/docs/tasks/feature/backfill.md), [`mit`](testbed/docs/tasks/feature/mit.md), [`validate`](testbed/docs/tasks/feature/validate.md), [`incremental_load`](testbed/docs/tasks/feature/incremental_load.md), [`full_reload`](testbed/docs/tasks/feature/full_reload.md), [`pit`](testbed/docs/tasks/feature/pit.md) (point-in-time correct), [`leakage`](testbed/docs/tasks/feature/leakage.md) |
-| training | [`train`](testbed/docs/tasks/training/train.md), [`mdt`](testbed/docs/tasks/training/mdt.md), [`register`](testbed/docs/tasks/training/register.md), [`llm_finetuning`](testbed/docs/tasks/training/llm_finetuning.md) |
-| inference | [`batch`](testbed/docs/tasks/inference/batch.md), [`online`](testbed/docs/tasks/inference/online.md), [`odt`](testbed/docs/tasks/inference/odt.md), [`skew`](testbed/docs/tasks/inference/skew.md), [`llm_serving`](testbed/docs/tasks/inference/llm_serving.md), [`recsys`](testbed/docs/tasks/inference/recsys.md), [`vector_search`](testbed/docs/tasks/inference/vector_search.md) |
-| ops | [`drift`](testbed/docs/tasks/ops/drift.md), [`prediction_monitoring`](testbed/docs/tasks/ops/prediction_monitoring.md), [`scheduled_jobs`](testbed/docs/tasks/ops/scheduled_jobs.md), [`alerting`](testbed/docs/tasks/ops/alerting.md), [`lineage`](testbed/docs/tasks/ops/lineage.md) |
-| capstone | [`ccfraud`](testbed/docs/tasks/capstone/ccfraud.md), [`airquality`](testbed/docs/tasks/capstone/airquality.md) |
+| feature | [`ingest`](docs/tasks/feature/ingest.md), [`backfill`](docs/tasks/feature/backfill.md), [`mit`](docs/tasks/feature/mit.md), [`validate`](docs/tasks/feature/validate.md), [`incremental_load`](docs/tasks/feature/incremental_load.md), [`full_reload`](docs/tasks/feature/full_reload.md), [`pit`](docs/tasks/feature/pit.md) (point-in-time correct), [`leakage`](docs/tasks/feature/leakage.md) |
+| training | [`train`](docs/tasks/training/train.md), [`mdt`](docs/tasks/training/mdt.md), [`register`](docs/tasks/training/register.md), [`llm_finetuning`](docs/tasks/training/llm_finetuning.md) |
+| inference | [`batch`](docs/tasks/inference/batch.md), [`online`](docs/tasks/inference/online.md), [`odt`](docs/tasks/inference/odt.md), [`skew`](docs/tasks/inference/skew.md), [`llm_serving`](docs/tasks/inference/llm_serving.md), [`recsys`](docs/tasks/inference/recsys.md), [`vector_search`](docs/tasks/inference/vector_search.md) |
+| ops | [`drift`](docs/tasks/ops/drift.md), [`prediction_monitoring`](docs/tasks/ops/prediction_monitoring.md), [`scheduled_jobs`](docs/tasks/ops/scheduled_jobs.md), [`alerting`](docs/tasks/ops/alerting.md), [`lineage`](docs/tasks/ops/lineage.md) |
+| capstone | [`ccfraud`](docs/tasks/capstone/ccfraud.md), [`airquality`](docs/tasks/capstone/airquality.md) |
 
 ### Treatments (`configs/treatments/`)
 
@@ -81,7 +76,6 @@ Each is a numbered flat yaml; its results live under `results/<n>_<name>/`.
 ## Quickstart
 
 ```bash
-cd testbed
 make install        # create .venv, install mlpab + evals + dev tools, link `mlpab` onto PATH
 make setup          # interactive: authenticate agent engine(s) and set up platform(s)
 
@@ -103,7 +97,7 @@ mlpab run configs/treatments/22_gcp-full-cli-sdk-skills-opus.yaml
 mlpab run --retry configs/treatments/18_db-full-cli-sdk-skills-opus.yaml
 ```
 
-Credentials are read from `testbed/.env`. macOS is the primary target. It uses
+Credentials are read from `.env`. macOS is the primary target. It uses
 APFS copy-on-write clones for the per-run virtual environments and the macOS
 Keychain for the Claude OAuth token. Other systems fall back to plain copies.
 
@@ -118,9 +112,9 @@ make fmt         # auto-fix: isort imports, then ruff format, then ruff --fix
 ## Results
 
 ```
-testbed/results/results.csv     one row per run (the single results table)
-testbed/results/<config>/...    per-run artifacts: agent.log, submission/, grading, commands
-testbed/results/*.ipynb         hand-curated analysis notebooks
+results/results.csv     one row per run (the single results table)
+results/<config>/...    per-run artifacts: agent.log, submission/, grading, commands
+results/*.ipynb         hand-curated analysis notebooks
 ```
 
 Each row records the identity of the cell (`model`, `platform`, `interface`,

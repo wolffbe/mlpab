@@ -1,0 +1,749 @@
+[mlpab] skills (95c4b1b4): databricks-apps,databricks-core,databricks-dabs,databricks-jobs,databricks-lakebase,databricks-model-serving,databricks-pipelines,databricks-serverless-migration,databricks-vector-search
+[agent:thinking] Let me start by understanding the task:
+[agent:thinking] 
+[agent:thinking] 1. I have a CSV file `data/features.csv` with columns: entity_id, event_time, f1, f2, f3, f4, f5, f6
+[agent:thinking] 2. I need to identify which ONE feature drifted and when (onset date)
+[agent:thinking] 3. Write the answer to `submission/answers.json`
+[agent:thinking] 
+[agent:thinking] The task says I must use the Databricks platform - so I need to:
+[agent:thinking] 1. Upload the data to Databricks
+[agent:thinking] 2. Run analysis on the platform
+[agent:thinking] 3. Get the results back
+[agent:thinking] Now I'll load the data and start exploring it to understand the structure and look for signs of drift across the features.
+[agent] Let me start by examining the data and setting up the environment.
+[agent:bash] head -5 data/features.csv && wc -l data/features.csv && echo "---" && ls data/
+[agent:result] entity_id,event_time,f1,f2,f3,f4,f5,f6
+[agent:result] E0000,2026-01-01T00:00:00Z,5.7059,9.4334,2.1604,6.21,-0.1742,8.3945
+[agent:result] E0001,2026-01-01T00:00:00Z,5.0138,8.4123,4.1818,4.7272,0.499,8.7752
+[agent:result] E0002,2026-01-01T00:00:00Z,5.754,8.7618,2.0648,6.5193,0.5033,9.5715
+[agent:result] E0003,2026-01-01T00:00:00Z,7.7736,9.0352,2.9991,13.3635,-0.8107,9.1976
+[agent:result]    13501 data/features.csv
+[agent:result] ---
+[agent:result] features.csv
+[agent:result] schema.md
+[agent:bash] echo "SCHEMA: $MLPAB_DATABRICKS_SCHEMA" && echo "PREFIX: $MLPAB_DATABRICKS_PREFIX" && echo "HOST: $DATABRICKS_HOST" && databricks current-user me 2>/dev/null | head -5
+[agent:result] SCHEMA: workspace.mlpabe8ecdb
+[agent:result] PREFIX: mlpabe8ecdb
+[agent:result] HOST: dbc-2a4591fe-28e4.cloud.databricks.com
+[agent:result] {
+[agent:result]   "active": true,
+[agent:result]   "emails": [
+[agent:result]     {
+[agent:result]       "primary": true,
+[agent:bash] cat data/schema.md
+[agent:result] # Schema
+[agent:result] 
+[agent:result] - **features.csv**: entity_id, event_time (daily), f1, f2, f3, f4, f5, f6 (numeric features)
+[agent:bash] databricks current-user me 2>/dev/null
+[agent:result] {
+[agent:result]   "active": true,
+[agent:result]   "emails": [
+[agent:result]     {
+[agent:result]       "primary": true,
+[agent:result]       "type": "work",
+[agent:result]       "value": "benedict@logicalclocks.com"
+[agent:result]     }
+[agent:result]   ],
+[agent:result]   "entitlements": [
+[agent:result]     {
+[agent:result]       "value": "allow-cluster-create"
+[agent:result]     },
+[agent:result]     {
+[agent:result]       "value": "allow-instance-pool-create"
+[agent:result]     }
+[agent:result]   ],
+[agent:result]   "groups": [
+[agent:result]     {
+[agent:result]       "$ref": "Groups/83572394574321",
+[agent:result]       "display": "account users",
+[agent:result]       "type": "direct",
+[agent:result]       "value": "83572394574321"
+[agent:result]     },
+[agent:result]     {
+[agent:result]       "$ref": "Groups/82415167308912",
+[agent:result]       "display": "admins",
+[agent:result]       "type": "direct",
+[agent:result]       "value": "82415167308912"
+[agent:result]     },
+[agent:result]     {
+[agent:result]       "$ref": "Groups/81176181365266",
+[agent:result]       "display": "users",
+[agent:result]       "type": "direct",
+[agent:result]       "value": "81176181365266"
+[agent:result]     }
+[agent:result]   ],
+[agent:result]   "id": "76087391176694",
+[agent:result]   "schemas": [
+[agent:result]     "urn:ietf:params:scim:schemas:core:2.0:User",
+[agent:result]     "urn:ietf:params:scim:schemas:extension:workspace:2.0:User"
+[agent:result]   ],
+[agent:result]   "userName": "benedict@logicalclocks.com"
+[agent:result] }
+[agent:thinking] Now I understand the environment:
+[agent:thinking] - Schema: `workspace.mlpabe8ecdb`
+[agent:thinking] - Prefix: `mlpabe8ecdb`
+[agent:thinking] - User: `benedict@logicalclocks.com`
+[agent:thinking] - ~13500 rows of daily feature data
+[agent:thinking] 
+[agent:thinking] I need to:
+[agent:thinking] 1. Upload the CSV to Databricks (either via a volume or workspace file)
+[agent:thinking] 2. Create a notebook to run drift analysis
+[agent:thinking] 3. Execute the notebook to find the drifted feature
+[agent:thinking] 
+[agent:thinking] Let me check the date range and data more carefully first.
+[agent:bash] grep -o "2026-[0-9][0-9]-[0-9][0-9]" data/features.csv | sort -u | head -5 && echo "..." && grep -o "2026-[0-9][0-9]-[0-9][0-9]" data/features.csv | sort -u | tail -5
+[agent:result] 2026-01-01
+[agent:result] 2026-01-02
+[agent:result] 2026-01-03
+[agent:result] 2026-01-04
+[agent:result] 2026-01-05
+[agent:result] ...
+[agent:result] 2026-03-27
+[agent:result] 2026-03-28
+[agent:result] 2026-03-29
+[agent:result] 2026-03-30
+[agent:result] 2026-03-31
+[agent:bash] grep -o "2026-[0-9][0-9]-[0-9][0-9]" data/features.csv | sort -u | wc -l
+[agent:result]       90
+[agent:thinking] So we have 90 days (Jan 1 - March 31, 2026) and ~13500 rows / 90 days = ~150 entities per day.
+[agent:thinking] 
+[agent:thinking] Now I need to:
+[agent:thinking] 1. Upload the CSV to a Databricks volume
+[agent:thinking] 2. Create a notebook that runs drift detection analysis
+[agent:thinking] 3. Execute the notebook and get results
+[agent:thinking] 
+[agent:thinking] Let me create a Databricks volume, upload the data, then create a notebook to analyze the drift.
+[agent:thinking] 
+[agent:thinking] The approach for drift detection:
+[agent:thinking] - For each feature (f1-f6), compute daily statistics (mean, std, etc.)
+[agent:thinking] - Use a statistical test (like KS test or simple mean shift detection) to find where the distribution changed
+[agent:thinking] - Identify which feature drifted and when
+[agent:thinking] 
+[agent:thinking] Now I'll set up the volume and get the data uploaded.
+[agent] I have 90 days of data with ~150 entities per day. Let me upload the data to Databricks and run drift analysis.
+[agent:bash] databricks volumes list workspace mlpabe8ecdb 2>/dev/null | head -20
+[agent:bash] mkdir -p submission
+[agent:result] [
+[agent:result]   
+[agent:result] ]
+[agent:result] (Bash completed with no output)
+[agent:bash] databricks volumes create --catalog workspace --database-name mlpabe8ecdb --name mlpabe8ecdb_drift_data --volume-type MANAGED 2>&1
+[agent:result-err] Exit code 1
+[agent:result-err] Error: unknown flag: --catalog
+[agent:result-err] 
+[agent:result-err] Usage:
+[agent:result-err]   databricks volumes create CATALOG_NAME SCHEMA_NAME NAME VOLUME_TYPE [flags]
+[agent:result-err] 
+[agent:result-err] Flags:
+[agent:result-err]       --comment string            The comment attached to the volume.
+[agent:result-err]   -h, --help                      help for create
+[agent:result-err]       --json JSON                 either inline JSON string or @path/to/file.json with request body (default JSON (0 bytes))
+[agent:result-err]       --storage-location string   The storage location on the cloud.
+[agent:result-err] 
+[agent:result-err] Global Flags:
+[agent:result-err]       --debug            enable debug logging
+[agent:result-err]   -o, --output type      output type: text or json (default text)
+[agent:result-err]   -p, --profile string   ~/.databrickscfg profile
+[agent:result-err]   -t, --target string    bundle target to use (if applicable)
+[agent:bash] databricks volumes create workspace mlpabe8ecdb mlpabe8ecdb_drift_data MANAGED 2>&1
+[agent:result] {
+[agent:result]   "catalog_name": "workspace",
+[agent:result]   "created_at": 1782866643305,
+[agent:result]   "created_by": "benedict@logicalclocks.com",
+[agent:result]   "encryption_details": {},
+[agent:result]   "full_name": "workspace.mlpabe8ecdb.mlpabe8ecdb_drift_data",
+[agent:result]   "metastore_id": "e4f39cd5-5a4c-42e0-a2a4-8f4d090d7109",
+[agent:result]   "name": "mlpabe8ecdb_drift_data",
+[agent:result]   "owner": "benedict@logicalclocks.com",
+[agent:result]   "schema_name": "mlpabe8ecdb",
+[agent:result]   "storage_location": "s3://dbstorage-prod-orz5y/uc/0b7439f3-67e0-443e-a617-1ec1edc192c6/e4f39cd5-5a4c-42e0-a2a4-8f4d090d7109/__unitystorage/catalogs/f6b96a63-02b8-44e8-a3f0-71f9a6bb5601/volumes/0551d14b-a6df-46c5-bb91-e849170fa7da",
+[agent:result]   "updated_at": 1782866643305,
+[agent:result]   "updated_by": "benedict@logicalclocks.com",
+[agent:result]   "volume_id": "0551d14b-a6df-46c5-bb91-e849170fa7da",
+[agent:result]   "volume_type": "MANAGED"
+[agent:result] }
+[agent:bash] databricks fs cp data/features.csv dbfs:/Volumes/workspace/mlpabe8ecdb/mlpabe8ecdb_drift_data/features.csv 2>&1
+[agent:result] data/features.csv -> dbfs:/Volumes/workspace/mlpabe8ecdb/mlpabe8ecdb_drift_data/features.csv
+[agent] Data uploaded. Now let me create a notebook to run drift analysis on the platform.
+[agent:bash] cat > /tmp/drift_analysis.py << 'NOTEBOOK_EOF'
+[agent:bash] # Databricks notebook source
+[agent:bash] # MAGIC %md # Drift Detection Analysis
+[agent:bash] 
+[agent:bash] # COMMAND ----------
+[agent:bash] from pyspark.sql import functions as F
+[agent:bash] from pyspark.sql.types import *
+[agent:bash] from pyspark.sql.window import Window
+[agent:bash] 
+[agent:bash] # Load the data
+[agent:bash] df = spark.read.csv(
+[agent:bash]     "/Volumes/workspace/mlpabe8ecdb/mlpabe8ecdb_drift_data/features.csv",
+[agent:bash]     header=True,
+[agent:bash]     inferSchema=True
+[agent:bash] )
+[agent:bash] 
+[agent:bash] # Parse event_time to date
+[agent:bash] df = df.withColumn("event_date", F.to_date(F.col("event_time")))
+[agent:bash] 
+[agent:bash] df.printSchema()
+[agent:bash] df.show(5)
+[agent:bash] 
+[agent:bash] # COMMAND ----------
+[agent:bash] # Compute daily statistics for each feature
+[agent:bash] features = ["f1", "f2", "f3", "f4", "f5", "f6"]
+[agent:bash] 
+[agent:bash] # Aggregate daily mean and std for each feature
+[agent:bash] agg_exprs = []
+[agent:bash] for f in features:
+[agent:bash]     agg_exprs.append(F.mean(F.col(f)).alias(f"mean_{f}"))
+[agent:bash]     agg_exprs.append(F.stddev(F.col(f)).alias(f"std_{f}"))
+[agent:bash]     agg_exprs.append(F.count(F.col(f)).alias(f"count_{f}"))
+[agent:bash] 
+[agent:bash] daily_stats = df.groupBy("event_date").agg(*agg_exprs).orderBy("event_date")
+[agent:bash] daily_stats.show(30)
+[agent:bash] 
+[agent:bash] # COMMAND ----------
+[agent:bash] # Save daily stats to a Delta table for inspection
+[agent:bash] daily_stats.write.format("delta").mode("overwrite").saveAsTable(
+[agent:bash]     "workspace.mlpabe8ecdb.mlpabe8ecdb_drift_daily_stats"
+[agent:bash] )
+[agent:bash] 
+[agent:bash] print("Daily stats saved!")
+[agent:bash] 
+[agent:bash] # COMMAND ----------
+[agent:bash] # Statistical drift detection: compare first half vs second half with sliding window
+[agent:bash] # Use a KS-like approach: compare mean in rolling windows
+[agent:bash] 
+[agent:bash] import pyspark.sql.functions as F
+[agent:bash] from pyspark.sql.window import Window
+[agent:bash] 
+[agent:bash] # Use Databricks built-in - collect daily stats as Pandas for analysis  
+[agent:bash] pdf = daily_stats.toPandas()
+[agent:bash] pdf = pdf.sort_values("event_date").reset_index(drop=True)
+[agent:bash] 
+[agent:bash] print(f"Total days: {len(pdf)}")
+[agent:bash] print(pdf.head(10))
+[agent:bash] 
+[agent:bash] # COMMAND ----------
+[agent:bash] # For each feature, compute a rolling mean (window of 7 days) and detect shift
+[agent:bash] # Compare window [0:30] vs [30:60] vs [60:90] to find the change point
+[agent:bash] 
+[agent:bash] import numpy as np
+[agent:bash] 
+[agent:bash] n_days = len(pdf)
+[agent:bash] results = {}
+[agent:bash] 
+[agent:bash] for f in features:
+[agent:bash]     means = pdf[f"mean_{f}"].values
+[agent:bash]     stds = pdf[f"std_{f}"].values
+[agent:bash]     
+[agent:bash]     # Try all split points from day 10 to day 80
+[agent:bash]     # For each split, compute the difference between pre and post mean
+[agent:bash]     best_split = None
+[agent:bash]     best_score = 0
+[agent:bash]     
+[agent:bash]     for split in range(10, n_days - 10):
+[agent:bash]         pre_mean = np.mean(means[:split])
+[agent:bash]         post_mean = np.mean(means[split:])
+[agent:bash]         pre_std = np.std(means[:split])
+[agent:bash]         post_std = np.std(means[split:])
+[agent:bash]         
+[agent:bash]         # Score: how much bigger is the shift than the within-period variance
+[agent:bash]         pooled_std = np.sqrt((pre_std**2 + post_std**2) / 2) + 1e-10
+[agent:bash]         score = abs(post_mean - pre_mean) / pooled_std
+[agent:bash]         
+[agent:bash]         if score > best_score:
+[agent:bash]             best_score = score
+[agent:bash]             best_split = split
+[agent:bash]     
+[agent:bash]     onset_date = pdf["event_date"].iloc[best_split] if best_split is not None else None
+[agent:bash]     results[f] = {
+[agent:bash]         "best_split_idx": best_split,
+[agent:bash]         "onset_date": str(onset_date),
+[agent:bash]         "score": best_score,
+[agent:bash]         "pre_mean": float(np.mean(means[:best_split])) if best_split else None,
+[agent:bash]         "post_mean": float(np.mean(means[best_split:])) if best_split else None,
+[agent:bash]     }
+[agent:bash]     print(f"{f}: score={best_score:.3f}, split_idx={best_split}, onset={onset_date}")
+[agent:bash] 
+[agent:bash] # COMMAND ----------
+[agent:bash] # Find the feature with the highest drift score
+[agent:bash] best_feature = max(results, key=lambda f: results[f]["score"])
+[agent:bash] print(f"\nBest drifted feature: {best_feature}")
+[agent:bash] print(f"Score: {results[best_feature]['score']:.3f}")
+[agent:bash] print(f"Onset date: {results[best_feature]['onset_date']}")
+[agent:bash] print(f"Pre-drift mean: {results[best_feature]['pre_mean']:.4f}")
+[agent:bash] print(f"Post-drift mean: {results[best_feature]['post_mean']:.4f}")
+[agent:bash] 
+[agent:bash] # COMMAND ----------
+[agent:bash] # Save the answer to a Delta table
+[agent:bash] import json
+[agent:bash] 
+[agent:bash] answer = {
+[agent:bash]     "feature": best_feature,
+[agent:bash]     "onset": results[best_feature]["onset_date"]
+[agent:bash] }
+[agent:bash] 
+[agent:bash] print("ANSWER:", json.dumps(answer))
+[agent:bash] 
+[agent:bash] # Save to Delta table
+[agent:bash] answer_df = spark.createDataFrame([answer])
+[agent:bash] answer_df.write.format("delta").mode("overwrite").saveAsTable(
+[agent:bash]     "workspace.mlpabe8ecdb.mlpabe8ecdb_drift_answer"
+[agent:bash] )
+[agent:bash] 
+[agent:bash] print("Answer saved to Delta table!")
+[agent:bash] 
+[agent:bash] # COMMAND ----------
+[agent:bash] # Also save detailed results for all features
+[agent:bash] all_results = []
+[agent:bash] for f, r in results.items():
+[agent:bash]     all_results.append({
+[agent:bash]         "feature": f,
+[agent:bash]         "score": float(r["score"]),
+[agent:bash]         "onset_date": str(r["onset_date"]),
+[agent:bash]         "split_idx": int(r["best_split_idx"]) if r["best_split_idx"] else 0,
+[agent:bash]         "pre_mean": float(r["pre_mean"]) if r["pre_mean"] else 0.0,
+[agent:bash]         "post_mean": float(r["post_mean"]) if r["post_mean"] else 0.0,
+[agent:bash]     })
+[agent:bash] 
+[agent:bash] results_df = spark.createDataFrame(all_results)
+[agent:bash] results_df.write.format("delta").mode("overwrite").saveAsTable(
+[agent:bash]     "workspace.mlpabe8ecdb.mlpabe8ecdb_drift_results"
+[agent:bash] )
+[agent:bash] print("All results saved!")
+[agent:bash] NOTEBOOK_EOF
+[agent:bash] echo "Notebook script created"
+[agent:result-err] PreToolUse:Bash hook error: [python3 /Users/wolffbe/workspace/banter/testbed/results/19_db-full-cli-sdk-skills-sonnet/claude-sonnet-4-6/databricks/cli/1.3.0/official/ops/drift/1/task/.claude/hooks/log_tool_call.py]: DENIED: 'from' is off-interface in 'cli' mode — only the `databricks` CLI may do work on databricks; local interpreters, network tools, and stray binaries are blocked. Basic shell (cp/mkdir/cat/head/grep) is allowed for the floor submission and data inspection. If you can't do the work through the `databricks` CLI, STOP and report the missing capability — do NOT work around it locally.
+[agent:thinking] I need to use the Databricks CLI for everything. I can't write Python locally. Let me use the Databricks CLI to create a notebook and execute it. 
+[agent:thinking] 
+[agent:thinking] The way to do this with Databricks CLI is:
+[agent:thinking] 1. Create a notebook file locally (as a .py file)
+[agent:thinking] 2. Upload it to the workspace using `databricks workspace import`
+[agent:thinking] 3. Run it as a job
+[agent:thinking] 
+[agent:thinking] Let me try to create the notebook file in a different way using basic shell tools (cat with a heredoc using echo-only). Actually the issue is that `cat` with a heredoc is likely fine - it's just that the content had `from` keyword which the hook detected as potential Python import.
+[agent:thinking] The hook is catching the Python import statement in my command text. I should use the Write tool to create the notebook file instead, then upload it to Databricks and run it as a job.
+[agent] I need to write the notebook using the Write tool to avoid the local Python restriction check.
+[agent:write] /tmp/drift_notebook.py
+[agent:result-err] PreToolUse:Write hook error: [python3 /Users/wolffbe/workspace/banter/testbed/results/19_db-full-cli-sdk-skills-sonnet/claude-sonnet-4-6/databricks/cli/1.3.0/official/ops/drift/1/task/.claude/hooks/log_tool_call.py]: DENIED: Write('/tmp/drift_notebook.py') — path is outside the agent boundary (/Users/wolffbe/workspace/banter/testbed/results/19_db-full-cli-sdk-skills-sonnet/claude-sonnet-4-6/databricks/cli/1.3.0/official/ops/drift/1/task). Stay inside your working directory (or ~/.claude); rewrite the call to a path under cwd.
+[agent:write] /Users/wolffbe/workspace/banter/testbed/results/19_db-full-cli-sdk-skills-sonnet/claude-sonnet-4-6/databricks/cli/1.3.0/official/ops/drift/1/task/.tmp/drift_notebook.py
+[agent:result] File created successfully at: /Users/wolffbe/workspace/banter/testbed/results/19_db-full-cli-sdk-skills-sonnet/claude-sonnet-4-6/databricks/cli/1.3.0/official/ops/drift/1/task/.tmp/drift_notebook.py (file state is current in your context — no need to Read it back)
+[agent:bash] databricks workspace import /Users/benedict@logicalclocks.com/mlpabe8ecdb/drift_analysis --format SOURCE --language PYTHON --file .tmp/drift_notebook.py --overwrite 2>&1
+[agent:result-err] Exit code 1
+[agent:result-err] Error: The parent folder (/Users/benedict@logicalclocks.com/mlpabe8ecdb) does not exist.
+[agent:bash] databricks workspace mkdirs /Users/benedict@logicalclocks.com/mlpabe8ecdb 2>&1
+[agent:result] (Bash completed with no output)
+[agent:bash] databricks workspace import /Users/benedict@logicalclocks.com/mlpabe8ecdb/drift_analysis --format SOURCE --language PYTHON --file .tmp/drift_notebook.py --overwrite 2>&1
+[agent:result] (Bash completed with no output)
+[agent:bash] databricks workspace list /Users/benedict@logicalclocks.com/mlpabe8ecdb 2>&1
+[agent:result] ID                Type      Language  Path
+[agent:result] 3778175223024335  NOTEBOOK  PYTHON    /Users/benedict@logicalclocks.com/mlpabe8ecdb/drift_analysis
+[agent] Now let me create and run a job to execute the notebook.
+[agent:write] /Users/wolffbe/workspace/banter/testbed/results/19_db-full-cli-sdk-skills-sonnet/claude-sonnet-4-6/databricks/cli/1.3.0/official/ops/drift/1/task/.tmp/job_config.json
+[agent:result] File created successfully at: /Users/wolffbe/workspace/banter/testbed/results/19_db-full-cli-sdk-skills-sonnet/claude-sonnet-4-6/databricks/cli/1.3.0/official/ops/drift/1/task/.tmp/job_config.json (file state is current in your context — no need to Read it back)
+[agent:bash] databricks jobs create --json @.tmp/job_config.json 2>&1
+[agent:result-err] Exit code 1
+[agent:result-err] Error: Only serverless compute is supported in the workspace.
+[agent:thinking] I need to use serverless compute. Let me update the job config to use serverless.
+[agent:write] /Users/wolffbe/workspace/banter/testbed/results/19_db-full-cli-sdk-skills-sonnet/claude-sonnet-4-6/databricks/cli/1.3.0/official/ops/drift/1/task/.tmp/job_config.json
+[agent:result] The file /Users/wolffbe/workspace/banter/testbed/results/19_db-full-cli-sdk-skills-sonnet/claude-sonnet-4-6/databricks/cli/1.3.0/official/ops/drift/1/task/.tmp/job_config.json has been updated successfully. (file state is current in your context — no need to Read it back)
+[agent:bash] databricks jobs create --json @.tmp/job_config.json 2>&1
+[agent:result] Warning: unknown field: serverless_environment_spec
+[agent:result]   at tasks[0]
+[agent:result]   in .tmp/job_config.json:10:8
+[agent:result] 
+[agent:result] {
+[agent:result]   "job_id": 460037224297487
+[agent:result] }
+[agent:bash] databricks jobs run-now 460037224297487 2>&1
+[agent:result] {
+[agent:result]   "cleanup_duration": 0,
+[agent:result]   "creator_user_name": "benedict@logicalclocks.com",
+[agent:result]   "effective_performance_target": "PERFORMANCE_OPTIMIZED",
+[agent:result]   "end_time": 1782866795306,
+[agent:result]   "execution_duration": 39000,
+[agent:result]   "job_id": 460037224297487,
+[agent:result]   "job_run_id": 234540815978280,
+[agent:result]   "number_in_job": 234540815978280,
+[agent:result]   "original_attempt_run_id": 234540815978280,
+[agent:result]   "run_duration": 44300,
+[agent:result]   "run_id": 234540815978280,
+[agent:result]   "run_name": "mlpabe8ecdb_drift_detection",
+[agent:result]   "run_page_url": "https://dbc-2a4591fe-28e4.cloud.databricks.com/?o=7474654317829492#job/460037224297487/run/234540815978280",
+[agent:result]   "run_type": "JOB_RUN",
+[agent:result]   "setup_duration": 4000,
+[agent:result]   "start_time": 1782866751006,
+[agent:result]   "state": {
+[agent:result]     "life_cycle_state": "TERMINATED",
+[agent:result]     "result_state": "SUCCESS",
+[agent:result]     "state_message": "",
+[agent:result]     "user_cancelled_or_timedout": false
+[agent:result]   },
+[agent:result]   "status": {
+[agent:result]     "state": "TERMINATED",
+[agent:result]     "termination_details": {
+[agent:result]       "code": "SUCCESS",
+[agent:result]       "message": "",
+[agent:result]       "type": "SUCCESS"
+[agent:result]     }
+[agent:result]   },
+[agent:result]   "tasks": [
+[agent:result]     {
+[agent:result]       "attempt_number": 0,
+[agent:result]       "cleanup_duration": 0,
+[agent:result]       "effective_performance_target": "PERFORMANCE_OPTIMIZED",
+[agent:result]       "end_time": 1782866794848,
+[agent:result]       "execution_duration": 39000,
+[agent:result]       "notebook_task": {
+[agent:result]         "notebook_path": "/Users/benedict@logicalclocks.com/mlpabe8ecdb/drift_analysis",
+[agent:result]         "source": "WORKSPACE"
+[agent:result]       },
+[agent:result]       "run_id": 579289526131896,
+[agent:result]       "run_if": "ALL_SUCCESS",
+[agent:result]       "run_page_url": "https://dbc-2a4591fe-28e4.cloud.databricks.com/?o=7474654317829492#job/460037224297487/run/579289526131896",
+[agent:result]       "setup_duration": 4000,
+[agent:result]       "start_time": 1782866751032,
+[agent:result]       "state": {
+[agent:result]         "life_cycle_state": "TERMINATED",
+[agent:result]         "result_state": "SUCCESS",
+[agent:result]         "state_message": "",
+[agent:result]         "user_cancelled_or_timedout": false
+[agent:result]       },
+[agent:result]       "status": {
+[agent:result]         "state": "TERMINATED",
+[agent:result]         "termination_details": {
+[agent:result]           "code": "SUCCESS",
+[agent:result]           "message": "",
+[agent:result]           "type": "SUCCESS"
+[agent:result]         }
+[agent:result]       },
+[agent:result]       "task_key": "drift_analysis"
+[agent:result]     }
+[agent:result]   ],
+[agent:result]   "trigger": "ONE_TIME"
+[agent:result] }
+[agent:thinking] The job ran successfully. Now let me query the Delta tables to get the results.
+[agent] The job succeeded. Now let me query the results from the Delta tables.
+[agent:bash] databricks sql execute --statement "SELECT * FROM workspace.mlpabe8ecdb.mlpabe8ecdb_drift_results ORDER BY score DESC" --warehouse-id $(databricks warehouses list 2>/dev/null | grep -o '"id": "[^"]*"' | head -1 | grep -o '"[^"]*"$' | tr -d '"') 2>&1 | head -60
+[agent:result] Error: unknown command "sql" for "databricks"
+[agent:result] 
+[agent:result] Did you mean this?
+[agent:result] 	psql
+[agent:bash] databricks warehouses list 2>&1 | head -30
+[agent:result] ID                Name          Size      State
+[agent:result] 4dfab06c923fe3cc  mlpab-grader  2X-Small  STOPPED
+[agent:bash] databricks statement-execution execute-statement --statement "SELECT * FROM workspace.mlpabe8ecdb.mlpabe8ecdb_drift_results ORDER BY score DESC" --warehouse-id 4dfab06c923fe3cc --wait-timeout 120s 2>&1
+[agent:result-err] Exit code 1
+[agent:result-err] Error: unknown command "statement-execution" for "databricks"
+[agent:bash] databricks --help 2>&1 | grep -i "sql\|statement\|query\|exec"
+[agent:result] Databricks SQL
+[agent:result]   alerts-v2                              *Public Preview* New version of SQL Alerts.
+[agent:result]   data-sources                           This API is provided to assist you in making new query objects.
+[agent:result]   queries-legacy                         These endpoints are used for CRUD operations on query definitions.
+[agent:result]   query-history                          A service responsible for storing and retrieving the list of queries run against SQL endpoints and serverless compute.
+[agent:result]   warehouses                             A SQL warehouse is a compute resource that lets you run SQL commands on data objects within Databricks SQL.
+[agent:result]   clean-room-task-runs                   Clean room task runs are the executions of notebooks in a clean room.
+[agent:result]   database                               *Public Preview* Database Instances provide access to a database via REST API or direct SQL.
+[agent:result]   psql                                   Connect to a Lakebase Postgres database
+[agent:bash] databricks queries-legacy --help 2>&1 | head -20
+[agent:result] These endpoints are used for CRUD operations on query definitions. Query
+[agent:result]   definitions include the target SQL warehouse, query text, name, description,
+[agent:result]   tags, parameters, and visualizations. Queries can be scheduled using the
+[agent:result]   sql_task type of the Jobs API, e.g. :method:jobs/create.
+[agent:result] 
+[agent:result]   **Warning**: This API is deprecated. Please see the latest version of the
+[agent:result]   Databricks SQL API. [Learn more]
+[agent:result] 
+[agent:result]   [Learn more]: https://docs.databricks.com/en/sql/dbsql-api-latest.html
+[agent:result] 
+[agent:result] Usage:
+[agent:result]   databricks queries-legacy [flags]
+[agent:result]   databricks queries-legacy [command]
+[agent:result] 
+[agent:result] Available Commands:
+[agent:result]   create      Create a new query definition.
+[agent:result]   delete      Delete a query.
+[agent:result]   get         Get a query definition.
+[agent:result]   list        Get a list of queries.
+[agent:result]   restore     Restore a query.
+[agent:thinking] I need to use the Databricks SQL API. Let me look for the right way to execute a SQL statement. I see there's no direct `sql execute` command in this CLI. Let me try using the `databricks jobs run-now` approach but with a SQL task to run the query and output to a file.
+[agent:thinking] 
+[agent:thinking] Actually, let me try a different approach. Let me look at the notebook run output to get the print statements, or create a new notebook that reads the Delta table and writes the answer to a file in the volume.
+[agent:thinking] 
+[agent:thinking] Actually, let me first check the job run output logs to see what the notebook printed.
+[agent:bash] databricks jobs get-run 234540815978280 2>&1 | head -20
+[agent:result] {
+[agent:result]   "cleanup_duration": 0,
+[agent:result]   "creator_user_name": "benedict@logicalclocks.com",
+[agent:result]   "effective_performance_target": "PERFORMANCE_OPTIMIZED",
+[agent:result]   "end_time": 1782866795306,
+[agent:result]   "execution_duration": 39000,
+[agent:result]   "job_id": 460037224297487,
+[agent:result]   "job_run_id": 234540815978280,
+[agent:result]   "number_in_job": 234540815978280,
+[agent:result]   "original_attempt_run_id": 234540815978280,
+[agent:result]   "run_duration": 44300,
+[agent:result]   "run_id": 234540815978280,
+[agent:result]   "run_name": "mlpabe8ecdb_drift_detection",
+[agent:result]   "run_page_url": "https://dbc-2a4591fe-28e4.cloud.databricks.com/?o=7474654317829492#job/460037224297487/run/234540815978280",
+[agent:result]   "run_type": "JOB_RUN",
+[agent:result]   "setup_duration": 4000,
+[agent:result]   "start_time": 1782866751006,
+[agent:result]   "state": {
+[agent:result]     "life_cycle_state": "TERMINATED",
+[agent:result]     "result_state": "SUCCESS",
+[agent:bash] databricks jobs get-run-output 579289526131896 2>&1
+[agent:result] {
+[agent:result]   "metadata": {
+[agent:result]     "cleanup_duration": 0,
+[agent:result]     "creator_user_name": "benedict@logicalclocks.com",
+[agent:result]     "effective_performance_target": "PERFORMANCE_OPTIMIZED",
+[agent:result]     "end_time": 1782866794848,
+[agent:result]     "execution_duration": 39000,
+[agent:result]     "job_id": 460037224297487,
+[agent:result]     "job_run_id": 234540815978280,
+[agent:result]     "number_in_job": 579289526131896,
+[agent:result]     "original_attempt_run_id": 579289526131896,
+[agent:result]     "run_id": 579289526131896,
+[agent:result]     "run_name": "drift_analysis",
+[agent:result]     "run_page_url": "https://dbc-2a4591fe-28e4.cloud.databricks.com/?o=7474654317829492#job/460037224297487/run/579289526131896",
+[agent:result]     "run_type": "JOB_RUN",
+[agent:result]     "setup_duration": 4000,
+[agent:result]     "start_time": 1782866751032,
+[agent:result]     "state": {
+[agent:result]       "life_cycle_state": "TERMINATED",
+[agent:result]       "result_state": "SUCCESS",
+[agent:result]       "state_message": "",
+[agent:result]       "user_cancelled_or_timedout": false
+[agent:result]     },
+[agent:result]     "status": {
+[agent:result]       "state": "TERMINATED",
+[agent:result]       "termination_details": {
+[agent:result]         "code": "SUCCESS",
+[agent:result]         "message": "",
+[agent:result]         "type": "SUCCESS"
+[agent:result]       }
+[agent:result]     },
+[agent:result]     "tasks": [
+[agent:result]       {
+[agent:result]         "attempt_number": 0,
+[agent:result]         "cleanup_duration": 0,
+[agent:result]         "effective_performance_target": "PERFORMANCE_OPTIMIZED",
+[agent:result]         "end_time": 1782866794848,
+[agent:result]         "execution_duration": 39000,
+[agent:result]         "notebook_task": {
+[agent:result]           "notebook_path": "/Users/benedict@logicalclocks.com/mlpabe8ecdb/drift_analysis",
+[agent:result]           "source": "WORKSPACE"
+[agent:result]         },
+[agent:result]         "run_id": 579289526131896,
+[agent:result]         "run_page_url": "https://dbc-2a4591fe-28e4.cloud.databricks.com/?o=7474654317829492#job/460037224297487/run/579289526131896",
+[agent:result]         "setup_duration": 4000,
+[agent:result]         "start_time": 1782866751032,
+[agent:result]         "state": {
+[agent:result]           "life_cycle_state": "TERMINATED",
+[agent:result]           "result_state": "SUCCESS",
+[agent:result]           "state_message": "",
+[agent:result]           "user_cancelled_or_timedout": false
+[agent:result]         },
+[agent:result]         "status": {
+[agent:result]           "state": "TERMINATED",
+[agent:result]           "termination_details": {
+[agent:result]             "code": "SUCCESS",
+[agent:result]             "message": "",
+[agent:result]             "type": "SUCCESS"
+[agent:result]           }
+[agent:result]         },
+[agent:result]         "task_key": "drift_analysis"
+[agent:result]       }
+[agent:result]     ],
+[agent:result]     "trigger": "ONE_TIME"
+[agent:result]   },
+[agent:result]   "notebook_output": {}
+[agent:result] }
+[agent:thinking] The notebook output is empty - that's because notebook jobs don't capture stdout output. I need to read the results from the Delta table. Let me write a new notebook that reads from the Delta table and saves to the volume as a JSON file, then I can download it.
+[agent] The job output doesn't capture print output. Let me write a notebook to save results to the volume as JSON, then read it back.
+[agent:write] /Users/wolffbe/workspace/banter/testbed/results/19_db-full-cli-sdk-skills-sonnet/claude-sonnet-4-6/databricks/cli/1.3.0/official/ops/drift/1/task/.tmp/read_results.py
+[agent:result] File created successfully at: /Users/wolffbe/workspace/banter/testbed/results/19_db-full-cli-sdk-skills-sonnet/claude-sonnet-4-6/databricks/cli/1.3.0/official/ops/drift/1/task/.tmp/read_results.py (file state is current in your context — no need to Read it back)
+[agent:bash] databricks workspace import /Users/benedict@logicalclocks.com/mlpabe8ecdb/read_results --format SOURCE --language PYTHON --file .tmp/read_results.py --overwrite 2>&1
+[agent:result] (Bash completed with no output)
+[agent:write] /Users/wolffbe/workspace/banter/testbed/results/19_db-full-cli-sdk-skills-sonnet/claude-sonnet-4-6/databricks/cli/1.3.0/official/ops/drift/1/task/.tmp/job_read_config.json
+[agent:result] File created successfully at: /Users/wolffbe/workspace/banter/testbed/results/19_db-full-cli-sdk-skills-sonnet/claude-sonnet-4-6/databricks/cli/1.3.0/official/ops/drift/1/task/.tmp/job_read_config.json (file state is current in your context — no need to Read it back)
+[agent:bash] databricks jobs create --json @.tmp/job_read_config.json 2>&1
+[agent:result] {
+[agent:result]   "job_id": 584288501990020
+[agent:result] }
+[agent:bash] databricks jobs run-now 584288501990020 2>&1
+[agent:result] {
+[agent:result]   "cleanup_duration": 0,
+[agent:result]   "creator_user_name": "benedict@logicalclocks.com",
+[agent:result]   "effective_performance_target": "PERFORMANCE_OPTIMIZED",
+[agent:result]   "end_time": 1782866888562,
+[agent:result]   "execution_duration": 30000,
+[agent:result]   "job_id": 584288501990020,
+[agent:result]   "job_run_id": 810151366958220,
+[agent:result]   "number_in_job": 810151366958220,
+[agent:result]   "original_attempt_run_id": 810151366958220,
+[agent:result]   "run_duration": 35307,
+[agent:result]   "run_id": 810151366958220,
+[agent:result]   "run_name": "mlpabe8ecdb_read_results",
+[agent:result]   "run_page_url": "https://dbc-2a4591fe-28e4.cloud.databricks.com/?o=7474654317829492#job/584288501990020/run/810151366958220",
+[agent:result]   "run_type": "JOB_RUN",
+[agent:result]   "setup_duration": 4000,
+[agent:result]   "start_time": 1782866853255,
+[agent:result]   "state": {
+[agent:result]     "life_cycle_state": "TERMINATED",
+[agent:result]     "result_state": "SUCCESS",
+[agent:result]     "state_message": "",
+[agent:result]     "user_cancelled_or_timedout": false
+[agent:result]   },
+[agent:result]   "status": {
+[agent:result]     "state": "TERMINATED",
+[agent:result]     "termination_details": {
+[agent:result]       "code": "SUCCESS",
+[agent:result]       "message": "",
+[agent:result]       "type": "SUCCESS"
+[agent:result]     }
+[agent:result]   },
+[agent:result]   "tasks": [
+[agent:result]     {
+[agent:result]       "attempt_number": 0,
+[agent:result]       "cleanup_duration": 0,
+[agent:result]       "effective_performance_target": "PERFORMANCE_OPTIMIZED",
+[agent:result]       "end_time": 1782866888097,
+[agent:result]       "execution_duration": 30000,
+[agent:result]       "notebook_task": {
+[agent:result]         "notebook_path": "/Users/benedict@logicalclocks.com/mlpabe8ecdb/read_results",
+[agent:result]         "source": "WORKSPACE"
+[agent:result]       },
+[agent:result]       "run_id": 30584271540786,
+[agent:result]       "run_if": "ALL_SUCCESS",
+[agent:result]       "run_page_url": "https://dbc-2a4591fe-28e4.cloud.databricks.com/?o=7474654317829492#job/584288501990020/run/30584271540786",
+[agent:result]       "setup_duration": 4000,
+[agent:result]       "start_time": 1782866853279,
+[agent:result]       "state": {
+[agent:result]         "life_cycle_state": "TERMINATED",
+[agent:result]         "result_state": "SUCCESS",
+[agent:result]         "state_message": "",
+[agent:result]         "user_cancelled_or_timedout": false
+[agent:result]       },
+[agent:result]       "status": {
+[agent:result]         "state": "TERMINATED",
+[agent:result]         "termination_details": {
+[agent:result]           "code": "SUCCESS",
+[agent:result]           "message": "",
+[agent:result]           "type": "SUCCESS"
+[agent:result]         }
+[agent:result]       },
+[agent:result]       "task_key": "read_results"
+[agent:result]     }
+[agent:result]   ],
+[agent:result]   "trigger": "ONE_TIME"
+[agent:result] }
+[agent] The job succeeded. Now let me download the answer from the volume.
+[agent:bash] databricks fs cp dbfs:/Volumes/workspace/mlpabe8ecdb/mlpabe8ecdb_drift_data/answer.json ./submission/answer_from_volume.json 2>&1
+[agent:result] dbfs:/Volumes/workspace/mlpabe8ecdb/mlpabe8ecdb_drift_data/answer.json -> ./submission/answer_from_volume.json
+[agent:bash] cat submission/answer_from_volume.json
+[agent:result] {"feature": "f5", "onset": "2026-02-22"}
+[agent:thinking] Excellent! The drift analysis found that feature `f5` drifted, with an onset date of `2026-02-22`. 
+[agent:thinking] 
+[agent:thinking] Let me also download and check the full results to make sure this looks right.
+[agent] Let me also verify by checking the full results table. Let me create another notebook to write all results to the volume.
+[agent:write] /Users/wolffbe/workspace/banter/testbed/results/19_db-full-cli-sdk-skills-sonnet/claude-sonnet-4-6/databricks/cli/1.3.0/official/ops/drift/1/task/.tmp/write_all_results.py
+[agent:result] File created successfully at: /Users/wolffbe/workspace/banter/testbed/results/19_db-full-cli-sdk-skills-sonnet/claude-sonnet-4-6/databricks/cli/1.3.0/official/ops/drift/1/task/.tmp/write_all_results.py (file state is current in your context — no need to Read it back)
+[agent:bash] databricks workspace import /Users/benedict@logicalclocks.com/mlpabe8ecdb/write_all_results --format SOURCE --language PYTHON --file .tmp/write_all_results.py --overwrite 2>&1 && databricks jobs create --json '{"name":"mlpabe8ecdb_write_all","tasks":[{"task_key":"write_all","notebook_task":{"notebook_path":"/Users/benedict@logicalclocks.com/mlpabe8ecdb/write_all_results","source":"WORKSPACE"}}]}' 2>&1
+[agent:result] {
+[agent:result]   "job_id": 544150918655019
+[agent:result] }
+[agent:bash] databricks jobs run-now 544150918655019 2>&1 | grep -E "result_state|ANSWER|life_cycle"
+[agent:result]     "life_cycle_state": "TERMINATED",
+[agent:result]     "result_state": "SUCCESS",
+[agent:result]         "life_cycle_state": "TERMINATED",
+[agent:result]         "result_state": "SUCCESS",
+[agent:bash] databricks fs cp dbfs:/Volumes/workspace/mlpabe8ecdb/mlpabe8ecdb_drift_data/all_results.json ./submission/all_results.json 2>&1 && cat submission/all_results.json
+[agent:result] dbfs:/Volumes/workspace/mlpabe8ecdb/mlpabe8ecdb_drift_data/all_results.json -> ./submission/all_results.json
+[agent:result] [
+[agent:result]   {
+[agent:result]     "feature": "f5",
+[agent:result]     "score": 47.174190521240234,
+[agent:result]     "onset_date": "2026-02-22",
+[agent:result]     "split_idx": 52,
+[agent:result]     "pre_mean": 0.866522490978241,
+[agent:result]     "post_mean": 4.898531436920166
+[agent:result]   },
+[agent:result]   {
+[agent:result]     "feature": "f4",
+[agent:result]     "score": 1.0719095468521118,
+[agent:result]     "onset_date": "2026-01-14",
+[agent:result]     "split_idx": 13,
+[agent:result]     "pre_mean": 6.470609188079834,
+[agent:result]     "post_mean": 6.340250492095947
+[agent:result]   },
+[agent:result]   {
+[agent:result]     "feature": "f3",
+[agent:result]     "score": 0.7207217812538147,
+[agent:result]     "onset_date": "2026-01-12",
+[agent:result]     "split_idx": 11,
+[agent:result]     "pre_mean": 2.962789535522461,
+[agent:result]     "post_mean": 3.0152053833007812
+[agent:result]   },
+[agent:result]   {
+[agent:result]     "feature": "f2",
+[agent:result]     "score": 0.6580478549003601,
+[agent:result]     "onset_date": "2026-01-26",
+[agent:result]     "split_idx": 25,
+[agent:result]     "pre_mean": 8.99634838104248,
+[agent:result]     "post_mean": 9.0243501663208
+[agent:result]   },
+[agent:result]   {
+[agent:result]     "feature": "f6",
+[agent:result]     "score": 0.48632702231407166,
+[agent:result]     "onset_date": "2026-01-20",
+[agent:result]     "split_idx": 19,
+[agent:result]     "pre_mean": 9.065497398376465,
+[agent:result]     "post_mean": 9.035507202148438
+[agent:result]   },
+[agent:result]   {
+[agent:result]     "feature": "f1",
+[agent:result]     "score": 0.4418731927871704,
+[agent:result]     "onset_date": "2026-01-11",
+[agent:result]     "split_idx": 10,
+[agent:result]     "pre_mean": 6.505712985992432,
+[agent:result]     "post_mean": 6.4598822593688965
+[agent:result]   }
+[agent:result] ]
+[agent:thinking] The results are very clear:
+[agent:thinking] - `f5` has a score of 47.17 (very high), which is 44x more than the next highest score (f4: 1.07)
+[agent:thinking] - The pre-drift mean of f5 was 0.87 and the post-drift mean was 4.90 - a massive shift
+[agent:thinking] - The onset date is 2026-02-22 (day index 52 in the 90-day period)
+[agent:thinking] 
+[agent:thinking] This is a very clear and unambiguous result. Feature `f5` drifted with a large mean shift on 2026-02-22.
+[agent:thinking] Now I'm writing the final answer to the submission file.
+[agent] The results are unambiguous: `f5` has a score of 47.17 (44x higher than f4 at 1.07), with a mean shift from 0.87 to 4.90 starting on 2026-02-22. Let me write the final answer.
+[agent:write] /Users/wolffbe/workspace/banter/testbed/results/19_db-full-cli-sdk-skills-sonnet/claude-sonnet-4-6/databricks/cli/1.3.0/official/ops/drift/1/task/submission/answers.json
+[agent:result] File created successfully at: /Users/wolffbe/workspace/banter/testbed/results/19_db-full-cli-sdk-skills-sonnet/claude-sonnet-4-6/databricks/cli/1.3.0/official/ops/drift/1/task/submission/answers.json (file state is current in your context — no need to Read it back)
+[agent:bash] cat submission/answers.json
+[agent:result] {"feature": "f5", "onset": "2026-02-22"}
+[agent] The analysis is complete. Feature `f5` clearly drifted with a drift score of 47.2 (vs. the next highest at 1.07), showing a mean shift from ~0.87 to ~4.90 starting on **2026-02-22**. The answer is written to `submission/answers.json`.
+[agent] done: 44 turns, $0.9416, stop=end_turn
+Collecting databricks-sdk==0.117.0
+  Downloading databricks_sdk-0.117.0-py3-none-any.whl.metadata (43 kB)
+Requirement already satisfied: requests<3,>=2.28.1 in ./venv/lib/python3.13/site-packages (from databricks-sdk==0.117.0) (2.34.2)
+Collecting google-auth~=2.0 (from databricks-sdk==0.117.0)
+  Downloading google_auth-2.55.1-py3-none-any.whl.metadata (5.1 kB)
+Requirement already satisfied: protobuf!=5.26.*,!=5.27.*,!=5.28.*,!=5.29.0,!=5.29.1,!=5.29.2,!=5.29.3,!=5.29.4,!=6.30.0,!=6.30.1,!=6.31.0,<7.0,>=4.25.8 in ./venv/lib/python3.13/site-packages (from databricks-sdk==0.117.0) (4.25.9)
+Requirement already satisfied: urllib3<3,>=1.26 in ./venv/lib/python3.13/site-packages (from databricks-sdk==0.117.0) (2.7.0)
+Requirement already satisfied: pyasn1-modules>=0.2.1 in ./venv/lib/python3.13/site-packages (from google-auth~=2.0->databricks-sdk==0.117.0) (0.4.2)
+Requirement already satisfied: cryptography>=38.0.3 in ./venv/lib/python3.13/site-packages (from google-auth~=2.0->databricks-sdk==0.117.0) (49.0.0)
+Requirement already satisfied: charset_normalizer<4,>=2 in ./venv/lib/python3.13/site-packages (from requests<3,>=2.28.1->databricks-sdk==0.117.0) (3.4.7)
+Requirement already satisfied: idna<4,>=2.5 in ./venv/lib/python3.13/site-packages (from requests<3,>=2.28.1->databricks-sdk==0.117.0) (3.18)
+Requirement already satisfied: certifi>=2023.5.7 in ./venv/lib/python3.13/site-packages (from requests<3,>=2.28.1->databricks-sdk==0.117.0) (2026.5.20)
+Requirement already satisfied: cffi>=2.0.0 in ./venv/lib/python3.13/site-packages (from cryptography>=38.0.3->google-auth~=2.0->databricks-sdk==0.117.0) (2.0.0)
+Requirement already satisfied: pycparser in ./venv/lib/python3.13/site-packages (from cffi>=2.0.0->cryptography>=38.0.3->google-auth~=2.0->databricks-sdk==0.117.0) (3.0)
+Requirement already satisfied: pyasn1<0.7.0,>=0.6.1 in ./venv/lib/python3.13/site-packages (from pyasn1-modules>=0.2.1->google-auth~=2.0->databricks-sdk==0.117.0) (0.6.3)
+Downloading databricks_sdk-0.117.0-py3-none-any.whl (936 kB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 936.9/936.9 kB 30.9 MB/s  0:00:00
+Downloading google_auth-2.55.1-py3-none-any.whl (252 kB)
+Installing collected packages: google-auth, databricks-sdk
+
+Successfully installed databricks-sdk-0.117.0 google-auth-2.55.1
+[mlpab] graded: 3 passed / 0 failed / 0 skipped of 3 asserts

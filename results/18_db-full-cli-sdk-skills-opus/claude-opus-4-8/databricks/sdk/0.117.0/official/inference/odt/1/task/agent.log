@@ -1,0 +1,509 @@
+[mlpab] skills (95c4b1b4): databricks-apps,databricks-core,databricks-dabs,databricks-jobs,databricks-lakebase,databricks-model-serving,databricks-pipelines,databricks-serverless-migration,databricks-vector-search
+[agent] I'll start by exploring the task inputs and environment.
+[agent:bash] cat data/schema.md; echo "---REQUESTS---"; head -5 data/requests.csv; echo "---PROFILES---"; head -5 data/profiles.csv; echo "---COUNTS---"; wc -l data/requests.csv data/profiles.csv
+[agent:result] # Schema
+[agent:result] 
+[agent:result] - **requests.csv**: request_id (unique key), account_id, request_lat, request_lon (the request's coordinates — only known at request time), requested_at (ISO UTC)
+[agent:result] - **profiles.csv**: account_id (unique key), home_lat, home_lon, base_score (precomputed profile score)
+[agent:result] ---REQUESTS---
+[agent:result] request_id,account_id,request_lat,request_lon,requested_at
+[agent:result] Q00000,A0015,-32.723054,-37.046886,2026-04-01T02:32:00Z
+[agent:result] Q00001,A0045,-58.792201,-98.969255,2026-04-01T04:31:00Z
+[agent:result] Q00002,A0024,48.589667,-166.392334,2026-04-01T05:31:00Z
+[agent:result] Q00003,A0030,-3.251487,-140.568097,2026-04-01T07:35:00Z
+[agent:result] ---PROFILES---
+[agent:result] account_id,home_lat,home_lon,base_score
+[agent:result] A0000,2.785222,-18.408738,0.495268
+[agent:result] A0001,-5.902677,60.864278,0.857081
+[agent:result] A0002,-57.526118,142.21771,0.428507
+[agent:result] A0003,23.328374,-139.0809,0.744259
+[agent:result] ---COUNTS---
+[agent:result]      401 data/requests.csv
+[agent:result]       61 data/profiles.csv
+[agent:result]      462 total
+[agent:bash] echo "SCHEMA=$MLPAB_DATABRICKS_SCHEMA"; echo "PREFIX=$MLPAB_DATABRICKS_PREFIX"; echo "HOST=$DATABRICKS_HOST"; echo "PWD=$(pwd)"; python -c "import databricks.sdk; print(databricks.sdk.__version__)"
+[agent:result-err] Exit code 1
+[agent:result-err] SCHEMA=workspace.mlpab877323
+[agent:result-err] PREFIX=mlpab877323
+[agent:result-err] HOST=***REDACTED***
+[agent:result-err] PWD=/Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/sdk/0.117.0/official/inference/odt/1/task
+[agent:result-err] Traceback (most recent call last):
+[agent:result-err]   File "<string>", line 1, in <module>
+[agent:result-err]     import databricks.sdk; print(databricks.sdk.__version__)
+[agent:result-err]                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^
+[agent:result-err] AttributeError: module 'databricks.sdk' has no attribute '__version__'
+[agent:bash] python -c "
+[agent:bash] from databricks.sdk import WorkspaceClient
+[agent:bash] w = WorkspaceClient()
+[agent:bash] print('current user:', w.current_user.me().user_name)
+[agent:bash] print('---attrs---')
+[agent:bash] attrs = [a for a in dir(w) if not a.startswith('_')]
+[agent:bash] print(attrs)
+[agent:bash] "
+[agent:result] current user: benedict@logicalclocks.com
+[agent:result] ---attrs---
+[agent:result] ['access_control', 'account_access_control_proxy', 'agent_bricks', 'ai_search', 'alerts', 'alerts_legacy', 'alerts_v2', 'api_client', 'apps', 'apps_settings', 'artifact_allowlists', 'bundle_deployments', 'catalogs', 'clean_room_asset_revisions', 'clean_room_assets', 'clean_room_auto_approval_rules', 'clean_room_task_runs', 'clean_rooms', 'cluster_policies', 'clusters', 'command_execution', 'config', 'connections', 'consumer_fulfillments', 'consumer_installations', 'consumer_listings', 'consumer_personalization_requests', 'consumer_providers', 'credentials', 'credentials_manager', 'current_user', 'dashboard_widgets', 'dashboards', 'data_classification', 'data_quality', 'data_sources', 'database', 'dbfs', 'dbsql_permissions', 'dbutils', 'entity_tag_assignments', 'environments', 'experiments', 'external_lineage', 'external_locations', 'external_metadata', 'feature_engineering', 'feature_store', 'files', 'forecasting', 'functions', 'genie', 'get_workspace_id', 'git_credentials', 'global_init_scripts', 'grants', 'groups', 'groups_v2', 'instance_pools', 'instance_profiles', 'ip_access_lists', 'jobs', 'knowledge_assistants', 'lakeview', 'lakeview_embedded', 'libraries', 'materialized_features', 'metastores', 'model_registry', 'model_versions', 'notification_destinations', 'online_tables', 'permission_migration', 'permissions', 'pipelines', 'policies', 'policy_compliance_for_clusters', 'policy_compliance_for_jobs', 'policy_families', 'postgres', 'provider_exchange_filters', 'provider_exchanges', 'provider_files', 'provider_listings', 'provider_personalization_requests', 'provider_provider_analytics_dashboards', 'provider_providers', 'providers', 'quality_monitor_v2', 'quality_monitors', 'queries', 'queries_legacy', 'query_history', 'query_visualizations', 'query_visualizations_legacy', 'recipient_activation', 'recipient_federation_policies', 'recipients', 'redash_config', 'registered_models', 'repos', 'resource_quotas', 'rfa', 'schemas', 'secrets', 'secrets_uc', 'service_principal_secrets_proxy', 'service_principals', 'service_principals_v2', 'serving_endpoints', 'serving_endpoints_data_plane', 'settings', 'shares', 'statement_execution', 'storage_credentials', 'supervisor_agents', 'system_schemas', 'table_constraints', 'tables', 'tag_policies', 'temporary_path_credentials', 'temporary_table_credentials', 'temporary_volume_credentials', 'token_management', 'tokens', 'users', 'users_v2', 'vector_search_endpoints', 'vector_search_indexes', 'volumes', 'warehouses', 'workspace', 'workspace_bindings', 'workspace_conf', 'workspace_entity_tag_assignments', 'workspace_iam_v2', 'workspace_settings_v2']
+[agent] This is a feature store task. Let me introspect the relevant APIs.
+[agent:bash] python -c "
+[agent:bash] from databricks.sdk import WorkspaceClient
+[agent:bash] w = WorkspaceClient()
+[agent:bash] for name in ['feature_engineering','feature_store','materialized_features','online_tables']:
+[agent:bash]     obj = getattr(w, name)
+[agent:bash]     print('=====', name, '=====')
+[agent:bash]     print([a for a in dir(obj) if not a.startswith('_')])
+[agent:bash] "
+[agent:result] ===== feature_engineering =====
+[agent:result] ['batch_create_materialized_features', 'create_feature', 'create_kafka_config', 'create_materialized_feature', 'create_stream', 'delete_feature', 'delete_kafka_config', 'delete_materialized_feature', 'delete_stream', 'get_feature', 'get_kafka_config', 'get_materialized_feature', 'get_stream', 'list_features', 'list_kafka_configs', 'list_materialized_features', 'list_streams', 'update_feature', 'update_kafka_config', 'update_materialized_feature', 'update_stream']
+[agent:result] ===== feature_store =====
+[agent:result] ['create_online_store', 'delete_online_store', 'delete_online_table', 'get_online_store', 'list_online_stores', 'publish_table', 'update_online_store']
+[agent:result] ===== materialized_features =====
+[agent:result] ['create_feature_tag', 'delete_feature_tag', 'get_feature_lineage', 'get_feature_tag', 'list_feature_tags', 'update_feature_tag']
+[agent:result] ===== online_tables =====
+[agent:result] ['create', 'create_and_wait', 'delete', 'get', 'wait_get_online_table_active']
+[agent:bash] python -c "
+[agent:bash] from databricks.sdk import WorkspaceClient
+[agent:bash] w = WorkspaceClient()
+[agent:bash] print('=== warehouses ===')
+[agent:bash] for wh in w.warehouses.list():
+[agent:bash]     print(wh.id, wh.name, wh.state)
+[agent:bash] print('=== online_stores ===')
+[agent:bash] try:
+[agent:bash]     for s in w.feature_store.list_online_stores():
+[agent:bash]         print(s)
+[agent:bash] except Exception as e:
+[agent:bash]     print('err', e)
+[agent:bash] "
+[agent:result] === warehouses ===
+[agent:result] 4dfab06c923fe3cc mlpab-grader State.RUNNING
+[agent:result] === online_stores ===
+[agent] A running warehouse `mlpab-grader` is available. Let me look at the key API signatures for online publishing.
+[agent:bash] python -c "
+[agent:bash] from databricks.sdk import WorkspaceClient
+[agent:bash] import inspect
+[agent:bash] w = WorkspaceClient()
+[agent:bash] print('=== feature_store.create_online_store ==='); print(inspect.signature(w.feature_store.create_online_store)); print(w.feature_store.create_online_store.__doc__)
+[agent:bash] print('=== feature_store.publish_table ==='); print(inspect.signature(w.feature_store.publish_table)); print(w.feature_store.publish_table.__doc__)
+[agent:bash] "
+[agent:result] === feature_store.create_online_store ===
+[agent:result] (online_store: 'OnlineStore') -> 'OnlineStore'
+[agent:result] Create an Online Feature Store.
+[agent:result] 
+[agent:result] :param online_store: :class:`OnlineStore`
+[agent:result]   Online store to create.
+[agent:result] 
+[agent:result] :returns: :class:`OnlineStore`
+[agent:result] 
+[agent:result] === feature_store.publish_table ===
+[agent:result] (source_table_name: 'str', publish_spec: 'PublishSpec') -> 'PublishTableResponse'
+[agent:result] Publish features.
+[agent:result] 
+[agent:result] :param source_table_name: str
+[agent:result]   The full three-part (catalog, schema, table) name of the source table.
+[agent:result] :param publish_spec: :class:`PublishSpec`
+[agent:result]   The specification for publishing the online table from the source table.
+[agent:result] 
+[agent:result] :returns: :class:`PublishTableResponse`
+[agent:bash] python -c "
+[agent:bash] from databricks.sdk import WorkspaceClient
+[agent:bash] import inspect
+[agent:bash] w = WorkspaceClient()
+[agent:bash] print('=== online_tables.create ==='); print(inspect.signature(w.online_tables.create)); print(w.online_tables.create.__doc__)
+[agent:bash] from databricks.sdk.service import online_store
+[agent:bash] print('=== online_store module ==='); print([x for x in dir(online_store) if not x.startswith('_')])
+[agent:bash] "
+[agent:result-err] Exit code 1
+[agent:result-err] Traceback (most recent call last):
+[agent:result-err]   File "<string>", line 6, in <module>
+[agent:result-err]     from databricks.sdk.service import online_store
+[agent:result-err] ImportError: cannot import name 'online_store' from 'databricks.sdk.service' (/Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/sdk/0.117.0/official/inference/odt/1/task/venv/lib/python3.13/site-packages/databricks/sdk/service/__init__.py)
+[agent:result-err] === online_tables.create ===
+[agent:result-err] (table: 'OnlineTable') -> 'Wait[OnlineTable]'
+[agent:result-err] Create a new Online Table.
+[agent:result-err] 
+[agent:result-err] :param table: :class:`OnlineTable`
+[agent:result-err]   Specification of the online table to be created.
+[agent:result-err] 
+[agent:result-err] :returns:
+[agent:result-err]   Long-running operation waiter for :class:`OnlineTable`.
+[agent:result-err]   See :method:wait_get_online_table_active for more details.
+[agent:bash] python -c "
+[agent:bash] import databricks.sdk.service as svc
+[agent:bash] import pkgutil, databricks.sdk.service as s
+[agent:bash] print([m.name for m in pkgutil.iter_modules(s.__path__)])
+[agent:bash] "
+[agent:result] ['_internal', 'agentbricks', 'aisearch', 'apps', 'billing', 'bundle', 'bundledeployments', 'catalog', 'cleanrooms', 'compute', 'dashboards', 'database', 'dataclassification', 'dataquality', 'disasterrecovery', 'environments', 'files', 'iam', 'iamv2', 'jobs', 'knowledgeassistants', 'marketplace', 'ml', 'networking', 'oauth2', 'pipelines', 'postgres', 'provisioning', 'qualitymonitorv2', 'serving', 'settings', 'settingsv2', 'sharing', 'sql', 'supervisoragents', 'tags', 'vectorsearch', 'workspace']
+[agent:bash] python -c "
+[agent:bash] from databricks.sdk.service import ml
+[agent:bash] names = [x for x in dir(ml) if any(k in x for k in ['Online','Publish','Feature','Materialized'])]
+[agent:bash] print(names)
+[agent:bash] "
+[agent:result] ['BatchCreateMaterializedFeaturesResponse', 'CreateMaterializedFeatureRequest', 'Feature', 'FeatureEngineeringAPI', 'FeatureLineage', 'FeatureLineageFeatureSpec', 'FeatureLineageModel', 'FeatureLineageOnlineFeature', 'FeatureList', 'FeatureStoreAPI', 'FeatureTag', 'LinkedFeature', 'ListFeatureTagsResponse', 'ListFeaturesResponse', 'ListMaterializedFeaturesResponse', 'ListOnlineStoresResponse', 'MaterializedFeature', 'MaterializedFeaturePipelineScheduleState', 'MaterializedFeaturesAPI', 'OnlineStore', 'OnlineStoreConfig', 'OnlineStoreState', 'PublishSpec', 'PublishSpecPublishMode', 'PublishTableResponse']
+[agent:bash] python -c "
+[agent:bash] from databricks.sdk.service import ml, catalog
+[agent:bash] import inspect
+[agent:bash] for cls in [ml.OnlineStore, ml.OnlineStoreConfig, ml.PublishSpec, ml.PublishSpecPublishMode]:
+[agent:bash]     print('===', cls.__name__, '===')
+[agent:bash]     try:
+[agent:bash]         print(inspect.getsource(cls).split('def ')[0][:1500])
+[agent:bash]     except Exception as e:
+[agent:bash]         print('src err', e)
+[agent:bash] "
+[agent:result] === OnlineStore ===
+[agent:result] @dataclass
+[agent:result] class OnlineStore:
+[agent:result]     """An OnlineStore is a logical database instance that stores and serves features online."""
+[agent:result] 
+[agent:result]     name: str
+[agent:result]     """The name of the online store. This is the unique identifier for the online store."""
+[agent:result] 
+[agent:result]     capacity: str
+[agent:result]     """The capacity of the online store. Valid values are "CU_1", "CU_2", "CU_4", "CU_8"."""
+[agent:result] 
+[agent:result]     creation_time: Optional[str] = None
+[agent:result]     """The timestamp when the online store was created."""
+[agent:result] 
+[agent:result]     creator: Optional[str] = None
+[agent:result]     """The email of the creator of the online store."""
+[agent:result] 
+[agent:result]     read_replica_count: Optional[int] = None
+[agent:result]     """The number of read replicas for the online store. Defaults to 0."""
+[agent:result] 
+[agent:result]     state: Optional[OnlineStoreState] = None
+[agent:result]     """The current state of the online store."""
+[agent:result] 
+[agent:result]     usage_policy_id: Optional[str] = None
+[agent:result]     """The usage policy applied to the online store to track billing."""
+[agent:result] 
+[agent:result]     
+[agent:result] === OnlineStoreConfig ===
+[agent:result] @dataclass
+[agent:result] class OnlineStoreConfig:
+[agent:result]     """Configuration for online store destination."""
+[agent:result] 
+[agent:result]     catalog_name: str
+[agent:result]     """The Unity Catalog catalog name. This name is also used as the Lakebase logical database name.
+[agent:result]     Quoting is handled by the backend where needed, do not pre-quote it."""
+[agent:result] 
+[agent:result]     schema_name: str
+[agent:result]     """The Unity Catalog schema name. This name is also used as the Lakebase schema name under the
+[agent:result]     database. Quoting is handled by the backend where needed, do not pre-quote it."""
+[agent:result] 
+[agent:result]     table_name_prefix: str
+[agent:result]     """Prefix for Unity Catalog table name. The materialized feature will be stored in a Lakebase table
+[agent:result]     with this prefix and a generated postfix."""
+[agent:result] 
+[agent:result]     online_store_name: str
+[agent:result]     """The name of the target online store."""
+[agent:result] 
+[agent:result]     
+[agent:result] === PublishSpec ===
+[agent:result] @dataclass
+[agent:result] class PublishSpec:
+[agent:result]     online_store: str
+[agent:result]     """The name of the target online store."""
+[agent:result] 
+[agent:result]     online_table_name: str
+[agent:result]     """The full three-part (catalog, schema, table) name of the online table."""
+[agent:result] 
+[agent:result]     publish_mode: PublishSpecPublishMode
+[agent:result]     """The publish mode of the pipeline that syncs the online table with the source table."""
+[agent:result] 
+[agent:result]     
+[agent:result] === PublishSpecPublishMode ===
+[agent:result] class PublishSpecPublishMode(Enum):
+[agent:result]     CONTINUOUS = "CONTINUOUS"
+[agent:result]     SNAPSHOT = "SNAPSHOT"
+[agent:result]     TRIGGERED = "TRIGGERED"
+[agent] Now I understand the APIs. Let me set up SQL execution and upload the data to a volume.
+[agent:bash] python -c "
+[agent:bash] from databricks.sdk import WorkspaceClient
+[agent:bash] import inspect
+[agent:bash] w = WorkspaceClient()
+[agent:bash] print(inspect.signature(w.statement_execution.execute_statement))
+[agent:bash] print('--- files.upload ---')
+[agent:bash] print(inspect.signature(w.files.upload))
+[agent:bash] "
+[agent:result] (statement: 'str', warehouse_id: 'str', *, byte_limit: 'Optional[int]' = None, catalog: 'Optional[str]' = None, disposition: 'Optional[Disposition]' = None, format: 'Optional[Format]' = None, on_wait_timeout: 'Optional[ExecuteStatementRequestOnWaitTimeout]' = None, parameters: 'Optional[List[StatementParameterListItem]]' = None, query_tags: 'Optional[List[QueryTag]]' = None, row_limit: 'Optional[int]' = None, schema: 'Optional[str]' = None, wait_timeout: 'Optional[str]' = None) -> 'StatementResponse'
+[agent:result] --- files.upload ---
+[agent:result] (file_path: 'str', contents: 'BinaryIO', *, overwrite: 'Optional[bool]' = None, part_size: 'Optional[int]' = None, use_parallel: 'bool' = True, parallelism: 'Optional[int]' = None) -> 'UploadStreamResult'
+[agent:bash] cat > .tmp_setup.py 2>/dev/null || mkdir -p . && cat > .tmp_setup.py << 'PYEOF'
+[agent:bash] import os, time
+[agent:bash] from databricks.sdk import WorkspaceClient
+[agent:bash] from databricks.sdk.service.sql import StatementState
+[agent:bash] 
+[agent:bash] w = WorkspaceClient()
+[agent:bash] WID = "4dfab06c923fe3cc"
+[agent:bash] CATALOG, SCHEMA = os.environ["MLPAB_DATABRICKS_SCHEMA"].split(".")
+[agent:bash] print("catalog/schema:", CATALOG, SCHEMA)
+[agent:bash] 
+[agent:bash] def sql(stmt, catalog=CATALOG, schema=SCHEMA):
+[agent:bash]     r = w.statement_execution.execute_statement(stmt, WID, catalog=catalog, schema=schema, wait_timeout="50s")
+[agent:bash]     sid = r.statement_id
+[agent:bash]     while r.status.state in (StatementState.PENDING, StatementState.RUNNING):
+[agent:bash]         time.sleep(2); r = w.statement_execution.get_statement(sid)
+[agent:bash]     if r.status.state != StatementState.SUCCEEDED:
+[agent:bash]         raise RuntimeError(f"SQL FAILED: {r.status.state} :: {r.status.error} :: {stmt[:200]}")
+[agent:bash]     return r
+[agent:bash] 
+[agent:bash] # 1. create volume
+[agent:bash] sql(f"CREATE VOLUME IF NOT EXISTS {CATALOG}.{SCHEMA}.staging")
+[agent:bash] print("volume created")
+[agent:bash] 
+[agent:bash] vbase = f"/Volumes/{CATALOG}/{SCHEMA}/staging"
+[agent:bash] for fn in ["requests.csv", "profiles.csv"]:
+[agent:bash]     with open(f"data/{fn}", "rb") as f:
+[agent:bash]         w.files.upload(f"{vbase}/{fn}", f, overwrite=True)
+[agent:bash]     print("uploaded", fn)
+[agent:bash] print("DONE setup")
+[agent:bash] PYEOF
+[agent:bash] python .tmp_setup.py
+[agent:result-err] PreToolUse:Bash hook error: [python3 /Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/sdk/0.117.0/official/inference/odt/1/task/.claude/hooks/log_tool_call.py]: DENIED: cannot read local script(s) .tmp_setup.py to verify they don't train locally. Run python from your working directory so the script is readable, drive the SDK inline (`python -c ...`), or push the work to databricks as a remote job.
+[agent:write] /Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/sdk/0.117.0/official/inference/odt/1/task/setup.py
+[agent:result] File created successfully at: /Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/sdk/0.117.0/official/inference/odt/1/task/setup.py (file state is current in your context — no need to Read it back)
+[agent:bash] python setup.py
+[agent:result] catalog/schema: workspace mlpab877323
+[agent:result] volume created
+[agent:result] uploaded requests.csv
+[agent:result] uploaded profiles.csv
+[agent:result] DONE setup
+[agent] Now let me build the feature table with the on-demand transformation via SQL on the warehouse.
+[agent:write] /Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/sdk/0.117.0/official/inference/odt/1/task/build_table.py
+[agent:result] File created successfully at: /Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/sdk/0.117.0/official/inference/odt/1/task/build_table.py (file state is current in your context — no need to Read it back)
+[agent:bash] python build_table.py
+[agent:result] staging loaded
+[agent:result] feature table created
+[agent:result] feature table populated
+[agent:result] row count: 400
+[agent:result] sample: [['Q00000', 'A0015', '2.22792', '0.12663'], ['Q00001', 'A0045', '0.936631', '0.767579'], ['Q00002', 'A0024', '3.323256', '-0.013088']]
+[agent:result] DONE build
+[agent] The feature table is built with 400 rows. Now let me make it available online. Let me inspect the online table spec options.
+[agent:bash] python -c "
+[agent:bash] from databricks.sdk.service import catalog
+[agent:bash] import inspect
+[agent:bash] for n in ['OnlineTable','OnlineTableSpec','OnlineTableSpecContinuousSchedulingPolicy','OnlineTableSpecTriggeredSchedulingPolicy']:
+[agent:bash]     c = getattr(catalog, n, None)
+[agent:bash]     if c is None: print('MISSING', n); continue
+[agent:bash]     print('===',n,'==='); print(inspect.getsource(c).split('def ')[0][:900])
+[agent:bash] "
+[agent:result] === OnlineTable ===
+[agent:result] @dataclass
+[agent:result] class OnlineTable:
+[agent:result]     """Online Table information."""
+[agent:result] 
+[agent:result]     name: Optional[str] = None
+[agent:result]     """Full three-part (catalog, schema, table) name of the table."""
+[agent:result] 
+[agent:result]     spec: Optional[OnlineTableSpec] = None
+[agent:result]     """Specification of the online table."""
+[agent:result] 
+[agent:result]     status: Optional[OnlineTableStatus] = None
+[agent:result]     """Online Table data synchronization status"""
+[agent:result] 
+[agent:result]     table_serving_url: Optional[str] = None
+[agent:result]     """Data serving REST API URL for this table"""
+[agent:result] 
+[agent:result]     unity_catalog_provisioning_state: Optional[ProvisioningInfoState] = None
+[agent:result]     """The provisioning state of the online table entity in Unity Catalog. This is distinct from the
+[agent:result]     state of the data synchronization pipeline (i.e. the table may be in "ACTIVE" but the pipeline
+[agent:result]     may be in "PROVISIONING" as it runs asynchronously)."""
+[agent:result] 
+[agent:result]     
+[agent:result] === OnlineTableSpec ===
+[agent:result] @dataclass
+[agent:result] class OnlineTableSpec:
+[agent:result]     """Specification of an online table."""
+[agent:result] 
+[agent:result]     perform_full_copy: Optional[bool] = None
+[agent:result]     """Whether to create a full-copy pipeline -- a pipeline that stops after creates a full copy of the
+[agent:result]     source table upon initialization and does not process any change data feeds (CDFs) afterwards.
+[agent:result]     The pipeline can still be manually triggered afterwards, but it always perform a full copy of
+[agent:result]     the source table and there are no incremental updates. This mode is useful for syncing views or
+[agent:result]     tables without CDFs to online tables. Note that the full-copy pipeline only supports "triggered"
+[agent:result]     scheduling policy."""
+[agent:result] 
+[agent:result]     pipeline_id: Optional[str] = None
+[agent:result]     """ID of the associated pipeline. Generated by the server - cannot be set by the caller."""
+[agent:result] 
+[agent:result]     primary_key_columns: Optional[List[str]] = None
+[agent:result]     """Primary Key columns to be used for data insert/update
+[agent:result] === OnlineTableSpecContinuousSchedulingPolicy ===
+[agent:result] @dataclass
+[agent:result] class OnlineTableSpecContinuousSchedulingPolicy:
+[agent:result]     
+[agent:result] === OnlineTableSpecTriggeredSchedulingPolicy ===
+[agent:result] @dataclass
+[agent:result] class OnlineTableSpecTriggeredSchedulingPolicy:
+[agent:bash] python -c "
+[agent:bash] from databricks.sdk.service import catalog
+[agent:bash] import inspect
+[agent:bash] src = inspect.getsource(catalog.OnlineTableSpec)
+[agent:bash] print(src[:2200])
+[agent:bash] "
+[agent:result] @dataclass
+[agent:result] class OnlineTableSpec:
+[agent:result]     """Specification of an online table."""
+[agent:result] 
+[agent:result]     perform_full_copy: Optional[bool] = None
+[agent:result]     """Whether to create a full-copy pipeline -- a pipeline that stops after creates a full copy of the
+[agent:result]     source table upon initialization and does not process any change data feeds (CDFs) afterwards.
+[agent:result]     The pipeline can still be manually triggered afterwards, but it always perform a full copy of
+[agent:result]     the source table and there are no incremental updates. This mode is useful for syncing views or
+[agent:result]     tables without CDFs to online tables. Note that the full-copy pipeline only supports "triggered"
+[agent:result]     scheduling policy."""
+[agent:result] 
+[agent:result]     pipeline_id: Optional[str] = None
+[agent:result]     """ID of the associated pipeline. Generated by the server - cannot be set by the caller."""
+[agent:result] 
+[agent:result]     primary_key_columns: Optional[List[str]] = None
+[agent:result]     """Primary Key columns to be used for data insert/update in the destination."""
+[agent:result] 
+[agent:result]     run_continuously: Optional[OnlineTableSpecContinuousSchedulingPolicy] = None
+[agent:result]     """Pipeline runs continuously after generating the initial data."""
+[agent:result] 
+[agent:result]     run_triggered: Optional[OnlineTableSpecTriggeredSchedulingPolicy] = None
+[agent:result]     """Pipeline stops after generating the initial data and can be triggered later (manually, through a
+[agent:result]     cron job or through data triggers)"""
+[agent:result] 
+[agent:result]     source_table_full_name: Optional[str] = None
+[agent:result]     """Three-part (catalog, schema, table) name of the source Delta table."""
+[agent:result] 
+[agent:result]     timeseries_key: Optional[str] = None
+[agent:result]     """Time series key to deduplicate (tie-break) rows with the same primary key."""
+[agent:result] 
+[agent:result]     def as_dict(self) -> dict:
+[agent:result]         """Serializes the OnlineTableSpec into a dictionary suitable for use as a JSON request body."""
+[agent:result]         body = {}
+[agent:result]         if self.perform_full_copy is not None:
+[agent:result]             body["perform_full_copy"] = self.perform_full_copy
+[agent:result]         if self.pipeline_id is not None:
+[agent:result]             body["pipeline_id"] = self.pipeline_id
+[agent:result]         if self.primary_key_columns:
+[agent:result]             body["primary_key_columns"] = [v for v in self.primary_key_columns]
+[agent:result]         if self.run_continuously:
+[agent:result]             body["run_continuously"] = self.run_continuously.as_dict()
+[agent:result]         if self.run_triggered:
+[agent:result]             body["run_triggered"]
+[agent] The `online_tables` path gives a low-latency online copy that the platform clearly distinguishes from the offline Delta table. Let me create it.
+[agent:write] /Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/sdk/0.117.0/official/inference/odt/1/task/make_online.py
+[agent:result] File created successfully at: /Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/sdk/0.117.0/official/inference/odt/1/task/make_online.py (file state is current in your context — no need to Read it back)
+[agent:bash] python make_online.py
+[agent:result-err] Exit code 1
+[agent:result-err] creating online table workspace.mlpab877323.scoredbfc4ef_online
+[agent:result-err] Traceback (most recent call last):
+[agent:result-err]   File "/Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/sdk/0.117.0/official/inference/odt/1/task/make_online.py", line 18, in <module>
+[agent:result-err]     res = w.online_tables.create_and_wait(table=OnlineTable(name=ONLINE, spec=spec))
+[agent:result-err]   File "/Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/sdk/0.117.0/official/inference/odt/1/task/venv/lib/python3.13/site-packages/databricks/sdk/service/catalog.py", line 14457, in create_and_wait
+[agent:result-err]     return self.create(table=table).result(timeout=timeout)
+[agent:result-err]            ~~~~~~~~~~~^^^^^^^^^^^^^
+[agent:result-err]   File "/Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/sdk/0.117.0/official/inference/odt/1/task/venv/lib/python3.13/site-packages/databricks/sdk/service/catalog.py", line 14451, in create
+[agent:result-err]     op_response = self._api.do("POST", "/api/2.0/online-tables", body=body, headers=headers)
+[agent:result-err]   File "/Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/sdk/0.117.0/official/inference/odt/1/task/venv/lib/python3.13/site-packages/databricks/sdk/core.py", line 95, in do
+[agent:result-err]     return self._api_client.do(
+[agent:result-err]            ~~~~~~~~~~~~~~~~~~~^
+[agent:result-err]         method=method,
+[agent:result-err]         ^^^^^^^^^^^^^^
+[agent:result-err]     ...<8 lines>...
+[agent:result-err]         response_headers=response_headers,
+[agent:result-err]         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[agent:result-err]     )
+[agent:result-err]     ^
+[agent:result-err]   File "/Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/sdk/0.117.0/official/inference/odt/1/task/venv/lib/python3.13/site-packages/databricks/sdk/_base_client.py", line 197, in do
+[agent:result-err]     response = call(
+[agent:result-err]         method,
+[agent:result-err]     ...<7 lines>...
+[agent:result-err]         auth=auth,
+[agent:result-err]     )
+[agent:result-err]   File "/Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/sdk/0.117.0/official/inference/odt/1/task/venv/lib/python3.13/site-packages/databricks/sdk/retries.py", line 59, in wrapper
+[agent:result-err]     raise err
+[agent:result-err]   File "/Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/sdk/0.117.0/official/inference/odt/1/task/venv/lib/python3.13/site-packages/databricks/sdk/retries.py", line 38, in wrapper
+[agent:result-err]     return func(*args, **kwargs)
+[agent:result-err]   File "/Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/sdk/0.117.0/official/inference/odt/1/task/venv/lib/python3.13/site-packages/databricks/sdk/_base_client.py", line 299, in _perform
+[agent:result-err]     raise error from None
+[agent:result-err] databricks.sdk.errors.platform.BadRequest: Online Table is being deprecated. Creating new online table is not allowed. Databricks recommends switching to Synced Tables.
+[agent] Online tables are deprecated — the platform now uses synced tables via the Feature Store online store. Let me use that path.
+[agent:bash] python -c "
+[agent:bash] from databricks.sdk.service import ml
+[agent:bash] import inspect
+[agent:bash] print('OnlineStoreState:', [s.value for s in ml.OnlineStoreState])
+[agent:bash] print(inspect.getsource(ml.PublishSpecPublishMode))
+[agent:bash] "
+[agent:result] OnlineStoreState: ['AVAILABLE', 'DELETING', 'FAILING_OVER', 'STARTING', 'STOPPED', 'UPDATING']
+[agent:result] class PublishSpecPublishMode(Enum):
+[agent:result]     CONTINUOUS = "CONTINUOUS"
+[agent:result]     SNAPSHOT = "SNAPSHOT"
+[agent:result]     TRIGGERED = "TRIGGERED"
+[agent:write] /Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/sdk/0.117.0/official/inference/odt/1/task/make_online2.py
+[agent:result] File created successfully at: /Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/sdk/0.117.0/official/inference/odt/1/task/make_online2.py (file state is current in your context — no need to Read it back)
+[agent:bash] python make_online2.py
+[agent:result-err] Exit code 1
+[agent:result-err] creating online store mlpab877323_scorestore
+[agent:result-err] Traceback (most recent call last):
+[agent:result-err]   File "/Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/sdk/0.117.0/official/inference/odt/1/task/make_online2.py", line 20, in <module>
+[agent:result-err]     st = w.feature_store.create_online_store(OnlineStore(name=STORE, capacity="CU_1"))
+[agent:result-err]   File "/Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/sdk/0.117.0/official/inference/odt/1/task/venv/lib/python3.13/site-packages/databricks/sdk/service/ml.py", line 9883, in create_online_store
+[agent:result-err]     res = self._api.do("POST", "/api/2.0/feature-store/online-stores", body=body, headers=headers)
+[agent:result-err]   File "/Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/sdk/0.117.0/official/inference/odt/1/task/venv/lib/python3.13/site-packages/databricks/sdk/core.py", line 95, in do
+[agent:result-err]     return self._api_client.do(
+[agent:result-err]            ~~~~~~~~~~~~~~~~~~~^
+[agent:result-err]         method=method,
+[agent:result-err]         ^^^^^^^^^^^^^^
+[agent:result-err]     ...<8 lines>...
+[agent:result-err]         response_headers=response_headers,
+[agent:result-err]         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[agent:result-err]     )
+[agent:result-err]     ^
+[agent:result-err]   File "/Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/sdk/0.117.0/official/inference/odt/1/task/venv/lib/python3.13/site-packages/databricks/sdk/_base_client.py", line 197, in do
+[agent:result-err]     response = call(
+[agent:result-err]         method,
+[agent:result-err]     ...<7 lines>...
+[agent:result-err]         auth=auth,
+[agent:result-err]     )
+[agent:result-err]   File "/Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/sdk/0.117.0/official/inference/odt/1/task/venv/lib/python3.13/site-packages/databricks/sdk/retries.py", line 59, in wrapper
+[agent:result-err]     raise err
+[agent:result-err]   File "/Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/sdk/0.117.0/official/inference/odt/1/task/venv/lib/python3.13/site-packages/databricks/sdk/retries.py", line 38, in wrapper
+[agent:result-err]     return func(*args, **kwargs)
+[agent:result-err]   File "/Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/sdk/0.117.0/official/inference/odt/1/task/venv/lib/python3.13/site-packages/databricks/sdk/_base_client.py", line 299, in _perform
+[agent:result-err]     raise error from None
+[agent:result-err] databricks.sdk.errors.platform.InvalidParameterValue: DatabaseInstance name must be DNS compliant; ensure it contains only alphanumeric characters and hyphens.
+[agent] The Lakebase instance name must be DNS-compliant (no underscores). Let me use a hyphen separator while keeping the prefix.
+[agent:edit] /Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/sdk/0.117.0/official/inference/odt/1/task/make_online2.py
+[agent:result] The file /Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/sdk/0.117.0/official/inference/odt/1/task/make_online2.py has been updated successfully. (file state is current in your context — no need to Read it back)
+[agent:bash] python make_online2.py
+[agent:result] creating online store mlpab877323-scorestore
+[agent:result] created, state: OnlineStoreState.STARTING
+[agent:result]   waiting, state: OnlineStoreState.UPDATING
+[agent:result] online store state: OnlineStoreState.AVAILABLE
+[agent:result] publishing workspace.mlpab877323.scoredbfc4ef -> workspace.mlpab877323.scoredbfc4ef_online
+[agent:result] publish response: PublishTableResponse(online_table_name='workspace.mlpab877323.scoredbfc4ef_online', pipeline_id='a34330d1-5280-40e1-9a18-55750b6a6646')
+[agent:result] DONE online
+[agent] Online store is AVAILABLE and the table is published. Let me verify the sync completed and spot-check the computation.
+[agent:write] /Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/sdk/0.117.0/official/inference/odt/1/task/verify.py
+[agent:result] File created successfully at: /Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/sdk/0.117.0/official/inference/odt/1/task/verify.py (file state is current in your context — no need to Read it back)
+[agent:bash] python verify.py
+[agent:result] columns: [('request_id', 'string'), ('account_id', 'string'), ('distance_deg', 'double'), ('score', 'double')]
+[agent:result] recompute Q00000: [['Q00000', 'A0015', '2.22792', '0.12663']]
+[agent:result] stored   Q00000: [['Q00000', 'A0015', '2.22792', '0.12663']]
+[agent:result] pipeline state: PipelineState.RUNNING
+[agent:result] latest update state: UpdateInfoState.RESETTING
+[agent:result] DONE verify
+[agent] Offline table is correct. Let me wait for the online sync pipeline to complete.
+[agent:write] /Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/sdk/0.117.0/official/inference/odt/1/task/wait_sync.py
+[agent:result] File created successfully at: /Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/sdk/0.117.0/official/inference/odt/1/task/wait_sync.py (file state is current in your context — no need to Read it back)
+[agent:bash] python wait_sync.py
+[agent:result] update state: UpdateInfoState.COMPLETED
+[agent:result] FINAL update state: UpdateInfoState.COMPLETED
+[agent] Everything is complete and verified. Here's the summary.
+[agent] ## Done — feature table `scoredbfc4ef` is live on Databricks
+[agent] **Offline feature table** — `workspace.mlpab877323.scoredbfc4ef`
+[agent] - Record key `request_id` (NOT NULL + PRIMARY KEY constraint), Change Data Feed enabled.
+[agent] - Exactly the required columns: `request_id, account_id, distance_deg, score`.
+[agent] - 400 rows, one per request.
+[agent] - On-demand transformation ran **platform-side** on the SQL warehouse (`mlpab-grader`): the request coordinates were joined to each stored profile and `distance_deg = round(sqrt((request_lat−home_lat)² + (request_lon−home_lon)²), 6)`, then `score = round(base_score − 0.1·distance_deg, 6)` using the rounded distance. Cross-checked Q00000: stored `[2.22792, 0.12663]` matches the recompute exactly.
+[agent] **Online / low-latency access** — published via the Feature Store online path the platform now mandates:
+[agent] - Created Lakebase-backed online store `mlpab877323-scorestore` (prefixed per the run namespace; used a hyphen because Lakebase instance names must be DNS-compliant — underscores are rejected).
+[agent] - `feature_store.publish_table` synced it to online table `workspace.mlpab877323.scoredbfc4ef_online`; the sync pipeline update finished `COMPLETED`. The platform cleanly distinguishes the offline Delta table from this online synced table.
+[agent] How data got on-platform: the two CSVs were uploaded to a UC volume (`workspace.mlpab877323.staging`) and ingested with `read_files`; no joins/transforms ran locally.
+[agent] Note on the deprecated path: the classic `online_tables.create` API is now rejected ("Online Table is being deprecated… switch to Synced Tables"), so I used `create_online_store` + `publish_table`, which is the current supported online mechanism. "Version 1" maps to the single UC table name `scoredbfc4ef` — Databricks UC feature tables don't carry a separate version axis.
+[agent] done: 30 turns, $1.6811, stop=end_turn
+[mlpab] WARNING: databricks sdk client crashed — see /Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/sdk/0.117.0/official/inference/odt/1/task/databricks_client.logs (markers: Traceback (most recent call last))
+[mlpab] graded: 3 passed / 0 failed / 0 skipped of 3 asserts

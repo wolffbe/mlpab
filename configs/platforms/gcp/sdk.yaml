@@ -1,0 +1,79 @@
+# Google Cloud Gemini Enterprise Agent Platform Python SDK interface — google-cloud-aiplatform.
+# Docs: https://cloud.google.com/python/docs/reference/aiplatform/latest
+#
+# Published PyPI package: each agent run pip-installs the pinned SDK (+ the
+# BigQuery client, since the platform's feature store is BigQuery-backed). Auth is a
+# service-account key whose path is GOOGLE_APPLICATION_CREDENTIALS (standard ADC).
+#
+# Set keys: edit the global testbed/.env (see `keys:` below).
+version: "1.157.0"
+
+runtime_install:
+  # google-cloud-monitoring: the grader reads alerting back through Cloud
+  # Monitoring alert policies (evals/adapters/gcp.py get_alert → monitoring_v3),
+  # and in SDK mode the agent needs it to CREATE them, so the ops/alerting task
+  # is otherwise ungradeable AND uncreatable.
+  - pip install "google-cloud-aiplatform==1.157.0" "google-cloud-bigquery==3.42.0" "google-cloud-monitoring==2.31.0" "db-dtypes>=1.2" "pyarrow>=14"
+
+# Importable module → mlpab accounts `import google.cloud…` as sdk_calls (covers
+# aiplatform + bigquery, the platform feature-store read path).
+sdk_module: google.cloud
+
+# OFFLINE "does it import?" check.
+test_command: python -c "import google.cloud.aiplatform, google.cloud.bigquery, google.cloud.monitoring_v3"
+
+# Live connectivity + permission check: init the platform for the project/region from
+# the SA key and do a cheap list. Exits non-zero on bad creds / missing roles.
+auth_command: |
+  python - <<'AUTHCHECK'
+  import os
+  from google.cloud import aiplatform
+  aiplatform.init(project=os.environ["GCP_PROJECT"], location=os.environ["GCP_LOCATION"])
+  list(aiplatform.Model.list())
+  AUTHCHECK
+
+allowed_domains:
+  - "*.googleapis.com"
+  - "oauth2.googleapis.com"
+  - "aiplatform.googleapis.com"
+  - "bigquery.googleapis.com"
+  - "storage.googleapis.com"
+  - "*.google.com"
+
+# Platform setup — ensure the Gemini Enterprise Agent Platform feature store plumbing exists: a
+# BigQuery dataset (the feature-group backing store) + a Feature Online Store,
+# exported to the agent env via $MLPAB_PLATFORM_ENV. Committed logic in
+# configs/platforms/gcp/setup.py ($MLPAB_PLATFORM_DIR).
+# Run under $MLPAB_PLUMBING_PY (mlpab's per-platform plumbing venv with the
+# BigQuery/aiplatform client) rather than the run venv, so setup/teardown work
+# identically across interfaces — the SDK run venv has the client too, but the
+# plumbing venv keeps this plumbing off the agent's measured run venv.
+serve:
+  - '"$MLPAB_PLUMBING_PY" "$MLPAB_PLATFORM_DIR/setup.py"'
+
+# Platform teardown — sweep agent-created resources (endpoints, batch-prediction
+# jobs, custom/pipeline jobs, registered models, feature groups + online-store
+# feature views, vector-search indexes) in cost order. By default it deletes only
+# THIS run's resources — prefixed aiplatform display_names + the run's whole
+# BigQuery dataset (MLPAB_GCP_PREFIX / per-run GCP_BQ_DATASET) — so parallel runs
+# don't clobber each other; `teardown.py --all` does the old account-wide sweep
+# (empties but preserves the shared dataset) as a janitor. Runs at run START+END.
+teardown:
+  - '"$MLPAB_PLUMBING_PY" "$MLPAB_PLATFORM_DIR/teardown.py"'
+
+keys:
+  - GCP_PROJECT                     # project id
+  - GCP_LOCATION                    # region, e.g. us-central1
+  - GOOGLE_APPLICATION_CREDENTIALS  # path to the service-account JSON key (ADC)
+  - GCP_BQ_DATASET                  # BigQuery dataset backing the feature store
+
+prompt: |
+  The Google Cloud Gemini Enterprise Agent Platform Python SDK is available as `import google.cloud.aiplatform as aiplatform`
+  (initialise with `aiplatform.init(project=GCP_PROJECT, location=GCP_LOCATION)`). It is authenticated via a
+  service-account key (GOOGLE_APPLICATION_CREDENTIALS) from the environment. The feature store is backed by the
+  BigQuery dataset GCP_BQ_DATASET; read feature data with `import google.cloud.bigquery`. Use Python introspection
+  (`help()`/`dir()`) on the package to see what it can do.
+  Isolate your work so it is cleaned up correctly: create ALL BigQuery feature/training tables INSIDE the dataset
+  named by GCP_BQ_DATASET (it is already per-run) — do not create other datasets. PREFIX the display_name of every
+  Vertex resource you create — model, custom/pipeline/batch job, endpoint, vector-search index — and every Cloud
+  Monitoring alert policy with `${MLPAB_GCP_PREFIX}_` (e.g. `${MLPAB_GCP_PREFIX}_fraud_model`).

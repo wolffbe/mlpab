@@ -1,1 +1,0 @@
-SELECT * FROM `***REDACTED***.mlpab_mlpab7232d6.churntrainingcdae59_v1` ORDER BY account_id LIMIT 5

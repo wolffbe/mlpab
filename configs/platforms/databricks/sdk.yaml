@@ -1,0 +1,86 @@
+# Databricks Python SDK interface — config (where it lives + how to build/run it).
+# Docs: https://databricks-sdk-py.readthedocs.io/en/latest/
+#
+# Unlike the Hopsworks SDK (built from source), this is a PUBLISHED PyPI package,
+# so there is NO `repo`/`install` build step and NO local `binary` — each agent
+# run just `pip install`s the pinned version into its venv (`runtime_install`).
+#
+# Set keys: edit the global testbed/.env (see `keys:` below).
+
+# --- How to run it (per agent run) — install the pinned SDK from PyPI. Pinned
+#     for reproducibility (the interface source must not drift mid-session), mirror
+#     of the fixed `ref:` the build-from-source interfaces pin. To advance, bump
+#     this version. ---
+# The interface version/ref under test — written to the results `version`
+# column. Keep in sync with the pin below (ref: / ==X.Y.Z / VER=).
+version: "0.117.0"
+
+runtime_install:
+  - pip install "databricks-sdk==0.117.0"
+
+# The importable module, so mlpab accounts `import databricks…` as sdk_calls and
+# the agent hook treats off-interface interpreters/binaries as escapes.
+sdk_module: databricks
+
+# Deterministic, OFFLINE "does it import?" check (no live workspace): after the
+# package installs, it imports cleanly.
+test_command: python -c "import databricks.sdk"
+
+# Real connectivity check: build a WorkspaceClient from DATABRICKS_HOST /
+# DATABRICKS_TOKEN in the environment and fetch the current user. Exits non-zero
+# on a bad/missing token, so preflight fails fast (`mlpab test --no-login` skips).
+auth_command: python -c "from databricks.sdk import WorkspaceClient; WorkspaceClient().current_user.me()"
+
+# Outbound hosts the agent needs reachable at run time (drives the sandbox
+# allowedDomains). The workspace host comes from DATABRICKS_HOST; cover the cloud
+# variants so any configured workspace resolves.
+allowed_domains:
+  - "*.cloud.databricks.com"   # AWS
+  - "*.azuredatabricks.net"    # Azure
+  - "*.gcp.databricks.com"     # GCP
+  - "*.databricks.com"
+
+# --- Platform setup — run automatically by mlpab at the START of every run,
+#     right AFTER the teardown sweep below. Databricks has no project container
+#     to pre-create; instead this ensures this run's per-run Unity Catalog schema
+#     (workspace.mlpab<hex>, from MLPAB_DATABRICKS_SCHEMA) exists — the landing
+#     zone the agent and grader share. The logic is the committed
+#     configs/platforms/databricks/setup.py — $MLPAB_PLATFORM_DIR points there
+#     (fixed infra); pure-stdlib REST, so it runs in any run venv. ---
+serve:
+  - './venv/bin/python "$MLPAB_PLATFORM_DIR/setup.py"'
+
+# --- Platform teardown — run automatically by mlpab at the START and END of
+#     every run. Databricks has no project whose deletion cascades, so this
+#     sweeps the workspace PER RESOURCE TYPE in cost order — serving/vector
+#     endpoints, active runs, clusters, warehouses, DLT pipelines, jobs, MLflow
+#     experiments + models, Unity Catalog objects, workspace home + DBFS
+#     /FileStore. By default it deletes only THIS run's resources (the per-run
+#     schema + prefix-named resources, via MLPAB_DATABRICKS_SCHEMA/PREFIX) so
+#     parallel runs don't clobber each other; `teardown.py --all` does the old
+#     user-wide sweep as a janitor. The cleanup logic is the committed
+#     configs/platforms/databricks/teardown.py — $MLPAB_PLATFORM_DIR points
+#     there (fixed infra); pure-stdlib REST, so it runs in any run venv. ---
+teardown:
+  - './venv/bin/python "$MLPAB_PLATFORM_DIR/teardown.py"'
+
+# --- Credentials — names only; values resolve from the GLOBAL testbed/.env at
+#     run time (never stored here). The SDK reads DATABRICKS_HOST / DATABRICKS_TOKEN
+#     via WorkspaceClient(); the auth_command above verifies them live. ---
+keys:
+  - DATABRICKS_HOST    # workspace URL, e.g. https://dbc-xxxx.cloud.databricks.com
+  - DATABRICKS_TOKEN   # secret — personal access token
+
+# --- Agent-facing prompt ---
+prompt: |
+  The Databricks Python SDK is available as `import databricks.sdk`; connect with `WorkspaceClient()`. It is
+  authenticated via DATABRICKS_HOST and DATABRICKS_TOKEN from the environment. Use Python introspection
+  (`help()`/`dir()`) on the package to see what it can do.
+
+  Create everything inside your per-run namespace so it is isolated and cleaned up correctly:
+  - Put ALL Unity Catalog objects you create (tables, volumes, registered models, online tables, vector
+    search indexes) in the schema named by the MLPAB_DATABRICKS_SCHEMA environment variable (it is
+    `workspace.<run-id>`). Use it as the catalog.schema for every object — do not use `workspace.default`.
+  - Prefix the NAME of any job, DLT pipeline, serving/vector-search endpoint, cluster, or Lakebase database
+    instance you create with the MLPAB_DATABRICKS_PREFIX env var (e.g. `${MLPAB_DATABRICKS_PREFIX}_<your-name>`).
+  - Put any workspace notebooks/files and MLflow experiments under `/Users/<your-user>/${MLPAB_DATABRICKS_PREFIX}/`.

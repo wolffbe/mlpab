@@ -1,1 +1,0 @@
-CREATE TABLE workspace.mlpabbc4768.prediction_log USING CSV OPTIONS (path 'dbfs:/Volumes/workspace/mlpabbc4768/prediction_volume/prediction_log.csv', header 'true', inferSchema 'true');

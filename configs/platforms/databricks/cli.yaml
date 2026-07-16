@@ -1,0 +1,112 @@
+# Databricks CLI interface — the standalone `databricks` CLI (Go binary).
+# Docs: https://docs.databricks.com/aws/en/dev-tools/cli/
+#
+# Distributed as a prebuilt binary (NOT pip): preflight downloads the pinned
+# release archive from GitHub into $INTERFACE_DIR (the gitignored build home,
+# build/databricks/cli/), and that dir is on the agent's PATH at run time, so
+# no `runtime_install` is needed — the `databricks` binary is directly invokable.
+#
+# Set keys: edit the global testbed/.env (see `keys:` below).
+
+# --- Where it lives / how to build it (run automatically at preflight) ---
+# Download the PINNED release for this host's OS/arch into $INTERFACE_DIR and
+# extract just the `databricks` binary. Pinned for reproducibility (the official
+# install.sh hardcodes a version but installs to /usr/local/bin with sudo and no
+# bindir flag, which doesn't fit the $INTERFACE_DIR model). To advance, bump VER.
+# The interface version/ref under test — written to the results `version`
+# column. Keep in sync with the pin below (ref: / ==X.Y.Z / VER=).
+version: "1.3.0"
+
+install:
+  - >-
+    sh -c 'set -e;
+    VER=1.3.0;
+    OS=$(uname -s | tr "[:upper:]" "[:lower:]");
+    ARCH=$(uname -m);
+    case "$ARCH" in x86_64|amd64) ARCH=amd64 ;; arm64|aarch64) ARCH=arm64 ;; esac;
+    curl -fsSL "https://github.com/databricks/cli/releases/download/v${VER}/databricks_cli_${VER}_${OS}_${ARCH}.tar.gz"
+    | tar -xz -C "$INTERFACE_DIR" databricks'
+
+# The downloaded binary; its bytes are folded into the interface hash for
+# reproducibility, and mlpab accounts `databricks …` calls as cli_calls.
+binary: databricks
+cli_command: databricks
+# Copy the bare binary INTO the run venv's bin: (1) it lands on the agent's
+# PATH like a console script, (2) it's INSIDE the sandbox boundary (the build
+# dir isn't readable from the agent's seatbelt), and (3) referencing
+# $INTERFACE_DIR here is what tells preflight the artifact must be built.
+runtime_install:
+  - 'cp "$INTERFACE_DIR/databricks" ./venv/bin/databricks'
+
+# Deterministic, OFFLINE "does it run?" check (no live workspace): the binary
+# installed and reports its version.
+test_command: databricks version
+
+# Real connectivity check: `databricks current-user me` authenticates using
+# DATABRICKS_HOST / DATABRICKS_TOKEN from the environment and exits non-zero on a
+# bad/missing token, so preflight fails fast (`mlpab test --no-login` skips it).
+auth_command: databricks current-user me
+
+# Outbound hosts the agent needs reachable at run time (drives the sandbox
+# allowedDomains). The workspace host comes from DATABRICKS_HOST; cover the cloud
+# variants so any configured workspace resolves.
+allowed_domains:
+  - "*.cloud.databricks.com"   # AWS
+  - "*.azuredatabricks.net"    # Azure
+  - "*.gcp.databricks.com"     # GCP
+  - "*.databricks.com"
+
+# The CLI is a Go binary: inside the macOS Seatbelt sandbox it cannot reach
+# trustd, so EVERY TLS handshake fails with `x509: OSStatus -26276` (the
+# Claude Code docs name gh/gcloud/terraform; same failure here). The
+# documented fix is to run it outside the sandbox via `excludedCommands`.
+# Trade-off: `databricks …` calls bypass the domain allowlist above — but the
+# binary only talks to DATABRICKS_HOST, and the PreToolUse hook still
+# enforces the exec allowlist + path denies on every call.
+sandbox_excluded_commands:
+  - "databricks"
+  - "databricks *"
+
+# --- Platform setup — run automatically by mlpab at the START of every run,
+#     right AFTER the teardown sweep below. Databricks has no project container
+#     to pre-create; instead this ensures this run's per-run Unity Catalog schema
+#     (workspace.mlpab<hex>, from MLPAB_DATABRICKS_SCHEMA) exists — the landing
+#     zone the agent and grader share. The logic is the committed
+#     configs/platforms/databricks/setup.py — $MLPAB_PLATFORM_DIR points there
+#     (fixed infra); pure-stdlib REST, so it runs in any run venv. ---
+serve:
+  - './venv/bin/python "$MLPAB_PLATFORM_DIR/setup.py"'
+
+# --- Platform teardown — run automatically by mlpab at the START and END of
+#     every run. Databricks has no project whose deletion cascades, so this
+#     sweeps the workspace PER RESOURCE TYPE in cost order — serving/vector
+#     endpoints, active runs, clusters, warehouses, DLT pipelines, jobs, MLflow
+#     experiments + models, Unity Catalog objects, workspace home + DBFS
+#     /FileStore. By default it deletes only THIS run's resources (the per-run
+#     schema + prefix-named resources, via MLPAB_DATABRICKS_SCHEMA/PREFIX) so
+#     parallel runs don't clobber each other; `teardown.py --all` does the old
+#     user-wide sweep as a janitor. The cleanup logic is the committed
+#     configs/platforms/databricks/teardown.py — $MLPAB_PLATFORM_DIR points
+#     there (fixed infra); pure-stdlib REST, so it runs in any run venv. ---
+teardown:
+  - './venv/bin/python "$MLPAB_PLATFORM_DIR/teardown.py"'
+
+# --- Credentials — names only; values resolve from the GLOBAL testbed/.env at
+#     run time (never stored here). The CLI reads DATABRICKS_HOST / DATABRICKS_TOKEN
+#     from the environment; the auth_command above verifies them live. ---
+keys:
+  - DATABRICKS_HOST    # workspace URL, e.g. https://dbc-xxxx.cloud.databricks.com
+  - DATABRICKS_TOKEN   # secret — personal access token
+
+# --- Agent-facing prompt ---
+prompt: |
+  The Databricks CLI is available as `databricks`. It is authenticated via DATABRICKS_HOST and DATABRICKS_TOKEN
+  from the environment. Run `databricks --help` to see what it can do.
+
+  Create everything inside your per-run namespace so it is isolated and cleaned up correctly:
+  - Put ALL Unity Catalog objects you create (tables, volumes, registered models, online tables, vector
+    search indexes) in the schema named by the MLPAB_DATABRICKS_SCHEMA environment variable (it is
+    `workspace.<run-id>`). Use it as the catalog.schema for every object — do not use `workspace.default`.
+  - Prefix the NAME of any job, DLT pipeline, serving/vector-search endpoint, cluster, or Lakebase database
+    instance you create with the MLPAB_DATABRICKS_PREFIX env var (e.g. `${MLPAB_DATABRICKS_PREFIX}_<your-name>`).
+  - Put any workspace notebooks/files and MLflow experiments under `/Users/<your-user>/${MLPAB_DATABRICKS_PREFIX}/`.

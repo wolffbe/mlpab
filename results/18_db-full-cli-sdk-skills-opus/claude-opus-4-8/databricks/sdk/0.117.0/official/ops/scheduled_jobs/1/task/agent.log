@@ -1,0 +1,167 @@
+[mlpab] skills (95c4b1b4): databricks-apps,databricks-core,databricks-dabs,databricks-jobs,databricks-lakebase,databricks-model-serving,databricks-pipelines,databricks-serverless-migration,databricks-vector-search
+[agent] I'll start by examining the task inputs and environment.
+[agent:bash] cat data/instructions.md; echo "---HEARTBEAT---"; cat data/heartbeat.py; echo "---ENV---"; echo "SCHEMA=$MLPAB_DATABRICKS_SCHEMA"; echo "PREFIX=$MLPAB_DATABRICKS_PREFIX"; echo "HOST=$DATABRICKS_HOST"; echo "PWD=$(pwd)"
+[agent:result] # Heartbeat job
+[agent:result] 
+[agent:result] `heartbeat.py` is a trivial task: it prints one heartbeat line (token `HB-56927584`) and exits 0. It must run PERIODICALLY on the platform — set up a recurring schedule (any reasonable interval, e.g. hourly or daily) rather than a one-off run.
+[agent:result] ---HEARTBEAT---
+[agent:result] """Heartbeat — a trivial periodic task. Prints one line and exits 0."""
+[agent:result] import datetime
+[agent:result] 
+[agent:result] TOKEN = "HB-56927584"
+[agent:result] 
+[agent:result] if __name__ == "__main__":
+[agent:result]     print(f"heartbeat {TOKEN} alive at "
+[agent:result]           f"{datetime.datetime.now(datetime.timezone.utc).isoformat()}")
+[agent:result] ---ENV---
+[agent:result] SCHEMA=workspace.mlpab9d8192
+[agent:result] PREFIX=mlpab9d8192
+[agent:result] HOST=***REDACTED***
+[agent:result] PWD=/Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/sdk/0.117.0/official/ops/scheduled_jobs/1/task
+[agent] I have what I need. This is SDK mode — I'll drive Databricks via the Python SDK. Let me check the SDK and get my user identity.
+[agent:bash] cd "$(pwd)" && python -c "
+[agent:bash] import databricks.sdk
+[agent:bash] print('sdk version', databricks.sdk.__version__)
+[agent:bash] from databricks.sdk import WorkspaceClient
+[agent:bash] w = WorkspaceClient()
+[agent:bash] me = w.current_user.me()
+[agent:bash] print('user', me.user_name)
+[agent:bash] "
+[agent:result-err] Exit code 1
+[agent:result-err] Traceback (most recent call last):
+[agent:result-err]   File "<string>", line 3, in <module>
+[agent:result-err]     print('sdk version', databricks.sdk.__version__)
+[agent:result-err]                          ^^^^^^^^^^^^^^^^^^^^^^^^^^
+[agent:result-err] AttributeError: module 'databricks.sdk' has no attribute '__version__'
+[agent:bash] cd "$(pwd)" && python -c "
+[agent:bash] from databricks.sdk import WorkspaceClient
+[agent:bash] w = WorkspaceClient()
+[agent:bash] me = w.current_user.me()
+[agent:bash] print('user', me.user_name)
+[agent:bash] "
+[agent:result] user benedict@logicalclocks.com
+[agent] I'll create the orchestration script: upload the script as a notebook, create a recurring job on serverless, trigger a run, and wait.
+[agent:bash] cd "$(pwd)" && cat > .tmp_setup.py <<'PY'
+[agent:bash] import os, io, time, json
+[agent:bash] from databricks.sdk import WorkspaceClient
+[agent:bash] from databricks.sdk.service import jobs, workspace
+[agent:bash] 
+[agent:bash] w = WorkspaceClient()
+[agent:bash] me = w.current_user.me().user_name
+[agent:bash] prefix = os.environ["MLPAB_DATABRICKS_PREFIX"]
+[agent:bash] 
+[agent:bash] base_dir = f"/Users/{me}/{prefix}"
+[agent:bash] w.workspace.mkdirs(base_dir)
+[agent:bash] nb_path = f"{base_dir}/heartbeat468788"
+[agent:bash] 
+[agent:bash] # read the local heartbeat script
+[agent:bash] with open("data/heartbeat.py") as f:
+[agent:bash]     src = f.read()
+[agent:bash] 
+[agent:bash] # upload as a python notebook (SOURCE format)
+[agent:bash] w.workspace.upload(
+[agent:bash]     path=nb_path,
+[agent:bash]     content=io.BytesIO(src.encode("utf-8")),
+[agent:bash]     format=workspace.ImportFormat.SOURCE,
+[agent:bash]     language=workspace.Language.PYTHON,
+[agent:bash]     overwrite=True,
+[agent:bash] )
+[agent:bash] print("uploaded notebook to", nb_path)
+[agent:bash] 
+[agent:bash] job_name = "heartbeat468788"
+[agent:bash] 
+[agent:bash] # create a recurring scheduled job on serverless compute
+[agent:bash] created = w.jobs.create(
+[agent:bash]     name=job_name,
+[agent:bash]     tasks=[
+[agent:bash]         jobs.Task(
+[agent:bash]             task_key="heartbeat",
+[agent:bash]             notebook_task=jobs.NotebookTask(notebook_path=nb_path),
+[agent:bash]         )
+[agent:bash]     ],
+[agent:bash]     schedule=jobs.CronSchedule(
+[agent:bash]         quartz_cron_expression="0 0 * * * ?",  # top of every hour
+[agent:bash]         timezone_id="UTC",
+[agent:bash]         pause_status=jobs.PauseStatus.UNPAUSED,
+[agent:bash]     ),
+[agent:bash] )
+[agent:bash] job_id = created.job_id
+[agent:bash] print("created job_id", job_id)
+[agent:bash] print(json.dumps({"job_id": job_id, "name": job_name}))
+[agent:bash] with open(".tmp_jobid.txt", "w") as f:
+[agent:bash]     f.write(str(job_id))
+[agent:bash] PY
+[agent:bash] python .tmp_setup.py
+[agent:result-err] PreToolUse:Bash hook error: [python3 /Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/sdk/0.117.0/official/ops/scheduled_jobs/1/task/.claude/hooks/log_tool_call.py]: DENIED: cannot read local script(s) .tmp_setup.py to verify they don't train locally. Run python from your working directory so the script is readable, drive the SDK inline (`python -c ...`), or push the work to databricks as a remote job.
+[agent] The hook wants inline SDK usage. Let me run it via `python -c`.
+[agent:bash] cd "$(pwd)" && python -c '
+[agent:bash] import os, io, json
+[agent:bash] from databricks.sdk import WorkspaceClient
+[agent:bash] from databricks.sdk.service import jobs, workspace
+[agent:bash] 
+[agent:bash] w = WorkspaceClient()
+[agent:bash] me = w.current_user.me().user_name
+[agent:bash] prefix = os.environ["MLPAB_DATABRICKS_PREFIX"]
+[agent:bash] 
+[agent:bash] base_dir = f"/Users/{me}/{prefix}"
+[agent:bash] w.workspace.mkdirs(base_dir)
+[agent:bash] nb_path = f"{base_dir}/heartbeat468788"
+[agent:bash] 
+[agent:bash] with open("data/heartbeat.py") as f:
+[agent:bash]     src = f.read()
+[agent:bash] 
+[agent:bash] w.workspace.upload(path=nb_path, content=io.BytesIO(src.encode("utf-8")),
+[agent:bash]     format=workspace.ImportFormat.SOURCE, language=workspace.Language.PYTHON, overwrite=True)
+[agent:bash] print("uploaded notebook to", nb_path)
+[agent:bash] 
+[agent:bash] created = w.jobs.create(
+[agent:bash]     name="heartbeat468788",
+[agent:bash]     tasks=[jobs.Task(task_key="heartbeat", notebook_task=jobs.NotebookTask(notebook_path=nb_path))],
+[agent:bash]     schedule=jobs.CronSchedule(quartz_cron_expression="0 0 * * * ?", timezone_id="UTC",
+[agent:bash]         pause_status=jobs.PauseStatus.UNPAUSED),
+[agent:bash] )
+[agent:bash] print("created job_id", created.job_id)
+[agent:bash] open(".tmp_jobid.txt","w").write(str(created.job_id))
+[agent:bash] '
+[agent:result] uploaded notebook to /Users/benedict@logicalclocks.com/mlpab9d8192/heartbeat468788
+[agent:result] created job_id 303759009453210
+[agent] Job created with an hourly schedule (unpaused). Now trigger a run and wait for it to complete.
+[agent:bash] cd "$(pwd)" && python -c '
+[agent:bash] import json
+[agent:bash] from databricks.sdk import WorkspaceClient
+[agent:bash] from datetime import timedelta
+[agent:bash] w = WorkspaceClient()
+[agent:bash] job_id = int(open(".tmp_jobid.txt").read().strip())
+[agent:bash] run = w.jobs.run_now(job_id=job_id).result(timeout=timedelta(minutes=20))
+[agent:bash] print("run_id", run.run_id)
+[agent:bash] print("life_cycle", run.state.life_cycle_state, "result", run.state.result_state)
+[agent:bash] '
+[agent:result] run_id 515047947417352
+[agent:result] life_cycle RunLifeCycleState.TERMINATED result RunResultState.SUCCESS
+[agent] The run completed successfully. Let me verify the job is recurring and write the deliverable.
+[agent:bash] cd "$(pwd)" && mkdir -p submission && python -c '
+[agent:bash] import json
+[agent:bash] from databricks.sdk import WorkspaceClient
+[agent:bash] w = WorkspaceClient()
+[agent:bash] job_id = int(open(".tmp_jobid.txt").read().strip())
+[agent:bash] j = w.jobs.get(job_id=job_id)
+[agent:bash] print("name:", j.settings.name)
+[agent:bash] print("schedule:", j.settings.schedule)
+[agent:bash] ' && printf "%s" "{\"job_name\": \"heartbeat468788\"}" > submission/answers.json && echo "---answers.json---" && cat submission/answers.json && rm -f .tmp_jobid.txt
+[agent:result] name: heartbeat468788
+[agent:result] schedule: CronSchedule(quartz_cron_expression='0 0 * * * ?', timezone_id='UTC', pause_status=<PauseStatus.UNPAUSED: 'UNPAUSED'>)
+[agent:result] ---answers.json---
+[agent:result] {"job_name": "heartbeat468788"}
+[agent] Done. The deliverable exists on the platform and locally.
+[agent] **What I did (all via the Databricks Python SDK):**
+[agent] 1. Uploaded `data/heartbeat.py` as a Python notebook to `/Users/benedict@logicalclocks.com/mlpab9d8192/heartbeat468788` (under the per-run prefix dir).
+[agent] 2. Created a **recurring scheduled job** named `heartbeat468788` (job_id `303759009453210`) with a Quartz cron schedule `0 0 * * * ?` (top of every hour, UTC, **UNPAUSED**), running the notebook on serverless compute.
+[agent] 3. Triggered one run — it completed with `RunResultState.SUCCESS`.
+[agent] 4. Verified the job's recurring schedule, then wrote `submission/answers.json`:
+[agent] ```json
+[agent] {"job_name": "heartbeat468788"}
+[agent] ```
+[agent] The job is a genuine recurring (scheduled) job — not a one-off — confirmed by the active `CronSchedule` on the job definition.
+[agent] done: 8 turns, $0.6144, stop=end_turn
+[mlpab] WARNING: databricks sdk client crashed — see /Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/sdk/0.117.0/official/ops/scheduled_jobs/1/task/databricks_client.logs (markers: Traceback (most recent call last))
+[mlpab] graded: 3 passed / 0 failed / 0 skipped of 3 asserts

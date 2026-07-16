@@ -1,0 +1,301 @@
+[agent] I'll start by inspecting the task inputs and environment.
+[agent:bash] ls data/ && cat data/schema.md && head -5 data/features_train.csv data/features_serve.csv && wc -l data/*.csv && echo "SCHEMA=$MLPAB_DATABRICKS_SCHEMA PREFIX=$MLPAB_DATABRICKS_PREFIX"
+[agent:result] features_serve.csv
+[agent:result] features_train.csv
+[agent:result] schema.md
+[agent:result] # Schema
+[agent:result] 
+[agent:result] Two splits of the same numeric features; `row_id` is unique across both files.
+[agent:result] 
+[agent:result] - **features_train.csv**: row_id, f1, f2, f3, f4 — the training split
+[agent:result] - **features_serve.csv**: row_id, f1, f2, f3, f4 — the serving split
+[agent:result] ==> data/features_train.csv <==
+[agent:result] row_id,f1,f2,f3,f4
+[agent:result] R00000,-0.32159,-3.119535,-1.339767,0.675241
+[agent:result] R00001,0.80977,0.086773,0.159321,2.963242
+[agent:result] R00002,0.252126,-2.424051,1.656354,3.501779
+[agent:result] R00003,2.524278,-1.860079,0.272294,4.654029
+[agent:result] 
+[agent:result] ==> data/features_serve.csv <==
+[agent:result] row_id,f1,f2,f3,f4
+[agent:result] R00400,1.286276,5.982729,8.445556,3.478692
+[agent:result] R00401,-3.333864,6.262648,8.93555,3.666231
+[agent:result] R00402,-0.123985,6.721126,6.220602,2.52453
+[agent:result] R00403,-1.311616,5.775187,9.949213,2.972495
+[agent:result]      251 data/features_serve.csv
+[agent:result]      401 data/features_train.csv
+[agent:result]      652 total
+[agent:result] SCHEMA=workspace.mlpab8804f3 PREFIX=mlpab8804f3
+[agent:bash] ./venv/bin/python -c "
+[agent:bash] import os
+[agent:bash] from databricks.sdk import WorkspaceClient
+[agent:bash] w = WorkspaceClient()
+[agent:bash] print('user:', w.current_user.me().user_name)
+[agent:bash] for wh in w.warehouses.list():
+[agent:bash]     print('WH:', wh.id, wh.name, wh.state)
+[agent:bash] print('online_tables' in dir(w), hasattr(w, 'online_tables'))
+[agent:bash] "
+[agent:result] user: benedict@hopsworks.ai
+[agent:result] WH: 8a93fc195da2ceb1 mlpab-grader State.RUNNING
+[agent:result] WH: a832b544eb7dc3fe Serverless Starter Warehouse State.RUNNING
+[agent:result] True True
+[agent:bash] ./venv/bin/python -c "
+[agent:bash] from databricks.sdk import WorkspaceClient
+[agent:bash] from databricks.sdk.service.catalog import VolumeType
+[agent:bash] import io, os
+[agent:bash] w = WorkspaceClient()
+[agent:bash] cat, sch = os.environ['MLPAB_DATABRICKS_SCHEMA'].split('.')
+[agent:bash] try:
+[agent:bash]     w.volumes.create(catalog_name=cat, schema_name=sch, name='raw', volume_type=VolumeType.MANAGED)
+[agent:bash]     print('volume created')
+[agent:bash] except Exception as e:
+[agent:bash]     print('volume:', e)
+[agent:bash] for f in ['features_train.csv','features_serve.csv']:
+[agent:bash]     with open(f'data/{f}','rb') as fh:
+[agent:bash]         w.files.upload(f'/Volumes/{cat}/{sch}/raw/{f}', fh, overwrite=True)
+[agent:bash]     print('uploaded', f)
+[agent:bash] "
+[agent:result] volume created
+[agent:result] uploaded features_train.csv
+[agent:result] uploaded features_serve.csv
+[agent:bash] cat > .tmp_build.py <<'EOF'
+[agent:bash] import os
+[agent:bash] from databricks.sdk import WorkspaceClient
+[agent:bash] 
+[agent:bash] w = WorkspaceClient()
+[agent:bash] cat, sch = os.environ['MLPAB_DATABRICKS_SCHEMA'].split('.')
+[agent:bash] WH = '8a93fc195da2ceb1'
+[agent:bash] FQN = f'{cat}.{sch}.scaledf9e607'
+[agent:bash] VOL = f'/Volumes/{cat}/{sch}/raw'
+[agent:bash] 
+[agent:bash] def sql(stmt):
+[agent:bash]     r = w.statement_execution.execute_statement(statement=stmt, warehouse_id=WH, wait_timeout='50s')
+[agent:bash]     if r.status.state.value != 'SUCCEEDED':
+[agent:bash]         raise RuntimeError(f'{r.status.state}: {r.status.error}')
+[agent:bash]     return r
+[agent:bash] 
+[agent:bash] sql(f"""
+[agent:bash] CREATE TABLE {FQN} (
+[agent:bash]   row_id STRING NOT NULL,
+[agent:bash]   split STRING,
+[agent:bash]   f1 DOUBLE, f2 DOUBLE, f3 DOUBLE, f4 DOUBLE,
+[agent:bash]   CONSTRAINT scaledf9e607_pk PRIMARY KEY (row_id)
+[agent:bash] ) TBLPROPERTIES (delta.enableChangeDataFeed = true)
+[agent:bash] """)
+[agent:bash] print('table created')
+[agent:bash] 
+[agent:bash] sql(f"""
+[agent:bash] WITH train AS (
+[agent:bash]   SELECT row_id, CAST(f1 AS DOUBLE) f1, CAST(f2 AS DOUBLE) f2, CAST(f3 AS DOUBLE) f3, CAST(f4 AS DOUBLE) f4
+[agent:bash]   FROM read_files('{VOL}/features_train.csv', format => 'csv', header => true)
+[agent:bash] ),
+[agent:bash] serve AS (
+[agent:bash]   SELECT row_id, CAST(f1 AS DOUBLE) f1, CAST(f2 AS DOUBLE) f2, CAST(f3 AS DOUBLE) f3, CAST(f4 AS DOUBLE) f4
+[agent:bash]   FROM read_files('{VOL}/features_serve.csv', format => 'csv', header => true)
+[agent:bash] ),
+[agent:bash] allrows AS (
+[agent:bash]   SELECT row_id, 'train' AS split, f1, f2, f3, f4 FROM train
+[agent:bash]   UNION ALL
+[agent:bash]   SELECT row_id, 'serve' AS split, f1, f2, f3, f4 FROM serve
+[agent:bash] ),
+[agent:bash] stats AS (
+[agent:bash]   SELECT avg(f1) m1, stddev_pop(f1) s1,
+[agent:bash]          avg(f2) m2, stddev_pop(f2) s2,
+[agent:bash]          avg(f3) m3, stddev_pop(f3) s3,
+[agent:bash]          avg(f4) m4, stddev_pop(f4) s4
+[agent:bash]   FROM train
+[agent:bash] )
+[agent:bash] INSERT INTO {FQN}
+[agent:bash] SELECT row_id, split,
+[agent:bash]        round((f1 - m1) / s1, 6),
+[agent:bash]        round((f2 - m2) / s2, 6),
+[agent:bash]        round((f3 - m3) / s3, 6),
+[agent:bash]        round((f4 - m4) / s4, 6)
+[agent:bash] FROM allrows CROSS JOIN stats
+[agent:bash] """)
+[agent:bash] print('data inserted')
+[agent:bash] 
+[agent:bash] r = sql(f"SELECT split, count(*) c, round(avg(f1),4), round(stddev_pop(f1),4) FROM {FQN} GROUP BY split ORDER BY split")
+[agent:bash] for row in r.result.data_array:
+[agent:bash]     print(row)
+[agent:bash] r = sql(f"SELECT * FROM {FQN} ORDER BY row_id LIMIT 3")
+[agent:bash] for row in r.result.data_array:
+[agent:bash]     print(row)
+[agent:bash] EOF
+[agent:bash] ./venv/bin/python .tmp_build.py
+[agent:result-err] PreToolUse:Bash hook error: [python3 /Users/wolffbe/workspace/banter/testbed/results/24_db-full-cli-sdk-fable/claude-fable-5/databricks/sdk/0.117.0/no-skills/training/mdt/1/task/.claude/hooks/log_tool_call.py]: DENIED: cannot read local script(s) .tmp_build.py to verify they don't train locally. Run python from your working directory so the script is readable, drive the SDK inline (`python -c ...`), or push the work to databricks as a remote job.
+[agent] The hook needs the script to exist before the run. I'll write it with the Write tool, then execute.
+[agent:write] /Users/wolffbe/workspace/banter/testbed/results/24_db-full-cli-sdk-fable/claude-fable-5/databricks/sdk/0.117.0/no-skills/training/mdt/1/task/build_table.py
+[agent:result] File created successfully at: /Users/wolffbe/workspace/banter/testbed/results/24_db-full-cli-sdk-fable/claude-fable-5/databricks/sdk/0.117.0/no-skills/training/mdt/1/task/build_table.py (file state is current in your context — no need to Read it back)
+[agent:bash] ./venv/bin/python build_table.py
+[agent:result] table created
+[agent:result] data inserted
+[agent:result] ['serve', '250', '-0.4797', '1.5276']
+[agent:result] ['train', '400', '0.0', '1.0']
+[agent:result] ['R00000', 'train', '-0.550398', '-0.991797', '-1.42847', '-0.871637']
+[agent:result] ['R00001', 'train', '0.13389', '1.970577', '-0.518189', '0.912811']
+[agent:result] ['R00002', 'train', '-0.203394', '-0.349225', '0.390843', '1.332825']
+[agent] Train rows standardize to mean 0, population std 1 — correct. Now creating the online table for low-latency access.
+[agent:write] /Users/wolffbe/workspace/banter/testbed/results/24_db-full-cli-sdk-fable/claude-fable-5/databricks/sdk/0.117.0/no-skills/training/mdt/1/task/build_online.py
+[agent:result] File created successfully at: /Users/wolffbe/workspace/banter/testbed/results/24_db-full-cli-sdk-fable/claude-fable-5/databricks/sdk/0.117.0/no-skills/training/mdt/1/task/build_online.py (file state is current in your context — no need to Read it back)
+[agent:bash] ./venv/bin/python build_online.py
+[agent:result-err] Exit code 1
+[agent:result-err] Traceback (most recent call last):
+[agent:result-err]   File "/Users/wolffbe/workspace/banter/testbed/results/24_db-full-cli-sdk-fable/claude-fable-5/databricks/sdk/0.117.0/no-skills/training/mdt/1/task/build_online.py", line 20, in <module>
+[agent:result-err]     waiter = w.online_tables.create(table=OnlineTable(name=ONLINE, spec=spec))
+[agent:result-err]   File "/Users/wolffbe/workspace/banter/testbed/results/24_db-full-cli-sdk-fable/claude-fable-5/databricks/sdk/0.117.0/no-skills/training/mdt/1/task/venv/lib/python3.13/site-packages/databricks/sdk/service/catalog.py", line 14451, in create
+[agent:result-err]     op_response = self._api.do("POST", "/api/2.0/online-tables", body=body, headers=headers)
+[agent:result-err]   File "/Users/wolffbe/workspace/banter/testbed/results/24_db-full-cli-sdk-fable/claude-fable-5/databricks/sdk/0.117.0/no-skills/training/mdt/1/task/venv/lib/python3.13/site-packages/databricks/sdk/core.py", line 95, in do
+[agent:result-err]     return self._api_client.do(
+[agent:result-err]            ~~~~~~~~~~~~~~~~~~~^
+[agent:result-err]         method=method,
+[agent:result-err]         ^^^^^^^^^^^^^^
+[agent:result-err]     ...<8 lines>...
+[agent:result-err]         response_headers=response_headers,
+[agent:result-err]         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[agent:result-err]     )
+[agent:result-err]     ^
+[agent:result-err]   File "/Users/wolffbe/workspace/banter/testbed/results/24_db-full-cli-sdk-fable/claude-fable-5/databricks/sdk/0.117.0/no-skills/training/mdt/1/task/venv/lib/python3.13/site-packages/databricks/sdk/_base_client.py", line 197, in do
+[agent:result-err]     response = call(
+[agent:result-err]         method,
+[agent:result-err]     ...<7 lines>...
+[agent:result-err]         auth=auth,
+[agent:result-err]     )
+[agent:result-err]   File "/Users/wolffbe/workspace/banter/testbed/results/24_db-full-cli-sdk-fable/claude-fable-5/databricks/sdk/0.117.0/no-skills/training/mdt/1/task/venv/lib/python3.13/site-packages/databricks/sdk/retries.py", line 59, in wrapper
+[agent:result-err]     raise err
+[agent:result-err]   File "/Users/wolffbe/workspace/banter/testbed/results/24_db-full-cli-sdk-fable/claude-fable-5/databricks/sdk/0.117.0/no-skills/training/mdt/1/task/venv/lib/python3.13/site-packages/databricks/sdk/retries.py", line 38, in wrapper
+[agent:result-err]     return func(*args, **kwargs)
+[agent:result-err]   File "/Users/wolffbe/workspace/banter/testbed/results/24_db-full-cli-sdk-fable/claude-fable-5/databricks/sdk/0.117.0/no-skills/training/mdt/1/task/venv/lib/python3.13/site-packages/databricks/sdk/_base_client.py", line 299, in _perform
+[agent:result-err]     raise error from None
+[agent:result-err] databricks.sdk.errors.platform.BadRequest: Online Table is being deprecated. Creating new online table is not allowed. Databricks recommends switching to Synced Tables.
+[agent:bash] ./venv/bin/python -c "
+[agent:bash] from databricks.sdk import WorkspaceClient
+[agent:bash] w = WorkspaceClient()
+[agent:bash] print([m for m in dir(w.database) if not m.startswith('_')])
+[agent:bash] for i in w.database.list_database_instances():
+[agent:bash]     print('INSTANCE:', i.name, i.state)
+[agent:bash] " && ./venv/bin/python -c "
+[agent:bash] from databricks.sdk.service.database import SyncedDatabaseTable, SyncedTableSpec, DatabaseInstance
+[agent:bash] import inspect
+[agent:bash] print(inspect.signature(SyncedTableSpec.__init__))
+[agent:bash] print(inspect.signature(DatabaseInstance.__init__))
+[agent:bash] "
+[agent:result] ['create_database_catalog', 'create_database_instance', 'create_database_instance_and_wait', 'create_database_instance_role', 'create_database_table', 'create_synced_database_table', 'delete_database_catalog', 'delete_database_instance', 'delete_database_instance_role', 'delete_database_table', 'delete_synced_database_table', 'find_database_instance_by_uid', 'generate_database_credential', 'get_database_catalog', 'get_database_instance', 'get_database_instance_role', 'get_database_table', 'get_synced_database_table', 'list_database_catalogs', 'list_database_instance_roles', 'list_database_instances', 'list_synced_database_tables', 'update_database_catalog', 'update_database_instance', 'update_synced_database_table', 'wait_get_database_instance_database_available']
+[agent:result] INSTANCE: workspace-mlpab5a4a3d-online-store DatabaseInstanceState.AVAILABLE
+[agent:result] INSTANCE: scored-online-store DatabaseInstanceState.AVAILABLE
+[agent:result] INSTANCE: workspace-mlpab9fadd9-online-store DatabaseInstanceState.AVAILABLE
+[agent:result] (self, accelerated_sync: 'Optional[bool]' = None, create_database_objects_if_missing: 'Optional[bool]' = None, existing_pipeline_id: 'Optional[str]' = None, new_pipeline_spec: 'Optional[NewPipelineSpec]' = None, primary_key_columns: 'Optional[List[str]]' = None, scheduling_policy: 'Optional[SyncedTableSchedulingPolicy]' = None, source_table_full_name: 'Optional[str]' = None, timeseries_key: 'Optional[str]' = None, type_overrides: 'Optional[List[SyncedTableSpecTypeOverride]]' = None) -> None
+[agent:result] (self, name: 'str', capacity: 'Optional[str]' = None, child_instance_refs: 'Optional[List[DatabaseInstanceRef]]' = None, creation_time: 'Optional[str]' = None, creator: 'Optional[str]' = None, custom_tags: 'Optional[List[CustomTag]]' = None, effective_capacity: 'Optional[str]' = None, effective_custom_tags: 'Optional[List[CustomTag]]' = None, effective_enable_pg_native_login: 'Optional[bool]' = None, effective_enable_readable_secondaries: 'Optional[bool]' = None, effective_node_count: 'Optional[int]' = None, effective_retention_window_in_days: 'Optional[int]' = None, effective_stopped: 'Optional[bool]' = None, effective_usage_policy_id: 'Optional[str]' = None, enable_pg_native_login: 'Optional[bool]' = None, enable_readable_secondaries: 'Optional[bool]' = None, node_count: 'Optional[int]' = None, parent_instance_ref: 'Optional[DatabaseInstanceRef]' = None, pg_version: 'Optional[str]' = None, read_only_dns: 'Optional[str]' = None, read_write_dns: 'Optional[str]' = None, retention_window_in_days: 'Optional[int]' = None, state: 'Optional[DatabaseInstanceState]' = None, stopped: 'Optional[bool]' = None, uid: 'Optional[str]' = None, usage_policy_id: 'Optional[str]' = None) -> None
+[agent:bash] ./venv/bin/python -c "
+[agent:bash] from databricks.sdk.service.database import SyncedDatabaseTable
+[agent:bash] import inspect
+[agent:bash] print(inspect.signature(SyncedDatabaseTable.__init__))
+[agent:bash] from databricks.sdk import WorkspaceClient
+[agent:bash] w = WorkspaceClient()
+[agent:bash] import inspect as i2
+[agent:bash] print(i2.signature(w.database.create_synced_database_table))
+[agent:bash] print(i2.signature(w.database.create_database_instance))
+[agent:bash] "
+[agent:result] (self, name: 'str', data_synchronization_status: 'Optional[SyncedTableStatus]' = None, database_instance_name: 'Optional[str]' = None, effective_database_instance_name: 'Optional[str]' = None, effective_logical_database_name: 'Optional[str]' = None, logical_database_name: 'Optional[str]' = None, spec: 'Optional[SyncedTableSpec]' = None, unity_catalog_provisioning_state: 'Optional[ProvisioningInfoState]' = None) -> None
+[agent:result] (synced_table: 'SyncedDatabaseTable') -> 'SyncedDatabaseTable'
+[agent:result] (database_instance: 'DatabaseInstance') -> 'Wait[DatabaseInstance]'
+[agent:write] /Users/wolffbe/workspace/banter/testbed/results/24_db-full-cli-sdk-fable/claude-fable-5/databricks/sdk/0.117.0/no-skills/training/mdt/1/task/build_synced.py
+[agent:result] File created successfully at: /Users/wolffbe/workspace/banter/testbed/results/24_db-full-cli-sdk-fable/claude-fable-5/databricks/sdk/0.117.0/no-skills/training/mdt/1/task/build_synced.py (file state is current in your context — no need to Read it back)
+[agent:bash] ./venv/bin/python build_synced.py
+[agent:result] instance created: DatabaseInstanceState.AVAILABLE
+[agent:result] synced table created: workspace.mlpab8804f3.scaledf9e607_online
+[agent:result] state: SYNCED_TABLE_PROVISIONING_PIPELINE_RESOURCES
+[agent:result] state: SYNCED_TABLE_PROVISIONING_INITIAL_SNAPSHOT
+[agent:result] state: SYNCED_TABLE_ONLINE_NO_PENDING_UPDATE
+[agent:result] state: SYNCED_TABLE_ONLINE_NO_PENDING_UPDATE
+[agent:result] state: SYNCED_TABLE_ONLINE_NO_PENDING_UPDATE
+[agent:result] state: SYNCED_TABLE_ONLINE_NO_PENDING_UPDATE
+[agent:result] state: SYNCED_TABLE_ONLINE_NO_PENDING_UPDATE
+[agent:result] state: SYNCED_TABLE_ONLINE_NO_PENDING_UPDATE
+[agent:result] state: SYNCED_TABLE_ONLINE_NO_PENDING_UPDATE
+[agent:result] state: SYNCED_TABLE_ONLINE_NO_PENDING_UPDATE
+[agent:result] state: SYNCED_TABLE_ONLINE_NO_PENDING_UPDATE
+[agent:result] state: SYNCED_TABLE_ONLINE_NO_PENDING_UPDATE
+[agent:result] state: SYNCED_TABLE_ONLINE_NO_PENDING_UPDATE
+[agent:result] state: SYNCED_TABLE_ONLINE_NO_PENDING_UPDATE
+[agent:result] state: SYNCED_TABLE_ONLINE_NO_PENDING_UPDATE
+[agent:result] state: SYNCED_TABLE_ONLINE_NO_PENDING_UPDATE
+[agent:result] state: SYNCED_TABLE_ONLINE_NO_PENDING_UPDATE
+[agent:result] state: SYNCED_TABLE_ONLINE_NO_PENDING_UPDATE
+[agent:result] state: SYNCED_TABLE_ONLINE_NO_PENDING_UPDATE
+[agent:result] state: SYNCED_TABLE_ONLINE_NO_PENDING_UPDATE
+[agent:result] state: SYNCED_TABLE_ONLINE_NO_PENDING_UPDATE
+[agent:result] state: SYNCED_TABLE_ONLINE_NO_PENDING_UPDATE
+[agent:result] state: SYNCED_TABLE_ONLINE_NO_PENDING_UPDATE
+[agent:result] state: SYNCED_TABLE_ONLINE_NO_PENDING_UPDATE
+[agent:result] state: SYNCED_TABLE_ONLINE_NO_PENDING_UPDATE
+[agent:result] state: SYNCED_TABLE_ONLINE_NO_PENDING_UPDATE
+[agent:result] state: SYNCED_TABLE_ONLINE_NO_PENDING_UPDATE
+[agent:result] state: SYNCED_TABLE_ONLINE_NO_PENDING_UPDATE
+[agent:result] state: SYNCED_TABLE_ONLINE_NO_PENDING_UPDATE
+[agent:result] state: SYNCED_TABLE_ONLINE_NO_PENDING_UPDATE
+[agent:result] state: SYNCED_TABLE_ONLINE_NO_PENDING_UPDATE
+[agent:result] state: SYNCED_TABLE_ONLINE_NO_PENDING_UPDATE
+[agent:result] state: SYNCED_TABLE_ONLINE_NO_PENDING_UPDATE
+[agent:result] state: SYNCED_TABLE_ONLINE_NO_PENDING_UPDATE
+[agent:result] state: SYNCED_TABLE_ONLINE_NO_PENDING_UPDATE
+[agent:result] state: SYNCED_TABLE_ONLINE_NO_PENDING_UPDATE
+[agent:result] state: SYNCED_TABLE_ONLINE_NO_PENDING_UPDATE
+[agent:result] state: SYNCED_TABLE_ONLINE_NO_PENDING_UPDATE
+[agent:result] state: SYNCED_TABLE_ONLINE_NO_PENDING_UPDATE
+[agent:result] state: SYNCED_TABLE_ONLINE_NO_PENDING_UPDATE
+[agent:result] state: SYNCED_TABLE_ONLINE_NO_PENDING_UPDATE
+[agent:result] state: SYNCED_TABLE_ONLINE_NO_PENDING_UPDATE
+[agent:result] state: SYNCED_TABLE_ONLINE_NO_PENDING_UPDATE
+[agent:result] state: SYNCED_TABLE_ONLINE_NO_PENDING_UPDATE
+[agent:result] state: SYNCED_TABLE_ONLINE_NO_PENDING_UPDATE
+[agent:result] state: SYNCED_TABLE_ONLINE_NO_PENDING_UPDATE
+[agent:result] state: SYNCED_TABLE_ONLINE_NO_PENDING_UPDATE
+[agent:result] state: SYNCED_TABLE_ONLINE_NO_PENDING_UPDATE
+[agent:result] state: SYNCED_TABLE_ONLINE_NO_PENDING_UPDATE
+[agent:result] state: SYNCED_TABLE_ONLINE_NO_PENDING_UPDATE
+[agent:result] state: SYNCED_TABLE_ONLINE_NO_PENDING_UPDATE
+[agent:result] state: SYNCED_TABLE_ONLINE_NO_PENDING_UPDATE
+[agent:result] state: SYNCED_TABLE_ONLINE_NO_PENDING_UPDATE
+[agent:result] state: SYNCED_TABLE_ONLINE_NO_PENDING_UPDATE
+[agent:result] state: SYNCED_TABLE_ONLINE_NO_PENDING_UPDATE
+[agent:result] state: SYNCED_TABLE_ONLINE_NO_PENDING_UPDATE
+[agent:result] state: SYNCED_TABLE_ONLINE_NO_PENDING_UPDATE
+[agent:result] state: SYNCED_TABLE_ONLINE_NO_PENDING_UPDATE
+[agent:result] state: SYNCED_TABLE_ONLINE_NO_PENDING_UPDATE
+[agent:result] state: SYNCED_TABLE_ONLINE_NO_PENDING_UPDATE
+[agent:result] state: SYNCED_TABLE_ONLINE_NO_PENDING_UPDATE
+[agent:result] state: SYNCED_TABLE_ONLINE_NO_PENDING_UPDATE
+[agent:result] state: SYNCED_TABLE_ONLINE_NO_PENDING_UPDATE
+[agent:result] state: SYNCED_TABLE_ONLINE_NO_PENDING_UPDATE
+[agent:result] state: SYNCED_TABLE_ONLINE_NO_PENDING_UPDATE
+[agent:result] state: SYNCED_TABLE_ONLINE_NO_PENDING_UPDATE
+[agent:result] state: SYNCED_TABLE_ONLINE_NO_PENDING_UPDATE
+[agent:result] state: SYNCED_TABLE_ONLINE_NO_PENDING_UPDATE
+[agent:result] state: SYNCED_TABLE_ONLINE_NO_PENDING_UPDATE
+[agent:result] state: SYNCED_TABLE_ONLINE_NO_PENDING_UPDATE
+[agent:result] done
+[agent] The synced table reached `SYNCED_TABLE_ONLINE_NO_PENDING_UPDATE` (fully synced; my loop's exact-match check just didn't recognize that success variant and polled to timeout — no harm). Quick final verification:
+[agent:bash] ./venv/bin/python -c "
+[agent:bash] from databricks.sdk import WorkspaceClient
+[agent:bash] w = WorkspaceClient()
+[agent:bash] r = w.statement_execution.execute_statement(
+[agent:bash]     statement='SELECT split, count(*) FROM workspace.mlpab8804f3.scaledf9e607 GROUP BY split',
+[agent:bash]     warehouse_id='8a93fc195da2ceb1', wait_timeout='50s')
+[agent:bash] print(r.status.state, r.result.data_array)
+[agent:bash] t = w.tables.get('workspace.mlpab8804f3.scaledf9e607')
+[agent:bash] print('pk constraint:', t.table_constraints)
+[agent:bash] s = w.database.get_synced_database_table(name='workspace.mlpab8804f3.scaledf9e607_online')
+[agent:bash] print('online state:', s.data_synchronization_status.detailed_state)
+[agent:bash] "
+[agent:result] StatementState.SUCCEEDED [['train', '400'], ['serve', '250']]
+[agent:result] pk constraint: [TableConstraint(foreign_key_constraint=None, named_table_constraint=None, primary_key_constraint=PrimaryKeyConstraint(name='scaledf9e607_pk', child_columns=['row_id'], rely=None, timeseries_columns=None))]
+[agent:result] online state: SyncedTableState.SYNCED_TABLE_ONLINE_NO_PENDING_UPDATE
+[agent] Done. The feature table is registered on Databricks and served online.
+[agent] **What was created (all inside `workspace.mlpab8804f3`):**
+[agent] - **`workspace.mlpab8804f3.scaledf9e607`** — Delta table with columns `row_id, split, f1, f2, f3, f4` and primary key constraint on `row_id` (which is what makes it a Unity Catalog feature table). It holds all 650 rows: 400 tagged `split='train'` and 250 tagged `split='serve'`. Standardization ran entirely on a SQL warehouse: means and population standard deviations (`stddev_pop`, no Bessel's correction) were computed over the training rows only and applied to both splits, with results rounded to 6 decimals. Verified: the train rows come back with mean 0.0 and population std 1.0 per feature.
+[agent] - **Online access** — the workspace rejects new Online Tables (deprecated: "Databricks recommends switching to Synced Tables"), so I created a Lakebase database instance **`mlpab8804f3-online-store`** (prefixed per convention) and a synced table **`workspace.mlpab8804f3.scaledf9e607_online`** keyed on `row_id`, which finished its initial snapshot and is in state `SYNCED_TABLE_ONLINE_NO_PENDING_UPDATE` — features are available for low-latency real-time lookup.
+[agent] - Supporting objects: managed volume `workspace.mlpab8804f3.raw` holding the two uploaded source CSVs.
+[agent] done: 14 turns, $1.9915, stop=end_turn
+[mlpab] WARNING: databricks sdk client crashed — see /Users/wolffbe/workspace/banter/testbed/results/24_db-full-cli-sdk-fable/claude-fable-5/databricks/sdk/0.117.0/no-skills/training/mdt/1/task/databricks_client.logs (markers: Traceback (most recent call last))
+[mlpab] graded: 3 passed / 0 failed / 0 skipped of 3 asserts

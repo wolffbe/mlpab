@@ -1,0 +1,143 @@
+# Amazon SageMaker Python SDK interface — config (where it lives + how to run it).
+# Docs: https://sagemaker.readthedocs.io/en/stable/
+#
+# Published PyPI package (no build-from-source), so there is NO `repo`/`install`
+# build step and NO local `binary` — each agent run `pip install`s the pinned
+# version into its venv (`runtime_install`).
+#
+# Set keys: edit the global testbed/.env (see `keys:` below).
+
+# --- How to run it (per agent run) — install the pinned SDK from PyPI. Pinned
+#     for reproducibility (mirror of the fixed `ref:` the build-from-source
+#     interfaces pin). To advance, bump this version. ---
+# The interface version/ref under test — written to the results `version`
+# column. Keep in sync with the pin below (ref: / ==X.Y.Z / VER=).
+version: "3.13.1"
+
+runtime_install:
+  # sagemaker==3.13.1 (via sagemaker-mlops -> pyiceberg[glue]) pulls s3fs UNCONSTRAINED;
+  # its aiobotocore pin cannot match the base botocore, so pip backtracks through YEARS
+  # of s3fs/aiobotocore versions (~10 min) before settling on s3fs 0.4.2 (last s3fs with
+  # no aiobotocore dep). Pin it so pip picks it immediately.
+  - pip install "sagemaker==3.13.1" "s3fs==0.4.2"
+
+# Grader read-client install (CLI/MCP runs only — see interfaces.install_for_grader).
+# The checker adapter (evals/adapters/aws.py) reads back through boto3 ALONE
+# (describe_feature_group, S3 get_object, batch_get_record) — it never imports
+# sagemaker. So grade with just boto3 instead of dragging in the full sagemaker
+# SDK (torch/mlflow/onnx, hundreds of MB). Pinned to botocore 1.43.30 — the
+# version awscli 1.45.30 pins — so the CLI venv stays self-consistent.
+grader_install:
+  - pip install "boto3==1.43.30"
+
+# The importable module, so mlpab accounts `import sagemaker…` as sdk_calls and
+# the agent hook treats off-interface interpreters/binaries as escapes.
+sdk_module: sagemaker
+
+# Deterministic, OFFLINE "does it import?" check (no AWS calls): after the package
+# installs, it imports cleanly.
+test_command: python -c "import sagemaker"
+
+# Real connectivity + PERMISSIONS check (botocore ships with the SDK's boto3).
+# STS alone is not enough: it needs no IAM permission, so it green-lights
+# credentials that cannot call SageMaker at all. This probes that (1) the account
+# policy actually grants SageMaker (cheap read), and (2) setup.py's execution-role
+# bootstrap can work — iam:GetRole succeeds or the role merely doesn't exist yet
+# (NoSuchEntity is fine; setup.py creates it). Exits non-zero with the missing
+# grant named; `mlpab test --no-login` skips it.
+auth_command: |
+  python - <<'AUTHCHECK'
+  import os, sys
+  import botocore.session
+  session = botocore.session.get_session()
+  region = os.environ.get("AWS_REGION")
+  ident = session.create_client("sts", region_name=region).get_caller_identity()
+  try:
+      session.create_client("sagemaker", region_name=region).list_training_jobs(MaxResults=1)
+  except Exception as e:
+      sys.exit(f"{ident['Arn']} lacks SageMaker permissions — attach "
+               f"AmazonSageMakerFullAccess (or equivalent) to it: {e}")
+  # An explicit SAGEMAKER_ROLE_ARN (.env or setup.py's platform.env export)
+  # reaches the agent regardless of IAM rights — only the bootstrap path
+  # needs iam:GetRole (NoSuchEntity is fine; setup.py then creates the role).
+  if not os.environ.get("SAGEMAKER_ROLE_ARN"):
+      role = "mlpab-sagemaker-execution-role"
+      try:
+          session.create_client("iam", region_name=region).get_role(RoleName=role)
+      except Exception as e:
+          if getattr(e, "response", {}).get("Error", {}).get("Code") != "NoSuchEntity":
+              sys.exit(f"{ident['Arn']} cannot read execution role {role!r}, so setup.py's "
+                       f"role bootstrap will fail — grant iam:GetRole/CreateRole/"
+                       f"AttachRolePolicy on that role (or pre-provision it and set "
+                       f"SAGEMAKER_ROLE_ARN in .env): {e}")
+  AUTHCHECK
+
+# Outbound hosts the agent needs reachable at run time (drives the sandbox
+# allowedDomains). SageMaker/STS/S3 all live under amazonaws.com.
+allowed_domains:
+  - "*.amazonaws.com"
+
+# --- AWS Free Tier guard — the ONLY `ml.<family>.<size>` instance types the
+#     agent may request; the PreToolUse hook DENIES any other instance-type
+#     token in a tool call (TESTBED_INSTANCE_ALLOW). SageMaker Free Tier (first
+#     2 months): training 50 h + real-time inference 125 h on ml.m4.xlarge /
+#     ml.m5.xlarge; Studio/notebooks 250 h on ml.t3.medium; Serverless Inference
+#     (no instance type) 150k seconds. ---
+instance_allowlist:
+  - ml.t3.medium
+  - ml.m4.xlarge
+  - ml.m5.xlarge
+
+# --- Platform setup — run automatically by mlpab at the START of every run,
+#     right AFTER the teardown sweep below. SageMaker has no project container to
+#     pre-create; instead this ensures the plumbing the agent is locked out of
+#     creating: the default bucket `sagemaker-<region>-<account>` (jobs write
+#     artifacts to S3, and S3 is off-interface) and the IAM execution role (jobs
+#     need a RoleArn, and IAM is off-interface), whose ARN setup.py exports into
+#     the agent's env as SAGEMAKER_ROLE_ARN via $MLPAB_PLATFORM_ENV.
+#     The logic is the committed configs/platforms/sagemaker/setup.py —
+#     $MLPAB_PLATFORM_DIR points there (fixed infra); `./venv` is the agent's
+#     run venv (botocore is installed there). ---
+serve:
+  - './venv/bin/python "$MLPAB_PLATFORM_DIR/setup.py"'
+
+# --- Platform teardown — run automatically by mlpab at the START and END of
+#     every run. SageMaker has no project whose deletion cascades, so this sweeps
+#     PER RESOURCE TYPE in cost order: endpoints + MLflow tracking servers, stop
+#     in-flight jobs, then endpoint configs / models / feature groups / pipelines
+#     / model packages / experiments, then the default bucket's contents. By
+#     default it deletes only THIS run's prefixed resources (MLPAB_AWS_PREFIX) so
+#     parallel runs don't clobber each other; `teardown.py --all` does the old
+#     account-wide sweep as a janitor. The cleanup logic is the committed
+#     configs/platforms/aws/teardown.py — $MLPAB_PLATFORM_DIR points there
+#     (fixed infra); `./venv` is the agent's run venv. ---
+teardown:
+  - './venv/bin/python "$MLPAB_PLATFORM_DIR/teardown.py"'
+
+# --- Credentials — names only; values resolve from the GLOBAL testbed/.env at
+#     run time (never stored here). boto3 / the SDK read these standard AWS env
+#     vars; the auth_command above verifies them live. ---
+keys:
+  - AWS_ACCESS_KEY_ID       # secret
+  - AWS_SECRET_ACCESS_KEY   # secret
+  - AWS_REGION              # e.g. us-east-1
+  # OPTIONAL override — normally LEAVE UNSET in .env: setup.py creates/finds the
+  # execution role (default name mlpab-sagemaker-execution-role) and exports its
+  # ARN into the agent env as SAGEMAKER_ROLE_ARN automatically. Set it only to
+  # force a specific pre-provisioned role (an explicit .env value wins).
+  - {name: SAGEMAKER_ROLE_ARN, optional: true}
+
+# --- Agent-facing prompt ---
+prompt: |
+  The Amazon SageMaker Python SDK is available as `import sagemaker`. It is
+  authenticated via AWS credentials and AWS_REGION (via boto3) from the environment. Operations that require an
+  IAM execution role (role/role_arn) must use the pre-provisioned role in SAGEMAKER_ROLE_ARN from the environment.
+  Use Python introspection (`help()`/`dir()`) on the package to see what it can do.
+  Isolate your work so it is cleaned up correctly: PREFIX the name of every resource you create — feature group,
+  training/processing job, pipeline, model package group, endpoint (and its config), CloudWatch alarm — with
+  `${MLPAB_AWS_PREFIX}-` (e.g. `${MLPAB_AWS_PREFIX}-transactions`). Write training-set objects under the key
+  prefix `${MLPAB_AWS_PREFIX}/` in SAGEMAKER_DEFAULT_BUCKET (e.g.
+  `s3://<bucket>/${MLPAB_AWS_PREFIX}/training_datasets/<name>/v<version>/`).
+  Stay within the AWS Free Tier: any job, endpoint, or notebook may request ONLY the instance types ml.m5.xlarge,
+  ml.m4.xlarge (jobs/endpoints) or ml.t3.medium (notebooks), with a single instance — every other instance type is
+  hard-blocked. Serverless Inference (no instance type) is also Free Tier.

@@ -1,0 +1,1006 @@
+"""Tests for the remote-only / single-interface enforcement added to the
+PreToolUse hook, the agent-prompt mode gating, and the auth-error retry
+detection in claude_runner."""
+
+import importlib.util
+import os
+import tempfile
+import unittest
+from pathlib import Path
+
+from mlpab import claude_runner, runner
+
+# The hook is designed to run standalone (copied into each run dir), so load it
+# straight from its file — exactly how the harness executes it.
+_HOOK_PATH = Path(__file__).resolve().parents[1] / "src" / "mlpab" / "hooks" / "log_tool_call.py"
+_spec = importlib.util.spec_from_file_location("log_tool_call", _HOOK_PATH)
+hook = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(hook)
+
+_MARKERS = {
+    "TESTBED_SDK_MODULE": "hopsworks",
+    "TESTBED_CLI_BINARY": "hops",
+    "TESTBED_PLATFORM": "hopsworks",
+    "TESTBED_COMPUTE_DENY": "torch,tensorflow,sklearn,xgboost",
+}
+
+
+class EnforceHookTests(unittest.TestCase):
+    def _enforce(self, interface, tool, command=None, **input_extra):
+        env = dict(_MARKERS, TESTBED_INTERFACE=interface)
+        # Also clear TESTBED_CLI_SUBCOMMAND/AUX so an entrypoint/aux test can't
+        # leak into the default (single-token) cases.
+        for k in ("TESTBED_INTERFACE", "TESTBED_CLI_SUBCOMMAND", "TESTBED_CLI_AUX", *_MARKERS):
+            os.environ.pop(k, None)
+        os.environ.update(env)
+        tool_input = dict(input_extra)
+        if command is not None:
+            tool_input["command"] = command
+        return hook.enforce(tool, tool_input)
+
+    def _enforce_entrypoint(self, command, cli_binary="aws", cli_subcommand="sagemaker"):
+        """Enforce in CLI mode with a SUBCOMMAND ENTRYPOINT (e.g. `aws sagemaker`):
+        only `<cli_binary> <cli_subcommand> …` is on-interface."""
+        for k in ("TESTBED_INTERFACE", "TESTBED_CLI_SUBCOMMAND", "TESTBED_CLI_AUX", *_MARKERS):
+            os.environ.pop(k, None)
+        os.environ.update(
+            {
+                "TESTBED_INTERFACE": "cli",
+                "TESTBED_CLI_BINARY": cli_binary,
+                "TESTBED_CLI_SUBCOMMAND": cli_subcommand,
+                "TESTBED_SDK_MODULE": "sagemaker",
+                "TESTBED_PLATFORM": "aws",
+                "TESTBED_COMPUTE_DENY": "torch,tensorflow,sklearn,xgboost",
+            }
+        )
+        return hook.enforce("Bash", {"command": command})
+
+    # --- compute libraries: blocked locally in every mode ---
+    def test_local_torch_blocked_in_cli(self):
+        self.assertIsNotNone(self._enforce("cli", "Bash", 'python -c "import torch"'))
+
+    def test_local_sklearn_comma_import_blocked_in_sdk(self):
+        # `import hopsworks, sklearn` — the comma-list must still be caught.
+        self.assertIsNotNone(
+            self._enforce("sdk", "Bash", 'python -c "import hopsworks, sklearn; sklearn.fit()"')
+        )
+
+    def test_script_file_with_torch_blocked(self):
+        d = Path(tempfile.mkdtemp())
+        (d / "train.py").write_text("import torch\nmodel.fit()\n")
+        cwd = os.getcwd()
+        os.chdir(d)
+        try:
+            self.assertIsNotNone(self._enforce("sdk", "Bash", "python train.py"))
+        finally:
+            os.chdir(cwd)
+
+    def test_pip_install_torch_allowed(self):
+        # Installing is setup, not local execution of the library.
+        self.assertIsNone(self._enforce("sdk", "Bash", "pip install torch"))
+
+    def test_echo_import_torch_not_executed_allowed(self):
+        self.assertIsNone(self._enforce("cli", "Bash", 'echo "import torch"'))
+
+    # --- CLI mode: only hops ---
+    def test_cli_hops_allowed(self):
+        self.assertIsNone(self._enforce("cli", "Bash", "hops jobs create --name t"))
+
+    def test_cli_any_local_python_blocked(self):
+        self.assertIsNotNone(self._enforce("cli", "Bash", 'python -c "import pandas"'))
+
+    def test_cli_cp_floor_submission_allowed(self):
+        self.assertIsNone(
+            self._enforce(
+                "cli",
+                "Bash",
+                "mkdir -p submission && cp data/sample_submission.csv submission/submission.csv",
+            )
+        )
+
+    def test_cli_command_substitution_escape_blocked(self):
+        # `echo $(node …)` ran an off-interface interpreter through the (allowed)
+        # echo — the command-substitution body must face the same allowlist.
+        self.assertIsNotNone(self._enforce("cli", "Bash", 'echo $(node -e "1")'))
+        self.assertIsNotNone(self._enforce("cli", "Bash", "echo `node -e 1`"))
+
+    def test_cli_find_exec_escape_blocked(self):
+        self.assertIsNotNone(self._enforce("cli", "Bash", "find . -name '*.py' -exec node {} ;"))
+
+    def test_cli_command_substitution_with_allowed_cmd_ok(self):
+        # A substitution whose inner exec is basic shell / the CLI is fine.
+        self.assertIsNone(self._enforce("cli", "Bash", "hops jobs list $(cat manifest.txt)"))
+        self.assertIsNone(self._enforce("cli", "Bash", 'echo "$(date)"'))
+
+    def test_single_quoted_dollar_paren_is_literal_not_escape(self):
+        # `$(…)` inside SINGLE quotes is literal (bash doesn't expand it) → must
+        # not be treated as a sub-command (no false denial).
+        self.assertIsNone(self._enforce("cli", "Bash", "hops fs cp 'weird$(node).csv' /dst"))
+
+    def test_separators_inside_cmdsub_dont_split_outer_segment(self):
+        # Regression: a `|`/flag INSIDE `$( … )` must not split the outer segment
+        # and surface the body's flags (`-n`, `-d,`) as a bogus exec. These are
+        # allowed basic-shell data-inspection one-liners; they were false-denied.
+        for cmd in (
+            'tot=$(tail -n +2 data/batch_1.csv | wc -l); echo "$tot"',
+            "uniq=$(cut -d, -f1 data/batch_1.csv | sort -u | wc -l); echo $uniq",
+            "for i in 1 2 3; do n=$(tail -n +2 data/batch_$i.csv | wc -l); echo $n; done",
+        ):
+            self.assertIsNone(self._enforce("sdk", "Bash", cmd), cmd)
+            self.assertIsNone(self._enforce("cli", "Bash", cmd), cmd)
+
+    def test_cmdsub_body_still_allowlist_checked(self):
+        # Masking the span for OUTER segmentation must not stop `_nested_commands`
+        # from enforcing the body: an off-interface interpreter inside `$( … )`
+        # with a pipe is still denied.
+        self.assertIsNotNone(self._enforce("cli", "Bash", "x=$(node -e 1 | cat); echo $x"))
+
+    def test_leading_comment_line_not_treated_as_command(self):
+        # Regression: a `#` comment line in a multi-line command was tokenized to
+        # a `#` segment and denied as an off-interface binary.
+        cmd = "# max updated_at per row_id\ntail -q -n +2 data/*.csv | awk -F, '{print $1}' | sort"
+        self.assertIsNone(self._enforce("cli", "Bash", cmd), cmd)
+        # A `#` mid-token (not a word boundary) stays literal, not a comment.
+        self.assertIsNone(self._enforce("cli", "Bash", "cut -d# -f1 data/x.csv"))
+
+    def test_cli_solution_answer_key_blocked(self):
+        for cmd in (
+            "cat solution/truth.json",
+            "cat ../solution/truth.json",
+            "head /abs/run/solution/grading.json",
+        ):
+            self.assertIsNotNone(
+                __import__("mlpab.hooks.log_tool_call", fromlist=["x"]).gate_check(cmd), cmd
+            )
+
+    def test_gate_check_matches_enforce_for_offinterface(self):
+        import os as _os
+
+        from mlpab.hooks import log_tool_call as h
+
+        _os.environ.update({"TESTBED_INTERFACE": "cli", "TESTBED_CLI_BINARY": "aws"})
+        self.assertIsNotNone(h.gate_check('python -c "import torch"'))
+        self.assertIsNone(h.gate_check("aws sagemaker list-training-jobs"))
+
+    def test_cli_sleep_then_poll_allowed(self):
+        # A bounded foreground sleep before a single status poll (so the agent
+        # waits on a remote job instead of busy-polling every LLM turn) — sleep
+        # is basic shell; the interface command on the other side stays allowed.
+        self.assertIsNone(self._enforce("cli", "Bash", "sleep 30 && hops jobs get x"))
+
+    def test_cli_mcp_tool_blocked(self):
+        self.assertIsNotNone(self._enforce("cli", "mcp__hopsworks__create_job"))
+
+    # --- MCP mode: only the tools ---
+    def test_mcp_tool_allowed(self):
+        self.assertIsNone(self._enforce("mcp", "mcp__hopsworks__create_job"))
+
+    def test_mcp_local_python_blocked(self):
+        self.assertIsNotNone(self._enforce("mcp", "Bash", 'python -c "print(1)"'))
+
+    def test_mcp_hops_blocked(self):
+        self.assertIsNotNone(self._enforce("mcp", "Bash", "hops project create x"))
+
+    def test_mcp_native_sdk_blocked(self):
+        # The agent must NOT drive the SDK natively (locally) in MCP mode —
+        # only the MCP tools may touch the platform. (Shipping SDK code to a
+        # remote Job is server-side and uncounted; using it locally is the escape.)
+        self.assertIsNotNone(
+            self._enforce(
+                "mcp", "Bash", 'python -c "import hopsworks; hopsworks.login().get_feature_store()"'
+            )
+        )
+
+    def test_cli_native_sdk_blocked(self):
+        # Likewise in CLI mode: only `hops`, never the SDK driven locally.
+        self.assertIsNotNone(
+            self._enforce("cli", "Bash", 'python -c "import hopsworks; fs.create_feature_group()"')
+        )
+
+    # --- SDK mode: only hopsworks python, no ML ---
+    def test_sdk_hopsworks_python_allowed(self):
+        self.assertIsNone(
+            self._enforce("sdk", "Bash", 'python -c "import hopsworks; j=p.create_job(); j.run()"')
+        )
+
+    def test_sdk_pandas_glue_allowed(self):
+        self.assertIsNone(
+            self._enforce("sdk", "Bash", 'python -c "import pandas as pd; pd.read_csv(1)"')
+        )
+
+    def test_sdk_hops_blocked(self):
+        self.assertIsNotNone(self._enforce("sdk", "Bash", "hops jobs run x"))
+
+    def test_sdk_mcp_tool_blocked(self):
+        self.assertIsNotNone(self._enforce("sdk", "mcp__hopsworks__x"))
+
+    # --- fail-closed allowlist: only the interface + basic shell; everything
+    #     else (node/ruby/curl/stray binaries) denied by default in EVERY mode ---
+    def test_node_blocked_in_every_mode(self):
+        # The field failure: when python was blocked the agent used `node -e`
+        # to wrangle data locally. The allowlist denies it in all three modes.
+        for iface in ("cli", "mcp", "sdk"):
+            self.assertIsNotNone(self._enforce(iface, "Bash", 'node -e "console.log(1)"'), iface)
+
+    def test_other_interpreters_blocked(self):
+        for cmd in ('ruby -e "puts 1"', "perl -e 'print 1'", 'php -r "echo 1;"', "deno run x.ts"):
+            self.assertIsNotNone(self._enforce("mcp", "Bash", cmd), cmd)
+
+    def test_network_tools_blocked_in_every_mode(self):
+        # curl/wget would hit the REST API directly, bypassing the interface
+        # (and the api_calls log). Denied by the allowlist — not on it.
+        for iface in ("cli", "mcp", "sdk"):
+            self.assertIsNotNone(self._enforce(iface, "Bash", "curl https://host/api"), iface)
+            self.assertIsNotNone(self._enforce(iface, "Bash", "wget https://host/x"), iface)
+
+    def test_unknown_binary_blocked(self):
+        self.assertIsNotNone(self._enforce("mcp", "Bash", "./some_custom_tool --go"))
+
+    def test_sleep_allowed_in_every_mode(self):
+        # `sleep` is allowed so an agent can pause between remote-job status
+        # polls instead of busy-polling every LLM turn (which inflated llm_calls
+        # / tokens, seen live 2026-06-14). It does no interface work; the budget
+        # (max_seconds = wall − rate_limit_wait) still bounds total idle time, so
+        # an agent that over-sleeps just exhausts its own budget.
+        for iface in ("cli", "mcp", "sdk"):
+            self.assertIsNone(self._enforce(iface, "Bash", "sleep 30"), iface)
+            self.assertIsNone(self._enforce(iface, "Bash", "sleep 5 && ls"), iface)
+
+    def test_bash_c_node_blocked(self):
+        # `bash -c "node …"` — the wrapper is unwrapped and the real exec gated.
+        self.assertIsNotNone(self._enforce("cli", "Bash", 'bash -c "node -e \\"x\\""'))
+
+    def test_which_node_allowed(self):
+        # Probing availability is fine — the exec is `which`, not node.
+        self.assertIsNone(self._enforce("mcp", "Bash", "which ruby node perl jq"))
+
+    def test_basic_shell_inspection_allowed_in_mcp(self):
+        for cmd in (
+            "cat data/train.csv",
+            "head -20 data/train.csv",
+            "wc -l data/train.csv",
+            "ls -la data/",
+        ):
+            self.assertIsNone(self._enforce("mcp", "Bash", cmd), cmd)
+
+    def test_pipeline_of_basic_shell_allowed(self):
+        self.assertIsNone(self._enforce("mcp", "Bash", "cat data/train.csv | grep -c , | sort"))
+
+    def test_redirect_not_misparsed_as_off_interface(self):
+        # `2>&1` and `> out` must not split into a bogus segment that gets denied.
+        self.assertIsNone(self._enforce("mcp", "Bash", "cp a b 2>&1"))
+        self.assertIsNone(self._enforce("cli", "Bash", "cat data/train.csv > /tmp/out.txt"))
+
+    def test_line_continuation_keeps_one_segment(self):
+        # A multi-line `hops` command joined with backslash-newline must stay one
+        # segment — the `\<nl>` is a continuation, not a separator. Otherwise the
+        # continuation lines (`--primary-key id`) become bogus segments whose
+        # first token is treated as a stray off-interface binary and denied.
+        cmd = 'hops fg create --name trips \\\n  --primary-key id \\\n  --description "trip data"'
+        self.assertEqual(len(hook._segments(cmd)), 1)
+        self.assertIsNone(self._enforce("cli", "Bash", cmd))
+
+    def test_line_continuation_real_separator_still_splits(self):
+        # Folding `\<nl>` must not swallow a genuine separator on the next line:
+        # a backgrounded interpreter after the continuation is still denied.
+        cmd = "hops fg create --name t \\\n  --primary-key id\nnode evil.js"
+        self.assertIsNotNone(self._enforce("cli", "Bash", cmd))
+
+    def test_escaped_char_not_treated_as_separator(self):
+        # An escaped `;` is a literal char in the argument, not a command
+        # separator — the single `hops` segment stays allowed in CLI mode.
+        self.assertIsNone(self._enforce("cli", "Bash", "hops fg create --filter a\\;b"))
+
+    # --- subcommand entrypoint (`aws sagemaker`): only that service is on-interface ---
+    def test_entrypoint_subcommand_allowed(self):
+        self.assertIsNone(self._enforce_entrypoint("aws sagemaker list-models"))
+        # flags after the service are fine (still starts `aws sagemaker`)
+        self.assertIsNone(self._enforce_entrypoint("aws sagemaker list-endpoints --max-results 5"))
+
+    def test_entrypoint_other_service_denied(self):
+        # Same binary, different service → off-interface escape.
+        self.assertIsNotNone(self._enforce_entrypoint("aws s3 ls"))
+        self.assertIsNotNone(self._enforce_entrypoint("aws ec2 describe-instances"))
+
+    def test_entrypoint_bare_binary_denied(self):
+        # `aws` with no service is not the `aws sagemaker` entrypoint.
+        self.assertIsNotNone(self._enforce_entrypoint("aws configure list"))
+
+    def test_entrypoint_subcommand_in_pipeline_allowed(self):
+        # On-interface even piped into a basic shell util for inspection.
+        self.assertIsNone(
+            self._enforce_entrypoint("aws sagemaker list-models --output json | head -50")
+        )
+
+    def test_entrypoint_other_service_after_separator_denied(self):
+        # `aws sagemaker …; aws s3 …` — the second segment is off-interface.
+        self.assertIsNotNone(self._enforce_entrypoint("aws sagemaker list-models; aws s3 cp x y"))
+
+    def test_entrypoint_allowlist_multiple_services(self):
+        # `cli_subcommand` is an allowlist (comma-joined in the env): sagemaker
+        # needs its S3 data plane and the runtime for endpoint invocation.
+        subs = "sagemaker,sagemaker-runtime,s3"
+        self.assertIsNone(
+            self._enforce_entrypoint(
+                "aws s3 cp data/train s3://bkt/train --recursive", cli_subcommand=subs
+            )
+        )
+        self.assertIsNone(
+            self._enforce_entrypoint(
+                "aws sagemaker-runtime invoke-endpoint --endpoint-name e out.json",
+                cli_subcommand=subs,
+            )
+        )
+        self.assertIsNone(
+            self._enforce_entrypoint("aws sagemaker list-training-jobs", cli_subcommand=subs)
+        )
+
+    def test_entrypoint_allowlist_other_services_still_denied(self):
+        subs = "sagemaker,sagemaker-runtime,s3"
+        # s3api is a DIFFERENT service token than s3 — not on the allowlist.
+        for cmd in (
+            "aws ec2 describe-instances",
+            "aws iam create-role --role-name x",
+            "aws s3api create-bucket --bucket x",
+            "aws configure list",
+        ):
+            msg = self._enforce_entrypoint(cmd, cli_subcommand=subs)
+            self.assertIsNotNone(msg, cmd)
+        # The denial names the full allowlist so the agent knows its options.
+        self.assertIn("sagemaker-runtime", msg)
+
+    def test_entrypoint_global_options_before_service_allowed(self):
+        # The AWS CLI accepts global options BEFORE the service; the service
+        # token after them is still the entrypoint, not the option.
+        self.assertIsNone(self._enforce_entrypoint("aws --region us-east-1 sagemaker list-models"))
+        self.assertIsNone(
+            self._enforce_entrypoint(
+                "aws --output json --region us-east-1 sagemaker list-training-jobs"
+            )
+        )
+        self.assertIsNone(
+            self._enforce_entrypoint("aws --region=us-east-1 sagemaker list-models")
+        )  # --opt=value form
+        self.assertIsNone(
+            self._enforce_entrypoint("aws --debug sagemaker list-models")
+        )  # valueless flag
+        self.assertIsNone(
+            self._enforce_entrypoint("aws --no-cli-pager sagemaker list-models")
+        )  # --no-* flag
+
+    def test_entrypoint_global_options_other_service_still_denied(self):
+        # Skipping options must not skip PAST an off-interface service.
+        self.assertIsNotNone(
+            self._enforce_entrypoint("aws --region us-east-1 ec2 describe-instances")
+        )
+        self.assertIsNotNone(self._enforce_entrypoint("aws --debug s3api create-bucket --bucket x"))
+
+    # --- aux on-interface binaries (e.g. GCP's `bq` alongside `gcloud`) ---
+    def _enforce_aux(self, command, interface="cli"):
+        """CLI mode with `gcloud {ai,storage}` + an aux binary `bq` — GCP's
+        split offline store (`bq`) is on-interface alongside the main binary."""
+        for k in ("TESTBED_INTERFACE", "TESTBED_CLI_SUBCOMMAND", "TESTBED_CLI_AUX", *_MARKERS):
+            os.environ.pop(k, None)
+        os.environ.update(
+            {
+                "TESTBED_INTERFACE": interface,
+                "TESTBED_CLI_BINARY": "gcloud",
+                "TESTBED_CLI_SUBCOMMAND": "ai,storage",
+                "TESTBED_CLI_AUX": "bq",
+                "TESTBED_SDK_MODULE": "google.cloud.aiplatform",
+                "TESTBED_PLATFORM": "gcp",
+                "TESTBED_COMPUTE_DENY": "torch,tensorflow,sklearn,xgboost",
+            }
+        )
+        return hook.enforce("Bash", {"command": command})
+
+    def test_aux_binary_allowed_any_subcommand(self):
+        # `bq` is on-interface with any subcommand (no subcommand allowlist).
+        self.assertIsNone(self._enforce_aux('bq query --use_legacy_sql=false "SELECT 1"'))
+        self.assertIsNone(self._enforce_aux("bq load --source_format=CSV ds.t ./data.csv"))
+        self.assertIsNone(self._enforce_aux("bq mk --table ds.transactions row_id:STRING"))
+
+    def test_aux_binary_alongside_main_binary(self):
+        # Main binary (`gcloud ai`) and aux (`bq`) both allowed in one pipeline.
+        self.assertIsNone(self._enforce_aux("gcloud ai models list && bq ls ds"))
+
+    def test_aux_binary_blocked_in_sdk_mode(self):
+        # The aux binary is a CLI tool — off-interface when the SDK is under test.
+        self.assertIsNotNone(self._enforce_aux("bq query 'SELECT 1'", interface="sdk"))
+
+    def test_aux_does_not_widen_main_binary_subcommands(self):
+        # Allowing `bq` must not relax the `gcloud` subcommand allowlist.
+        self.assertIsNotNone(self._enforce_aux("gcloud compute instances list"))
+
+    def test_non_aux_binary_still_denied(self):
+        # A stray binary not on cli/aux is still blocked.
+        self.assertIsNotNone(self._enforce_aux("gsutil ls gs://bkt"))
+
+    def test_entrypoint_option_value_matching_service_not_entrypoint(self):
+        # Fail closed: an option VALUE that happens to equal an allowed service
+        # must not legitimize the real (off-interface) service after it.
+        self.assertIsNotNone(
+            self._enforce_entrypoint("aws --profile sagemaker ec2 describe-instances")
+        )
+
+    def test_denials_logged_structurally(self):
+        # A denied call must land in TESTBED_COMMAND_LOG with `denied: true` +
+        # the reason — results.denied_calls counts these records instead of
+        # substring-scanning transcripts.
+        import io
+        import json
+        from unittest import mock
+
+        log = Path(tempfile.mkdtemp()) / "commands.jsonl"
+        for k in ("TESTBED_INTERFACE", "TESTBED_CLI_SUBCOMMAND", *_MARKERS):
+            os.environ.pop(k, None)
+        os.environ.update(dict(_MARKERS, TESTBED_INTERFACE="cli", TESTBED_COMMAND_LOG=str(log)))
+        try:
+            payload = {"tool_name": "Bash", "tool_input": {"command": 'python -c "import torch"'}}
+            with mock.patch("sys.stdin", io.StringIO(json.dumps(payload))):
+                rc = hook.main()
+            self.assertEqual(rc, 2)
+            allowed = {"tool_name": "Bash", "tool_input": {"command": "hops fg list"}}
+            with mock.patch("sys.stdin", io.StringIO(json.dumps(allowed))):
+                rc = hook.main()
+            self.assertEqual(rc, 0)
+            recs = [json.loads(l) for l in log.read_text().splitlines() if l.strip()]
+            self.assertEqual(len(recs), 2)
+            self.assertTrue(recs[0].get("denied"))
+            self.assertIn("DENIED:", recs[0]["reason"])
+            self.assertNotIn("denied", recs[1])
+        finally:
+            os.environ.pop("TESTBED_COMMAND_LOG", None)
+
+    # --- denial messages name the ACTIVE platform/interface, never a hardcoded one ---
+    def test_denial_message_names_active_interface(self):
+        # Regression: messages used to hardcode Hopsworks ("Use only the `hops`
+        # CLI") regardless of platform — a sagemaker agent denied `aws s3`
+        # was told to use `hops`. Must derive from TESTBED_* env instead.
+        msg = self._enforce_entrypoint("aws s3 ls")
+        self.assertIn("aws sagemaker", msg)
+        self.assertNotIn("hops", msg)
+        msg = self._enforce_entrypoint('python -c "import torch"')
+        self.assertIn("sagemaker", msg)
+        self.assertNotIn("Hopsworks", msg)
+
+    def test_denial_message_falls_back_without_platform_env(self):
+        # No TESTBED_PLATFORM (e.g. an old run dir's settings) → generic wording,
+        # still no hardcoded platform.
+        env = {k: v for k, v in _MARKERS.items() if k != "TESTBED_PLATFORM"}
+        for k in ("TESTBED_INTERFACE", "TESTBED_CLI_SUBCOMMAND", *_MARKERS):
+            os.environ.pop(k, None)
+        os.environ.update(dict(env, TESTBED_INTERFACE="mcp"))
+        msg = hook.enforce("Bash", {"command": "hops project use x"})
+        self.assertIn("the platform's MCP tools", msg)
+        msg = hook.enforce("Bash", {"command": 'python -c "print(1)"'})
+        self.assertIn("the remote platform", msg)
+
+    def test_mcp_floor_submission_allowed(self):
+        self.assertIsNone(
+            self._enforce(
+                "mcp",
+                "Bash",
+                "mkdir -p submission && cp data/sample_submission.csv submission/submission.csv",
+            )
+        )
+
+    def test_compound_keywords_not_denied(self):
+        # Shell control-flow keywords are skipped, not treated as binaries.
+        self.assertIsNone(self._enforce("cli", "Bash", 'for f in a b; do cp "$f" out/; done'))
+
+    # --- parser-bypass regressions (separators, interpreters, dynamic import) ---
+    def test_semicolon_glued_separator_blocked(self):
+        # shlex keeps `true;python` as one token — the raw splitter must still
+        # see the second command. (CLI mode: no local python.)
+        self.assertIsNotNone(self._enforce("cli", "Bash", "true;python train.py"))
+
+    def test_semicolon_attached_to_prev_token_blocked(self):
+        self.assertIsNotNone(self._enforce("cli", "Bash", "cd foo; python train.py"))
+
+    def test_versioned_interpreter_blocked(self):
+        self.assertIsNotNone(self._enforce("cli", "Bash", "python3.11 train.py"))
+        self.assertIsNotNone(self._enforce("cli", "Bash", "/usr/bin/python3.12 train.py"))
+
+    def test_env_and_uv_prefixed_python_blocked(self):
+        self.assertIsNotNone(self._enforce("cli", "Bash", "env X=1 python train.py"))
+        self.assertIsNotNone(self._enforce("cli", "Bash", "uv run python train.py"))
+
+    def test_dynamic_import_of_ml_lib_blocked(self):
+        self.assertIsNotNone(self._enforce("sdk", "Bash", "python -c \"__import__('torch')\""))
+        self.assertIsNotNone(
+            self._enforce(
+                "sdk", "Bash", "python -c \"import importlib; importlib.import_module('sklearn')\""
+            )
+        )
+
+    # --- installs stay LOCKED in CLI/MCP: mlpab installs the interface + deps
+    #     before the run, so the agent never needs pip there. ---
+    def test_pip_blocked_in_cli_and_mcp(self):
+        for iface in ("cli", "mcp"):
+            self.assertIsNotNone(self._enforce(iface, "Bash", "pip install pandas"), iface)
+            self.assertIsNotNone(
+                self._enforce(iface, "Bash", "python -m pip install pandas"), iface
+            )
+
+    def test_pip_allowed_in_sdk_mode(self):
+        # SDK mode is python-allowed (the SDK IS python); pip is just tooling and
+        # an installed ML lib still can't be EXECUTED (rule 1 blocks `import`).
+        self.assertIsNone(self._enforce("sdk", "Bash", "pip install pandas"))
+        self.assertIsNone(self._enforce("sdk", "Bash", "python -m pip install torch"))
+
+    def test_sdk_unreadable_script_fails_closed(self):
+        # SDK mode allows python, but an executed script we can't read to verify
+        # it's ML-free must be blocked (fail closed), not allowed.
+        self.assertIsNotNone(self._enforce("sdk", "Bash", "python /nonexistent/dir/train.py"))
+
+    def test_sdk_inline_and_no_script_not_affected_by_failclosed(self):
+        # `-c` and bare interpreter have no script file → no unreadable → allowed.
+        self.assertIsNone(self._enforce("sdk", "Bash", 'python -c "import hopsworks; j.run()"'))
+
+    def test_sdk_py_arg_not_treated_as_unreadable_script(self):
+        # A trailing `.py` ARG (config) is not the executed script; with the real
+        # script readable and ML-free, the command is allowed.
+        d = Path(tempfile.mkdtemp())
+        (d / "drive.py").write_text("import hopsworks\nhopsworks.login()\n")
+        cwd = os.getcwd()
+        os.chdir(d)
+        try:
+            self.assertIsNone(
+                self._enforce("sdk", "Bash", "python drive.py --config missing_cfg.py")
+            )
+        finally:
+            os.chdir(cwd)
+
+    def test_semicolon_inside_quotes_not_a_separator(self):
+        # The `;` is inside the -c body, not a shell separator — single segment,
+        # payload intact, and it imports only os/pandas → allowed in SDK mode.
+        self.assertIsNone(self._enforce("sdk", "Bash", 'python -c "import os; os.getcwd()"'))
+
+    # --- no interface under test → no enforcement (none/none baseline) ---
+    def test_no_interface_no_enforcement(self):
+        for k in ("TESTBED_INTERFACE", *_MARKERS):
+            os.environ.pop(k, None)
+        self.assertIsNone(hook.enforce("Bash", {"command": 'python -c "import torch"'}))
+
+    def test_none_interface_trains_locally(self):
+        # The none/none baseline (interface "none") must NOT be enforced — it
+        # legitimately trains locally with torch.
+        self.assertIsNone(self._enforce("none", "Bash", 'python -c "import torch; train()"'))
+
+
+class InstanceTypeGuardTests(unittest.TestCase):
+    """Free-tier guard: with TESTBED_INSTANCE_ALLOW set, any `ml.<family>.<size>`
+    token outside the allowlist is denied — in Bash commands, executed python
+    payloads, MCP tool args, and Write/Edit content."""
+
+    FREE_TIER = "ml.t3.medium,ml.m4.xlarge,ml.m5.xlarge"
+
+    def _check(self, tool, tool_input, allow=FREE_TIER):
+        os.environ.pop("TESTBED_INSTANCE_ALLOW", None)
+        if allow is not None:
+            os.environ["TESTBED_INSTANCE_ALLOW"] = allow
+        try:
+            return hook.enforce_instance_types(tool, tool_input)
+        finally:
+            os.environ.pop("TESTBED_INSTANCE_ALLOW", None)
+
+    def test_no_allowlist_no_enforcement(self):
+        self.assertIsNone(
+            self._check(
+                "Bash",
+                {
+                    "command": "aws sagemaker create-training-job --resource-config "
+                    "InstanceType=ml.p3.2xlarge,InstanceCount=1"
+                },
+                allow=None,
+            )
+        )
+
+    def test_cli_free_tier_instance_allowed(self):
+        self.assertIsNone(
+            self._check(
+                "Bash",
+                {
+                    "command": "aws sagemaker create-training-job --resource-config "
+                    "InstanceType=ml.m5.xlarge,InstanceCount=1,VolumeSizeInGB=10"
+                },
+            )
+        )
+
+    def test_cli_gpu_instance_denied(self):
+        reason = self._check(
+            "Bash",
+            {
+                "command": "aws sagemaker create-training-job --resource-config "
+                "InstanceType=ml.p3.2xlarge,InstanceCount=1"
+            },
+        )
+        self.assertIsNotNone(reason)
+        self.assertIn("ml.p3.2xlarge", reason)
+
+    def test_cli_big_cpu_instance_denied(self):
+        self.assertIsNotNone(
+            self._check(
+                "Bash",
+                {
+                    "command": "aws sagemaker create-endpoint-config --production-variants "
+                    "VariantName=v1,InstanceType=ml.m5.24xlarge,InitialInstanceCount=1"
+                },
+            )
+        )
+
+    def test_mcp_args_denied(self):
+        self.assertIsNotNone(
+            self._check(
+                "mcp__sagemaker__create_training_job",
+                {"resource_config": {"InstanceType": "ml.g5.xlarge", "InstanceCount": 1}},
+            )
+        )
+
+    def test_mcp_args_free_tier_allowed(self):
+        self.assertIsNone(
+            self._check(
+                "mcp__sagemaker__create_training_job",
+                {"resource_config": {"InstanceType": "ml.m4.xlarge", "InstanceCount": 1}},
+            )
+        )
+
+    def test_write_job_spec_denied(self):
+        # A job spec written to disk first (`--cli-input-json file://job.json`)
+        # is caught at Write time.
+        self.assertIsNotNone(
+            self._check(
+                "Write",
+                {
+                    "file_path": "/x/job.json",
+                    "content": '{"ResourceConfig": {"InstanceType": "ml.trn1.32xlarge"}}',
+                },
+            )
+        )
+
+    def test_executed_script_payload_denied(self):
+        with tempfile.TemporaryDirectory() as td:
+            script = Path(td) / "train.py"
+            script.write_text("est = Estimator(instance_type='ml.c5.18xlarge')\n")
+            cwd = os.getcwd()
+            os.chdir(td)
+            try:
+                self.assertIsNotNone(self._check("Bash", {"command": "python train.py"}))
+            finally:
+                os.chdir(cwd)
+
+    def test_serverless_no_instance_type_allowed(self):
+        self.assertIsNone(
+            self._check(
+                "Bash",
+                {
+                    "command": "aws sagemaker create-endpoint-config --production-variants "
+                    "VariantName=v1,ServerlessConfig={MemorySizeInMB=2048,MaxConcurrency=1}"
+                },
+            )
+        )
+
+    def test_plain_text_not_misflagged(self):
+        # `html.parser` etc. must not match the ml.<family>.<size> pattern.
+        self.assertIsNone(
+            self._check("Bash", {"command": 'grep "html.parser" data/description.md'})
+        )
+
+
+class MlpabRunForegroundTests(unittest.TestCase):
+    """A nested `mlpab run` must be foreground —
+    never piped (SIGPIPE-kills it mid-build) or backgrounded."""
+
+    def _misuse(self, command):
+        return hook._mlpab_run_misuse(command)
+
+    # --- blocked: piping / backgrounding ---
+    def test_pipe_to_head_blocked(self):
+        # This is the exact failure from the field: `… 2>&1 | head -300`.
+        self.assertIsNotNone(
+            self._misuse("mlpab run --category t --task c --platform hopsworks 2>&1 | head -300")
+        )
+
+    def test_pipe_to_tail_blocked(self):
+        self.assertIsNotNone(self._misuse("mlpab run --task t | tail -40"))
+
+    def test_absolute_mlpab_path_pipe_blocked(self):
+        self.assertIsNotNone(
+            self._misuse("/Users/x/testbed/.venv/bin/mlpab run --task t | head -5")
+        )
+
+    def test_background_ampersand_blocked(self):
+        self.assertIsNotNone(self._misuse("mlpab run --category t --task c &"))
+
+    def test_background_then_poll_blocked(self):
+        self.assertIsNotNone(self._misuse("mlpab run --task t & sleep 30"))
+
+    def test_pipe_after_cd_guard_blocked(self):
+        # The cd-guard prefix is fine; the trailing pipe on `mlpab run` is not.
+        self.assertIsNotNone(self._misuse("cd /run && mlpab run --category t --task c | head -100"))
+
+    # --- allowed: foreground, redirects, other subcommands ---
+    def test_plain_foreground_allowed(self):
+        self.assertIsNone(self._misuse("mlpab run --category t --task c --platform hopsworks"))
+
+    def test_redirect_to_file_allowed(self):
+        # The sanctioned way to cap output: redirect, then read agent.log.
+        self.assertIsNone(self._misuse("mlpab run --task t > run.log 2>&1"))
+
+    def test_redirect_to_devnull_allowed(self):
+        self.assertIsNone(self._misuse("mlpab run --category t --task c > /dev/null 2>&1"))
+
+    def test_redirect_then_chained_tail_allowed(self):
+        # `&&` chains a SEPARATE tail of agent.log — not a pipe of mlpab run.
+        self.assertIsNone(
+            self._misuse("mlpab run --task t > run.log 2>&1 && tail -60 v1/t/c/agent.log")
+        )
+
+    def test_budget_check_piped_not_blocked(self):
+        # Only `mlpab run` is gated; other subcommands may be piped freely.
+        self.assertIsNone(self._misuse("mlpab budget-check --start 1 | grep CONTINUE"))
+
+    def test_non_mlpab_pipe_allowed(self):
+        self.assertIsNone(self._misuse("ls v1 | head -5"))
+
+    def test_2to1_redirect_alone_not_flagged_as_background(self):
+        # `2>&1` without a pipe/`&` must NOT be misread as backgrounding.
+        self.assertIsNone(self._misuse("mlpab run --category t --task c 2>&1"))
+
+
+class PromptModeGatingTests(unittest.TestCase):
+    def test_under_test_is_remote_only(self):
+        text = runner._build_prompt("comp", "FRAG", interface_under_test=True)
+        self.assertIn("nothing runs locally", text.lower())
+        self.assertIn("HARD-ENFORCED", text)  # restrictions stated explicitly
+        self.assertIn("Always BLOCKED", text)
+        self.assertIn("give up", text.lower())
+        self.assertNotIn("HF_HOME", text)  # local-only block stripped
+        self.assertNotIn("UNDER_TEST", text)  # markers consumed
+        self.assertNotIn("LOCAL_ONLY", text)
+
+    def test_baseline_is_local_training(self):
+        text = runner._build_prompt("comp", "FRAG", interface_under_test=False)
+        self.assertIn("you are the LOCAL BASELINE", text)
+        self.assertNotIn("nothing runs locally", text.lower())
+        self.assertNotIn("The interface is what's being measured", text)
+        self.assertNotIn("UNDER_TEST", text)
+        self.assertNotIn("LOCAL_ONLY", text)
+
+
+class AuthRetryDetectionTests(unittest.TestCase):
+    def _transcript(self, result_event):
+        import json
+
+        p = Path(tempfile.mkdtemp()) / "transcript.jsonl"
+        p.write_text(json.dumps(result_event) + "\n")
+        return p
+
+    def test_401_detected_as_auth_error(self):
+        tr = self._transcript(
+            {
+                "type": "result",
+                "is_error": True,
+                "result": "API Error: 401 Invalid authentication credentials",
+            }
+        )
+        self.assertTrue(claude_runner._last_result_is_auth_error(tr))
+        self.assertFalse(claude_runner._last_result_is_rate_limited(tr))
+
+    def test_429_is_rate_limit_not_auth(self):
+        tr = self._transcript(
+            {"type": "result", "is_error": True, "api_error_status": "429", "result": "rate_limit"}
+        )
+        self.assertTrue(claude_runner._last_result_is_rate_limited(tr))
+        self.assertFalse(claude_runner._last_result_is_auth_error(tr))
+
+    def test_success_is_neither(self):
+        tr = self._transcript({"type": "result", "is_error": False, "result": "ok"})
+        self.assertFalse(claude_runner._last_result_is_auth_error(tr))
+        self.assertFalse(claude_runner._last_result_is_rate_limited(tr))
+
+
+class RateLimitWaitAccountingTests(unittest.TestCase):
+    """`run_with_retry` returns the back-off sleep total as a third value so
+    callers can report compute time (wall − wait) — results rows must not be
+    penalized for time spent waiting on rate limits."""
+
+    def test_backoff_wait_returned_separately_from_wall(self):
+        import json
+        from unittest import mock
+
+        d = Path(tempfile.mkdtemp())
+        marker = d / "ran_once"
+        rl = json.dumps(
+            {"type": "result", "is_error": True, "api_error_status": "429", "result": "rate_limit"}
+        )
+        ok = json.dumps({"type": "result", "is_error": False, "result": "ok"})
+        # First attempt: rate-limited result + non-zero exit → one back-off
+        # sleep (base 2s, mocked). Second attempt: success.
+        script = (
+            f"if [ -e {marker} ]; then echo '{ok}'; else touch {marker}; echo '{rl}'; exit 1; fi"
+        )
+        with mock.patch("time.sleep") as slept:
+            exit_code, wall, wait = claude_runner.run_with_retry(
+                cmd=["sh", "-c", script],
+                cwd=d,
+                env={},
+                transcript_path=d / "transcript.jsonl",
+                stderr_path=d / "stderr.log",
+            )
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(wait, claude_runner.RATE_LIMIT_BASE_BACKOFF_S)
+        slept.assert_called_once_with(claude_runner.RATE_LIMIT_BASE_BACKOFF_S)
+        # Wall stays the true elapsed time; the wait is reported alongside, not
+        # silently folded in or subtracted here (callers decide).
+        self.assertGreaterEqual(wall, 0.0)
+
+
+class _FakeClock:
+    """monotonic() advances `read_step` per read (models compute elapsing);
+    sleep() advances by the slept amount (models back-off waiting). Lets a test
+    drive the compute-vs-wait split without real wall time."""
+
+    def __init__(self, read_step: float = 0.0) -> None:
+        self.t = 0.0
+        self.read_step = read_step
+
+    def monotonic(self) -> float:
+        v = self.t
+        self.t += self.read_step
+        return v
+
+    def sleep(self, s: float) -> None:
+        self.t += s
+
+
+class TimeoutExcludesBackoffTests(unittest.TestCase):
+    """`timeout_s` caps cumulative COMPUTE (execution − rate-limit waits): prior
+    attempts' compute draws the budget down, but back-off sleeps never do."""
+
+    def _rl_then_ok_script(self, marker: Path) -> str:
+        import json
+
+        rl = json.dumps(
+            {"type": "result", "is_error": True, "api_error_status": "429", "result": "rate_limit"}
+        )
+        ok = json.dumps({"type": "result", "is_error": False, "result": "ok"})
+        return f"if [ -e {marker} ]; then echo '{ok}'; else touch {marker}; echo '{rl}'; exit 1; fi"
+
+    def test_backoff_does_not_consume_the_compute_budget(self):
+        # No compute elapses (read_step=0); only a 2s back-off sleep. Even with
+        # timeout_s (1s) SMALLER than the back-off, the retry still runs and the
+        # run succeeds — waiting is not charged against the budget.
+        from unittest import mock
+
+        d = Path(tempfile.mkdtemp())
+        fake = _FakeClock(read_step=0.0)
+        with mock.patch("mlpab.claude_runner.time", fake):
+            exit_code, _wall, wait = claude_runner.run_with_retry(
+                cmd=["sh", "-c", self._rl_then_ok_script(d / "ran_once")],
+                cwd=d,
+                env={},
+                transcript_path=d / "transcript.jsonl",
+                stderr_path=d / "stderr.log",
+                timeout_s=1,
+            )
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(wait, claude_runner.RATE_LIMIT_BASE_BACKOFF_S)
+
+    def test_compute_budget_exhausted_across_retries_gives_up_124(self):
+        # Compute elapses (read_step>0) so the first attempt's execution time
+        # exceeds the 1s budget; the retry is refused with exit 124 rather than
+        # handed a fresh full budget. The 2s back-off in between is excluded.
+        import json
+        from unittest import mock
+
+        d = Path(tempfile.mkdtemp())
+        rl = json.dumps(
+            {"type": "result", "is_error": True, "api_error_status": "429", "result": "rate_limit"}
+        )
+        # Always rate-limited + non-zero exit, so the only way out is a budget.
+        script = f"echo '{rl}'; exit 1"
+        fake = _FakeClock(read_step=0.4)
+        with mock.patch("mlpab.claude_runner.time", fake):
+            exit_code, _wall, wait = claude_runner.run_with_retry(
+                cmd=["sh", "-c", script],
+                cwd=d,
+                env={},
+                transcript_path=d / "transcript.jsonl",
+                stderr_path=d / "stderr.log",
+                timeout_s=1,
+            )
+        self.assertEqual(exit_code, 124)
+        # Gave up on the COMPUTE budget after one back-off, not the 6h rate-limit
+        # window — exactly one sleep happened.
+        self.assertEqual(wait, claude_runner.RATE_LIMIT_BASE_BACKOFF_S)
+
+
+class TransientErrorClassifierTests(unittest.TestCase):
+    """text_is_transient_error (the single rate-limit/transient matcher shared by
+    the structured Claude path and the free-text codex/vibe engines): phrases
+    match as substrings, numeric codes match ONLY on word boundaries."""
+
+    def test_transient_phrases_and_codes_match(self):
+        for txt in (
+            "Error code: 429 - too many requests",
+            "the server is overloaded_error",
+            "ThrottlingException: Rate exceeded",
+            "HTTP 503 Service Unavailable",
+            "status 500: internal server error",
+            "529 overloaded",
+        ):
+            self.assertTrue(claude_runner.text_is_transient_error(txt), txt)
+
+    def test_codes_embedded_in_larger_numbers_do_not_match(self):
+        # The whole point of word-boundary matching: a code inside a request id
+        # or model name must NOT trigger a retry.
+        for txt in ("request req_4290 failed", "model gpt-5290 not found", "offset 5000 bytes"):
+            self.assertFalse(claude_runner.text_is_transient_error(txt), txt)
+
+    def test_non_transient_failures_not_matched(self):
+        # quota exhaustion is NOT transient; plain auth/validation errors aren't either.
+        for txt in (
+            "You exceeded your current quota",
+            "AccessDeniedException: not authorized",
+            "ValidationException: parameter invalid",
+        ):
+            self.assertFalse(claude_runner.text_is_transient_error(txt), txt)
+
+
+class ActivateRunVenvTests(unittest.TestCase):
+    """activate_run_venv prepends the per-run venv bin to PATH (so the agent's
+    bash finds the interface binary) and sets VIRTUAL_ENV; no-op without a venv."""
+
+    def test_prepends_venv_bin_and_sets_virtual_env(self):
+        d = Path(tempfile.mkdtemp())
+        (d / "venv" / "bin").mkdir(parents=True)
+        env = {"PATH": "/usr/bin"}
+        claude_runner.activate_run_venv(env, d)
+        self.assertEqual(env["PATH"], f"{d / 'venv' / 'bin'}{os.pathsep}/usr/bin")
+        self.assertEqual(env["VIRTUAL_ENV"], str(d / "venv"))
+
+    def test_noop_without_venv(self):
+        d = Path(tempfile.mkdtemp())  # no venv/bin
+        env = {"PATH": "/usr/bin"}
+        claude_runner.activate_run_venv(env, d)
+        self.assertEqual(env["PATH"], "/usr/bin")
+        self.assertNotIn("VIRTUAL_ENV", env)
+
+
+class DeadRowSchemaTests(unittest.TestCase):
+    def test_error_column_present_and_last_is_run_dir(self):
+        from mlpab import results
+
+        self.assertIn("error", results.RESULTS_FIELDS)
+        self.assertEqual(results.RESULTS_FIELDS[-1], "run_dir")  # invariant preserved
+
+    def test_dead_row_round_trips_with_error_and_zeros(self):
+        import csv
+
+        from mlpab import results
+
+        out = Path(tempfile.mkdtemp()) / "results.csv"
+        row = results.Row(
+            started_at="2026-06-04T00:00:00+00:00",
+            run="9",
+            version="v1",
+            platform="hopsworks",
+            interface="sdk",
+            skills="none",
+            category="t",
+            task="c",
+            sdk_calls=0,
+            error="no valid submission produced",
+            run_dir=str(out.parent),
+        )
+        results.append(out, row)
+        got = list(csv.DictReader(out.open()))[0]
+        self.assertEqual(got["error"], "no valid submission produced")
+        self.assertEqual(got["asserts_passed"], "0")  # Row default
+        self.assertEqual(got["total_asserts"], "0")
+
+
+if __name__ == "__main__":
+    unittest.main()

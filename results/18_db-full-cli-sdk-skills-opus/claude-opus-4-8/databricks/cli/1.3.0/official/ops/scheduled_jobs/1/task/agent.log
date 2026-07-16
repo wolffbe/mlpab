@@ -1,0 +1,180 @@
+[mlpab] skills (95c4b1b4): databricks-apps,databricks-core,databricks-dabs,databricks-jobs,databricks-lakebase,databricks-model-serving,databricks-pipelines,databricks-serverless-migration,databricks-vector-search
+[agent] I'll start by examining the task inputs and understanding the environment.
+[agent:bash] cat data/instructions.md; echo "---HEARTBEAT---"; cat data/heartbeat.py; echo "---ENV---"; echo "SCHEMA=$MLPAB_DATABRICKS_SCHEMA"; echo "PREFIX=$MLPAB_DATABRICKS_PREFIX"
+[agent:result] # Heartbeat job
+[agent:result] 
+[agent:result] `heartbeat.py` is a trivial task: it prints one heartbeat line (token `HB-56927584`) and exits 0. It must run PERIODICALLY on the platform — set up a recurring schedule (any reasonable interval, e.g. hourly or daily) rather than a one-off run.
+[agent:result] ---HEARTBEAT---
+[agent:result] """Heartbeat — a trivial periodic task. Prints one line and exits 0."""
+[agent:result] import datetime
+[agent:result] 
+[agent:result] TOKEN = "HB-56927584"
+[agent:result] 
+[agent:result] if __name__ == "__main__":
+[agent:result]     print(f"heartbeat {TOKEN} alive at "
+[agent:result]           f"{datetime.datetime.now(datetime.timezone.utc).isoformat()}")
+[agent:result] ---ENV---
+[agent:result] SCHEMA=workspace.mlpab0b4268
+[agent:result] PREFIX=mlpab0b4268
+[agent] I have the task. Let me invoke the databricks-jobs skill which is the relevant capability here.
+[agent:tool] Skill
+[agent:result] Launching skill: databricks-jobs
+[agent] Let me check my current user identity and CLI basics.
+[agent:bash] databricks current-user me --output json 2>&1 | grep -E '"userName"|"id"' | head -5
+[agent:result]   "id": "76087391176694",
+[agent:result]   "userName": "benedict@logicalclocks.com"
+[agent] My user is `benedict@logicalclocks.com`. The script has an `if __name__ == "__main__":` guard, so it must run as a real Python script (a notebook task wouldn't trigger the print). I'll use a `spark_python_task` with the raw file uploaded to the workspace. Let me set up the directory and upload.
+[agent:bash] databricks workspace import --help 2>&1 | head -40
+[agent:result] Import a workspace object.
+[agent:result] 
+[agent:result]   Imports a workspace object (for example, a notebook or file) or the contents
+[agent:result]   of an entire directory. If path already exists and overwrite is set to
+[agent:result]   false, this call returns an error RESOURCE_ALREADY_EXISTS. To import a
+[agent:result]   directory, you can use either the DBC format or the SOURCE format with the
+[agent:result]   language field unset. To import a single file as SOURCE, you must set the
+[agent:result]   language field. Zip files within directories are not supported.
+[agent:result] 
+[agent:result]   Arguments:
+[agent:result]     PATH: The absolute path of the object or directory. Importing a directory is
+[agent:result]       only supported for the DBC and SOURCE formats.
+[agent:result] 
+[agent:result] Usage:
+[agent:result]   databricks workspace import TARGET_PATH [flags]
+[agent:result] 
+[agent:result] Flags:
+[agent:result]       --content string        The base64-encoded content.
+[agent:result]       --file string           Path of local file to import
+[agent:result]       --format ImportFormat   This specifies the format of the file to be imported. Supported values: [
+[agent:result]                                 AUTO,
+[agent:result]                                 DBC,
+[agent:result]                                 HTML,
+[agent:result]                                 JUPYTER,
+[agent:result]                                 RAW,
+[agent:result]                                 R_MARKDOWN,
+[agent:result]                                 SOURCE,
+[agent:result]                               ]
+[agent:result]   -h, --help                  help for import
+[agent:result]       --json JSON             either inline JSON string or @path/to/file.json with request body (default JSON (0 bytes))
+[agent:result]       --language Language     The language of the object. Supported values: [PYTHON, R, SCALA, SQL]
+[agent:result]       --overwrite             The flag that specifies whether to overwrite existing object.
+[agent:result] 
+[agent:result] Global Flags:
+[agent:result]       --debug            enable debug logging
+[agent:result]   -o, --output type      output type: text or json (default text)
+[agent:result]   -p, --profile string   ~/.databrickscfg profile
+[agent:result]   -t, --target string    bundle target to use (if applicable)
+[agent:bash] databricks workspace mkdirs "/Users/benedict@logicalclocks.com/mlpab0b4268" 2>&1
+[agent:bash] databricks workspace import "/Users/benedict@logicalclocks.com/mlpab0b4268/heartbeat.py" --file data/heartbeat.py --format AUTO --overwrite 2>&1
+[agent:bash] echo "---LIST---"
+[agent:bash] databricks workspace list "/Users/benedict@logicalclocks.com/mlpab0b4268" 2>&1
+[agent:result] ---LIST---
+[agent:result] ID                Type  Language  Path
+[agent:result] 2906278400856793  FILE            /Users/benedict@logicalclocks.com/mlpab0b4268/heartbeat.py
+[agent] The file uploaded as a workspace FILE. Now I'll create the recurring scheduled job. Per the isolation rules I'll prefix the job name, while answers.json records the logical name. Let me create it on serverless with a daily cron schedule.
+[agent:bash] cat > .tmp_job.json <<'EOF'
+[agent:bash] {
+[agent:bash]   "name": "mlpab0b4268_heartbeat468788",
+[agent:bash]   "tasks": [
+[agent:bash]     {
+[agent:bash]       "task_key": "heartbeat",
+[agent:bash]       "spark_python_task": {
+[agent:bash]         "python_file": "/Users/benedict@logicalclocks.com/mlpab0b4268/heartbeat.py"
+[agent:bash]       },
+[agent:bash]       "environment_key": "default"
+[agent:bash]     }
+[agent:bash]   ],
+[agent:bash]   "environments": [
+[agent:bash]     {
+[agent:bash]       "environment_key": "default",
+[agent:bash]       "spec": {
+[agent:bash]         "client": "3"
+[agent:bash]       }
+[agent:bash]     }
+[agent:bash]   ],
+[agent:bash]   "schedule": {
+[agent:bash]     "quartz_cron_expression": "0 0 * * * ?",
+[agent:bash]     "timezone_id": "UTC",
+[agent:bash]     "pause_status": "UNPAUSED"
+[agent:bash]   }
+[agent:bash] }
+[agent:bash] EOF
+[agent:bash] mkdir -p .tmp 2>/dev/null
+[agent:bash] databricks jobs create --json @.tmp_job.json 2>&1
+[agent:result-err] PreToolUse:Bash hook error: [python3 /Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/cli/1.3.0/official/ops/scheduled_jobs/1/task/.claude/hooks/log_tool_call.py]: DENIED: 'name:' is off-interface in 'cli' mode — only the `databricks` CLI may do work on databricks; local interpreters, network tools, and stray binaries are blocked. Basic shell (cp/mkdir/cat/head/grep) is allowed for the floor submission and data inspection. If you can't do the work through the `databricks` CLI, STOP and report the missing capability — do NOT work around it locally.
+[agent] The heredoc tripped the hook. Let me write the JSON with the Write tool instead.
+[agent:write] /Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/cli/1.3.0/official/ops/scheduled_jobs/1/task/.tmp_job.json
+[agent:result] File created successfully at: /Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/cli/1.3.0/official/ops/scheduled_jobs/1/task/.tmp_job.json (file state is current in your context — no need to Read it back)
+[agent:bash] databricks jobs create --json @.tmp_job.json 2>&1
+[agent:result] {
+[agent:result]   "job_id": 756976153113762
+[agent:result] }
+[agent] Job created (id `756976153113762`) with an hourly cron schedule, unpaused. Now let me trigger a run and wait for completion.
+[agent:bash] databricks jobs run-now 756976153113762 --timeout 15m0s 2>&1 | grep -E '"run_id"|"state"|"result_state"|"life_cycle_state"' | head
+[agent:result]   "run_id": 20820201741918,
+[agent:result]   "state": {
+[agent:result]     "life_cycle_state": "TERMINATED",
+[agent:result]     "result_state": "SUCCESS",
+[agent:result]     "state": "TERMINATED",
+[agent:result]       "run_id": 973361470783885,
+[agent:result]       "state": {
+[agent:result]         "life_cycle_state": "TERMINATED",
+[agent:result]         "result_state": "SUCCESS",
+[agent:result]         "state": "TERMINATED",
+[agent] The run completed with SUCCESS. Let me verify the schedule is in place and the script actually printed the heartbeat token.
+[agent:bash] echo "=== SCHEDULE ==="; databricks jobs get 756976153113762 --output json 2>&1 | grep -A4 '"schedule"'
+[agent:bash] echo "=== TASK OUTPUT ==="; databricks jobs get-run-output 973361470783885 --output json 2>&1 | grep -iE 'heartbeat|HB-56927584|logs' | head
+[agent:result] === SCHEDULE ===
+[agent:result]     "schedule": {
+[agent:result]       "pause_status": "UNPAUSED",
+[agent:result]       "quartz_cron_expression": "0 0 * * * ?",
+[agent:result]       "timezone_id": "UTC"
+[agent:result]     },
+[agent:result] === TASK OUTPUT ===
+[agent:result]   "logs": "heartbeat HB-56927584 alive at 2026-06-30T04:52:28.498828+00:00\n",
+[agent:result]   "logs_truncated": false,
+[agent:result]     "run_name": "heartbeat",
+[agent:result]           "python_file": "/Users/benedict@logicalclocks.com/mlpab0b4268/heartbeat.py"
+[agent:result]         "task_key": "heartbeat"
+[agent] Everything is confirmed:
+[agent] - **Recurring schedule**: hourly cron `0 0 * * * ?`, UNPAUSED.
+[agent] - **Run completed**: SUCCESS, and logs show `heartbeat HB-56927584 alive at ...` — the exact token from the script.
+[agent] Now I'll write the deliverable.
+[agent:bash] mkdir -p submission
+[agent:result] (Bash completed with no output)
+[agent:write] /Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/cli/1.3.0/official/ops/scheduled_jobs/1/task/submission/answers.json
+[agent:result] File created successfully at: /Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/cli/1.3.0/official/ops/scheduled_jobs/1/task/submission/answers.json (file state is current in your context — no need to Read it back)
+[agent] Done. The task is complete.
+[agent] ## Summary
+[agent] I created a **recurring scheduled job** on Databricks that runs the provided `heartbeat.py` script periodically:
+[agent] 1. **Uploaded the script** as a workspace file at `/Users/benedict@logicalclocks.com/mlpab0b4268/heartbeat.py` (under my user's per-run namespace dir). I used a raw workspace file + `spark_python_task` rather than a notebook task because the script's `if __name__ == "__main__":` guard only fires when run as a real script.
+[agent] 2. **Created the recurring job** (`job_id 756976153113762`), named `mlpab0b4268_heartbeat468788` to satisfy the per-run prefix isolation rule. It uses serverless compute with:
+[agent]    - An **hourly cron schedule** `0 0 * * * ?` (UTC), `pause_status: UNPAUSED` — a genuine recurring schedule, not a one-off.
+[agent] 3. **Triggered one run** which completed with `result_state: SUCCESS`, and confirmed the task logs contain the expected token: `heartbeat HB-56927584 alive at 2026-06-30T04:52:28...`.
+[agent] 4. **Wrote the deliverable** `submission/answers.json`:
+[agent]    ```json
+[agent]    {"job_name": "heartbeat468788"}
+[agent]    ```
+[agent] The job lives on the platform with a recurring schedule and a verified successful run.
+[agent] done: 14 turns, $0.8152, stop=end_turn
+Collecting databricks-sdk==0.117.0
+  Downloading databricks_sdk-0.117.0-py3-none-any.whl.metadata (43 kB)
+Requirement already satisfied: requests<3,>=2.28.1 in ./venv/lib/python3.13/site-packages (from databricks-sdk==0.117.0) (2.34.2)
+Collecting google-auth~=2.0 (from databricks-sdk==0.117.0)
+  Downloading google_auth-2.55.1-py3-none-any.whl.metadata (5.1 kB)
+Requirement already satisfied: protobuf!=5.26.*,!=5.27.*,!=5.28.*,!=5.29.0,!=5.29.1,!=5.29.2,!=5.29.3,!=5.29.4,!=6.30.0,!=6.30.1,!=6.31.0,<7.0,>=4.25.8 in ./venv/lib/python3.13/site-packages (from databricks-sdk==0.117.0) (4.25.9)
+Requirement already satisfied: urllib3<3,>=1.26 in ./venv/lib/python3.13/site-packages (from databricks-sdk==0.117.0) (2.7.0)
+Requirement already satisfied: pyasn1-modules>=0.2.1 in ./venv/lib/python3.13/site-packages (from google-auth~=2.0->databricks-sdk==0.117.0) (0.4.2)
+Requirement already satisfied: cryptography>=38.0.3 in ./venv/lib/python3.13/site-packages (from google-auth~=2.0->databricks-sdk==0.117.0) (49.0.0)
+Requirement already satisfied: charset_normalizer<4,>=2 in ./venv/lib/python3.13/site-packages (from requests<3,>=2.28.1->databricks-sdk==0.117.0) (3.4.7)
+Requirement already satisfied: idna<4,>=2.5 in ./venv/lib/python3.13/site-packages (from requests<3,>=2.28.1->databricks-sdk==0.117.0) (3.18)
+Requirement already satisfied: certifi>=2023.5.7 in ./venv/lib/python3.13/site-packages (from requests<3,>=2.28.1->databricks-sdk==0.117.0) (2026.5.20)
+Requirement already satisfied: cffi>=2.0.0 in ./venv/lib/python3.13/site-packages (from cryptography>=38.0.3->google-auth~=2.0->databricks-sdk==0.117.0) (2.0.0)
+Requirement already satisfied: pycparser in ./venv/lib/python3.13/site-packages (from cffi>=2.0.0->cryptography>=38.0.3->google-auth~=2.0->databricks-sdk==0.117.0) (3.0)
+Requirement already satisfied: pyasn1<0.7.0,>=0.6.1 in ./venv/lib/python3.13/site-packages (from pyasn1-modules>=0.2.1->google-auth~=2.0->databricks-sdk==0.117.0) (0.6.3)
+Downloading databricks_sdk-0.117.0-py3-none-any.whl (936 kB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 936.9/936.9 kB 24.5 MB/s  0:00:00
+Downloading google_auth-2.55.1-py3-none-any.whl (252 kB)
+Installing collected packages: google-auth, databricks-sdk
+
+Successfully installed databricks-sdk-0.117.0 google-auth-2.55.1
+[mlpab] graded: 3 passed / 0 failed / 0 skipped of 3 asserts

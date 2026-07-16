@@ -1,5 +1,0 @@
--- Create a Delta table from the CSV file
-CREATE TABLE workspace.mlpabb1ccad.training_data
-USING CSV
-OPTIONS (header = "true", inferSchema = "true")
-LOCATION 'dbfs:/Volumes/workspace/mlpabb1ccad/training_data_volume/training_data.csv';

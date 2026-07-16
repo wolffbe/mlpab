@@ -1,0 +1,1 @@
+SELECT ROUND(AVG(f1),6) a1, ROUND(AVG(f2),6) a2, ROUND(AVG(f3),6) a3, ROUND(AVG(f4),6) a4 FROM mlpab_mlpabd773ad.scaled7b36f6 WHERE split='train'

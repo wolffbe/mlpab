@@ -1,0 +1,709 @@
+[mlpab] skills (95c4b1b4): databricks-apps,databricks-core,databricks-dabs,databricks-jobs,databricks-lakebase,databricks-model-serving,databricks-pipelines,databricks-serverless-migration,databricks-vector-search
+[agent] I'll start by examining the task inputs and understanding the environment.
+[agent:bash] cat data/instructions.md; echo "---SCRIPT---"; cat data/failing_job.py; echo "---ENV---"; echo "SCHEMA=$MLPAB_DATABRICKS_SCHEMA"; echo "PREFIX=$MLPAB_DATABRICKS_PREFIX"
+[agent:result] # Flaky job + failure alert
+[agent:result] 
+[agent:result] `failing_job.py` ALWAYS exits 1 (it raises a seeded error, ERR-292576). That is intentional: the goal is to verify that a FAILURE of the job raises an alert. Configure the platform's alerting mechanism for the job's failures — name or mention `flaky62cc43` in the alert so it is identifiable.
+[agent:result] ---SCRIPT---
+[agent:result] """Flaky job — this task ALWAYS fails (that is the point)."""
+[agent:result] import sys
+[agent:result] 
+[agent:result] ERROR_CODE = "ERR-292576"
+[agent:result] 
+[agent:result] if __name__ == "__main__":
+[agent:result]     print(f"flaky62cc43 starting (error code {ERROR_CODE})", file=sys.stderr)
+[agent:result]     raise RuntimeError(
+[agent:result]         f"seeded failure {ERROR_CODE}: upstream source unavailable — "
+[agent:result]         "this job is EXPECTED to fail"
+[agent:result]     )
+[agent:result] ---ENV---
+[agent:result] SCHEMA=workspace.mlpab53f3e1
+[agent:result] PREFIX=mlpab53f3e1
+[agent] Let me consult the relevant skill before implementing.
+[agent:tool] Skill
+[agent:result] Launching skill: databricks-jobs
+[agent:read] /Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/cli/1.3.0/official/ops/alerting/1/task/.claude/skills/databricks-jobs/references/notifications-monitoring.md
+[agent:result] 1	# Notifications and Monitoring Reference
+[agent:result] 2	
+[agent:result] 3	## Contents
+[agent:result] 4	- [Email Notifications](#email-notifications)
+[agent:result] 5	- [Webhook Notifications](#webhook-notifications)
+[agent:result] 6	- [Health Rules](#health-rules)
+[agent:result] 7	- [Timeout Configuration](#timeout-configuration)
+[agent:result] 8	- [Retry Configuration](#retry-configuration)
+[agent:result] 9	- [Run Queue Settings](#run-queue-settings)
+[agent:result] 10	
+[agent:result] 11	---
+[agent:result] 12	
+[agent:result] 13	## Email Notifications
+[agent:result] 14	
+[agent:result] 15	Send email alerts for job lifecycle events.
+[agent:result] 16	
+[agent:result] 17	### DABs YAML
+[agent:result] 18	
+[agent:result] 19	```yaml
+[agent:result] 20	resources:
+[agent:result] 21	  jobs:
+[agent:result] 22	    monitored_job:
+[agent:result] 23	      name: "Monitored Job"
+[agent:result] 24	      email_notifications:
+[agent:result] 25	        on_start:
+[agent:result] 26	          - "team@example.com"
+[agent:result] 27	        on_success:
+[agent:result] 28	          - "team@example.com"
+[agent:result] 29	        on_failure:
+[agent:result] 30	          - "oncall@example.com"
+[agent:result] 31	          - "team@example.com"
+[agent:result] 32	        on_duration_warning_threshold_exceeded:
+[agent:result] 33	          - "oncall@example.com"
+[agent:result] 34	        no_alert_for_skipped_runs: true
+[agent:result] 35	      tasks:
+[agent:result] 36	        - task_key: main
+[agent:result] 37	          notebook_task:
+[agent:result] 38	            notebook_path: ../src/main.py
+[agent:result] 39	```
+[agent:result] 40	
+[agent:result] 41	### Python SDK
+[agent:result] 42	
+[agent:result] 43	```python
+[agent:result] 44	from databricks.sdk import WorkspaceClient
+[agent:result] 45	from databricks.sdk.service.jobs import JobEmailNotifications
+[agent:result] 46	
+[agent:result] 47	w = WorkspaceClient()
+[agent:result] 48	
+[agent:result] 49	job = w.jobs.create(
+[agent:result] 50	    name="Monitored Job",
+[agent:result] 51	    email_notifications=JobEmailNotifications(
+[agent:result] 52	        on_start=["team@example.com"],
+[agent:result] 53	        on_success=["team@example.com"],
+[agent:result] 54	        on_failure=["oncall@example.com", "team@example.com"],
+[agent:result] 55	        on_duration_warning_threshold_exceeded=["oncall@example.com"],
+[agent:result] 56	        no_alert_for_skipped_runs=True
+[agent:result] 57	    ),
+[agent:result] 58	    tasks=[...]
+[agent:result] 59	)
+[agent:result] 60	```
+[agent:result] 61	
+[agent:result] 62	### Email Notification Events
+[agent:result] 63	
+[agent:result] 64	| Event | Description |
+[agent:result] 65	|-------|-------------|
+[agent:result] 66	| `on_start` | When job run starts |
+[agent:result] 67	| `on_success` | When job run completes successfully |
+[agent:result] 68	| `on_failure` | When job run fails |
+[agent:result] 69	| `on_duration_warning_threshold_exceeded` | When run exceeds duration warning threshold |
+[agent:result] 70	| `on_streaming_backlog_exceeded` | When streaming backlog exceeds threshold |
+[agent:result] 71	
+[agent:result] 72	### Task-Level Email Notifications
+[agent:result] 73	
+[agent:result] 74	```yaml
+[agent:result] 75	tasks:
+[agent:result] 76	  - task_key: critical_task
+[agent:result] 77	    email_notifications:
+[agent:result] 78	      on_start:
+[agent:result] 79	        - "task-owner@example.com"
+[agent:result] 80	      on_success:
+[agent:result] 81	        - "task-owner@example.com"
+[agent:result] 82	      on_failure:
+[agent:result] 83	        - "oncall@example.com"
+[agent:result] 84	    notebook_task:
+[agent:result] 85	      notebook_path: ../src/critical.py
+[agent:result] 86	```
+[agent:result] 87	
+[agent:result] 88	---
+[agent:result] 89	
+[agent:result] 90	## Webhook Notifications
+[agent:result] 91	
+[agent:result] 92	Send HTTP webhooks for job events (Slack, PagerDuty, custom endpoints).
+[agent:result] 93	
+[agent:result] 94	### Create Notification Destination First
+[agent:result] 95	
+[agent:result] 96	Before using webhooks, create a notification destination in the workspace:
+[agent:result] 97	
+[agent:result] 98	**Python SDK:**
+[agent:result] 99	```python
+[agent:result] 100	from databricks.sdk import WorkspaceClient
+[agent:result] 101	from databricks.sdk.service.settings import (
+[agent:result] 102	    CreateNotificationDestinationRequest,
+[agent:result] 103	    DestinationType,
+[agent:result] 104	    SlackConfig
+[agent:result] 105	)
+[agent:result] 106	
+[agent:result] 107	w = WorkspaceClient()
+[agent:result] 108	
+[agent:result] 109	# Create Slack destination
+[agent:result] 110	destination = w.notification_destinations.create(
+[agent:result] 111	    display_name="Slack Alerts",
+[agent:result] 112	    config=SlackConfig(
+[agent:result] 113	        url="https://hooks.slack.com/services/XXX/YYY/ZZZ"
+[agent:result] 114	    )
+[agent:result] 115	)
+[agent:result] 116	
+[agent:result] 117	print(f"Destination ID: {destination.id}")
+[agent:result] 118	```
+[agent:result] 119	
+[agent:result] 120	### DABs YAML
+[agent:result] 121	
+[agent:result] 122	```yaml
+[agent:result] 123	resources:
+[agent:result] 124	  jobs:
+[agent:result] 125	    webhook_job:
+[agent:result] 126	      name: "Job with Webhooks"
+[agent:result] 127	      webhook_notifications:
+[agent:result] 128	        on_start:
+[agent:result] 129	          - id: "notification-destination-uuid"
+[agent:result] 130	        on_success:
+[agent:result] 131	          - id: "notification-destination-uuid"
+[agent:result] 132	        on_failure:
+[agent:result] 133	          - id: "pagerduty-destination-uuid"
+[agent:result] 134	        on_duration_warning_threshold_exceeded:
+[agent:result] 135	          - id: "slack-destination-uuid"
+[agent:result] 136	      tasks:
+[agent:result] 137	        - task_key: main
+[agent:result] 138	          notebook_task:
+[agent:result] 139	            notebook_path: ../src/main.py
+[agent:result] 140	```
+[agent:result] 141	
+[agent:result] 142	### Python SDK
+[agent:result] 143	
+[agent:result] 144	```python
+[agent:result] 145	from databricks.sdk import WorkspaceClient
+[agent:result] 146	from databricks.sdk.service.jobs import WebhookNotifications, Webhook
+[agent:result] 147	
+[agent:result] 148	w = WorkspaceClient()
+[agent:result] 149	
+[agent:result] 150	job = w.jobs.create(
+[agent:result] 151	    name="Job with Webhooks",
+[agent:result] 152	    webhook_notifications=WebhookNotifications(
+[agent:result] 153	        on_start=[Webhook(id="notification-destination-uuid")],
+[agent:result] 154	        on_success=[Webhook(id="notification-destination-uuid")],
+[agent:result] 155	        on_failure=[Webhook(id="pagerduty-destination-uuid")],
+[agent:result] 156	        on_duration_warning_threshold_exceeded=[Webhook(id="slack-destination-uuid")]
+[agent:result] 157	    ),
+[agent:result] 158	    tasks=[...]
+[agent:result] 159	)
+[agent:result] 160	```
+[agent:result] 161	
+[agent:result] 162	### Supported Destinations
+[agent:result] 163	
+[agent:result] 164	| Type | Configuration |
+[agent:result] 165	|------|---------------|
+[agent:result] 166	| Slack | Slack webhook URL |
+[agent:result] 167	| Microsoft Teams | Teams webhook URL |
+[agent:result] 168	| PagerDuty | PagerDuty integration key |
+[agent:result] 169	| Generic Webhook | Custom HTTP endpoint |
+[agent:result] 170	| Email | Email addresses |
+[agent:result] 171	
+[agent:result] 172	### Task-Level Webhooks
+[agent:result] 173	
+[agent:result] 174	```yaml
+[agent:result] 175	tasks:
+[agent:result] 176	  - task_key: critical_task
+[agent:result] 177	    webhook_notifications:
+[agent:result] 178	      on_failure:
+[agent:result] 179	        - id: "pagerduty-destination-uuid"
+[agent:result] 180	    notebook_task:
+[agent:result] 181	      notebook_path: ../src/critical.py
+[agent:result] 182	```
+[agent:result] 183	
+[agent:result] 184	---
+[agent:result] 185	
+[agent:result] 186	## Health Rules
+[agent:result] 187	
+[agent:result] 188	Monitor job health metrics and trigger alerts.
+[agent:result] 189	
+[agent:result] 190	### DABs YAML
+[agent:result] 191	
+[agent:result] 192	```yaml
+[agent:result] 193	resources:
+[agent:result] 194	  jobs:
+[agent:result] 195	    health_monitored:
+[agent:result] 196	      name: "Health Monitored Job"
+[agent:result] 197	      health:
+[agent:result] 198	        rules:
+[agent:result] 199	          - metric: RUN_DURATION_SECONDS
+[agent:result] 200	            op: GREATER_THAN
+[agent:result] 201	            value: 3600  # Alert if run > 1 hour
+[agent:result] 202	          - metric: STREAMING_BACKLOG_BYTES
+[agent:result] 203	            op: GREATER_THAN
+[agent:result] 204	            value: 1073741824  # Alert if backlog > 1GB
+[agent:result] 205	          - metric: STREAMING_BACKLOG_SECONDS
+[agent:result] 206	            op: GREATER_THAN
+[agent:result] 207	            value: 300  # Alert if backlog > 5 minutes
+[agent:result] 208	          - metric: STREAMING_BACKLOG_FILES
+[agent:result] 209	            op: GREATER_THAN
+[agent:result] 210	            value: 1000  # Alert if backlog > 1000 files
+[agent:result] 211	          - metric: STREAMING_BACKLOG_RECORDS
+[agent:result] 212	            op: GREATER_THAN
+[agent:result] 213	            value: 100000  # Alert if backlog > 100k records
+[agent:result] 214	      email_notifications:
+[agent:result] 215	        on_duration_warning_threshold_exceeded:
+[agent:result] 216	          - "oncall@example.com"
+[agent:result] 217	        on_streaming_backlog_exceeded:
+[agent:result] 218	          - "oncall@example.com"
+[agent:result] 219	      tasks:
+[agent:result] 220	        - task_key: streaming
+[agent:result] 221	          notebook_task:
+[agent:result] 222	            notebook_path: ../src/streaming.py
+[agent:result] 223	```
+[agent:result] 224	
+[agent:result] 225	### Python SDK
+[agent:result] 226	
+[agent:result] 227	```python
+[agent:result] 228	from databricks.sdk import WorkspaceClient
+[agent:result] 229	from databricks.sdk.service.jobs import JobsHealthRules, JobsHealthRule, JobsHealthMetric, JobsHealthOperator
+[agent:result] 230	
+[agent:result] 231	w = WorkspaceClient()
+[agent:result] 232	
+[agent:result] 233	job = w.jobs.create(
+[agent:result] 234	    name="Health Monitored Job",
+[agent:result] 235	    health=JobsHealthRules(
+[agent:result] 236	        rules=[
+[agent:result] 237	            JobsHealthRule(
+[agent:result] 238	                metric=JobsHealthMetric.RUN_DURATION_SECONDS,
+[agent:result] 239	                op=JobsHealthOperator.GREATER_THAN,
+[agent:result] 240	                value=3600
+[agent:result] 241	            ),
+[agent:result] 242	            JobsHealthRule(
+[agent:result] 243	                metric=JobsHealthMetric.STREAMING_BACKLOG_BYTES,
+[agent:result] 244	                op=JobsHealthOperator.GREATER_THAN,
+[agent:result] 245	                value=1073741824
+[agent:result] 246	            )
+[agent:result] 247	        ]
+[agent:result] 248	    ),
+[agent:result] 249	    tasks=[...]
+[agent:result] 250	)
+[agent:result] 251	```
+[agent:result] 252	
+[agent:result] 253	### Health Metrics
+[agent:result] 254	
+[agent:result] 255	| Metric | Description | Use Case |
+[agent:result] 256	|--------|-------------|----------|
+[agent:result] 257	| `RUN_DURATION_SECONDS` | Total run time | Detect stuck/slow jobs |
+[agent:result] 258	| `STREAMING_BACKLOG_BYTES` | Unprocessed data size | Streaming lag |
+[agent:result] 259	| `STREAMING_BACKLOG_SECONDS` | Processing delay time | Streaming lag |
+[agent:result] 260	| `STREAMING_BACKLOG_FILES` | Unprocessed file count | File processing lag |
+[agent:result] 261	| `STREAMING_BACKLOG_RECORDS` | Unprocessed record count | Record processing lag |
+[agent:result] 262	
+[agent:result] 263	### Operators
+[agent:result] 264	
+[agent:result] 265	| Operator | Description |
+[agent:result] 266	|----------|-------------|
+[agent:result] 267	| `GREATER_THAN` | Value exceeds threshold |
+[agent:result] 268	
+[agent:result] 269	---
+[agent:result] 270	
+[agent:result] 271	## Timeout Configuration
+[agent:result] 272	
+[agent:result] 273	### Job-Level Timeout
+[agent:result] 274	
+[agent:result] 275	```yaml
+[agent:result] 276	resources:
+[agent:result] 277	  jobs:
+[agent:result] 278	    timeout_job:
+[agent:result] 279	      name: "Job with Timeout"
+[agent:result] 280	      timeout_seconds: 7200  # 2 hours max run time
+[agent:result] 281	      tasks:
+[agent:result] 282	        - task_key: main
+[agent:result] 283	          notebook_task:
+[agent:result] 284	            notebook_path: ../src/main.py
+[agent:result] 285	```
+[agent:result] 286	
+[agent:result] 287	### Task-Level Timeout
+[agent:result] 288	
+[agent:result] 289	```yaml
+[agent:result] 290	tasks:
+[agent:result] 291	  - task_key: long_running
+[agent:result] 292	    timeout_seconds: 3600  # 1 hour max for this task
+[agent:result] 293	    notebook_task:
+[agent:result] 294	      notebook_path: ../src/long_running.py
+[agent:result] 295	```
+[agent:result] 296	
+[agent:result] 297	### Python SDK
+[agent:result] 298	
+[agent:result] 299	```python
+[agent:result] 300	from databricks.sdk.service.jobs import Task, NotebookTask
+[agent:result] 301	
+[agent:result] 302	Task(
+[agent:result] 303	    task_key="long_running",
+[agent:result] 304	    timeout_seconds=3600,
+[agent:result] 305	    notebook_task=NotebookTask(
+[agent:result] 306	        notebook_path="/Workspace/long_running"
+[agent:result] 307	    )
+[agent:result] 308	)
+[agent:result] 309	```
+[agent:result] 310	
+[agent:result] 311	### Timeout Behavior
+[agent:result] 312	
+[agent:result] 313	- Value `0` = no timeout (default)
+[agent:result] 314	- When timeout exceeds, task/job is cancelled
+[agent:result] 315	- Partial results may be lost
+[agent:result] 316	- Triggers `on_failure` notifications
+[agent:result] 317	
+[agent:result] 318	---
+[agent:result] 319	
+[agent:result] 320	## Retry Configuration
+[agent:result] 321	
+[agent:result] 322	### Task Retry Settings
+[agent:result] 323	
+[agent:result] 324	```yaml
+[agent:result] 325	tasks:
+[agent:result] 326	  - task_key: flaky_task
+[agent:result] 327	    max_retries: 3
+[agent:result] 328	    min_retry_interval_millis: 30000  # 30 seconds between retries
+[agent:result] 329	    retry_on_timeout: true
+[agent:result] 330	    notebook_task:
+[agent:result] 331	      notebook_path: ../src/flaky_task.py
+[agent:result] 332	```
+[agent:result] 333	
+[agent:result] 334	### Python SDK
+[agent:result] 335	
+[agent:result] 336	```python
+[agent:result] 337	from databricks.sdk.service.jobs import Task, NotebookTask
+[agent:result] 338	
+[agent:result] 339	Task(
+[agent:result] 340	    task_key="flaky_task",
+[agent:result] 341	    max_retries=3,
+[agent:result] 342	    min_retry_interval_millis=30000,
+[agent:result] 343	    retry_on_timeout=True,
+[agent:result] 344	    notebook_task=NotebookTask(
+[agent:result] 345	        notebook_path="/Workspace/flaky_task"
+[agent:result] 346	    )
+[agent:result] 347	)
+[agent:result] 348	```
+[agent:result] 349	
+[agent:result] 350	### Retry Parameters
+[agent:result] 351	
+[agent:result] 352	| Parameter | Default | Description |
+[agent:result] 353	|-----------|---------|-------------|
+[agent:result] 354	| `max_retries` | 0 | Number of retry attempts |
+[agent:result] 355	| `min_retry_interval_millis` | 0 | Minimum wait between retries |
+[agent:result] 356	| `retry_on_timeout` | false | Retry when task times out |
+[agent:result] 357	
+[agent:result] 358	### Retry Behavior
+[agent:result] 359	
+[agent:result] 360	- Retries only apply to task failures
+[agent:result] 361	- Each retry is a new task attempt
+[agent:result] 362	- Retry count resets for each job run
+[agent:result] 363	- Dependencies wait for retries to complete
+[agent:result] 364	
+[agent:result] 365	---
+[agent:result] 366	
+[agent:result] 367	## Run Queue Settings
+[agent:result] 368	
+[agent:result] 369	Control concurrent run behavior.
+[agent:result] 370	
+[agent:result] 371	### Maximum Concurrent Runs
+[agent:result] 372	
+[agent:result] 373	```yaml
+[agent:result] 374	resources:
+[agent:result] 375	  jobs:
+[agent:result] 376	    concurrent_job:
+[agent:result] 377	      name: "Concurrent Job"
+[agent:result] 378	      max_concurrent_runs: 5  # Allow up to 5 simultaneous runs
+[agent:result] 379	      tasks:
+[agent:result] 380	        - task_key: main
+[agent:result] 381	          notebook_task:
+[agent:result] 382	            notebook_path: ../src/main.py
+[agent:result] 383	```
+[agent:result] 384	
+[agent:result] 385	### Queue Settings
+[agent:result] 386	
+[agent:result] 387	```yaml
+[agent:result] 388	resources:
+[agent:result] 389	  jobs:
+[agent:result] 390	    queued_job:
+[agent:result] 391	      name: "Queued Job"
+[agent:result] 392	      max_concurrent_runs: 1
+[agent:result] 393	      queue:
+[agent:result] 394	        enabled: true  # Queue additional runs instead of skipping
+[agent:result] 395	      tasks:
+[agent:result] 396	        - task_key: main
+[agent:result] 397	          notebook_task:
+[agent:result] 398	            notebook_path: ../src/main.py
+[agent:result] 399	```
+[agent:result] 400	
+[agent:result] 401	### Python SDK
+[agent:result] 402	
+[agent:result] 403	```python
+[agent:result] 404	from databricks.sdk import WorkspaceClient
+[agent:result] 405	from databricks.sdk.service.jobs import QueueSettings
+[agent:result] 406	
+[agent:result] 407	w = WorkspaceClient()
+[agent:result] 408	
+[agent:result] 409	job = w.jobs.create(
+[agent:result] 410	    name="Queued Job",
+[agent:result] 411	    max_concurrent_runs=1,
+[agent:result] 412	    queue=QueueSettings(enabled=True),
+[agent:result] 413	    tasks=[...]
+[agent:result] 414	)
+[agent:result] 415	```
+[agent:result] 416	
+[agent:result] 417	### Behavior Options
+[agent:result] 418	
+[agent:result] 419	| Setting | Behavior |
+[agent:result] 420	|---------|----------|
+[agent:result] 421	| `max_concurrent_runs=1`, `queue.enabled=false` | Skip if already running |
+[agent:result] 422	| `max_concurrent_runs=1`, `queue.enabled=true` | Queue runs, execute sequentially |
+[agent:result] 423	| `max_concurrent_runs=N` | Allow N simultaneous runs |
+[agent:result] 424	
+[agent:result] 425	---
+[agent:result] 426	
+[agent:result] 427	## Notification Settings
+[agent:result] 428	
+[agent:result] 429	Fine-tune notification behavior.
+[agent:result] 430	
+[agent:result] 431	### Job-Level Settings
+[agent:result] 432	
+[agent:result] 433	```yaml
+[agent:result] 434	resources:
+[agent:result] 435	  jobs:
+[agent:result] 436	    notification_settings_job:
+[agent:result] 437	      name: "Job with Notification Settings"
+[agent:result] 438	      notification_settings:
+[agent:result] 439	        no_alert_for_skipped_runs: true
+[agent:result] 440	        no_alert_for_canceled_runs: true
+[agent:result] 441	      email_notifications:
+[agent:result] 442	        on_failure:
+[agent:result] 443	          - "team@example.com"
+[agent:result] 444	      tasks:
+[agent:result] 445	        - task_key: main
+[agent:result] 446	          notebook_task:
+[agent:result] 447	            notebook_path: ../src/main.py
+[agent:result] 448	```
+[agent:result] 449	
+[agent:result] 450	### Python SDK
+[agent:result] 451	
+[agent:result] 452	```python
+[agent:result] 453	from databricks.sdk import WorkspaceClient
+[agent:result] 454	from databricks.sdk.service.jobs import JobNotificationSettings
+[agent:result] 455	
+[agent:result] 456	w = WorkspaceClient()
+[agent:result] 457	
+[agent:result] 458	job = w.jobs.create(
+[agent:result] 459	    name="Job with Notification Settings",
+[agent:result] 460	    notification_settings=JobNotificationSettings(
+[agent:result] 461	        no_alert_for_skipped_runs=True,
+[agent:result] 462	        no_alert_for_canceled_runs=True
+[agent:result] 463	    ),
+[agent:result] 464	    tasks=[...]
+[agent:result] 465	)
+[agent:result] 466	```
+[agent:result] 467	
+[agent:result] 468	### Settings
+[agent:result] 469	
+[agent:result] 470	| Setting | Default | Description |
+[agent:result] 471	|---------|---------|-------------|
+[agent:result] 472	| `no_alert_for_skipped_runs` | false | Suppress alerts when runs are skipped |
+[agent:result] 473	| `no_alert_for_canceled_runs` | false | Suppress alerts when runs are canceled |
+[agent:result] 474	
+[agent:result] 475	---
+[agent:result] 476	
+[agent:result] 477	## Complete Monitoring Example
+[agent:result] 478	
+[agent:result] 479	```yaml
+[agent:result] 480	resources:
+[agent:result] 481	  jobs:
+[agent:result] 482	    fully_monitored:
+[agent:result] 483	      name: "[${bundle.target}] Fully Monitored ETL"
+[agent:result] 484	
+[agent:result] 485	      # Timeout and retries
+[agent:result] 486	      timeout_seconds: 14400  # 4 hours max
+[agent:result] 487	      max_concurrent_runs: 1
+[agent:result] 488	      queue:
+[agent:result] 489	        enabled: true
+[agent:result] 490	
+[agent:result] 491	      # Health monitoring
+[agent:result] 492	      health:
+[agent:result] 493	        rules:
+[agent:result] 494	          - metric: RUN_DURATION_SECONDS
+[agent:result] 495	            op: GREATER_THAN
+[agent:result] 496	            value: 7200  # Warn if > 2 hours
+[agent:result] 497	
+[agent:result] 498	      # Email notifications
+[agent:result] 499	      email_notifications:
+[agent:result] 500	        on_start:
+[agent:result] 501	          - "team@example.com"
+[agent:result] 502	        on_success:
+[agent:result] 503	          - "team@example.com"
+[agent:result] 504	        on_failure:
+[agent:result] 505	          - "oncall@example.com"
+[agent:result] 506	          - "team@example.com"
+[agent:result] 507	        on_duration_warning_threshold_exceeded:
+[agent:result] 508	          - "oncall@example.com"
+[agent:result] 509	        no_alert_for_skipped_runs: true
+[agent:result] 510	
+[agent:result] 511	      # Webhook notifications
+[agent:result] 512	      webhook_notifications:
+[agent:result] 513	        on_failure:
+[agent:result] 514	          - id: "pagerduty-destination-uuid"
+[agent:result] 515	        on_duration_warning_threshold_exceeded:
+[agent:result] 516	          - id: "slack-alerts-uuid"
+[agent:result] 517	
+[agent:result] 518	      # Notification settings
+[agent:result] 519	      notification_settings:
+[agent:result] 520	        no_alert_for_canceled_runs: true
+[agent:result] 521	
+[agent:result] 522	      tasks:
+[agent:result] 523	        - task_key: extract
+[agent:result] 524	          max_retries: 2
+[agent:result] 525	          min_retry_interval_millis: 60000
+[agent:result] 526	          timeout_seconds: 3600
+[agent:result] 527	          notebook_task:
+[agent:result] 528	            notebook_path: ../src/extract.py
+[agent:result] 529	
+[agent:result] 530	        - task_key: transform
+[agent:result] 531	          depends_on:
+[agent:result] 532	            - task_key: extract
+[agent:result] 533	          max_retries: 1
+[agent:result] 534	          timeout_seconds: 3600
+[agent:result] 535	          notebook_task:
+[agent:result] 536	            notebook_path: ../src/transform.py
+[agent:result] 537	
+[agent:result] 538	        - task_key: load
+[agent:result] 539	          depends_on:
+[agent:result] 540	            - task_key: transform
+[agent:result] 541	          timeout_seconds: 1800
+[agent:result] 542	          # Critical task - specific notifications
+[agent:result] 543	          email_notifications:
+[agent:result] 544	            on_failure:
+[agent:result] 545	              - "data-team-lead@example.com"
+[agent:result] 546	          notebook_task:
+[agent:result] 547	            notebook_path: ../src/load.py
+[agent:result] 548	```
+[agent:result] 549
+[agent] The skill recommends the `databricks-core` skill for CLI basics. Let me get the current user and set up. I'll use the CLI directly (CLI mode).
+[agent:bash] databricks current-user me --output json 2>/dev/null | grep -E '"userName"|"emails"|"value"' | head -20
+[agent:result]   "emails": [
+[agent:result]       "value": "benedict@logicalclocks.com"
+[agent:result]       "value": "allow-cluster-create"
+[agent:result]       "value": "allow-instance-pool-create"
+[agent:result]       "value": "83572394574321"
+[agent:result]       "value": "82415167308912"
+[agent:result]       "value": "81176181365266"
+[agent:result]   "userName": "benedict@logicalclocks.com"
+[agent] User is `benedict@logicalclocks.com`. Now let me upload the script to the workspace under the per-run namespace.
+[agent:bash] USERDIR="/Users/benedict@logicalclocks.com/${MLPAB_DATABRICKS_PREFIX}"
+[agent:bash] databricks workspace mkdirs "$USERDIR" 2>&1
+[agent:bash] databricks workspace import "$USERDIR/failing_job.py" --file data/failing_job.py --language PYTHON --format SOURCE --overwrite 2>&1
+[agent:bash] echo "---LIST---"
+[agent:bash] databricks workspace list "$USERDIR" 2>&1
+[agent:result] ---LIST---
+[agent:result] ID                Type      Language  Path
+[agent:result] 2906278400856801  NOTEBOOK  PYTHON    /Users/benedict@logicalclocks.com/mlpab53f3e1/failing_job.py
+[agent] The import created a NOTEBOOK object. For the script to actually fail (its `raise` is under `if __name__ == "__main__":`), I need it run as a real Python script via `spark_python_task`, not as a notebook. I'll place the file in a UC Volume in my per-run schema and reference it.
+[agent:bash] SCHEMA="${MLPAB_DATABRICKS_SCHEMA}"
+[agent:bash] CAT="${SCHEMA%%.*}"; SCH="${SCHEMA##*.}"
+[agent:bash] echo "catalog=$CAT schema=$SCH"
+[agent:bash] databricks volumes create "$CAT" "$SCH" flakyvol MANAGED 2>&1 | grep -E '"full_name"|error|Error' | head
+[agent:bash] databricks fs cp data/failing_job.py "dbfs:/Volumes/$CAT/$SCH/flakyvol/failing_job.py" 2>&1
+[agent:bash] echo "---"
+[agent:bash] databricks fs ls "dbfs:/Volumes/$CAT/$SCH/flakyvol/" 2>&1
+[agent:result] catalog=workspace schema=mlpab53f3e1
+[agent:result]   "full_name": "workspace.mlpab53f3e1.flakyvol",
+[agent:result] data/failing_job.py -> dbfs:/Volumes/workspace/mlpab53f3e1/flakyvol/failing_job.py
+[agent:result] ---
+[agent:result] failing_job.py
+[agent] Now create the job with a serverless `spark_python_task` and a failure email notification.
+[agent:write] /Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/cli/1.3.0/official/ops/alerting/1/task/.tmp/job.json
+[agent:result] File created successfully at: /Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/cli/1.3.0/official/ops/alerting/1/task/.tmp/job.json (file state is current in your context — no need to Read it back)
+[agent:bash] databricks jobs create --json @.tmp/job.json 2>&1
+[agent:result] {
+[agent:result]   "job_id": 365222229140615
+[agent:result] }
+[agent] Job created (id 365222229140615). Now run it once and wait for it to fail.
+[agent:bash] databricks jobs run-now 365222229140615 --timeout 30m0s 2>&1 | tail -40
+[agent:result] Error: failed to reach TERMINATED or SKIPPED, got INTERNAL_ERROR: Task run_flaky62cc43 failed with message: Cannot read the python file /Volumes/workspace/mlpab53f3e1/flakyvol/failing_job.py. Either it does not exist, or the identity used to run this job, benedict@logicalclocks.com, lacks the required permissions. Please check driver logs for more details.
+[agent] The serverless job ran and failed, but because it couldn't read the file from the volume — not from the script's own error. Let me verify the file and access.
+[agent:bash] CAT=workspace; SCH=mlpab53f3e1
+[agent:bash] databricks fs cat "dbfs:/Volumes/$CAT/$SCH/flakyvol/failing_job.py" 2>&1 | head -5
+[agent:bash] echo "---GRANTS---"
+[agent:bash] databricks grants get VOLUME "$CAT.$SCH.flakyvol" 2>&1 | head -30
+[agent:result] """Flaky job — this task ALWAYS fails (that is the point)."""
+[agent:result] import sys
+[agent:result] 
+[agent:result] ERROR_CODE = "ERR-292576"
+[agent:result] 
+[agent:result] ---GRANTS---
+[agent:result] {}
+[agent] File is readable. The serverless `spark_python_task` couldn't access the volume path. Since the script was already imported as a notebook, I'll switch the job to a `notebook_task` — Databricks notebooks run with `__name__ == "__main__"`, so the guarded `raise` will execute and produce the script's seeded failure. Let me reset the job.
+[agent:write] /Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/cli/1.3.0/official/ops/alerting/1/task/.tmp/reset.json
+[agent:result] File created successfully at: /Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/cli/1.3.0/official/ops/alerting/1/task/.tmp/reset.json (file state is current in your context — no need to Read it back)
+[agent:bash] databricks jobs reset --json @.tmp/reset.json 2>&1
+[agent:bash] echo "exit=$?"
+[agent:result] exit=0
+[agent:bash] databricks jobs run-now 365222229140615 --timeout 30m0s 2>&1 | tail -30
+[agent:bash] echo "exit=${PIPESTATUS[0]}"
+[agent:result] Error: failed to reach TERMINATED or SKIPPED, got INTERNAL_ERROR: Task run_flaky62cc43 failed with message: Workload failed, see run output for details.
+[agent:result] exit=
+[agent] The job failed. Let me confirm it failed with the script's seeded error (ERR-292576), not an infra error. Let me get the run details.
+[agent:bash] RUN=$(databricks jobs list-runs 365222229140615 --limit 1 --output json 2>/dev/null | grep '"run_id"' | head -1 | grep -oE '[0-9]+')
+[agent:bash] echo "run_id=$RUN"
+[agent:bash] databricks jobs get-run-output "$RUN" 2>&1 | grep -iE 'ERR-292576|RuntimeError|seeded failure|error' | head -10
+[agent:result] run_id=
+[agent:result] Error: invalid RUN_ID:
+[agent:bash] databricks jobs list-runs --job-id 365222229140615 --limit 2 --output json 2>&1 | grep -E '"run_id"|"result_state"|"state_message"|"life_cycle_state"' | head -20
+[agent:result]     "run_id": 819533071043005,
+[agent:result]       "life_cycle_state": "INTERNAL_ERROR",
+[agent:result]       "result_state": "FAILED",
+[agent:result]       "state_message": "Task run_flaky62cc43 failed with message: Workload failed, see run output for details.",
+[agent:result]     "run_id": 955018154636552,
+[agent:result]       "life_cycle_state": "INTERNAL_ERROR",
+[agent:result]       "result_state": "FAILED",
+[agent:result]       "state_message": "Task run_flaky62cc43 failed with message: Cannot read the python file /Volumes/workspace/mlpab53f3e1/flakyvol/failing_job.py. Either it does not exist, or the identity used to run this job, benedict@logicalclocks.com, lacks the required permissions. Please check driver logs for more details.",
+[agent:bash] TASKRUN=$(databricks jobs get-run 819533071043005 --output json 2>/dev/null | python3 -c "import sys,json;d=json.load(sys.stdin);print(d['tasks'][0]['run_id'])" 2>/dev/null)
+[agent:bash] echo "taskrun=$TASKRUN"
+[agent:bash] databricks jobs get-run-output "$TASKRUN" --output json 2>&1 | grep -iE 'ERR-292576|RuntimeError|seeded' | head
+[agent:result-err] PreToolUse:Bash hook error: [python3 /Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/cli/1.3.0/official/ops/alerting/1/task/.claude/hooks/log_tool_call.py]: DENIED: local python is off-interface in 'cli' mode. Use only the `databricks` CLI to run work on databricks. Basic shell (cp/mkdir/cat) is fine for writing the floor submission.
+[agent:bash] databricks jobs get-run 819533071043005 --output json 2>/dev/null | grep -A2 '"tasks"' | grep '"run_id"' | head
+[agent:bash] echo "---all task run_ids---"
+[agent:bash] databricks jobs get-run 819533071043005 --output json 2>/dev/null | grep '"run_id"'
+[agent:result] ---all task run_ids---
+[agent:result]   "run_id": 819533071043005,
+[agent:result]       "run_id": 630148573697277,
+[agent:bash] databricks jobs get-run-output 630148573697277 2>&1 | grep -ioE 'ERR-292576|RuntimeError[^"]*|seeded failure[^"]*' | head
+[agent:result] RuntimeError: seeded failure ERR-292576: upstream source unavailable — this job is EXPECTED to fail
+[agent:result] RuntimeError\u001b[0m                              Traceback (most recent call last)\nFile \u001b[0;32m\u003ccommand-8043106884138931\u003e, line 8\u001b[0m\n\u001b[1;32m      6\u001b[0m \u001b[38;5;28;01mif\u001b[39;00m \u001b[38;5;18m__name__\u001b[39m \u001b[38;5;241m==\u001b[39m \u001b[38;5;124m\
+[agent:result] RuntimeError\u001b[39;00m(\n\u001b[1;32m      9\u001b[0m         \u001b[38;5;124mf\u001b[39m\u001b[38;5;124m\
+[agent:result] seeded failure \u001b[39m\u001b[38;5;132;01m{\u001b[39;00mERROR_CODE\u001b[38;5;132;01m}\u001b[39;00m\u001b[38;5;124m: upstream source unavailable — \u001b[39m\u001b[38;5;124m\
+[agent:result] RuntimeError\u001b[0m: seeded failure ERR-292576: upstream source unavailable — this job is EXPECTED to fail
+[agent] Confirmed: the job ran the provided script and failed with the exact seeded error `ERR-292576`, and the `on_failure` email alert is attached to the job (whose name contains `flaky62cc43`). Now I'll write the submission.
+[agent:bash] mkdir -p submission
+[agent:result] (Bash completed with no output)
+[agent:write] /Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/cli/1.3.0/official/ops/alerting/1/task/submission/answers.json
+[agent:result] File created successfully at: /Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/cli/1.3.0/official/ops/alerting/1/task/submission/answers.json (file state is current in your context — no need to Read it back)
+[agent] Done. Here's a summary of what I built on the Databricks platform:
+[agent] **Job** — Created job `mlpab53f3e1_flaky62cc43` (id `365222229140615`), name prefixed with the per-run namespace prefix and containing `flaky62cc43` for identifiability. It runs the provided `data/failing_job.py` via a serverless notebook task (the script's `raise` is under `if __name__ == "__main__":`, which executes in the Databricks notebook context).
+[agent] **Failure alert** — Configured the platform's job-failure notification mechanism: `email_notifications.on_failure → benedict@logicalclocks.com`, which fires on every failed run of `flaky62cc43`.
+[agent] **Ran once, confirmed failure** — The job ran and failed exactly as intended, with the script's own seeded error:
+[agent] > `RuntimeError: seeded failure ERR-292576: upstream source unavailable — this job is EXPECTED to fail`
+[agent] (My first attempt used a serverless `spark_python_task` reading the script from a UC volume; serverless couldn't access that volume path, so I switched to the notebook task, which produced the genuine script failure rather than an infra error.)
+[agent] **Deliverable** — `submission/answers.json`:
+[agent] ```json
+[agent] {"job_name": "flaky62cc43", "alert": "Job-failure email notification (on_failure -> benedict@logicalclocks.com) configured on job mlpab53f3e1_flaky62cc43; fires whenever the flaky62cc43 job run FAILS (confirmed by run that failed with seeded error ERR-292576)"}
+[agent] ```
+[agent] All objects live in the per-run namespace: the job is prefixed with `mlpab53f3e1`, the script volume is in `workspace.mlpab53f3e1`, and the notebook is under `/Users/benedict@logicalclocks.com/mlpab53f3e1/`.
+[agent] done: 22 turns, $1.3004, stop=end_turn
+Collecting databricks-sdk==0.117.0
+  Downloading databricks_sdk-0.117.0-py3-none-any.whl.metadata (43 kB)
+Requirement already satisfied: requests<3,>=2.28.1 in ./venv/lib/python3.13/site-packages (from databricks-sdk==0.117.0) (2.34.2)
+Collecting google-auth~=2.0 (from databricks-sdk==0.117.0)
+  Downloading google_auth-2.55.1-py3-none-any.whl.metadata (5.1 kB)
+Requirement already satisfied: protobuf!=5.26.*,!=5.27.*,!=5.28.*,!=5.29.0,!=5.29.1,!=5.29.2,!=5.29.3,!=5.29.4,!=6.30.0,!=6.30.1,!=6.31.0,<7.0,>=4.25.8 in ./venv/lib/python3.13/site-packages (from databricks-sdk==0.117.0) (4.25.9)
+Requirement already satisfied: urllib3<3,>=1.26 in ./venv/lib/python3.13/site-packages (from databricks-sdk==0.117.0) (2.7.0)
+Requirement already satisfied: pyasn1-modules>=0.2.1 in ./venv/lib/python3.13/site-packages (from google-auth~=2.0->databricks-sdk==0.117.0) (0.4.2)
+Requirement already satisfied: cryptography>=38.0.3 in ./venv/lib/python3.13/site-packages (from google-auth~=2.0->databricks-sdk==0.117.0) (49.0.0)
+Requirement already satisfied: charset_normalizer<4,>=2 in ./venv/lib/python3.13/site-packages (from requests<3,>=2.28.1->databricks-sdk==0.117.0) (3.4.7)
+Requirement already satisfied: idna<4,>=2.5 in ./venv/lib/python3.13/site-packages (from requests<3,>=2.28.1->databricks-sdk==0.117.0) (3.18)
+Requirement already satisfied: certifi>=2023.5.7 in ./venv/lib/python3.13/site-packages (from requests<3,>=2.28.1->databricks-sdk==0.117.0) (2026.5.20)
+Requirement already satisfied: cffi>=2.0.0 in ./venv/lib/python3.13/site-packages (from cryptography>=38.0.3->google-auth~=2.0->databricks-sdk==0.117.0) (2.0.0)
+Requirement already satisfied: pycparser in ./venv/lib/python3.13/site-packages (from cffi>=2.0.0->cryptography>=38.0.3->google-auth~=2.0->databricks-sdk==0.117.0) (3.0)
+Requirement already satisfied: pyasn1<0.7.0,>=0.6.1 in ./venv/lib/python3.13/site-packages (from pyasn1-modules>=0.2.1->google-auth~=2.0->databricks-sdk==0.117.0) (0.6.3)
+Downloading databricks_sdk-0.117.0-py3-none-any.whl (936 kB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 936.9/936.9 kB 30.5 MB/s  0:00:00
+Downloading google_auth-2.55.1-py3-none-any.whl (252 kB)
+Installing collected packages: google-auth, databricks-sdk
+
+Successfully installed databricks-sdk-0.117.0 google-auth-2.55.1
+[mlpab] WARNING: databricks cli client crashed — see /Users/wolffbe/workspace/banter/testbed/results/18_db-full-cli-sdk-skills-opus/claude-opus-4-8/databricks/cli/1.3.0/official/ops/alerting/1/task/databricks_client.logs (markers: Traceback (most recent call last))
+[mlpab] graded: 3 passed / 0 failed / 0 skipped of 3 asserts

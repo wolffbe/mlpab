@@ -1,0 +1,121 @@
+[agent] I'll identify the leaking feature by loading the data into Databricks and running per-feature analysis via SQL there. First, let me inspect the task inputs and environment.
+[agent:bash] ls data/ submission/ 2>/dev/null; head -5 data/training_data.csv; wc -l data/training_data.csv; echo "SCHEMA=$MLPAB_DATABRICKS_SCHEMA PREFIX=$MLPAB_DATABRICKS_PREFIX"
+[agent:result] data/:
+[agent:result] schema.md
+[agent:result] training_data.csv
+[agent:result] 
+[agent:result] submission/:
+[agent:result] row_id,f1,f2,f3,f4,f5,f6,label
+[agent:result] R00000,-0.925284,1.165112,-1.367339,0.148535,-2.10138,-0.51304,0
+[agent:result] R00001,-1.432416,-0.077124,1.148746,0.012232,-0.791619,0.869094,0
+[agent:result] R00002,-1.979763,-0.332486,0.502322,-0.002217,-0.461986,-0.200256,0
+[agent:result] R00003,2.86184,0.774907,-0.283732,0.170036,1.047213,1.575084,0
+[agent:result]      801 data/training_data.csv
+[agent:result] SCHEMA=workspace.mlpabaf0ca5 PREFIX=mlpabaf0ca5
+[agent:bash] databricks current-user me 2>&1 | head -20; databricks warehouses list 2>&1 | head -10
+[agent:result] {
+[agent:result]   "active": true,
+[agent:result]   "emails": [
+[agent:result]     {
+[agent:result]       "primary": true,
+[agent:result]       "type": "work",
+[agent:result]       "value": "benedict@hopsworks.ai"
+[agent:result]     }
+[agent:result]   ],
+[agent:result]   "entitlements": [
+[agent:result]     {
+[agent:result]       "value": "allow-cluster-create"
+[agent:result]     },
+[agent:result]     {
+[agent:result]       "value": "allow-instance-pool-create"
+[agent:result]     }
+[agent:result]   ],
+[agent:result]   "groups": [
+[agent:result]     {
+[agent:result]       "$ref": "Groups/83692064545336",
+[agent:result] ID                Name                          Size      State
+[agent:result] 8a93fc195da2ceb1  mlpab-grader                  2X-Small  RUNNING
+[agent:result] a832b544eb7dc3fe  Serverless Starter Warehouse  Small     RUNNING
+[agent] Data is 800 rows with 6 numeric features. Now I'll upload it to a Unity Catalog volume in my run schema and build a table there.
+[agent:bash] cat data/schema.md
+[agent:result] # Schema
+[agent:result] 
+[agent:result] - **training_data.csv**: row_id, f1, f2, f3, f4, f5, f6 (numeric features), label (0/1 — the prediction target)
+[agent:bash] databricks volumes create workspace mlpabaf0ca5 raw MANAGED 2>&1 | head -5; databricks fs cp data/training_data.csv dbfs:/Volumes/workspace/mlpabaf0ca5/raw/training_data.csv 2>&1
+[agent:result] {
+[agent:result]   "catalog_name": "workspace",
+[agent:result]   "created_at": 1783109082709,
+[agent:result]   "created_by": "benedict@hopsworks.ai",
+[agent:result]   "encryption_details": {},
+[agent:result] data/training_data.csv -> dbfs:/Volumes/workspace/mlpabaf0ca5/raw/training_data.csv
+[agent:bash] databricks api post /api/2.0/sql/statements --json '{
+[agent:bash]   "warehouse_id": "a832b544eb7dc3fe",
+[agent:bash]   "wait_timeout": "50s",
+[agent:bash]   "statement": "CREATE OR REPLACE TABLE workspace.mlpabaf0ca5.training_data AS SELECT * FROM read_files(\"/Volumes/workspace/mlpabaf0ca5/raw/training_data.csv\", format => \"csv\", header => true)"
+[agent:bash] }' 2>&1 | grep -E '"state"|error_message'
+[agent:result]     "state": "SUCCEEDED"
+[agent:bash] databricks api post /api/2.0/sql/statements --json '{
+[agent:bash]   "warehouse_id": "a832b544eb7dc3fe",
+[agent:bash]   "wait_timeout": "50s",
+[agent:bash]   "statement": "SELECT corr(f1,label) c1, corr(f2,label) c2, corr(f3,label) c3, corr(f4,label) c4, corr(f5,label) c5, corr(f6,label) c6, avg(label) pos_rate, count(*) n FROM workspace.mlpabaf0ca5.training_data"
+[agent:bash] }' 2>&1 | grep -A40 '"data_array"'
+[agent:result]     "data_array": [
+[agent:result]       [
+[agent:result]         "0.01971049389738703",
+[agent:result]         "0.11088616580556163",
+[agent:result]         "0.01061130184028329",
+[agent:result]         "0.9927813832042883",
+[agent:result]         "0.07659393085909644",
+[agent:result]         "-0.002109735923584718",
+[agent:result]         "0.35875",
+[agent:result]         "800"
+[agent:result]       ]
+[agent:result]     ],
+[agent:result]     "row_count": 1,
+[agent:result]     "row_offset": 0
+[agent:result]   },
+[agent:result]   "statement_id": "01f1771a-7f51-15d9-87ec-138ab0bfbb6b",
+[agent:result]   "status": {
+[agent:result]     "state": "SUCCEEDED"
+[agent:result]   }
+[agent:result] }
+[agent:bash] databricks api post /api/2.0/sql/statements --json '{
+[agent:bash]   "warehouse_id": "a832b544eb7dc3fe",
+[agent:bash]   "wait_timeout": "50s",
+[agent:bash]   "statement": "WITH r AS (SELECT label, rank() OVER (ORDER BY f4) rk FROM workspace.mlpabaf0ca5.training_data), agg AS (SELECT sum(CASE WHEN label=1 THEN rk END) sp, sum(label) np, count(*) n FROM r) SELECT (sp - np*(np+1)/2) / (np*(n-np)) AS auc_f4, np, n FROM agg"
+[agent:bash] }' 2>&1 | grep -A12 '"data_array"'
+[agent:result]     "data_array": [
+[agent:result]       [
+[agent:result]         "1.0",
+[agent:result]         "287",
+[agent:result]         "800"
+[agent:result]       ]
+[agent:result]     ],
+[agent:result]     "row_count": 1,
+[agent:result]     "row_offset": 0
+[agent:result]   },
+[agent:result]   "statement_id": "01f1771a-8670-1abd-84ce-b08bea34c2f3",
+[agent:result]   "status": {
+[agent:result]     "state": "SUCCEEDED"
+[agent:write] /Users/wolffbe/workspace/banter/testbed/results/24_db-full-cli-sdk-fable/claude-fable-5/databricks/cli/1.3.0/no-skills/feature/leakage/1/task/submission/answers.json
+[agent:result] File created successfully at: /Users/wolffbe/workspace/banter/testbed/results/24_db-full-cli-sdk-fable/claude-fable-5/databricks/cli/1.3.0/no-skills/feature/leakage/1/task/submission/answers.json (file state is current in your context — no need to Read it back)
+[agent] The leaking feature is **f4**, and the answer is written to `submission/answers.json`.
+[agent] How I found it, entirely on the platform:
+[agent] 1. Uploaded `data/training_data.csv` to a Unity Catalog volume (`workspace.mlpabaf0ca5.raw`) and created the Delta table `workspace.mlpabaf0ca5.training_data` from it via the SQL warehouse.
+[agent] 2. Computed each feature's Pearson correlation with the label in SQL: f1=0.020, f2=0.111, f3=0.011, **f4=0.993**, f5=0.077, f6=−0.002.
+[agent] 3. Confirmed with a rank-sum AUC in SQL: f4 alone gives **AUC = 1.0** — a single threshold on f4 classifies all 800 rows (287 positives) perfectly, which is only possible if it was derived from post-outcome data.
+[agent] done: 9 turns, $1.1648, stop=end_turn
+Requirement already satisfied: databricks-sdk==0.117.0 in ./venv/lib/python3.13/site-packages (0.117.0)
+Requirement already satisfied: requests<3,>=2.28.1 in ./venv/lib/python3.13/site-packages (from databricks-sdk==0.117.0) (2.34.2)
+Requirement already satisfied: google-auth~=2.0 in ./venv/lib/python3.13/site-packages (from databricks-sdk==0.117.0) (2.55.1)
+Requirement already satisfied: protobuf!=5.26.*,!=5.27.*,!=5.28.*,!=5.29.0,!=5.29.1,!=5.29.2,!=5.29.3,!=5.29.4,!=6.30.0,!=6.30.1,!=6.31.0,<7.0,>=4.25.8 in ./venv/lib/python3.13/site-packages (from databricks-sdk==0.117.0) (4.25.9)
+Requirement already satisfied: urllib3<3,>=1.26 in ./venv/lib/python3.13/site-packages (from databricks-sdk==0.117.0) (2.7.0)
+Requirement already satisfied: pyasn1-modules>=0.2.1 in ./venv/lib/python3.13/site-packages (from google-auth~=2.0->databricks-sdk==0.117.0) (0.4.2)
+Requirement already satisfied: cryptography>=38.0.3 in ./venv/lib/python3.13/site-packages (from google-auth~=2.0->databricks-sdk==0.117.0) (49.0.0)
+Requirement already satisfied: charset_normalizer<4,>=2 in ./venv/lib/python3.13/site-packages (from requests<3,>=2.28.1->databricks-sdk==0.117.0) (3.4.7)
+Requirement already satisfied: idna<4,>=2.5 in ./venv/lib/python3.13/site-packages (from requests<3,>=2.28.1->databricks-sdk==0.117.0) (3.18)
+Requirement already satisfied: certifi>=2023.5.7 in ./venv/lib/python3.13/site-packages (from requests<3,>=2.28.1->databricks-sdk==0.117.0) (2026.5.20)
+Requirement already satisfied: cffi>=2.0.0 in ./venv/lib/python3.13/site-packages (from cryptography>=38.0.3->google-auth~=2.0->databricks-sdk==0.117.0) (2.0.0)
+Requirement already satisfied: pycparser in ./venv/lib/python3.13/site-packages (from cffi>=2.0.0->cryptography>=38.0.3->google-auth~=2.0->databricks-sdk==0.117.0) (3.0)
+Requirement already satisfied: pyasn1<0.7.0,>=0.6.1 in ./venv/lib/python3.13/site-packages (from pyasn1-modules>=0.2.1->google-auth~=2.0->databricks-sdk==0.117.0) (0.6.3)
+[mlpab] graded: 2 passed / 0 failed / 0 skipped of 2 asserts
