@@ -94,5 +94,122 @@ class UsdCostTests(unittest.TestCase):
         self.assertAlmostEqual(u["cost_usd"], 0.42)  # Claude-engine reported cost preserved
 
 
+class CacheInclusiveCostTests(unittest.TestCase):
+    """Cache-EXCLUSIVE usage reports (Claude) are billed cache inclusively:
+    writes at 2x (1h) / 1.25x (5m) of the base input rate, reads at 0.1x,
+    untiered writes at the 1h rate."""
+
+    PRICE = {"input": 5.0, "output": 25.0}  # USD per 1M tokens
+
+    def test_usd_cost_cached_arithmetic(self):
+        c = results.usd_cost_cached(
+            "any-model",
+            input_tokens=1_000_000,
+            output_tokens=1_000_000,
+            cache_read_tokens=10_000_000,
+            cache_write_5m_tokens=1_000_000,
+            cache_write_1h_tokens=2_000_000,
+            price=self.PRICE,
+        )
+        # 5 (in) + 20 (1h writes) + 6.25 (5m writes) + 5 (reads) + 25 (out)
+        self.assertAlmostEqual(c, 61.25)
+
+    def test_usd_cost_cached_unknown_model_is_none(self):
+        self.assertIsNone(
+            results.usd_cost_cached("totally-unknown-xyz", 100, 100, 100, 0, 0)
+        )
+
+    def _write_transcript(self, usage, total_cost_usd=0.0):
+        t = Path(tempfile.mkdtemp()) / "transcript.jsonl"
+        t.write_text(
+            json.dumps(
+                {
+                    "type": "result",
+                    "usage": usage,
+                    "num_turns": 1,
+                    "total_cost_usd": total_cost_usd,
+                }
+            )
+            + "\n"
+        )
+        return t
+
+    def test_parse_transcript_prices_claude_cache_fields(self):
+        t = self._write_transcript(
+            {
+                "input_tokens": 1_000_000,
+                "output_tokens": 0,
+                "cache_read_input_tokens": 10_000_000,
+                "cache_creation_input_tokens": 3_000_000,
+                "cache_creation": {
+                    "ephemeral_1h_input_tokens": 2_000_000,
+                    "ephemeral_5m_input_tokens": 1_000_000,
+                },
+            }
+        )
+        u = results.parse_transcript_usage(t, model="whatever", price=self.PRICE)
+        # 5 (in) + 20 (1h writes) + 6.25 (5m writes) + 5 (reads)
+        self.assertAlmostEqual(u["cost_usd"], 36.25)
+        # token columns stay cache exclusive
+        self.assertEqual(u["input_tokens"], 1_000_000)
+        self.assertEqual(u["total_tokens"], 1_000_000)
+
+    def test_parse_transcript_bills_untiered_writes_at_1h_rate(self):
+        t = self._write_transcript(
+            {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cache_creation_input_tokens": 1_000_000,  # no tier breakdown
+            }
+        )
+        u = results.parse_transcript_usage(t, model="whatever", price=self.PRICE)
+        self.assertAlmostEqual(u["cost_usd"], 10.0)  # 1M * 5/M * 2x
+
+    def test_parse_transcript_prefers_session_files_with_sidechains(self):
+        home = Path(tempfile.mkdtemp())
+        t = self._write_transcript({"input_tokens": 100, "output_tokens": 100})
+        sess = home / ".claude" / "projects" / "p"
+        sess.mkdir(parents=True)
+        entry = {
+            "type": "assistant",
+            "message": {
+                "id": "msg_1",
+                "usage": {"input_tokens": 1_000_000, "output_tokens": 1_000_000},
+            },
+        }
+        sidechain = {
+            "type": "assistant",
+            "message": {
+                "id": "msg_2",
+                "usage": {"input_tokens": 0, "output_tokens": 1_000_000},
+            },
+        }
+        # msg_1 twice (one entry per content block) → deduplicated by id
+        (sess / "s.jsonl").write_text(
+            "\n".join(json.dumps(e) for e in (entry, entry, sidechain)) + "\n"
+        )
+        u = results.parse_transcript_usage(
+            t,
+            model="whatever",
+            price=self.PRICE,
+            session_dir=home / ".claude" / "projects",
+        )
+        self.assertAlmostEqual(u["cost_usd"], 5.0 + 2 * 25.0)  # 1M in + 2M out
+        # token columns still come from the stream-json transcript
+        self.assertEqual(u["input_tokens"], 100)
+
+    def test_parse_transcript_empty_session_dir_falls_through(self):
+        home = Path(tempfile.mkdtemp())
+        (home / ".claude" / "projects").mkdir(parents=True)
+        t = self._write_transcript({"input_tokens": 1_000_000, "output_tokens": 1_000_000})
+        u = results.parse_transcript_usage(
+            t,
+            model="whatever",
+            price=self.PRICE,
+            session_dir=home / ".claude" / "projects",
+        )
+        self.assertAlmostEqual(u["cost_usd"], 30.0)  # plain in+out pricing
+
+
 if __name__ == "__main__":
     unittest.main()

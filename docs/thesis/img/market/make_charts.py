@@ -37,8 +37,8 @@ groups = {
     'CLI': ['feature 2', 'training 2', 'inference 2', 'ops 2'],
     'MCP': ['feature 3', 'training 3', 'inference 3', 'ops 3',
             'model context protocol server hosting'],
-    'Platform agent': ['feature 4', 'training 4', 'inference 4', 'ops 4',
-                       'PySpark code', 'file system', 'dashboards'],
+    'ML platform agents': ['feature 4', 'training 4', 'inference 4', 'ops 4',
+                   'PySpark code', 'file system', 'dashboards'],
 }
 MAX = 20.0
 for g, cols in groups.items():
@@ -58,7 +58,8 @@ df['hq'] = df['HQ'].replace({'Sweden': 'SE', 'Switzerland': 'CH'})
 MATRIX = [('active', 'Active', 'dot'),
           ('hq', 'Headquarters', 'text'),
           ('public SaaS', 'Public SaaS', 'dot'),
-          ('agent hosting (agentic AI)', 'Agent hosting', 'dot'),
+          ('own-agent infrastructure', 'Agent deployments', 'dot'),
+          ('meta harness', 'Meta harness', 'dot'),
           ('model context protocol server hosting', 'MCP server hosting', 'dot'),
           ('skills', 'Skills', 'dot')]
 # dot count breaks ties between equal bar totals
@@ -66,7 +67,7 @@ df['dots'] = sum((df[col].map(pts_url) > 0).astype(int)
                  for col, _, kind in MATRIX if kind == 'dot')
 
 colors = {'Python SDK': '#4477AA', 'CLI': '#66CCEE',
-          'MCP': '#EE6677', 'Platform agent': '#CCBB44'}
+          'MCP': '#EE6677', 'ML platform agents': '#CCBB44'}
 
 plt.rcParams.update({
     'pdf.fonttype': 42,
@@ -176,8 +177,10 @@ def coverage_chart_t(d, fname):
     ax.grid(True, axis='y', color='#E6E6E6', linewidth=0.6)
     ax.set_xticks(x); ax.set_xticklabels([])
     ax.tick_params(axis='x', length=0)
-    ax.legend(loc='upper right', bbox_to_anchor=(1.0, 1.0),
-              borderaxespad=0.1, frameon=False, fontsize=7.5)
+    # legend above the axes so it cannot collide with the bar total labels
+    ax.legend(loc='lower center', bbox_to_anchor=(0.5, 1.01), ncol=2,
+              borderaxespad=0.1, frameon=False, fontsize=7.5,
+              columnspacing=1.4, handlelength=1.4)
     # fact matrix below, criteria as rows sharing the platform columns
     ym = np.arange(len(MATRIX))[::-1]
     for r, (col, _, kind) in zip(ym, MATRIX):
@@ -222,9 +225,10 @@ ifrows = {'Python SDK': dict(zip(STAGES, groups['Python SDK'])),
           'MCP tools': dict(zip(STAGES, ['feature 3', 'training 3',
                                          'inference 3', 'ops 3'])),
           'MCP server hosting': {None: 'model context protocol server hosting'},
-          'Platform agent': dict(zip(STAGES, ['feature 4', 'training 4',
-                                              'inference 4', 'ops 4'])),
-          'Agent hosting': {None: 'agent hosting (agentic AI)'},
+          'ML platform agents': dict(zip(STAGES, ['feature 4', 'training 4',
+                                          'inference 4', 'ops 4'])),
+          'Agent deployments': {None: 'own-agent infrastructure'},
+          'Meta harness': {None: 'meta harness'},
           'Skills': {None: 'skills'}}
 N = len(df)
 fig, ax = plt.subplots(figsize=(6.2, 4.8))

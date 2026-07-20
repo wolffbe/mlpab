@@ -1,9 +1,12 @@
 """results.csv writer.
 
-One row per (task, platform, interface, skills, auth) run. Token/cost
-columns come from the stream-json transcript's `result` event (Claude Code's
-`total_cost_usd` + aggregated `usage`); command counts from walking each
-`tool_use` block in the same transcript; the assert tally
+One row per (task, platform, interface, skills, auth) run. Token columns come
+from the stream-json transcript's `result` event (aggregated `usage`). Cost is
+cache inclusive: priced from the retained session files when present (dedup by
+message id, includes subagent sidechains), else from the transcript's cache
+fields, with cache writes and reads billed at the published multipliers of the
+base input rate (see `parse_transcript_usage`). Command counts come from
+walking each `tool_use` block in the same transcript, and the assert tally
 (asserts_passed/asserts_failed/asserts_skipped/total_asserts) from the
 assertion-suite grading report.
 """
@@ -534,6 +537,135 @@ _LITELLM_ALIASES = {
     "mistral-large-3": "mistral/mistral-large-latest",
 }
 
+# Anthropic bills prompt-cache traffic at published multipliers of the base
+# input rate: cache writes at 2x for the one-hour TTL and 1.25x for the
+# five-minute TTL, cache reads at 0.1x. Cache writes without a recorded tier
+# are billed at the one-hour rate — the agent's cache configuration here.
+_CACHE_WRITE_1H_MULT = 2.0
+_CACHE_WRITE_5M_MULT = 1.25
+_CACHE_READ_MULT = 0.1
+
+
+def _litellm_candidates(model: str) -> list[str]:
+    cands = [model, _LITELLM_ALIASES.get(model)]
+    if model.lower().startswith("mistral-"):
+        cands.append("mistral/" + model)
+    return [c for c in cands if c]
+
+
+def _base_rates(model: str | None, price: dict | None = None) -> tuple[float, float] | None:
+    """Base (input, output) USD-per-token rates. A manual per-million-token
+    `price` (treatment yaml `prices:` block) wins when given; otherwise the
+    rates come from litellm's model-cost table. None when neither knows the
+    model."""
+    if price:
+        try:
+            pin = float(price.get("input", 0) or 0)
+            pout = float(price.get("output", 0) or 0)
+        except (AttributeError, TypeError, ValueError):
+            pin = pout = 0.0
+        if pin or pout:
+            return pin / 1_000_000, pout / 1_000_000
+    if not model:
+        return None
+    try:
+        import litellm
+
+        litellm.suppress_debug_info = True
+    except Exception:
+        return None
+    for cand in _litellm_candidates(model):
+        info = litellm.model_cost.get(cand) or {}
+        pin = float(info.get("input_cost_per_token") or 0.0)
+        pout = float(info.get("output_cost_per_token") or 0.0)
+        if pin or pout:
+            return pin, pout
+    return None
+
+
+def usd_cost_cached(
+    model: str | None,
+    input_tokens: int,
+    output_tokens: int,
+    cache_read_tokens: int,
+    cache_write_5m_tokens: int,
+    cache_write_1h_tokens: int,
+    price: dict | None = None,
+) -> float | None:
+    """Cache-inclusive USD cost for cache-EXCLUSIVE usage reports (Claude):
+    `input_tokens` excludes the cache traffic, which is billed separately at
+    the published multipliers of the base input rate. None when neither
+    `price` nor litellm knows the model's base rates — the caller then falls
+    back to plain pricing or the engine-reported cost."""
+    rates = _base_rates(model, price)
+    if rates is None:
+        return None
+    pin, pout = rates
+    return round(
+        int(input_tokens) * pin
+        + int(cache_write_1h_tokens) * pin * _CACHE_WRITE_1H_MULT
+        + int(cache_write_5m_tokens) * pin * _CACHE_WRITE_5M_MULT
+        + int(cache_read_tokens) * pin * _CACHE_READ_MULT
+        + int(output_tokens) * pout,
+        6,
+    )
+
+
+def _cache_fields(usage: dict) -> dict[str, int]:
+    """Cache token counts from a usage record. `w5`/`w1` are the tiered
+    subsets of `creation`; the remainder is an untiered cache write."""
+    cc = usage.get("cache_creation") or {}
+    return {
+        "read": int(usage.get("cache_read_input_tokens") or 0),
+        "creation": int(usage.get("cache_creation_input_tokens") or 0),
+        "w5": int(cc.get("ephemeral_5m_input_tokens") or 0),
+        "w1": int(cc.get("ephemeral_1h_input_tokens") or 0),
+    }
+
+
+def _session_usage(session_dir: Path) -> dict[str, int] | None:
+    """Aggregated usage from the coding agent's retained session files
+    (`.claude/projects/**/*.jsonl`), deduplicated by message id (a session
+    file writes one entry per content block) and covering every model
+    invocation including subagent sidechains, which the stream-json result
+    event omits. None when the directory holds no assistant usage records."""
+    if not session_dir.exists():
+        return None
+    totals = {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "read": 0,
+        "creation": 0,
+        "w5": 0,
+        "w1": 0,
+        "calls": 0,
+    }
+    seen: set[str] = set()
+    for f in sorted(session_dir.rglob("*.jsonl")):
+        try:
+            lines = f.read_text().splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if event.get("type") != "assistant":
+                continue
+            message = event.get("message") or {}
+            mid = message.get("id")
+            if not mid or mid in seen:
+                continue
+            seen.add(mid)
+            usage = message.get("usage") or {}
+            totals["calls"] += 1
+            totals["input_tokens"] += int(usage.get("input_tokens") or 0)
+            totals["output_tokens"] += int(usage.get("output_tokens") or 0)
+            for k, v in _cache_fields(usage).items():
+                totals[k] += v
+    return totals if totals["calls"] else None
+
 
 def usd_cost(
     model: str | None,
@@ -576,18 +708,13 @@ def usd_cost(
             return round((int(input_tokens) * pin + int(output_tokens) * pout) / 1_000_000, 6)
     if not model:
         return None
-    cands = [model, _LITELLM_ALIASES.get(model)]
-    if model.lower().startswith("mistral-"):
-        cands.append("mistral/" + model)
     try:
         import litellm
 
         litellm.suppress_debug_info = True
     except Exception:
         return None
-    for cand in cands:
-        if not cand:
-            continue
+    for cand in _litellm_candidates(model):
         try:
             pin, pout = litellm.cost_per_token(
                 model=cand,
@@ -607,17 +734,31 @@ def usd_cost(
 
 
 def parse_transcript_usage(
-    transcript_path: Path, model: str | None = None, price: dict | None = None
+    transcript_path: Path,
+    model: str | None = None,
+    price: dict | None = None,
+    session_dir: Path | None = None,
 ) -> dict[str, Any]:
     """Token + cost totals from the agent's stream-json transcript.
 
     Tokens come from the final `result` event's aggregated `usage` (fallback:
-    summed per-turn `message.usage`). COST is computed from those tokens via a
-    manual per-million-token `price` (from the treatment yaml) when given, else
-    via litellm (`usd_cost`) so it is uniform across claude/codex/mistral
-    engines; only if neither can price the model do we fall back to the
-    transcript's own `total_cost_usd` (Claude Code reports it; codex/mistral
-    report 0, i.e. cost stays 0).
+    summed per-turn `message.usage`). COST is cache inclusive wherever cache
+    accounting exists, priced from a manual per-million-token `price` (from
+    the treatment yaml) when given, else via litellm's rates, in this order:
+
+      1. the retained session files under `session_dir` (deduplicated by
+         message id, covering subagent sidechains) via `usd_cost_cached`
+      2. the transcript's own cache fields — Claude reports cache tokens
+         SEPARATELY from `input_tokens` — via `usd_cost_cached`
+      3. plain input/output pricing (`usd_cost`), rebilling the cached subset
+         of `input_tokens` at the discounted read rate (codex reports cache
+         reads as a subset of `input_tokens`)
+      4. the transcript's own `total_cost_usd` when nothing above can price
+         the model (Claude Code reports it; codex/mistral report 0, i.e. cost
+         stays 0)
+
+    The recorded token and turn figures stay those of the stream-json
+    transcript; the session files feed only the cost.
     """
     totals = {
         "input_tokens": 0,
@@ -626,15 +767,15 @@ def parse_transcript_usage(
         "cost_usd": 0.0,
         "llm_calls": 0,
     }
-    if not transcript_path.exists():
-        return totals
 
     final_result: dict[str, Any] | None = None
     per_turn_input = 0
     per_turn_output = 0
+    per_turn_cache = {"read": 0, "creation": 0, "w5": 0, "w1": 0}
     turn_count = 0
 
-    for line in transcript_path.read_text().splitlines():
+    lines = transcript_path.read_text().splitlines() if transcript_path.exists() else []
+    for line in lines:
         if not line.strip():
             continue
         try:
@@ -651,8 +792,11 @@ def parse_transcript_usage(
             if usage:
                 per_turn_input += int(usage.get("input_tokens") or 0)
                 per_turn_output += int(usage.get("output_tokens") or 0)
+                for k, v in _cache_fields(usage).items():
+                    per_turn_cache[k] += v
                 turn_count += 1
 
+    cache = per_turn_cache
     if final_result:
         usage = final_result.get("usage") or {}
         totals["input_tokens"] = int(usage.get("input_tokens") or per_turn_input)
@@ -660,24 +804,42 @@ def parse_transcript_usage(
         totals["total_tokens"] = totals["input_tokens"] + totals["output_tokens"]
         totals["cost_usd"] = float(final_result.get("total_cost_usd") or 0.0)
         totals["llm_calls"] = int(final_result.get("num_turns") or turn_count)
+        final_cache = _cache_fields(usage)
+        if any(final_cache.values()):
+            cache = final_cache
     else:
         totals["input_tokens"] = per_turn_input
         totals["output_tokens"] = per_turn_output
         totals["total_tokens"] = per_turn_input + per_turn_output
         totals["llm_calls"] = turn_count
 
-    # Cost via litellm (uniform across engines); keep the transcript's own
-    # total_cost_usd only when litellm can't price the model.
-    # Discount cached input ONLY when input_tokens is cache-inclusive (codex
-    # reports it that way). Claude's input_tokens excludes cache, so its
-    # cache_read (≫ input_tokens) fails the guard and is dropped — leaving
-    # Claude's pricing unchanged.
-    cache_read = 0
-    if final_result:
-        cr = int((final_result.get("usage") or {}).get("cache_read_input_tokens") or 0)
-        if cr <= totals["input_tokens"]:
-            cache_read = cr
-    cost = usd_cost(model, totals["input_tokens"], totals["output_tokens"], cache_read, price)
+    cost = None
+    sess = _session_usage(session_dir) if session_dir else None
+    if sess:
+        untiered = max(sess["creation"] - sess["w5"] - sess["w1"], 0)
+        cost = usd_cost_cached(
+            model,
+            sess["input_tokens"],
+            sess["output_tokens"],
+            sess["read"],
+            sess["w5"],
+            sess["w1"] + untiered,
+            price,
+        )
+    if cost is None and (cache["creation"] > 0 or cache["read"] > totals["input_tokens"]):
+        untiered = max(cache["creation"] - cache["w5"] - cache["w1"], 0)
+        cost = usd_cost_cached(
+            model,
+            totals["input_tokens"],
+            totals["output_tokens"],
+            cache["read"],
+            cache["w5"],
+            cache["w1"] + untiered,
+            price,
+        )
+    if cost is None:
+        cache_read = cache["read"] if cache["read"] <= totals["input_tokens"] else 0
+        cost = usd_cost(model, totals["input_tokens"], totals["output_tokens"], cache_read, price)
     if cost is not None:
         totals["cost_usd"] = cost
     return totals

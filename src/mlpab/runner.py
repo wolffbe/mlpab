@@ -818,7 +818,12 @@ def run(spec: RunSpec) -> results.Row:
         (attempt_dir / "solution" / "grading.json").write_text(json.dumps(grading, indent=2))
 
         usage = results.parse_transcript_usage(
-            cr.transcript_path, model=spec.model, price=spec.price
+            cr.transcript_path,
+            model=spec.model,
+            price=spec.price,
+            # Cache-inclusive cost from the agent's retained session files
+            # (Claude Code layout; absent for the other engines).
+            session_dir=run_dir / ".claude" / "projects",
         )
         # Counting classifies by the ACTIVE interface only: a `hops`/`import
         # hopsworks` call is `cli_calls`/`sdk_calls` ONLY when that interface is

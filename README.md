@@ -1,13 +1,13 @@
-<p align="center">
-  <img src="docs/logo.png" alt="MLPlatformAgentBench" width="420">
-</p>
-
 # MLPlatformAgentBench (MLPAB)
 
 MLPlatformAgentBench is a benchmark for evaluating large language model coding
 agents on machine learning platform tasks. It measures how the interface given
 to the agent, a command-line interface (CLI) or a Python SDK,
 affects how well the agent completes those tasks.
+
+<p align="center">
+  <img src="docs/mlpab.png" alt="MLPAB framework architecture" width="640">
+</p>
 
 ## What it measures
 

@@ -34,6 +34,20 @@ df = raw.sort_values('n').drop_duplicates(
     subset=['config', 'interface', 'skills', 'category', 'task'], keep='last')
 df = df[~df['error'].astype(str).str.contains('grader failed to run', na=False)].copy()
 
+# four tasks are graded from a local answers.json with no platform-state
+# assertion (leakage, skew, drift, prediction_monitoring) — 19 committed runs
+# passed them with zero interface calls, so they measure agent reasoning, not
+# platform operation, and are removed from the analyzed benchmark suite (26->22)
+EXCLUDED_TASKS = {'leakage', 'skew', 'drift', 'prediction_monitoring'}
+df = df[~df.task.isin(EXCLUDED_TASKS)].copy()
+
+# A killed agent does not emit final usage/timing metadata. Such rows remain
+# failed accuracy observations, but their recorded zero turns and local time
+# are placeholders rather than measurements and must not enter efficiency
+# aggregates or paired tests.
+df['timeout'] = df['error'].astype(str).str.contains('agent exited 124', na=False)
+df.loc[df['timeout'], ['llm_calls', 'local_time_s']] = np.nan
+
 # RQ2 scope: the two committed platforms, full grids only
 CFG = {
     'hopsworks': {
@@ -53,7 +67,23 @@ PLATFORMS = ['hopsworks', 'databricks']
 MODEL_ORDER = ['opus', 'mistral-large', 'sonnet', 'mistral-medium']
 df = df[df.config.isin([c for m in CFG.values() for c in m.values()])].copy()
 
+# cost_usd in results.csv is cache inclusive for the Claude rows, priced by
+# the framework from the retained session transcripts; Mistral cache usage was
+# not retained, so Mistral cost stays a lower bound and is excluded from cost
+# inference below
+df['cost_ok'] = df.model.astype(str).str.startswith('claude-')
+
 VARIANTS = [('cli', 'none'), ('cli', 'official'), ('sdk', 'none'), ('sdk', 'official')]
+
+# skills were never delivered to the Mistral agent (bundle discovery-location
+# bug), so Mistral appears only in the no-skills condition in every figure and
+# contrast family; its nominal official rows stay in results.csv as provenance
+def variants_for(m):
+    return [(i, sk) for i, sk in VARIANTS
+            if not (m.startswith('mistral') and sk == 'official')]
+
+def strata_for(m):
+    return ['none'] if m.startswith('mistral') else ['none', 'official']
 VLABEL = {('cli', 'none'): 'CLI no skills', ('cli', 'official'): 'CLI + skills',
           ('sdk', 'none'): 'SDK no skills', ('sdk', 'official'): 'SDK + skills'}
 VCOLOR = {('cli', 'none'): '#90a4ae', ('cli', 'official'): '#455a64',
@@ -110,11 +140,14 @@ w = 0.19
 for plat in PLATFORMS:
     fig, ax = plt.subplots(figsize=(TW, 2.9))
     x = np.arange(len(MODEL_ORDER))
-    for j_, (iface, sk) in enumerate(VARIANTS):
-        vals = [rate(sel(CFG[plat][m], iface, sk)) for m in MODEL_ORDER]
-        bars = ax.bar(x + (j_ - 1.5) * w, vals, w * 0.92, color=VCOLOR[(iface, sk)])
-        for b, h in zip(bars, vals):
+    for xi, m in enumerate(MODEL_ORDER):
+        vs = variants_for(m)
+        for j_, (iface, sk) in enumerate(vs):
+            h = rate(sel(CFG[plat][m], iface, sk))
+            bars = ax.bar(xi + (j_ - (len(vs) - 1) / 2) * w, h, w * 0.92,
+                          color=VCOLOR[(iface, sk)])
             if pd.notna(h):
+                b = bars[0]
                 ax.annotate(f'{h:.0%}', (b.get_x() + b.get_width() / 2, h + 0.01),
                             ha='center', va='bottom', fontsize=5.5, rotation=90,
                             color='#333')
@@ -136,13 +169,14 @@ for cat in CATEGORIES:
     for c, plat in enumerate(PLATFORMS):
         ax = axes[c]
         x = np.arange(len(MODEL_ORDER))
-        for j_, (iface, sk) in enumerate(VARIANTS):
-            vals = [rate(sel(CFG[plat][m], iface, sk, category=cat))
-                    for m in MODEL_ORDER]
-            bars = ax.bar(x + (j_ - 1.5) * w, vals, w * 0.92,
-                          color=VCOLOR[(iface, sk)])
-            for b, h in zip(bars, vals):
+        for xi, m in enumerate(MODEL_ORDER):
+            vs = variants_for(m)
+            for j_, (iface, sk) in enumerate(vs):
+                h = rate(sel(CFG[plat][m], iface, sk, category=cat))
+                bars = ax.bar(xi + (j_ - (len(vs) - 1) / 2) * w, h, w * 0.92,
+                              color=VCOLOR[(iface, sk)])
                 if pd.notna(h):
+                    b = bars[0]
                     ax.annotate(f'{h:.0%}',
                                 (b.get_x() + b.get_width() / 2, h + 0.02),
                                 ha='center', va='bottom', fontsize=4.2,
@@ -170,7 +204,7 @@ tcmap = mpl.colormaps['Blues'].copy()
 tcmap.set_bad('#eeeeee')
 for plat in PLATFORMS:
     for iface in ['cli', 'sdk']:
-        cols = [(m, sk) for m in MODEL_ORDER for sk in ['none', 'official']]
+        cols = [(m, sk) for m in MODEL_ORDER for sk in strata_for(m)]
         M = np.full((len(TASK_ORDER), len(cols)), np.nan)
         for i, (cat, t) in enumerate(TASK_ORDER):
             for k, (m, sk) in enumerate(cols):
@@ -182,8 +216,9 @@ for plat in PLATFORMS:
         ax.set_xticks(np.arange(len(cols)))
         ax.set_xticklabels(['+sk' if sk == 'official' else '–' for _, sk in cols],
                            fontsize=6)
-        for g, m in enumerate(MODEL_ORDER):
-            ax.text(2 * g + 0.5, -0.03, m.replace('mistral-', 'mistral-\n'),
+        for m in MODEL_ORDER:
+            ks = [k for k, (m_, _) in enumerate(cols) if m_ == m]
+            ax.text(sum(ks) / len(ks), -0.03, m.replace('mistral-', 'mistral-\n'),
                     ha='center', va='top', fontsize=6.5,
                     transform=ax.get_xaxis_transform(), color='#333')
         ax.set_yticks(np.arange(len(TASK_ORDER)))
@@ -194,19 +229,20 @@ for plat in PLATFORMS:
                     ax.text(k, i, f'{M[i, k] * 100:.0f}', ha='center', va='center',
                             fontsize=5.5,
                             color='white' if M[i, k] > 0.55 else '#222')
-        for xg in range(2, len(cols), 2):
-            ax.axvline(xg - 0.5, color='white', lw=1.6)
+        for k in range(1, len(cols)):
+            if cols[k][0] != cols[k - 1][0]:
+                ax.axvline(k - 0.5, color='white', lw=1.6)
         start = 0
         for cat in CATEGORIES:
             n_ = sum(1 for c_, _ in TASK_ORDER if c_ == cat)
             if start > 0:
                 ax.axhline(start - 0.5, color='white', lw=1.6)
-            ax.text(-0.5, (2 * start + n_ - 1) / 2, cat, rotation=90, ha='right',
+            ax.text(-0.2, (2 * start + n_ - 1) / 2, cat, rotation=90, ha='right',
                     va='center', fontsize=7, fontweight='bold',
                     transform=ax.get_yaxis_transform(), color='#444')
             start += n_
         ax.tick_params(length=0)
-        ax.set_xlabel('\u2013 = no skills    +sk = official skills', fontsize=6.5)
+        # the skill-condition key (\u2013 / +sk) is explained in the figure captions
         cb = fig.colorbar(im, ax=ax, fraction=0.03, pad=0.02)
         cb.ax.yaxis.set_major_formatter(PercentFormatter(1.0))
         cb.ax.tick_params(labelsize=6)
@@ -217,16 +253,17 @@ for plat in PLATFORMS:
 fr_rows = []
 for plat in PLATFORMS:
     for m in MODEL_ORDER:
-        for iface, sk in VARIANTS:
+        for iface, sk in variants_for(m):
             s = sel(CFG[plat][m], iface, sk)
             if len(s) == 0:
                 continue
             solved = int(s.success.sum())
+            turn_total = s.llm_calls.sum(min_count=len(s))
             fr_rows.append({
                 'platform': plat, 'model': m, 'interface': iface, 'skills': sk,
                 'solve_rate': solved / len(s),
                 'cost_per_solve': s.cost_usd.sum() / solved if solved else np.nan,
-                'turns_per_solve': s.llm_calls.sum() / solved if solved else np.nan,
+                'turns_per_solve': turn_total / solved if solved else np.nan,
             })
 frontier = pd.DataFrame(fr_rows)
 
@@ -252,7 +289,7 @@ fhandles = ([Line2D([], [], ls='', marker='s', color=MCOLOR[m], label=m)
                     label='+ skills (filled)'),
              Line2D([], [], ls='', marker='o', mfc='white', mec='#555',
                     label='no skills (open)')])
-for xcol, xlabel, tag in [('cost_per_solve', 'cost per solved task (USD, log)', 'cost'),
+for xcol, xlabel, tag in [('cost_per_solve', 'model invocation cost per solved task (USD, log)', 'cost'),
                           ('turns_per_solve', 'LLM turns per solved task (log)', 'turns')]:
     fig, axes = plt.subplots(1, 2, figsize=(TW, 3.2))
     for c_, plat in enumerate(PLATFORMS):
@@ -302,7 +339,7 @@ def holm(ps):
 
 
 df['pr0'] = df.pass_rate.where(df.valid, 0.0)
-METRICS = [('pr0', 'pass fraction'), ('cost_usd', 'cost'), ('llm_calls', 'turns')]
+METRICS = [('pr0', 'pass fraction'), ('cost_usd', 'model cost'), ('llm_calls', 'turns')]
 PSHORT = {'hopsworks': 'hw', 'databricks': 'db'}
 
 from itertools import combinations
@@ -318,13 +355,19 @@ SKL = {'none': '-', 'official': '+sk'}
 families = {}
 families['Interface (SDK vs CLI)'] = [
     (f'{PSH[p]} {m} {SKL[sk]}', cellf(p, m, 'cli', sk), cellf(p, m, 'sdk', sk))
-    for p in PLATFORMS for m in MODEL_ORDER for sk in ['none', 'official']]
+    for p in PLATFORMS for m in MODEL_ORDER for sk in strata_for(m)]
+# skills bundles were installed under .claude/skills/, which the Mistral Vibe
+# agent never reads (session logs list no platform skill, 0 skill calls in all
+# 208 mistral official rows) — the official condition was a no-op for Mistral,
+# so the skills family is restricted to the Claude cells where the treatment
+# was actually delivered
 families['Skills (official vs none)'] = [
     (f'{PSH[p]} {m} {i}', cellf(p, m, i, 'none'), cellf(p, m, i, 'official'))
-    for p in PLATFORMS for m in MODEL_ORDER for i in ['cli', 'sdk']]
+    for p in PLATFORMS for m in MODEL_ORDER for i in ['cli', 'sdk']
+    if not m.startswith('mistral')]
 families['Platform (Databricks vs Hopsworks)'] = [
     (f'{m} {i} {SKL[sk]}', cellf('hopsworks', m, i, sk), cellf('databricks', m, i, sk))
-    for m in MODEL_ORDER for i in ['cli', 'sdk'] for sk in ['none', 'official']]
+    for m in MODEL_ORDER for i in ['cli', 'sdk'] for sk in strata_for(m)]
 
 def wtest2(a, b, col):
     common = a.index.intersection(b.index)
@@ -340,14 +383,69 @@ def wtest2(a, b, col):
     rb = (r[nz > 0].sum() - r[nz < 0].sum()) / r.sum()
     return float(p), float(rb)
 
-def draw_family(ax, contrasts):
-    res = {}
+def cost_eligible(a, b):
+    return bool(a['cost_ok'].all() and b['cost_ok'].all())
+
+
+def mcnemar_success(a, b):
+    common = a.index.intersection(b.index)
+    x = a.loc[common, 'success'].astype(bool)
+    y = b.loc[common, 'success'].astype(bool)
+    n01 = int((~x & y).sum())
+    n10 = int((x & ~y).sum())
+    if n01 + n10 == 0:
+        return 1.0, n01, n10, len(common)
+    p = sps.binomtest(min(n01, n10), n01 + n10, 0.5).pvalue
+    return float(min(1.0, p)), n01, n10, len(common)
+
+
+def paired_counts(a, b, col):
+    common = a.index.intersection(b.index)
+    x = a.loc[common, col].astype(float)
+    y = b.loc[common, col].astype(float)
+    ok = x.notna() & y.notna()
+    d = y[ok] - x[ok]
+    return int(ok.sum()), int((d != 0).sum())
+
+
+def family_results(contrasts):
+    """Adjust every inferential test in one manipulated-factor family."""
+    tested = {}
+    keys, ps = [], []
     for col, _ in METRICS:
-        tested = [wtest2(a, b, col) for _, a, b in contrasts]
-        res[col] = list(zip([t[1] for t in tested], holm([t[0] for t in tested])))
+        rows = []
+        for i, (_, a, b) in enumerate(contrasts):
+            result = (None if col == 'cost_usd' and not cost_eligible(a, b)
+                      else wtest2(a, b, col))
+            rows.append(result)
+            if result is not None:
+                keys.append((col, i))
+                ps.append(result[0])
+        tested[col] = rows
+    mcnemar = [mcnemar_success(a, b) for _, a, b in contrasts]
+    for i, result in enumerate(mcnemar):
+        keys.append(('success', i))
+        ps.append(result[0])
+    adjusted = dict(zip(keys, holm(ps)))
+    result = {
+        col: [(entry[1], adjusted[(col, i)]) if entry is not None else None
+              for i, entry in enumerate(rows)]
+        for col, rows in tested.items()
+    }
+    result['success'] = [(*entry[1:], adjusted[('success', i)])
+                         for i, entry in enumerate(mcnemar)]
+    result['tests'] = len(ps)
+    return result
+
+
+def draw_family(ax, contrasts):
+    res = family_results(contrasts)
     y = np.arange(len(contrasts))[::-1]
     for col, _ in METRICS:
-        for yi, (rb, padj) in zip(y, res[col]):
+        for yi, entry in zip(y, res[col]):
+            if entry is None:
+                continue
+            rb, padj = entry
             filled = padj < 0.05
             ax.scatter(rb, yi + SOFF[col], s=16, marker='o', zorder=3,
                        facecolor=SCOLOR[col] if filled else 'white',
@@ -360,7 +458,7 @@ def draw_family(ax, contrasts):
     ax.grid(axis='x')
     ax.grid(axis='y', linewidth=0.3)
 
-METRICS = [('pr0', 'pass fraction'), ('cost_usd', 'cost'), ('llm_calls', 'turns'),
+METRICS = [('pr0', 'pass fraction'), ('cost_usd', 'model cost'), ('llm_calls', 'turns'),
            ('local_time_s', 'time')]
 SCOLOR = {'pr0': '#1565c0', 'cost_usd': '#ef6c00', 'llm_calls': '#00897b',
           'local_time_s': '#8e24aa'}
@@ -373,9 +471,8 @@ for fam, contrasts in families.items():
     fig, ax = plt.subplots(figsize=(TW, 0.165 * len(contrasts) + 1.55))
     draw_family(ax, contrasts)
     ax.set_title(fam, loc='left', fontsize=8, fontweight='bold')
-    ax.set_xlabel('rank-biserial correlation of the paired differences\n'
-                  '(positive = higher for the condition named first in the title, '
-                  '+sk = official skills)')
+    # the reading direction and the +sk key are explained in the figure captions
+    ax.set_xlabel('rank-biserial correlation of the paired differences')
     shandles = ([Line2D([], [], ls='', marker='o', mfc=SCOLOR[c], mec=SCOLOR[c],
                         ms=5, label=lab) for c, lab in METRICS] +
                 [Line2D([], [], ls='', marker='o', mfc='#555', mec='#555', ms=5,
@@ -389,16 +486,19 @@ for fam, contrasts in families.items():
     save(fig, f'benchmark_stats_{FTAG[fam]}')
 
 # fig: model family — pairwise model contrasts within platform x interface x skills
+# Mistral has no official-condition cells (skills never delivered), so pairs at
+# the official condition exist only between the Claude models
 model_contrasts = [
     (f'{PSH[p]} {i} {SKL[sk]} {m2} vs {m1}', cellf(p, m1, i, sk), cellf(p, m2, i, sk))
     for p in PLATFORMS for i in ['cli', 'sdk'] for sk in ['none', 'official']
-    for m1, m2 in combinations(MODEL_ORDER, 2)]
-fig, ax = plt.subplots(figsize=(TW, 9.2))
+    for m1, m2 in combinations(MODEL_ORDER, 2)
+    if not (sk == 'official'
+            and (m1.startswith('mistral') or m2.startswith('mistral')))]
+fig, ax = plt.subplots(figsize=(TW, 0.165 * len(model_contrasts) + 1.7))
 draw_family(ax, model_contrasts)
 ax.set_title('Model (second named vs first named)', loc='left', fontsize=8,
              fontweight='bold')
-ax.set_xlabel('rank-biserial correlation of the paired differences\n'
-              '(positive = higher for the model named second, +sk = official skills)')
+ax.set_xlabel('rank-biserial correlation of the paired differences')
 fig.legend(handles=shandles, loc='lower center', ncol=3, frameon=False,
            fontsize=6, bbox_to_anchor=(0.5, -0.005), columnspacing=0.9,
            handletextpad=0.4)
@@ -406,19 +506,8 @@ fig.tight_layout(rect=(0, 0.035, 1, 1))
 save(fig, 'benchmark_stats_models')
 
 
-# authoritative stats report: Wilcoxon (auto method), McNemar on success,
+# authoritative stats report: Wilcoxon (normal approximation), McNemar on success,
 # paired t with Cohen's d as sensitivity — all reported numbers derive from here
-def mcnemar_success(a, b):
-    common = a.index.intersection(b.index)
-    x = a.loc[common, 'success'].astype(bool)
-    y = b.loc[common, 'success'].astype(bool)
-    n01 = int((~x & y).sum())
-    n10 = int((x & ~y).sum())
-    if n01 + n10 == 0:
-        return 1.0, n01, n10
-    return float(min(1.0, sps.binomtest(min(n01, n10), n01 + n10, 0.5).pvalue)), n01, n10
-
-
 def ttest_d(a, b, col):
     common = a.index.intersection(b.index)
     x = a.loc[common, col].astype(float)
@@ -435,25 +524,37 @@ allfam = dict(families)
 allfam['Model (pairwise)'] = model_contrasts
 with open(OUT / 'stats_report.txt', 'w') as fh:
     for fam, contrasts in allfam.items():
-        fh.write(f'==== {fam} ({len(contrasts)} contrasts)\n')
+        fres = family_results(contrasts)
+        fh.write(f'==== {fam} ({len(contrasts)} contrasts, '
+                 f'{fres["tests"]} tests in one factor-wide Holm family)\n')
         for col, lab in METRICS:
-            res = [wtest2(a, b, col) for _, a, b in contrasts]
-            adj = holm([r[0] for r in res])
-            tt = [ttest_d(a, b, col) for _, a, b in contrasts]
-            agree = sum(1 for (wp, rb), (tp, d) in zip(res, tt)
-                        if (rb >= 0) == (d >= 0) or rb == 0)
-            nsig = sum(1 for a_ in adj if a_ < 0.05)
-            fh.write(f'-- {lab}: wilcoxon {nsig}/{len(contrasts)} sig after Holm; '
-                     f't-test direction agreement {agree}/{len(contrasts)}\n')
-            for (name, _, _), (wp, rb), a_, (tp, d) in zip(contrasts, res, adj, tt):
-                mark = '*' if a_ < 0.05 else ' '
-                fh.write(f'   {name:34s} rb={rb:+.2f} holm={a_:.4f}{mark} t_p={tp:.4f} d={d:+.2f}\n')
-        mres = [mcnemar_success(a, b) for _, a, b in contrasts]
-        madj = holm([r[0] for r in mres])
-        nsig = sum(1 for a_ in madj if a_ < 0.05)
-        fh.write(f'-- mcnemar on success: {nsig}/{len(contrasts)} sig after Holm\n')
-        for (name, _, _), (mp, n01, n10), a_ in zip(contrasts, mres, madj):
-            if a_ < 0.05:
-                fh.write(f'   {name:34s} n01={n01} n10={n10} holm={a_:.4f}*\n')
+            elig = [not (col == 'cost_usd' and not cost_eligible(a, b))
+                    for _, a, b in contrasts]
+            res = [wtest2(a, b, col) if e else None
+                   for (_, a, b), e in zip(contrasts, elig)]
+            idx = [i for i, r_ in enumerate(res) if r_ is not None]
+            padjs = {i: fres[col][i][1] for i in idx}
+            tt = [ttest_d(a, b, col) if e else None
+                  for (_, a, b), e in zip(contrasts, elig)]
+            agree = sum(1 for r_, t_ in zip(res, tt)
+                        if r_ and t_ and ((r_[1] >= 0) == (t_[1] >= 0) or r_[1] == 0))
+            nsig = sum(1 for i in idx if padjs[i] < 0.05)
+            fh.write(f'-- {lab}: wilcoxon {nsig}/{len(idx)} sig after factor-wide Holm '
+                     f'({len(contrasts) - len(idx)} excluded, Mistral cost unreliable); '
+                     f't-test direction agreement {agree}/{len(idx)}\n')
+            for i, (name, a, b) in enumerate(contrasts):
+                if res[i] is None:
+                    fh.write(f'   {name:34s} excluded (Mistral cost not reliable)\n')
+                    continue
+                n, nz = paired_counts(a, b, col)
+                mark = '*' if padjs[i] < 0.05 else ' '
+                fh.write(f'   {name:34s} rb={res[i][1]:+.2f} holm={padjs[i]:.4f}{mark} '
+                         f'n={n} nz={nz} t_p={tt[i][0]:.4f} d={tt[i][1]:+.2f}\n')
+        sres = fres['success']
+        nsig = sum(1 for _, _, _, a_ in sres if a_ < 0.05)
+        fh.write(f'-- mcnemar on success: {nsig}/{len(contrasts)} sig after factor-wide Holm\n')
+        for (name, _, _), (n01, n10, n, a_) in zip(contrasts, sres):
+            mark = ' *' if a_ < 0.05 else ''
+            fh.write(f'   {name:34s} n={n} n01={n01} n10={n10} holm={a_:.4f}{mark}\n')
 print('stats report written')
 print('stats chart generated')

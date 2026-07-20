@@ -28,7 +28,17 @@ raw['pass_rate'] = raw['asserts_passed'] / raw['total_asserts']
 df = raw.sort_values('n').drop_duplicates(
     subset=['config', 'interface', 'skills', 'category', 'task'], keep='last')
 df = df[~df['error'].astype(str).str.contains('grader failed to run', na=False)].copy()
+
+# four tasks are graded from a local answers.json with no platform-state
+# assertion (leakage, skew, drift, prediction_monitoring) — 19 committed runs
+# passed them with zero interface calls, so they measure agent reasoning, not
+# platform operation, and are removed from the analyzed benchmark suite (26->22)
+EXCLUDED_TASKS = {'leakage', 'skew', 'drift', 'prediction_monitoring'}
+df = df[~df.task.isin(EXCLUDED_TASKS)].copy()
 df['pr0'] = df.pass_rate.where(df.valid, 0.0)
+
+# cost_usd in results.csv is cache inclusive for Claude rows, priced by the
+# framework from the retained session transcripts; all rows here are Claude
 
 BASE = '1_hw-full-cli-sdk-skills-opus'
 ARMS = ['opt1-batch', 'opt2-session-reuse', 'opt3-compact-json',
@@ -48,6 +58,7 @@ def sel(cfg, iface=None, sk=None):
 
 
 base_cli = sel(BASE, 'cli', 'none')
+base_cli_official = sel(BASE, 'cli', 'official')
 base_sdk = sel(BASE, 'sdk', 'none')
 
 TW = 5.12
@@ -105,7 +116,7 @@ save(fig, 'optimizations_pass')
 
 # fig: efficiency, one figure per metric
 EFF = [('local_time_s', 'local compute time (s)', '{:.0f}', 'time'),
-       ('cost_usd', 'cost (USD)', '{:.2f}', 'cost'),
+       ('cost_usd', 'model invocation cost (USD)', '{:.2f}', 'cost'),
        ('llm_calls', 'LLM turns', '{:.0f}', 'turns')]
 for col, title, fmt, tag in EFF:
     fig, ax = plt.subplots(figsize=(TW, 2.9))
@@ -144,11 +155,12 @@ for col, title, fmt, tag in EFF:
 optsk_frame = sel(OPTSK)
 rows_cli = ([(f'{a}', base_cli, sel(NS_CFG[a])) for a in ARMS] +
             [('optimized skills', base_cli, optsk_frame)] +
+            [('optimized vs official skills', base_cli_official, optsk_frame)] +
             [(f'{a} + skills', optsk_frame, sel(SK_CFG[a])) for a in ARMS])
 rows_sdk = ([(f'{a}', base_sdk, sel(NS_CFG[a])) for a in ARMS] +
             [('optimized skills', base_sdk, optsk_frame)] +
             [(f'{a} + skills', base_sdk, sel(SK_CFG[a])) for a in ARMS])
-METRICS = [('pr0', 'pass fraction'), ('cost_usd', 'cost'),
+METRICS = [('pr0', 'pass fraction'), ('cost_usd', 'model cost'),
            ('llm_calls', 'turns'), ('local_time_s', 'time')]
 SCOLOR = {'pr0': '#1565c0', 'cost_usd': '#ef6c00', 'llm_calls': '#00897b',
           'local_time_s': '#8e24aa'}
@@ -180,19 +192,76 @@ def holm(ps):
         adj[i] = mx
     return adj
 
+
+def mcnemar_success(a, b):
+    ia = a.set_index(['category', 'task'])['success']
+    ib = b.set_index(['category', 'task'])['success']
+    common = ia.index.intersection(ib.index)
+    x, y = ia.loc[common].astype(bool), ib.loc[common].astype(bool)
+    n01 = int((~x & y).sum())
+    n10 = int((x & ~y).sum())
+    if n01 + n10 == 0:
+        return 1.0, n01, n10, len(common)
+    p = sps.binomtest(min(n01, n10), n01 + n10, 0.5).pvalue
+    return float(min(1.0, p)), n01, n10, len(common)
+
+
+def paired_counts(a, b, col):
+    ia = a.set_index(['category', 'task'])[col]
+    ib = b.set_index(['category', 'task'])[col]
+    common = ia.index.intersection(ib.index)
+    x, y = ia.loc[common].astype(float), ib.loc[common].astype(float)
+    ok = x.notna() & y.notna()
+    d = y[ok] - x[ok]
+    return int(ok.sum()), int((d != 0).sum())
+
+
+row_sets = [('cli', 'like for like CLI baseline', rows_cli),
+            ('sdk', 'SDK without skills', rows_sdk)]
+
+# The method defines one optimization family, so all outcomes and both
+# reference baselines share one Holm adjustment. McNemar success tests enter
+# the family even though the figures display the more informative pass fraction.
+raw_tests = {}
+keys, ps = [], []
+for tag, _, rows in row_sets:
+    for col, _ in METRICS:
+        for i, (_, a, b) in enumerate(rows):
+            result = wtest2(a, b, col)
+            raw_tests[(tag, col, i)] = result
+            keys.append((tag, col, i))
+            ps.append(result[0])
+    for i, (_, a, b) in enumerate(rows):
+        result = mcnemar_success(a, b)
+        raw_tests[(tag, 'success', i)] = result
+        keys.append((tag, 'success', i))
+        ps.append(result[0])
+adjusted = dict(zip(keys, holm(ps)))
+
 report = open(OUT / 'stats_report.txt', 'w')
-for rows, refname, tag in [(rows_cli, 'like for like CLI baseline', 'cli'),
-                           (rows_sdk, 'SDK without skills', 'sdk')]:
+report.write(f'Optimization family: {len(rows_cli) + len(rows_sdk)} contrasts, '
+             f'{len(ps)} tests in one factor-wide Holm family\n')
+for tag, refname, rows in row_sets:
     fig, ax = plt.subplots(figsize=(TW, 4.4))
     res = {}
     for col, lab in METRICS:
-        tested = [wtest2(a, b, col) for _, a, b in rows]
-        res[col] = list(zip([t[1] for t in tested], holm([t[0] for t in tested])))
+        res[col] = [(raw_tests[(tag, col, i)][1], adjusted[(tag, col, i)])
+                    for i in range(len(rows))]
         nsig = sum(1 for _, padj in res[col] if padj < 0.05)
-        report.write(f'{tag} {lab}: {nsig}/{len(rows)} sig after Holm\n')
-        for (name, _, _), (rb, padj) in zip(rows, res[col]):
+        report.write(f'{tag} {lab}: {nsig}/{len(rows)} sig after factor-wide Holm\n')
+        for i, ((name, a, b), (rb, padj)) in enumerate(zip(rows, res[col])):
+            n, nz = paired_counts(a, b, col)
             mark = '*' if padj < 0.05 else ' '
-            report.write(f'   {name:30s} rb={rb:+.2f} holm={padj:.4f}{mark}\n')
+            report.write(f'   {name:30s} rb={rb:+.2f} holm={padj:.4f}{mark} '
+                         f'n={n} nz={nz}\n')
+    sres = [(raw_tests[(tag, 'success', i)], adjusted[(tag, 'success', i)])
+            for i in range(len(rows))]
+    nsig = sum(1 for _, padj in sres if padj < 0.05)
+    report.write(f'{tag} success: {nsig}/{len(rows)} sig after factor-wide Holm\n')
+    for (name, _, _), ((_, n01, n10, n), padj) in zip(rows, sres):
+        mark = ' *' if padj < 0.05 else ''
+        report.write(f'   {name:30s} n={n} n01={n01} n10={n10} '
+                     f'holm={padj:.4f}{mark}\n')
     y = np.arange(len(rows))[::-1]
     for col, _ in METRICS:
         for yi, (rb, padj) in zip(y, res[col]):
