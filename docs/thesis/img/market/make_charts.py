@@ -58,8 +58,9 @@ df['hq'] = df['HQ'].replace({'Sweden': 'SE', 'Switzerland': 'CH'})
 MATRIX = [('active', 'Active', 'dot'),
           ('hq', 'Headquarters', 'text'),
           ('public SaaS', 'Public SaaS', 'dot'),
+          ('agentic AI', 'Agent', 'dot'),
           ('own-agent infrastructure', 'Agent deployments', 'dot'),
-          ('meta harness', 'Meta harness', 'dot'),
+          ('meta harness', 'Meta-Harness', 'dot'),
           ('model context protocol server hosting', 'MCP server hosting', 'dot'),
           ('skills', 'Skills', 'dot')]
 # dot count breaks ties between equal bar totals
@@ -228,7 +229,7 @@ ifrows = {'Python SDK': dict(zip(STAGES, groups['Python SDK'])),
           'ML platform agents': dict(zip(STAGES, ['feature 4', 'training 4',
                                           'inference 4', 'ops 4'])),
           'Agent deployments': {None: 'own-agent infrastructure'},
-          'Meta harness': {None: 'meta harness'},
+          'Meta-Harness': {None: 'meta harness'},
           'Skills': {None: 'skills'}}
 N = len(df)
 fig, ax = plt.subplots(figsize=(6.2, 4.8))
