@@ -4,7 +4,7 @@ Ports the print-sized figures of results/results.ipynb section 8, scoped to
 the committed RQ2 arms: Hopsworks and Databricks full grids (treatments 1-4
 and 18-21). Fable, GCP, and the RQ3 optimization arms are out of scope here.
 Sized for the KTH template text block (130 mm, included at width=linewidth).
-Fonts: prefers Times New Roman; falls back to Liberation Serif."""
+The fonts prefer Times New Roman and fall back to Liberation Serif."""
 from pathlib import Path
 
 import matplotlib
@@ -28,16 +28,11 @@ raw['valid'] = raw['valid'].astype(str).str.lower() == 'true'
 raw['success'] = raw['success'].astype(str).str.lower() == 'true'
 raw['pass_rate'] = raw['asserts_passed'] / raw['total_asserts']
 
-# cleaning as in the results notebook: keep the latest attempt per combo and
-# drop grader-infra crashes (the agent was never judged)
+# Cleaning as in the results notebook: keep the latest attempt per combination.
 df = raw.sort_values('n').drop_duplicates(
     subset=['config', 'interface', 'skills', 'category', 'task'], keep='last')
-df = df[~df['error'].astype(str).str.contains('grader failed to run', na=False)].copy()
 
-# four tasks are graded from a local answers.json with no platform-state
-# assertion (leakage, skew, drift, prediction_monitoring) — 19 committed runs
-# passed them with zero interface calls, so they measure agent reasoning, not
-# platform operation, and are removed from the analyzed benchmark suite (26->22)
+# Keep the 22 platform-grounded benchmark tasks analyzed in the thesis.
 EXCLUDED_TASKS = {'leakage', 'skew', 'drift', 'prediction_monitoring'}
 df = df[~df.task.isin(EXCLUDED_TASKS)].copy()
 
@@ -68,7 +63,7 @@ MODEL_ORDER = ['opus', 'mistral-large', 'sonnet', 'mistral-medium']
 df = df[df.config.isin([c for m in CFG.values() for c in m.values()])].copy()
 
 # cost_usd in results.csv is cache inclusive for the Claude rows, priced by
-# the framework from the retained session transcripts; Mistral cache usage was
+# the framework from the retained session transcripts. Mistral cache usage was
 # not retained, so Mistral cost stays a lower bound and is excluded from cost
 # inference below
 df['cost_ok'] = df.model.astype(str).str.startswith('claude-')
@@ -77,7 +72,7 @@ VARIANTS = [('cli', 'none'), ('cli', 'official'), ('sdk', 'none'), ('sdk', 'offi
 
 # skills were never delivered to the Mistral agent (bundle discovery-location
 # bug), so Mistral appears only in the no-skills condition in every figure and
-# contrast family; its nominal official rows stay in results.csv as provenance
+# contrast group. Its nominal official rows stay in results.csv as provenance
 def variants_for(m):
     return [(i, sk) for i, sk in VARIANTS
             if not (m.startswith('mistral') and sk == 'official')]
@@ -92,6 +87,10 @@ MCOLOR = {'opus': '#1565c0', 'sonnet': '#00897b',
           'mistral-large': '#ef6c00', 'mistral-medium': '#ad1457'}
 MMARK = {'cli': 'o', 'sdk': '^'}
 CATEGORIES = ['feature', 'training', 'inference', 'ops', 'capstone']
+BENCHMARK_TASKS = df[['category', 'task']].drop_duplicates()
+EXPECTED_TASKS = len(BENCHMARK_TASKS)
+EXPECTED_TASKS_BY_CATEGORY = BENCHMARK_TASKS.groupby('category').size().to_dict()
+INCOMPLETE_HATCH = '////'
 
 TW = 5.12  # KTH text block width in inches (130 mm)
 plt.rcParams.update({
@@ -120,13 +119,40 @@ def sel(cfg, iface=None, sk=None, category=None, task=None):
 
 
 def rate(d):
-    """Mean assertion pass fraction, invalid runs scored as zero
-    (the pre-registered accuracy aggregation rule); NaN when no runs."""
+    """Mean assertion pass fraction with invalid runs scored as zero.
+
+    This is the pre-registered accuracy aggregation rule. Return NaN when there
+    are no runs.
+    """
     return d.pass_rate.where(d.valid, 0.0).mean() if len(d) else np.nan
 
 
 def legend_handles():
-    return [Patch(facecolor=VCOLOR[v], label=VLABEL[v]) for v in VARIANTS]
+    return ([Patch(facecolor=VCOLOR[v], label=VLABEL[v]) for v in VARIANTS] +
+            [Patch(facecolor='white', edgecolor='#555', hatch=INCOMPLETE_HATCH,
+                   label='incomplete, n/planned')])
+
+
+def mark_and_annotate_bar(ax, bars, h, observed, expected, y_offset, fontsize):
+    """Label a pass-rate bar and visibly mark incomplete observations."""
+    if pd.isna(h):
+        return
+    b = bars[0]
+    incomplete = observed < expected
+    if incomplete:
+        b.set_hatch(INCOMPLETE_HATCH)
+        b.set_edgecolor('#444')
+        b.set_linewidth(0.7)
+        label = f'{h:.0%}\nn={observed}/{expected}'
+        if h == 0:
+            ax.plot(b.get_x() + b.get_width() / 2, 0.012, marker='x',
+                    color='#444', markersize=3.5, markeredgewidth=0.8,
+                    clip_on=False, zorder=4)
+    else:
+        label = f'{h:.0%}'
+    ax.annotate(label, (b.get_x() + b.get_width() / 2, h + y_offset),
+                ha='center', va='bottom', fontsize=fontsize, rotation=90,
+                color='#333')
 
 
 def save(fig, name):
@@ -135,7 +161,7 @@ def save(fig, name):
     plt.close(fig)
 
 
-# fig: overview — pass fraction per model, one figure per platform
+# fig: overview, pass fraction per model, one figure per platform
 w = 0.19
 for plat in PLATFORMS:
     fig, ax = plt.subplots(figsize=(TW, 2.9))
@@ -143,14 +169,12 @@ for plat in PLATFORMS:
     for xi, m in enumerate(MODEL_ORDER):
         vs = variants_for(m)
         for j_, (iface, sk) in enumerate(vs):
-            h = rate(sel(CFG[plat][m], iface, sk))
+            observed = sel(CFG[plat][m], iface, sk)
+            h = rate(observed)
             bars = ax.bar(xi + (j_ - (len(vs) - 1) / 2) * w, h, w * 0.92,
                           color=VCOLOR[(iface, sk)])
-            if pd.notna(h):
-                b = bars[0]
-                ax.annotate(f'{h:.0%}', (b.get_x() + b.get_width() / 2, h + 0.01),
-                            ha='center', va='bottom', fontsize=5.5, rotation=90,
-                            color='#333')
+            mark_and_annotate_bar(ax, bars, h, len(observed), EXPECTED_TASKS,
+                                  y_offset=0.01, fontsize=5.5)
     ax.set_xticks(x)
     ax.set_xticklabels(MODEL_ORDER)
     ax.yaxis.set_major_formatter(PercentFormatter(1.0))
@@ -163,7 +187,8 @@ for plat in PLATFORMS:
     fig.tight_layout()
     save(fig, f'benchmark_overview_{plat}')
 
-# fig: category — one figure per task family, both platforms side by side
+# fig: category, one figure each for feature, training, inference, operations,
+# and capstone tasks, with both platforms side by side
 for cat in CATEGORIES:
     fig, axes = plt.subplots(1, 2, figsize=(TW, 2.3), sharey=True)
     for c, plat in enumerate(PLATFORMS):
@@ -172,15 +197,13 @@ for cat in CATEGORIES:
         for xi, m in enumerate(MODEL_ORDER):
             vs = variants_for(m)
             for j_, (iface, sk) in enumerate(vs):
-                h = rate(sel(CFG[plat][m], iface, sk, category=cat))
+                observed = sel(CFG[plat][m], iface, sk, category=cat)
+                h = rate(observed)
                 bars = ax.bar(xi + (j_ - (len(vs) - 1) / 2) * w, h, w * 0.92,
                               color=VCOLOR[(iface, sk)])
-                if pd.notna(h):
-                    b = bars[0]
-                    ax.annotate(f'{h:.0%}',
-                                (b.get_x() + b.get_width() / 2, h + 0.02),
-                                ha='center', va='bottom', fontsize=4.2,
-                                rotation=90, color='#333')
+                mark_and_annotate_bar(
+                    ax, bars, h, len(observed), EXPECTED_TASKS_BY_CATEGORY[cat],
+                    y_offset=0.02, fontsize=4.2)
         ax.set_xticks(x)
         ax.set_xticklabels(MODEL_ORDER, rotation=35, ha='right', fontsize=6.5)
         ax.yaxis.set_major_formatter(PercentFormatter(1.0))
@@ -196,7 +219,7 @@ for cat in CATEGORIES:
     fig.tight_layout(rect=(0, 0.06, 1, 1))
     save(fig, f'benchmark_category_{cat}')
 
-# fig: per-task heatmaps — one per platform x interface (appendix, one page each)
+# fig: per-task heatmaps, one per platform x interface (appendix, one page each)
 TASK_ORDER = []
 for cat in CATEGORIES:
     TASK_ORDER += [(cat, t) for t in sorted(df[df.category == cat].task.unique())]
@@ -249,7 +272,7 @@ for plat in PLATFORMS:
         fig.tight_layout()
         save(fig, f'benchmark_tasks_{plat}_{iface}')
 
-# fig: efficiency frontier — 2 metrics x 2 platforms
+# fig: efficiency frontier, 2 metrics x 2 platforms
 fr_rows = []
 for plat in PLATFORMS:
     for m in MODEL_ORDER:
@@ -286,11 +309,11 @@ fhandles = ([Line2D([], [], ls='', marker='s', color=MCOLOR[m], label=m)
             [Line2D([], [], ls='', marker=MMARK[i_], mfc='white', mec='#555',
                     label=i_.upper()) for i_ in ['cli', 'sdk']] +
             [Line2D([], [], ls='', marker='o', mfc='#555', mec='#555',
-                    label='+ skills (filled)'),
+                    label='+ skills, filled'),
              Line2D([], [], ls='', marker='o', mfc='white', mec='#555',
-                    label='no skills (open)')])
-for xcol, xlabel, tag in [('cost_per_solve', 'model invocation cost per solved task (USD, log)', 'cost'),
-                          ('turns_per_solve', 'LLM turns per solved task (log)', 'turns')]:
+                    label='no skills, open')])
+for xcol, xlabel, tag in [('cost_per_solve', 'model invocation cost per solved task in USD, logarithmic scale', 'cost'),
+                          ('turns_per_solve', 'LLM turns per solved task, logarithmic scale', 'turns')]:
     fig, axes = plt.subplots(1, 2, figsize=(TW, 3.2))
     for c_, plat in enumerate(PLATFORMS):
         ax = axes[c_]
@@ -323,7 +346,7 @@ for xcol, xlabel, tag in [('cost_per_solve', 'model invocation cost per solved t
     save(fig, f'benchmark_frontier_{tag}')
 print('all charts generated')
 
-# fig: planned contrasts — Wilcoxon rank-biserial effect sizes, Holm-adjusted
+# fig: planned contrasts, Wilcoxon rank-biserial effect sizes, Holm-adjusted
 from scipy import stats as sps
 
 
@@ -350,22 +373,22 @@ def cellf(plat, m, iface, sk):
 
 PSH = {'hopsworks': 'hw', 'databricks': 'db'}
 SKL = {'none': '-', 'official': '+sk'}
-# interface and skills contrasts pair identical seeded instances (shared
-# run_id); platform and model contrasts pair task templates across instances
-families = {}
-families['Interface (SDK vs CLI)'] = [
+# interface and skills contrasts pair identical seeded instances with a shared
+# run_id. Platform and model contrasts pair task templates across instances
+contrast_groups = {}
+contrast_groups['Interface, SDK vs CLI'] = [
     (f'{PSH[p]} {m} {SKL[sk]}', cellf(p, m, 'cli', sk), cellf(p, m, 'sdk', sk))
     for p in PLATFORMS for m in MODEL_ORDER for sk in strata_for(m)]
 # skills bundles were installed under .claude/skills/, which the Mistral Vibe
 # agent never reads (session logs list no platform skill, 0 skill calls in all
-# 208 mistral official rows) — the official condition was a no-op for Mistral,
-# so the skills family is restricted to the Claude cells where the treatment
+# nominal Mistral official rows). The official condition was a no-op for Mistral,
+# so the skills contrasts are restricted to the Claude cells where the treatment
 # was actually delivered
-families['Skills (official vs none)'] = [
+contrast_groups['Skills, official vs none'] = [
     (f'{PSH[p]} {m} {i}', cellf(p, m, i, 'none'), cellf(p, m, i, 'official'))
     for p in PLATFORMS for m in MODEL_ORDER for i in ['cli', 'sdk']
     if not m.startswith('mistral')]
-families['Platform (Databricks vs Hopsworks)'] = [
+contrast_groups['Platform, Databricks vs Hopsworks'] = [
     (f'{m} {i} {SKL[sk]}', cellf('hopsworks', m, i, sk), cellf('databricks', m, i, sk))
     for m in MODEL_ORDER for i in ['cli', 'sdk'] for sk in strata_for(m)]
 
@@ -408,8 +431,8 @@ def paired_counts(a, b, col):
     return int(ok.sum()), int((d != 0).sum())
 
 
-def family_results(contrasts):
-    """Adjust every inferential test in one manipulated-factor family."""
+def group_results(contrasts):
+    """Adjust every inferential test in one manipulated-factor contrast group."""
     tested = {}
     keys, ps = [], []
     for col, _ in METRICS:
@@ -438,8 +461,8 @@ def family_results(contrasts):
     return result
 
 
-def draw_family(ax, contrasts):
-    res = family_results(contrasts)
+def draw_group(ax, contrasts):
+    res = group_results(contrasts)
     y = np.arange(len(contrasts))[::-1]
     for col, _ in METRICS:
         for yi, entry in zip(y, res[col]):
@@ -464,28 +487,28 @@ SCOLOR = {'pr0': '#1565c0', 'cost_usd': '#ef6c00', 'llm_calls': '#00897b',
           'local_time_s': '#8e24aa'}
 SOFF = {'pr0': 0.3, 'cost_usd': 0.1, 'llm_calls': -0.1, 'local_time_s': -0.3}
 
-FTAG = {'Interface (SDK vs CLI)': 'interface',
-        'Skills (official vs none)': 'skills',
-        'Platform (Databricks vs Hopsworks)': 'platform'}
-for fam, contrasts in families.items():
+FTAG = {'Interface, SDK vs CLI': 'interface',
+        'Skills, official vs none': 'skills',
+        'Platform, Databricks vs Hopsworks': 'platform'}
+for group, contrasts in contrast_groups.items():
     fig, ax = plt.subplots(figsize=(TW, 0.165 * len(contrasts) + 1.55))
-    draw_family(ax, contrasts)
-    ax.set_title(fam, loc='left', fontsize=8, fontweight='bold')
+    draw_group(ax, contrasts)
+    ax.set_title(group, loc='left', fontsize=8, fontweight='bold')
     # the reading direction and the +sk key are explained in the figure captions
     ax.set_xlabel('rank-biserial correlation of the paired differences')
     shandles = ([Line2D([], [], ls='', marker='o', mfc=SCOLOR[c], mec=SCOLOR[c],
                         ms=5, label=lab) for c, lab in METRICS] +
                 [Line2D([], [], ls='', marker='o', mfc='#555', mec='#555', ms=5,
-                        label='Holm p < 0.05 (filled)'),
+                        label='Holm p < 0.05, filled'),
                  Line2D([], [], ls='', marker='o', mfc='white', mec='#555', ms=5,
-                        label='not significant (open)')])
+                        label='not significant, open')])
     fig.legend(handles=shandles, loc='lower center', ncol=3, frameon=False,
                fontsize=6, bbox_to_anchor=(0.5, -0.01), columnspacing=0.9,
                handletextpad=0.4)
     fig.tight_layout(rect=(0, 0.10, 1, 1))
-    save(fig, f'benchmark_stats_{FTAG[fam]}')
+    save(fig, f'benchmark_stats_{FTAG[group]}')
 
-# fig: model family — pairwise model contrasts within platform x interface x skills
+# fig: pairwise model contrasts within platform x interface x skills
 # Mistral has no official-condition cells (skills never delivered), so pairs at
 # the official condition exist only between the Claude models
 model_contrasts = [
@@ -495,8 +518,8 @@ model_contrasts = [
     if not (sk == 'official'
             and (m1.startswith('mistral') or m2.startswith('mistral')))]
 fig, ax = plt.subplots(figsize=(TW, 0.165 * len(model_contrasts) + 1.7))
-draw_family(ax, model_contrasts)
-ax.set_title('Model (second named vs first named)', loc='left', fontsize=8,
+draw_group(ax, model_contrasts)
+ax.set_title('Model, second named vs first named', loc='left', fontsize=8,
              fontweight='bold')
 ax.set_xlabel('rank-biserial correlation of the paired differences')
 fig.legend(handles=shandles, loc='lower center', ncol=3, frameon=False,
@@ -507,7 +530,7 @@ save(fig, 'benchmark_stats_models')
 
 
 # authoritative stats report: Wilcoxon (normal approximation), McNemar on success,
-# paired t with Cohen's d as sensitivity — all reported numbers derive from here
+# paired t with Cohen's d as sensitivity. All reported numbers derive from here
 def ttest_d(a, b, col):
     common = a.index.intersection(b.index)
     x = a.loc[common, col].astype(float)
@@ -520,13 +543,13 @@ def ttest_d(a, b, col):
     return float(sps.ttest_rel(y, x).pvalue), float(d.mean() / d.std())
 
 
-allfam = dict(families)
-allfam['Model (pairwise)'] = model_contrasts
+all_groups = dict(contrast_groups)
+all_groups['Model, pairwise'] = model_contrasts
 with open(OUT / 'stats_report.txt', 'w') as fh:
-    for fam, contrasts in allfam.items():
-        fres = family_results(contrasts)
-        fh.write(f'==== {fam} ({len(contrasts)} contrasts, '
-                 f'{fres["tests"]} tests in one factor-wide Holm family)\n')
+    for group, contrasts in all_groups.items():
+        fres = group_results(contrasts)
+        fh.write(f'==== {group}, {len(contrasts)} contrasts, '
+                 f'{fres["tests"]} tests under one factor-wide Holm adjustment\n')
         for col, lab in METRICS:
             elig = [not (col == 'cost_usd' and not cost_eligible(a, b))
                     for _, a, b in contrasts]
@@ -540,11 +563,11 @@ with open(OUT / 'stats_report.txt', 'w') as fh:
                         if r_ and t_ and ((r_[1] >= 0) == (t_[1] >= 0) or r_[1] == 0))
             nsig = sum(1 for i in idx if padjs[i] < 0.05)
             fh.write(f'-- {lab}: wilcoxon {nsig}/{len(idx)} sig after factor-wide Holm '
-                     f'({len(contrasts) - len(idx)} excluded, Mistral cost unreliable); '
+                 f'{len(contrasts) - len(idx)} excluded because Mistral cost is unreliable, '
                      f't-test direction agreement {agree}/{len(idx)}\n')
             for i, (name, a, b) in enumerate(contrasts):
                 if res[i] is None:
-                    fh.write(f'   {name:34s} excluded (Mistral cost not reliable)\n')
+                    fh.write(f'   {name:34s} excluded because Mistral cost is not reliable\n')
                     continue
                 n, nz = paired_counts(a, b, col)
                 mark = '*' if padjs[i] < 0.05 else ' '

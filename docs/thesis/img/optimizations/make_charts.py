@@ -27,12 +27,8 @@ raw['success'] = raw['success'].astype(str).str.lower() == 'true'
 raw['pass_rate'] = raw['asserts_passed'] / raw['total_asserts']
 df = raw.sort_values('n').drop_duplicates(
     subset=['config', 'interface', 'skills', 'category', 'task'], keep='last')
-df = df[~df['error'].astype(str).str.contains('grader failed to run', na=False)].copy()
 
-# four tasks are graded from a local answers.json with no platform-state
-# assertion (leakage, skew, drift, prediction_monitoring) — 19 committed runs
-# passed them with zero interface calls, so they measure agent reasoning, not
-# platform operation, and are removed from the analyzed benchmark suite (26->22)
+# Keep the 22 platform-grounded benchmark tasks analyzed in the thesis.
 EXCLUDED_TASKS = {'leakage', 'skew', 'drift', 'prediction_monitoring'}
 df = df[~df.task.isin(EXCLUDED_TASKS)].copy()
 df['pr0'] = df.pass_rate.where(df.valid, 0.0)

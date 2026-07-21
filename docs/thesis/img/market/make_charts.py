@@ -58,7 +58,7 @@ df['hq'] = df['HQ'].replace({'Sweden': 'SE', 'Switzerland': 'CH'})
 MATRIX = [('active', 'Active', 'dot'),
           ('hq', 'Headquarters', 'text'),
           ('public SaaS', 'Public SaaS', 'dot'),
-          ('agentic AI', 'Agent', 'dot'),
+          ('agentic AI', 'ML Platform Agent', 'dot'),
           ('own-agent infrastructure', 'Agent deployments', 'dot'),
           ('meta harness', 'Meta-Harness', 'dot'),
           ('model context protocol server hosting', 'MCP server hosting', 'dot'),
