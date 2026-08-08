@@ -68,7 +68,9 @@ plt.rcParams.update({
     'axes.axisbelow': True, 'axes.edgecolor': '#bdbdbd', 'axes.linewidth': 0.8,
     'axes.spines.top': False, 'axes.spines.right': False, 'figure.dpi': 150,
 })
-NS_COLOR, SK_COLOR, SDK_COLOR = '#90a4ae', '#455a64', '#1565c0'
+# Okabe-Ito palette: colorblind-safe qualitative colors. CLI variants share
+# vermillion (lighter for no-skills, darker for skills), SDK uses blue.
+NS_COLOR, SK_COLOR, SDK_COLOR = '#F5B37F', '#D55E00', '#0072B2'
 
 
 def save(fig, name):
@@ -158,9 +160,10 @@ rows_sdk = ([(f'{a}', base_sdk, sel(NS_CFG[a])) for a in ARMS] +
             [(f'{a} + skills', base_sdk, sel(SK_CFG[a])) for a in ARMS])
 METRICS = [('pr0', 'pass fraction'), ('cost_usd', 'model cost'),
            ('llm_calls', 'turns'), ('local_time_s', 'time')]
-SCOLOR = {'pr0': '#1565c0', 'cost_usd': '#ef6c00', 'llm_calls': '#00897b',
-          'local_time_s': '#8e24aa'}
-SOFF = {'pr0': 0.3, 'cost_usd': 0.1, 'llm_calls': -0.1, 'local_time_s': -0.3}
+SCOLOR = {'pr0': '#0072B2', 'cost_usd': '#D55E00', 'llm_calls': '#009E73',
+          'local_time_s': '#CC79A7'}
+# Distinct shapes give a second, colorblind-safe channel of differentiation.
+SMARKER = {'pr0': 'o', 'cost_usd': 's', 'llm_calls': '^', 'local_time_s': 'D'}
 
 def wtest2(a, b, col):
     ia = a.set_index(['category', 'task'])[col] if 'category' in a.columns else a[col]
@@ -262,21 +265,21 @@ for tag, refname, rows in row_sets:
     for col, _ in METRICS:
         for yi, (rb, padj) in zip(y, res[col]):
             filled = padj < 0.05
-            ax.scatter(rb, yi + SOFF[col], s=14, marker='o', zorder=3,
+            ax.scatter(rb, yi, s=28, marker=SMARKER[col], zorder=3,
                        facecolor=SCOLOR[col] if filled else 'white',
                        edgecolor=SCOLOR[col], linewidth=0.9)
     ax.axvline(0, color='#888888', lw=0.8, zorder=1)
     ax.set_yticks(y)
     ax.set_yticklabels([r[0] for r in rows], fontsize=6)
     ax.set_ylim(-0.7, len(rows) - 0.3)
-    ax.set_xlim(-1.05, 1.05)
+    ax.set_xlim(-1.05, 1.2)
     ax.set_title(f'Optimization arm vs {refname}', loc='left', fontsize=8,
                  fontweight='bold')
     ax.grid(axis='x')
     ax.grid(axis='y', linewidth=0.3)
     ax.set_xlabel('rank-biserial correlation of the paired differences\n'
                   '(positive = higher for the optimization arm)')
-    shandles = ([Line2D([], [], ls='', marker='o', mfc=SCOLOR[c], mec=SCOLOR[c],
+    shandles = ([Line2D([], [], ls='', marker=SMARKER[c], mfc=SCOLOR[c], mec=SCOLOR[c],
                         ms=5, label=lab) for c, lab in METRICS] +
                 [Line2D([], [], ls='', marker='o', mfc='#555', mec='#555', ms=5,
                         label='Holm p < 0.05 (filled)'),

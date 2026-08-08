@@ -81,10 +81,14 @@ def strata_for(m):
     return ['none'] if m.startswith('mistral') else ['none', 'official']
 VLABEL = {('cli', 'none'): 'CLI no skills', ('cli', 'official'): 'CLI + skills',
           ('sdk', 'none'): 'SDK no skills', ('sdk', 'official'): 'SDK + skills'}
-VCOLOR = {('cli', 'none'): '#90a4ae', ('cli', 'official'): '#455a64',
-          ('sdk', 'none'): '#42a5f5', ('sdk', 'official'): '#1565c0'}
-MCOLOR = {'opus': '#1565c0', 'sonnet': '#00897b',
-          'mistral-large': '#ef6c00', 'mistral-medium': '#ad1457'}
+# Okabe-Ito palette: colorblind-safe qualitative colors. CLI and SDK use
+# distinct hues (vermillion vs blue), and the skills condition is a darker
+# shade of the same hue so shape (hue) still distinguishes interface after
+# black-and-white printing.
+VCOLOR = {('cli', 'none'): '#F5B37F', ('cli', 'official'): '#D55E00',
+          ('sdk', 'none'): '#7FB8DA', ('sdk', 'official'): '#0072B2'}
+MCOLOR = {'opus': '#0072B2', 'sonnet': '#009E73',
+          'mistral-large': '#D55E00', 'mistral-medium': '#CC79A7'}
 MMARK = {'cli': 'o', 'sdk': '^'}
 CATEGORIES = ['feature', 'training', 'inference', 'ops', 'capstone']
 BENCHMARK_TASKS = df[['category', 'task']].drop_duplicates()
@@ -219,59 +223,6 @@ for cat in CATEGORIES:
     fig.tight_layout(rect=(0, 0.06, 1, 1))
     save(fig, f'benchmark_category_{cat}')
 
-# fig: per-task heatmaps, one per platform x interface (appendix, one page each)
-TASK_ORDER = []
-for cat in CATEGORIES:
-    TASK_ORDER += [(cat, t) for t in sorted(df[df.category == cat].task.unique())]
-tcmap = mpl.colormaps['Blues'].copy()
-tcmap.set_bad('#eeeeee')
-for plat in PLATFORMS:
-    for iface in ['cli', 'sdk']:
-        cols = [(m, sk) for m in MODEL_ORDER for sk in strata_for(m)]
-        M = np.full((len(TASK_ORDER), len(cols)), np.nan)
-        for i, (cat, t) in enumerate(TASK_ORDER):
-            for k, (m, sk) in enumerate(cols):
-                M[i, k] = rate(sel(CFG[plat][m], iface, sk, task=t))
-        fig, ax = plt.subplots(figsize=(TW, 7.6))
-        ax.grid(False)
-        im = ax.imshow(np.ma.masked_invalid(M), cmap=tcmap, vmin=0, vmax=1,
-                       aspect='auto')
-        ax.set_xticks(np.arange(len(cols)))
-        ax.set_xticklabels(['+sk' if sk == 'official' else '–' for _, sk in cols],
-                           fontsize=6)
-        for m in MODEL_ORDER:
-            ks = [k for k, (m_, _) in enumerate(cols) if m_ == m]
-            ax.text(sum(ks) / len(ks), -0.03, m.replace('mistral-', 'mistral-\n'),
-                    ha='center', va='top', fontsize=6.5,
-                    transform=ax.get_xaxis_transform(), color='#333')
-        ax.set_yticks(np.arange(len(TASK_ORDER)))
-        ax.set_yticklabels([t for _, t in TASK_ORDER], fontsize=6.5)
-        for i in range(M.shape[0]):
-            for k in range(M.shape[1]):
-                if not np.isnan(M[i, k]):
-                    ax.text(k, i, f'{M[i, k] * 100:.0f}', ha='center', va='center',
-                            fontsize=5.5,
-                            color='white' if M[i, k] > 0.55 else '#222')
-        for k in range(1, len(cols)):
-            if cols[k][0] != cols[k - 1][0]:
-                ax.axvline(k - 0.5, color='white', lw=1.6)
-        start = 0
-        for cat in CATEGORIES:
-            n_ = sum(1 for c_, _ in TASK_ORDER if c_ == cat)
-            if start > 0:
-                ax.axhline(start - 0.5, color='white', lw=1.6)
-            ax.text(-0.2, (2 * start + n_ - 1) / 2, cat, rotation=90, ha='right',
-                    va='center', fontsize=7, fontweight='bold',
-                    transform=ax.get_yaxis_transform(), color='#444')
-            start += n_
-        ax.tick_params(length=0)
-        # the skill-condition key (\u2013 / +sk) is explained in the figure captions
-        cb = fig.colorbar(im, ax=ax, fraction=0.03, pad=0.02)
-        cb.ax.yaxis.set_major_formatter(PercentFormatter(1.0))
-        cb.ax.tick_params(labelsize=6)
-        fig.tight_layout()
-        save(fig, f'benchmark_tasks_{plat}_{iface}')
-
 # fig: efficiency frontier, 2 metrics x 2 platforms
 fr_rows = []
 for plat in PLATFORMS:
@@ -312,29 +263,45 @@ fhandles = ([Line2D([], [], ls='', marker='s', color=MCOLOR[m], label=m)
                     label='+ skills, filled'),
              Line2D([], [], ls='', marker='o', mfc='white', mec='#555',
                     label='no skills, open')])
-for xcol, xlabel, tag in [('cost_per_solve', 'model invocation cost per solved task in USD, logarithmic scale', 'cost'),
-                          ('turns_per_solve', 'LLM turns per solved task, logarithmic scale', 'turns')]:
+def frontier_panel(ax, sub, xcol, xlim=None):
+    """Draw one linear-scale frontier panel."""
+    if xlim is not None:
+        lo, hi = xlim
+        sub = sub[(sub[xcol].notna()) & (sub[xcol] >= lo) & (sub[xcol] <= hi)]
+    else:
+        sub = sub[sub[xcol].notna()]
+    for _, r in sub.iterrows():
+        filled = r.skills == 'official'
+        ax.scatter(r[xcol], r.solve_rate, s=26, marker=MMARK[r.interface],
+                   facecolor=MCOLOR[r.model] if filled else 'white',
+                   edgecolor=MCOLOR[r.model], linewidth=1.1, zorder=3)
+    par = pareto(sub, xcol)
+    ax.step(par[xcol], par.solve_rate, where='post', color='#9e9e9e',
+            lw=0.9, zorder=2)
+    if xlim is not None:
+        lo, hi = xlim
+        pad = (hi - lo) * 0.04
+        ax.set_xlim(lo - pad, hi + pad)
+    ax.set_ylim(0, 1.06)
+    ax.yaxis.set_major_formatter(PercentFormatter(1.0))
+    ax.tick_params(labelsize=6.5)
+
+
+# fig: cost frontier, split into two linear-scale figures at COST_SPLIT USD so
+# the cheap-model cluster is not compressed against the axis
+COST_SPLIT = 2.0
+COST_MAX = float(np.ceil(frontier.cost_per_solve.max() or COST_SPLIT))
+for tag_suffix, xlim, xlabel in [
+    ('cost_low', (0.0, COST_SPLIT),
+     'model invocation cost per solved task in USD'),
+    ('cost_high', (COST_SPLIT, COST_MAX),
+     'model invocation cost per solved task in USD'),
+]:
     fig, axes = plt.subplots(1, 2, figsize=(TW, 3.2))
     for c_, plat in enumerate(PLATFORMS):
         ax = axes[c_]
         sub = frontier[frontier.platform == plat]
-        for _, r in sub.iterrows():
-            if pd.isna(r[xcol]):
-                continue
-            filled = r.skills == 'official'
-            ax.scatter(r[xcol], r.solve_rate, s=26, marker=MMARK[r.interface],
-                       facecolor=MCOLOR[r.model] if filled else 'white',
-                       edgecolor=MCOLOR[r.model], linewidth=1.1, zorder=3)
-        par = pareto(sub, xcol)
-        ax.step(par[xcol], par.solve_rate, where='post', color='#9e9e9e',
-                lw=0.9, zorder=2)
-        ax.set_xscale('log')
-        ax.xaxis.set_major_locator(mpl.ticker.LogLocator(subs=(1, 2, 5)))
-        ax.xaxis.set_major_formatter(mpl.ticker.ScalarFormatter())
-        ax.xaxis.set_minor_formatter(mpl.ticker.NullFormatter())
-        ax.set_ylim(0, 1.06)
-        ax.yaxis.set_major_formatter(PercentFormatter(1.0))
-        ax.tick_params(labelsize=6.5)
+        frontier_panel(ax, sub, 'cost_per_solve', xlim=xlim)
         ax.set_title(plat.capitalize(), fontweight='bold')
         ax.set_xlabel(xlabel, fontsize=7)
         if c_ == 0:
@@ -343,7 +310,32 @@ for xcol, xlabel, tag in [('cost_per_solve', 'model invocation cost per solved t
                fontsize=6, bbox_to_anchor=(0.5, -0.02), columnspacing=0.9,
                handletextpad=0.4)
     fig.tight_layout(rect=(0, 0.09, 1, 1))
-    save(fig, f'benchmark_frontier_{tag}')
+    save(fig, f'benchmark_frontier_{tag_suffix}')
+
+# fig: turns frontier, split into two linear-scale figures at TURNS_SPLIT so
+# the low-turn cluster is not compressed against the axis
+TURNS_SPLIT = 50.0
+TURNS_MAX = float(np.ceil(frontier.turns_per_solve.max() or TURNS_SPLIT))
+for tag_suffix, xlim, xlabel in [
+    ('turns_low', (0.0, TURNS_SPLIT),
+     'LLM turns per solved task'),
+    ('turns_high', (TURNS_SPLIT, TURNS_MAX),
+     'LLM turns per solved task'),
+]:
+    fig, axes = plt.subplots(1, 2, figsize=(TW, 3.2))
+    for c_, plat in enumerate(PLATFORMS):
+        ax = axes[c_]
+        sub = frontier[frontier.platform == plat]
+        frontier_panel(ax, sub, 'turns_per_solve', xlim=xlim)
+        ax.set_title(plat.capitalize(), fontweight='bold')
+        ax.set_xlabel(xlabel, fontsize=7)
+        if c_ == 0:
+            ax.set_ylabel('solve rate')
+    fig.legend(handles=fhandles, loc='lower center', ncol=4, frameon=False,
+               fontsize=6, bbox_to_anchor=(0.5, -0.02), columnspacing=0.9,
+               handletextpad=0.4)
+    fig.tight_layout(rect=(0, 0.09, 1, 1))
+    save(fig, f'benchmark_frontier_{tag_suffix}')
 print('all charts generated')
 
 # fig: planned contrasts, Wilcoxon rank-biserial effect sizes, Holm-adjusted
@@ -464,28 +456,33 @@ def group_results(contrasts):
 def draw_group(ax, contrasts):
     res = group_results(contrasts)
     y = np.arange(len(contrasts))[::-1]
+    # All four metrics share the same y position per contrast row and are
+    # distinguished by both colorblind-safe color and marker shape, so
+    # overlapping dots remain identifiable.
     for col, _ in METRICS:
         for yi, entry in zip(y, res[col]):
             if entry is None:
                 continue
             rb, padj = entry
             filled = padj < 0.05
-            ax.scatter(rb, yi + SOFF[col], s=16, marker='o', zorder=3,
+            ax.scatter(rb, yi, s=28, marker=SMARKER[col], zorder=3,
                        facecolor=SCOLOR[col] if filled else 'white',
                        edgecolor=SCOLOR[col], linewidth=0.9)
     ax.axvline(0, color='#888888', lw=0.8, zorder=1)
     ax.set_yticks(y)
     ax.set_yticklabels([c[0] for c in contrasts], fontsize=6)
     ax.set_ylim(-0.7, len(contrasts) - 0.3)
-    ax.set_xlim(-1.05, 1.05)
+    ax.set_xlim(-1.05, 1.2)
     ax.grid(axis='x')
     ax.grid(axis='y', linewidth=0.3)
 
 METRICS = [('pr0', 'pass fraction'), ('cost_usd', 'model cost'), ('llm_calls', 'turns'),
            ('local_time_s', 'time')]
-SCOLOR = {'pr0': '#1565c0', 'cost_usd': '#ef6c00', 'llm_calls': '#00897b',
-          'local_time_s': '#8e24aa'}
-SOFF = {'pr0': 0.3, 'cost_usd': 0.1, 'llm_calls': -0.1, 'local_time_s': -0.3}
+# Okabe-Ito colorblind-safe palette
+SCOLOR = {'pr0': '#0072B2', 'cost_usd': '#D55E00', 'llm_calls': '#009E73',
+          'local_time_s': '#CC79A7'}
+# Distinct shapes give a second, colorblind-safe channel of differentiation
+SMARKER = {'pr0': 'o', 'cost_usd': 's', 'llm_calls': '^', 'local_time_s': 'D'}
 
 FTAG = {'Interface, SDK vs CLI': 'interface',
         'Skills, official vs none': 'skills',
@@ -496,7 +493,7 @@ for group, contrasts in contrast_groups.items():
     ax.set_title(group, loc='left', fontsize=8, fontweight='bold')
     # the reading direction and the +sk key are explained in the figure captions
     ax.set_xlabel('rank-biserial correlation of the paired differences')
-    shandles = ([Line2D([], [], ls='', marker='o', mfc=SCOLOR[c], mec=SCOLOR[c],
+    shandles = ([Line2D([], [], ls='', marker=SMARKER[c], mfc=SCOLOR[c], mec=SCOLOR[c],
                         ms=5, label=lab) for c, lab in METRICS] +
                 [Line2D([], [], ls='', marker='o', mfc='#555', mec='#555', ms=5,
                         label='Holm p < 0.05, filled'),

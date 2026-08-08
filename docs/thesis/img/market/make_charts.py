@@ -67,8 +67,9 @@ MATRIX = [('active', 'Active', 'dot'),
 df['dots'] = sum((df[col].map(pts_url) > 0).astype(int)
                  for col, _, kind in MATRIX if kind == 'dot')
 
-colors = {'Python SDK': '#4477AA', 'CLI': '#66CCEE',
-          'MCP': '#EE6677', 'ML platform agents': '#CCBB44'}
+# Okabe-Ito palette: colorblind-safe qualitative colors
+colors = {'Python SDK': '#0072B2', 'CLI': '#009E73',
+          'MCP': '#D55E00', 'ML platform agents': '#CC79A7'}
 
 plt.rcParams.update({
     'pdf.fonttype': 42,
@@ -184,6 +185,8 @@ def coverage_chart_t(d, fname):
               columnspacing=1.4, handlelength=1.4)
     # fact matrix below, criteria as rows sharing the platform columns
     ym = np.arange(len(MATRIX))[::-1]
+    for r in ym:
+        axm.axhline(r, color='#EEEEEE', linewidth=0.5, zorder=1)
     for r, (col, _, kind) in zip(ym, MATRIX):
         if kind == 'dot':
             for xi, v in enumerate(d[col].map(pts_url)):
@@ -191,7 +194,9 @@ def coverage_chart_t(d, fname):
         else:
             for xi, t in enumerate(d[col]):
                 axm.text(xi, r, t, va='center', ha='center',
-                         fontsize=6.5, color='#444444')
+                         fontsize=6.5, color='#444444',
+                         bbox=dict(facecolor='white', edgecolor='none',
+                                   pad=1.0))
     axm.set_yticks(ym); axm.set_yticklabels([lab for _, lab, _ in MATRIX],
                                             fontsize=7)
     axm.set_ylim(-0.6, len(MATRIX) - 0.4)
@@ -219,17 +224,17 @@ coverage_chart(df.drop(top5.index), 'coverage_rest', 8.2, -0.075)
 # Key finding: coverage by interface class, split by lifecycle stage; MCP
 # hosting and skills are single criteria, shown as single-bar rows
 STAGES = ['Feature', 'Training', 'Inference', 'Ops']
-stage_colors = {'Feature': '#4477AA', 'Training': '#EE6677',
-                'Inference': '#CCBB44', 'Ops': '#66CCEE'}
-ifrows = {'Python SDK': dict(zip(STAGES, groups['Python SDK'])),
+stage_colors = {'Feature': '#0072B2', 'Training': '#D55E00',
+                'Inference': '#CC79A7', 'Ops': '#009E73'}
+ifrows = {'Agent deployments': {None: 'own-agent infrastructure'},
           'CLI': dict(zip(STAGES, groups['CLI'])),
+          'MCP server hosting': {None: 'model context protocol server hosting'},
           'MCP tools': dict(zip(STAGES, ['feature 3', 'training 3',
                                          'inference 3', 'ops 3'])),
-          'MCP server hosting': {None: 'model context protocol server hosting'},
+          'Meta-Harness': {None: 'meta harness'},
           'ML platform agents': dict(zip(STAGES, ['feature 4', 'training 4',
                                           'inference 4', 'ops 4'])),
-          'Agent deployments': {None: 'own-agent infrastructure'},
-          'Meta-Harness': {None: 'meta harness'},
+          'Python SDK': dict(zip(STAGES, groups['Python SDK'])),
           'Skills': {None: 'skills'}}
 N = len(df)
 fig, ax = plt.subplots(figsize=(6.2, 4.8))
