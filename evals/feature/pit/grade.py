@@ -30,7 +30,7 @@ VARIANT_DIAGNOSIS = {
     "latest_join": "joined each account's overall-latest feature rows — values from "
     "AFTER label_time leaked into the training data",
     "ignore_late": "the late-arriving export (transactions_late.csv) was not ingested",
-    "leak_future": "PIT-correct except the leak-tempting table, whose post-label row "
+    "leak_future": "PIT-correct except the label-encoding table, whose post-label row "
     "was used — future information leaked into the training data",
 }
 

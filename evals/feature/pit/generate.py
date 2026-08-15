@@ -7,7 +7,7 @@ Usage:
 One task, no difficulty tiers: build a point-in-time-correct training dataset
 across four feature tables whose histories contain late-arriving rows and
 duplicates, including one table whose post-label rows strongly encode the
-label (the leak temptation). The prompt states the as-of join rule explicitly
+label, so that ignoring the as-of cutoff leaks it. The prompt states the join rule explicitly
 — what's measured is whether the agent can execute the discipline through the
 platform, not whether it guesses the requirement.
 
@@ -37,7 +37,8 @@ from evals.feature.pit.reference import TABLE_FEATURES, latest_join, leaky_join,
 KIND = "dataset"  # deliverable kind: table | dataset | answers | platform
 SUMMARY = (
     "Measures whether an agent can build a point-in-time-correct training dataset across "
-    "four feature tables with late-arriving rows, duplicates, and a leak-tempting table "
+    "four feature tables with late-arriving rows, duplicates, and one table whose "
+    "post-label rows strongly encode the label "
     "(the task family for the `training_data` FTI sub-category)."
 )
 

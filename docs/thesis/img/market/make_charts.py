@@ -39,8 +39,16 @@ groups = {
             'model context protocol server hosting'],
     'ML platform agents': ['feature 4', 'training 4', 'inference 4', 'ops 4',
                    'PySpark code', 'file system', 'dashboards'],
+    # A meta-harness is the second documented route by which a coding agent
+    # operates a platform, so it is scored in its own right rather than folded
+    # into the vendor-agent group.
+    'Meta-harness': ['meta harness'],
+    # Capabilities an agent operating the platform can draw on, scored in their
+    # own right rather than left as descriptive facts.
+    'Skills': ['skills'],
+    'Agent deployments': ['own-agent infrastructure'],
 }
-MAX = 20.0
+MAX = 23.0
 for g, cols in groups.items():
     df[g] = df[cols].map(pts_url).sum(axis=1)
 df['total'] = df[list(groups)].sum(axis=1) / MAX
@@ -58,18 +66,20 @@ df['hq'] = df['HQ'].replace({'Sweden': 'SE', 'Switzerland': 'CH'})
 MATRIX = [('active', 'Active', 'dot'),
           ('hq', 'Headquarters', 'text'),
           ('public SaaS', 'Public SaaS', 'dot'),
-          ('agentic AI', 'ML Platform Agent', 'dot'),
-          ('own-agent infrastructure', 'Agent deployments', 'dot'),
-          ('meta harness', 'Meta-Harness', 'dot'),
-          ('model context protocol server hosting', 'MCP server hosting', 'dot'),
-          ('skills', 'Skills', 'dot')]
+          ('other agent', 'Other software agent', 'dot')]
+# The matrix carries only facts that stay out of the score and are not implied
+# by a bar. Documented MCP server hosting and the meta-harness are scored
+# criteria, and the existence of an ML platform agent is already visible as a
+# non-empty agent segment, so none of the three is repeated here.
 # dot count breaks ties between equal bar totals
 df['dots'] = sum((df[col].map(pts_url) > 0).astype(int)
                  for col, _, kind in MATRIX if kind == 'dot')
 
 # Okabe-Ito palette: colorblind-safe qualitative colors
 colors = {'Python SDK': '#0072B2', 'CLI': '#009E73',
-          'MCP': '#D55E00', 'ML platform agents': '#CC79A7'}
+          'MCP': '#D55E00', 'ML platform agents': '#CC79A7',
+          'Meta-harness': '#E69F00', 'Skills': '#56B4E9',
+          'Agent deployments': '#999999'}
 
 plt.rcParams.update({
     'pdf.fonttype': 42,
@@ -107,7 +117,7 @@ DOT = {True: dict(facecolor='#555555', edgecolor='#555555'),
 def coverage_chart(d, fname, height, legend_y):
     d = d.sort_values(['total', 'dots'], ascending=True)
     fig, (axm, ax) = plt.subplots(1, 2, figsize=(6.2, height),
-                                  width_ratios=[1.35, 2.9])
+                                  width_ratios=[1.3, 3.0])
     y = np.arange(len(d))
     left = np.zeros(len(d))
     for g in groups:
@@ -158,7 +168,7 @@ def coverage_chart_t(d, fname):
     d = d.sort_values(['total', 'dots'], ascending=False)
     n = len(d)
     fig, (ax, axm) = plt.subplots(2, 1, figsize=(6.2, 4.6),
-                                  height_ratios=[2.6, 1.0])
+                                  height_ratios=[2.9, 0.9])
     x = np.arange(n)
     bottom = np.zeros(n)
     for g in groups:
@@ -217,9 +227,19 @@ def coverage_chart_t(d, fname):
                frameon=False, fontsize=7, handletextpad=0.4)
     fig.tight_layout(h_pad=0.5); save(fig, fname)
 
-top5 = df.nlargest(5, 'total')
+# Leading group = actively maintained, publicly available platforms at or above
+# a 35% coverage threshold. The rule is applied uniformly to all 39 platforms:
+# a platform an organization cannot adopt today does not lead the market.
+LEAD_THRESHOLD = 0.35
+top5 = df[(df['total'] >= LEAD_THRESHOLD)
+          & df['active'].str.strip().str.lower().eq('yes')
+          & df['public SaaS'].str.strip().str.lower().eq('yes')]
+print(f'leading group ({len(top5)} platforms at >= {LEAD_THRESHOLD:.0%}): '
+      + ', '.join(f'{r["company"]} {r["total"]:.1%}'
+                  for _, r in top5.sort_values('total', ascending=False).iterrows()))
+print(f'remaining: {len(df) - len(top5)} platforms')
 coverage_chart_t(top5, 'coverage_top5')
-coverage_chart(df.drop(top5.index), 'coverage_rest', 8.2, -0.075)
+coverage_chart(df.drop(top5.index), 'coverage_rest', 8.4, -0.075)
 
 # Key finding: coverage by interface class, split by lifecycle stage; MCP
 # hosting and skills are single criteria, shown as single-bar rows

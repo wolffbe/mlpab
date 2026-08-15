@@ -16,7 +16,7 @@ enumerated assert suite, and the named naive-variant diagnoses.
 | [`ingest`](feature/ingest.md) | table | Measures whether an agent can register a feature table and load a full export whose two files overlap, landing every row exactly once. |
 | [`leakage`](feature/leakage.md) | answers | Measures whether an agent can find the one feature in a training dataset that leaks the label through post-outcome computation. |
 | [`mit`](feature/mit.md) | table | Measures whether an agent can compute model-independent transformations, in particular a per-account rolling 7-day sum with exact window semantics, into a derived feature table. |
-| [`pit`](feature/pit.md) | dataset | Measures whether an agent can build a point-in-time-correct training dataset across four feature tables with late-arriving rows, duplicates, and a leak-tempting table (the task family for the `training_data` FTI sub-category). |
+| [`pit`](feature/pit.md) | dataset | Measures whether an agent can build a point-in-time-correct training dataset across four feature tables with late-arriving rows, duplicates, and one table whose post-label rows strongly encode the label (the task family for the `training_data` FTI sub-category). |
 | [`validate`](feature/validate.md) | table | Measures whether an agent can enforce a documented data contract, loading only clean rows into a feature table and reporting every rejected row id. |
 
 ## training
